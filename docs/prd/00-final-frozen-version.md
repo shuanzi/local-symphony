@@ -13,7 +13,7 @@ Go daemon
 + git worktree workspace
 + Codex app-server runner
 + CLI/IPC tool gateway
-+ atomic handoff
++ two-stage handoff finalization
 + review packet
 + REST/SSE API
 + balanced-secure local security baseline
@@ -63,9 +63,9 @@ issue → Human Review
 | Workspace | 每 issue 一个 `git worktree` |
 | Branch | 每 issue 一个稳定 branch |
 | Agent runtime | Codex app-server |
-| Transport | stdio JSONL |
+| Transport | version-aware Codex app-server adapter |
 | Tool Gateway | `symphony tool` CLI + 本地 IPC |
-| Handoff | 原子化 `symphony tool handoff` |
+| Handoff | `symphony tool handoff` 原子提交；review-packet finalizer 转 Human Review |
 | Review | review packet 是 Human Review 核心交付物 |
 | API | `/api/v1` REST + SSE |
 | UI | Control surface，不参与 orchestrator correctness |
@@ -102,9 +102,9 @@ v1 必须完整通过：
 8. 系统启动 codex app-server。
 9. Codex 在 workspace 内修改文件。
 10. Codex 运行测试。
-11. Codex 调用 symphony tool handoff。
-12. 系统生成 review packet。
-13. LOC-1 进入 Human Review。
+11. Codex 调用 `symphony tool handoff`，系统记录 handoff。
+12. run finalizer 生成 `status=generated` 的 review packet。
+13. 只有 review packet 成功生成后，LOC-1 进入 Human Review。
 14. UI 展示 diff、summary、tests、risks、commands。
 15. 用户选择 Send to Rework 或 Mark Done。
 ```

@@ -240,6 +240,19 @@ system comment
 handoff.missing event
 ```
 
+## Normalized issue DTO
+
+SQLite tables are not exposed directly to orchestrator, API, prompt, or UI code. These surfaces use `NormalizedIssue`, assembled from issue tables plus workspace metadata. See `docs/schema/normalized-issue-v1.md`.
+
+Important assembly rules:
+
+```text
+labels are lowercased and sorted
+blocked_by is derived from issue_relations where relation_type = blocks
+branch_name/workspace_path/base_ref/base_sha come from workspaces, not issues
+url is a local dashboard URL when available, otherwise null
+```
+
 ## Eligibility query
 
 ```sql
@@ -280,7 +293,7 @@ PRAGMA synchronous = NORMAL;
 | IS2-005 | issue identifier sequence inside transaction |
 | IS2-006 | UTC RFC3339 TEXT timestamps |
 | IS2-007 | JSON stored as TEXT, Go validated |
-| IS2-008 | tracker source: issues + labels/comments/relations/history |
+| IS2-008 | tracker source: issues + labels/comments/relations/history; surfaces use NormalizedIssue DTO |
 | IS2-009 | one workspace per issue |
 | IS2-010 | run_attempts record v1 run facts; no recovery leases |
 | IS2-011 | run_events.seq is SSE replay ID |

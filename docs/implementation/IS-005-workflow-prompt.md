@@ -235,6 +235,11 @@ prompt:
   save_prompt_snapshot: redacted
 ```
 
+
+## Compatibility aliases
+
+The parser accepts upstream-style `agent.max_turns` as a compatibility alias for `agent.max_turns_per_run`. If both are present, `agent.max_turns_per_run` wins and a warning is emitted. This alias does not enable upstream continuation semantics; Local v1 still uses one main turn plus bounded handoff continuations.
+
 ## Reload
 
 Reload sources:
@@ -327,7 +332,7 @@ DB stores only hashes and artifact paths, not full raw prompt. v1 has no raw pro
 | IS5-001 | optional front matter + prompt body; empty prompt blocks dispatch |
 | IS5-002 | unknown keys warning; type/enum/required errors block |
 | IS5-003 | defaults → env → path normalization → validation; no config interpolation |
-| IS5-004 | EffectiveConfig supports frozen sections |
+| IS5-004 | EffectiveConfig supports frozen sections and compatibility aliases |
 | IS5-005 | errors block dispatch; warnings do not |
 | IS5-006 | file watcher + manual reload + before-dispatch revalidate |
 | IS5-007 | Liquid-style prompt; unknown variable/filter fail |

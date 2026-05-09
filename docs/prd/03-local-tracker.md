@@ -69,9 +69,11 @@ Inbox → Ready → Working → Human Review → Done
 | Cancelled | 否 | 取消 |
 | Duplicate | 否 | 重复 |
 
-## 4. Issue 字段
+## 4. Issue 字段与 NormalizedIssue
 
-v1 issue 至少包含：
+v1 issue 表本身只保存 tracker 核心字段。API、prompt、UI 和 orchestrator 使用 normalized issue DTO。
+
+DTO 至少包含：
 
 ```text
 id
@@ -83,21 +85,34 @@ priority
 state
 labels
 blocked_by
+blocks
+dispatch_paused
+dispatch_pause_reason
+workspace.branch_name
+workspace.path
+workspace.base_ref
+workspace.base_sha
+latest_run
+latest_review_packet
 created_at
 updated_at
-branch_name
-workspace_path
-base_ref
-base_sha
 ```
+
+`branch_name`、`workspace_path`、`base_ref`、`base_sha` 来自 `workspaces` 表，不重复存入 `issues` 表。具体 DTO 见 `docs/schema/normalized-issue-v1.md`.
 
 ## 5. Blocker 规则
 
-issue 支持：
+issue 支持 blocker 关系：
 
 ```text
-blocked_by: [issue_id...]
-blocks:     [issue_id...]
+source_issue_id blocks target_issue_id
+```
+
+API/DTO 可以展示：
+
+```text
+blocked_by: [issue_id...]  # 从 blocks 关系反向推导
+blocks:     [issue_id...]  # 从 blocks 关系正向查询
 ```
 
 调度规则：
@@ -150,10 +165,12 @@ symphony tool ...
 read current issue
 add comment
 attach artifact
-handoff to Human Review
+submit handoff for review-packet finalizer
 create follow-up issue
 set Blocked with reason
 ```
+
+`issue.block` 只能把当前 issue 标为 `Blocked` 并写入 reason/comment。创建 blocker relation 必须走 operator blocker command，或由 `followup.create` 在同一 run 内创建 follow-up 后按明确定义的 relation 规则写入。
 
 禁止：
 
@@ -163,4 +180,7 @@ modify unrelated issue
 mark Done
 modify project settings
 push / PR / merge
+create arbitrary blocker relations
 ```
+
+`issue.block` 只表示 agent 将当前 issue 标记为 Blocked 并写入原因，不代表 agent 可以随意创建 blocker relation。Blocker relation 由 operator 通过 issue blocker API 管理。

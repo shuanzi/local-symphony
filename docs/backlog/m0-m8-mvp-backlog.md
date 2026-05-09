@@ -130,7 +130,7 @@ Backend:
 
 ```text
 Codex process manager
-stdio JSONL parser
+version-aware Codex protocol parser
 run_attempts
 run_events
 prompt builder
@@ -271,7 +271,7 @@ Backend:
 Overview state API
 Diagnostics API
 structured app log
-run JSONL log
+run event log
 raw Codex log reference
 workflow effective config
 redacted diagnostics export

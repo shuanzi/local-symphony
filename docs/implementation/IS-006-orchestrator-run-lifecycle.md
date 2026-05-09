@@ -97,7 +97,8 @@ Workspace preparation and Codex launch run outside the transaction.
 9. Wait for turn complete/fail/cancel
 10. If missing handoff, run at most one continuation
 11. If handoff exists, generate review packet
-12. Return outcome to actor
+12. Run hooks.after_run best-effort in a finally path if workspace exists
+13. Return outcome to actor
 ```
 
 ## Tick loop
@@ -126,7 +127,7 @@ attempt_no
 dispatch_reason = retry
 ```
 
-but v1 does not actively schedule retries.
+`dispatch_reason = retry` is reserved for an operator-initiated redispatch of a previously failed or paused issue. It must not imply an automatic retry timer, retry queue, or exponential backoff scheduler in v1.
 
 ## Failure behavior
 
@@ -178,6 +179,30 @@ still no handoff:
   dispatch_pause_reason = missing_handoff
   system comment
   handoff.missing event
+```
+
+## after_run hook guarantee
+
+If a workspace was prepared, the worker must attempt `hooks.after_run` in a `finally` path for all terminal worker outcomes:
+
+```text
+completed
+completed_without_handoff
+failed
+cancelled
+timeout-derived failure
+review_packet_failed
+```
+
+`after_run` failure is recorded as hook events and diagnostics. It does not hide the original run outcome and does not automatically move the issue to Human Review.
+
+Events:
+
+```text
+hook.after_run.started
+hook.after_run.completed
+hook.after_run.failed
+hook.after_run.timeout
 ```
 
 ## Handoff finalizer

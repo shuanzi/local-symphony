@@ -43,8 +43,8 @@ workflow validation status
 Codex availability
 Git repo status
 running agents
-queued / retrying issues
-paused issues
+paused failed issues
+manual resume candidates
 failed runs
 pending approvals
 recent events
@@ -101,7 +101,7 @@ turn_completed
 run_completed
 ```
 
-UI 展示归一化 event，不直接把 raw Codex JSONL 当主 UI。
+UI 展示归一化 event，不直接把 raw Codex protocol log 当主 UI。
 
 ## 6. Approval Inbox
 
@@ -154,7 +154,7 @@ Mark Done
 
 ```text
 没有 review packet，不允许 Done
-没有 handoff，可生成 partial review packet，但不自动进入 Human Review
+没有 handoff 时不进入 Human Review；v1 默认 completed_without_handoff 并暂停 dispatch。partial review packet 仅用于诊断，不满足 Done 条件
 Mark Done 默认只能由 operator 触发
 ```
 
@@ -218,10 +218,12 @@ Command API 需要 session token + CSRF。
 默认 endpoint：
 
 ```http
-GET /api/v1/events
+GET /api/v1/events/stream
 GET /api/v1/runs/:id/events/stream
 GET /api/v1/issues/:id/events/stream
 ```
+
+`GET /api/v1/events` 是 JSON query endpoint，不是 SSE endpoint。
 
 事件格式：
 
@@ -254,7 +256,7 @@ v1 日志分层：
 
 ```text
 structured app log
-run JSONL log
+run event log
 raw Codex protocol log reference
 review packet artifacts
 ```

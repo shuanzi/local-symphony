@@ -57,10 +57,9 @@ short_hash 来自 issue.id，避免重名
 默认规则：
 
 ```text
-1. WORKFLOW.md 中显式配置 git.base_ref
-2. 否则使用 origin/main
-3. 不存在 origin/main 时使用 origin/master
-4. 再不存在则使用当前 repo HEAD
+1. WORKFLOW.md 中显式配置 git.base_ref 时，必须能被 Git 解析。
+2. 未显式配置时，git.base_ref = auto。
+3. auto resolution order: origin/main → origin/master → main → master → HEAD。
 ```
 
 创建 workspace 时记录：
@@ -85,7 +84,7 @@ run hooks.before_run
 launch Codex
 ```
 
-后续 retry / Rework：
+后续 operator re-dispatch / Rework：
 
 ```text
 reuse same worktree
@@ -93,6 +92,8 @@ reuse same branch
 do not reset by default
 run hooks.before_run
 launch Codex
+
+# v1 does not have automatic retry timers; resume is operator-driven
 ```
 
 ## 6. Destructive action
@@ -179,7 +180,7 @@ v1 不做自动 PR / merge。
 
 ## 10. Cleanup 策略
 
-v1 不自动清理 Human Review 前的 workspace。
+v1 不自动清理 Human Review 前后的 workspace。这是相对 upstream SPEC terminal cleanup 的 intentional deviation，避免在没有 snapshot/backup/audit 前删除本地工作区。
 
 建议策略：
 

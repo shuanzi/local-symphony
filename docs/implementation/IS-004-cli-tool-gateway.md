@@ -233,6 +233,20 @@ handoff.submit
 
 No tool provides issue delete, Done, arbitrary state, project settings, workspace delete, git push, PR, or secret read.
 
+### issue.block semantics
+
+`issue.block` is limited to the current issue and records why agent progress is blocked:
+
+```text
+1. Validate token scope and current issue.
+2. Set current issue state to Blocked, if allowed by state transition rules.
+3. Add a system/agent-visible comment with the block reason.
+4. Set dispatch_paused=true with reason=agent_blocked.
+5. Emit issue.blocked and tool.call events.
+```
+
+`issue.block` must not create arbitrary blocker relations. Blocker relations are operator-controlled through normal issue blocker APIs. If the agent discovers follow-up work, it may use `followup.create` when allowed, but that is separate from blocking the current issue.
+
 ## Handoff
 
 Recommended:
@@ -242,6 +256,20 @@ symphony tool handoff --json ./handoff.json
 ```
 
 Handoff does not directly move issue to Human Review. It writes handoff data. The run finalizer generates review packet and then moves issue to Human Review.
+
+Successful `handoff.submit` output must indicate receipt, not final state transition:
+
+```json
+{
+  "success": true,
+  "tool": "handoff",
+  "issue_identifier": "LOC-123",
+  "handoff_status": "received",
+  "handoff_id": "hand_..."
+}
+```
+
+`handoff_status=received` means the handoff row and tool call were persisted. The issue enters `Human Review` only after the review-packet finalizer records `review_packet.status=generated`.
 
 ## Tool validation
 
@@ -283,6 +311,7 @@ All attributable tool calls are recorded in `tool_calls` and `run_events`, succe
 | IS4-018 | unified `/tool/v1/call` JSON protocol |
 | IS4-019 | v1 tool registry fixed |
 | IS4-020 | two-stage handoff |
+| IS4-020a | `issue.block` only blocks current issue; it does not create arbitrary blocker relations |
 | IS4-021 | token scope validated every call |
 | IS4-022 | tool calls persisted if attributable |
 | IS4-023 | CLI preflight + daemon final path validation |

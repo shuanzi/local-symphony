@@ -6,7 +6,7 @@ Frozen.
 
 ## Goal
 
-Define the v1 Codex app-server integration, stdio JSONL adapter, event normalization, approval handling, timeouts, cancellation, and fake runner test strategy.
+Define the v1 Codex app-server integration, version-aware protocol adapter, event normalization, approval handling, timeouts, cancellation, and fake runner test strategy.
 
 ## Process launch
 
@@ -35,11 +35,12 @@ SYMPHONY_RUN_ID
 SYMPHONY_WORKSPACE_PATH
 ```
 
-Streams:
+Protocol target:
 
 ```text
-stdout = JSONL protocol only
-stderr = diagnostic log
+v1 targets the selected Codex app-server stdio transport.
+The adapter must validate framing/schema compatibility for the installed Codex version in tests.
+stderr is diagnostic only unless the selected Codex protocol explicitly documents otherwise.
 ```
 
 Each run has a separate process group. Cancel first attempts graceful shutdown, then kills process group.
@@ -57,17 +58,17 @@ type Runner interface {
 
 The Codex implementation handles process, protocol, approvals, and event normalization internally.
 
-## JSONL parser
+## Protocol parser
 
 Rules:
 
 ```text
-read stdout line by line
-each line must be JSON
-malformed JSON → codex_protocol_error
-stderr is never protocol
-raw messages written to raw Codex log reference
+protocol framing/parser lives only in internal/agent/codex
+parser follows the selected Codex app-server protocol version
+framing/schema mismatch → codex_protocol_error
+raw protocol messages written to raw Codex log reference
 normalized events written to run_events
+orchestrator never depends on raw Codex protocol shapes
 ```
 
 ## Event normalization
@@ -169,7 +170,7 @@ Real Codex tests are opt-in.
 | ID | Decision |
 |---|---|
 | IS8-001 | one Codex subprocess per run |
-| IS8-002 | stdio JSONL only in v1 |
+| IS8-002 | version-aware Codex protocol adapter; stdio target is adapter detail |
 | IS8-003 | adapter hides Codex protocol from orchestrator |
 | IS8-004 | approval bridge handles blocking/decision/writeback |
 | IS8-005 | raw Codex log diagnostic only |

@@ -1,9 +1,13 @@
 # Local Symphony App v1 文档套件
 
-版本：v1 最终冻结版  
-冻结日期：2026-05-08  
-语言：中文  
-状态：已冻结，可进入 Implementation Spec / Engineering Backlog 阶段
+版本：v1 最终冻结版
+冻结日期：2026-05-09
+语言：中文
+状态：产品背景文档已冻结；实现以 `docs/implementation/`、`docs/schema/`、`docs/config/`、`docs/api/` 为准
+
+## 权威性说明
+
+本目录保留 PRD 和产品背景。若本目录内容与 implementation/schema/config/API 文档冲突，以后者为准。旧草案文件已在文件顶部标记 superseded 或 product context。若 upstream SPEC 与 Local v1 文档存在歧义，按 `docs/references/spec-conformance-matrix.md` 处理。
 
 ## 文档目录
 
@@ -17,12 +21,12 @@
 | `05-agent-prompt-tools.md` | Agent、Prompt、Tool Gateway 与 Handoff |
 | `06-ui-api-observability.md` | UI、API、SSE、日志与可观测性 |
 | `07-security-operations.md` | 安全、权限、Secrets、Sandbox 与 v1 后移项 |
-| `08-data-model.md` | v1 数据模型草案 |
-| `09-api-cli-spec.md` | v1 REST API 与 CLI 规格 |
-| `10-workflow-template.md` | `WORKFLOW.md` v1 模板 |
+| `08-data-model.md` | 数据模型概念说明；具体 schema 已由 `docs/implementation/IS-002-sqlite-schema-v1.md` 和 `docs/schema/project-schema-v1.md` 取代 |
+| `09-api-cli-spec.md` | API/CLI 产品概览；具体 API 以 `IS-003` / `docs/api/openapi-v1-outline.md` 为准，具体 CLI 以 `IS-004` 为准 |
+| `10-workflow-template.md` | 默认模板说明；唯一模板源为 `docs/config/starter-WORKFLOW.md` |
 | `11-mvp-roadmap.md` | M0–M8 MVP 里程碑与验收标准 |
 | `12-adr.md` | 架构决策记录 ADR |
-| `13-implementation-entrypoint.md` | 后续实施阶段建议入口 |
+| `13-implementation-entrypoint.md` | 实施入口说明；已同步到 Implementation Spec 权威结构 |
 | `99-references.md` | 参考资料 |
 
 ## 一句话定义
@@ -36,10 +40,12 @@ Go daemon
 + git worktree workspace
 + Codex app-server runner
 + CLI/IPC tool gateway
-+ atomic handoff
++ two-stage handoff finalization
 + review packet
 + REST/SSE API
 + balanced-secure local security baseline
 ```
 
 v1 的目标不是最大自动化，而是先建立一条可靠、可观察、可审查的本地 agent 工程工作流。
+
+补充权威 schema：`docs/schema/normalized-issue-v1.md` 定义 API、orchestrator、prompt 与 UI 共用的 normalized issue DTO。

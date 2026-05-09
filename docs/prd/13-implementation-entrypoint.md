@@ -1,199 +1,150 @@
 # Implementation Spec 阶段入口建议
 
-最终方案冻结后，下一阶段应进入 Implementation Spec。建议按以下顺序展开。
+## Status
+
+Superseded as implementation contract.
+
+Authoritative implementation file:
+
+```text
+docs/implementation/IS-001-repo-structure.md
+```
+
+本文档只保留阶段入口说明。代码结构、package 名称、schema 位置、OpenAPI 位置和 CLI 分组必须以 `IS-001`、`IS-002`、`IS-003`、`IS-004` 为准。
 
 ## 1. Repo structure
 
-建议代码结构：
+v1 使用单 binary：
 
 ```text
-local-symphony/
-├── cmd/
-│   ├── symphony/
-│   └── symphonyd/
-├── internal/
-│   ├── app/
-│   ├── config/
-│   ├── db/
-│   ├── tracker/
-│   ├── orchestrator/
-│   ├── workspace/
-│   ├── git/
-│   ├── agent/
-│   │   └── codex/
-│   ├── tools/
-│   ├── approvals/
-│   ├── review/
-│   ├── observability/
-│   ├── security/
-│   └── api/
-├── web/
-├── migrations/
-├── examples/
-├── docs/
-└── WORKFLOW.example.md
+cmd/symphony/
 ```
 
-## 2. Go backend module layout
+不要生成独立 daemon binary。`symphony serve` 是同一个 `symphony` binary 的 daemon/server mode。
 
-优先定义：
+Implementation package layout must follow `IS-001`，包括但不限于：
 
 ```text
-config loader
-DB interfaces
-tracker service
-orchestrator command queue
-workspace service
-Codex adapter interface
-tool gateway service
-review packet generator
+internal/app/
+internal/config/
+internal/db/
+internal/tracker/
+internal/orchestrator/
+internal/workspace/
+internal/gitx/
+internal/agent/codex/
+internal/toolgateway/
+internal/review/
+internal/httpapi/
+internal/cli/
+internal/security/
+internal/observability/
+internal/platform/
+db/schema/
+web/
+```
+
+## 2. Implementation order
+
+Recommended implementation order:
+
+```text
+1. repo skeleton and CLI command groups
+2. SQLite schema and migration/bootstrap loader
+3. WORKFLOW.md parser and effective config
+4. local tracker service and normalized issue DTO
+5. API skeleton + session/auth + health/state
+6. orchestrator actor + manual dispatch
+7. workspace/git worktree manager
+8. fake agent runner
+9. Tool Gateway and run-scoped tokens
+10. two-stage handoff + review packet finalizer
+11. Codex adapter behind Runner interface
+12. dashboard pages and SSE timelines
+13. security policy engine and approval bridge
+14. diagnostics/export and E2E acceptance tests
 ```
 
 ## 3. SQLite schema v1
 
-先实现最小表：
+Do not implement from this PRD. Use:
 
 ```text
-schema_version
-projects
-issues
-issue_comments
-issue_relations
-workspaces
-run_attempts
-run_events
-approval_requests
-tool_calls
-handoffs
-review_packets
-workflow_snapshots
-prompt_snapshots
-settings
+docs/implementation/IS-002-sqlite-schema-v1.md
+docs/schema/app-schema-v1.md
+docs/schema/project-schema-v1.md
+```
+
+Important field names:
+
+```text
+run_attempts.attempt_no
+review_packets.status = generated | partial | failed
+issue_relations.relation_type = blocks | duplicates | followup_of
+workspaces.status = planned | creating | ready | in_use | error | cleanup_pending | removed
 ```
 
 ## 4. OpenAPI v1 contract
 
-先定义：
+Use:
 
 ```text
-health/state
-issues
-runs
-approvals
-reviews
-workflow
-diagnostics
+docs/implementation/IS-003-openapi-v1.md
+docs/api/openapi-v1-outline.md
 ```
+
+When implemented, `api/openapi.yaml` becomes the source for generated clients and handler conformance tests.
 
 ## 5. CLI command spec
 
-先实现：
+Use:
+
+```text
+docs/implementation/IS-004-cli-tool-gateway.md
+```
+
+Single binary command groups:
 
 ```text
 symphony init
 symphony serve
-symphony issue create/list/show/transition/comment
-symphony run/show/cancel
-symphony tool issue get/comment/artifact/handoff
+symphony open
+symphony status
+symphony issue ...
+symphony run ...
+symphony approval ...
+symphony review ...
+symphony workflow ...
+symphony diagnostics ...
+symphony tool ...
 ```
 
-## 6. WORKFLOW.md parser spec
+## 6. Handoff implementation reminder
 
-必须支持：
+Do not implement a direct handoff transition.
+
+Correct sequence:
 
 ```text
-YAML front matter
-Markdown prompt body
-strict variable checking
-strict filter checking
-last known good config
-invalid workflow 阻止新 dispatch
+symphony tool handoff
+  -> validates run-scoped token
+  -> records handoff/tool_call/comment/event
+  -> returns handoff_status=received
+run finalizer
+  -> generates review packet
+  -> inserts review_packet.status=generated
+  -> sets run.status=completed
+  -> transitions issue to Human Review
 ```
 
-## 7. Orchestrator state machine
+## 7. Retry implementation reminder
 
-先实现：
+Do not implement automatic retry timers in v1.
+
+Correct behavior:
 
 ```text
-manual dispatch
-claim
-workspace prepare
-run start
-run event recording
-handoff transition
-run cancel
+failure -> issues.dispatch_paused = true
+operator dispatch-resume clears the pause
+next dispatch may use dispatch_reason=retry or rework depending on command/context
 ```
-
-自动 poll 可以在手动 dispatch 可用后增强。
-
-## 8. Codex adapter protocol wrapper
-
-先实现：
-
-```text
-process start
-stdio JSONL read/write
-thread/turn lifecycle
-event normalization
-approval request forwarding
-turn completed / failed / timeout
-stderr diagnostics
-```
-
-## 9. Tool Gateway contract
-
-先实现：
-
-```text
-local IPC / loopback fallback
-run-scoped token
-tool auth middleware
-JSON request/response
-handoff atomic transaction
-```
-
-## 10. Review Packet generator
-
-先实现：
-
-```text
-git diff
-changed-files.txt
-review.json
-review.md
-tool-calls.jsonl
-commands.jsonl
-approvals.jsonl
-prompt snapshot reference
-```
-
-## 11. React dashboard page-level plan
-
-实现顺序：
-
-```text
-Overview
-Board
-Issue Detail
-Run Detail
-Approval Inbox
-Review Packet
-Workflow
-Diagnostics
-```
-
-## 12. 工程优先级
-
-建议先打通最小纵向链路，而不是按模块横向做全功能：
-
-```text
-M0 skeleton
-→ create issue
-→ create worktree
-→ start Codex
-→ tool handoff
-→ review packet
-→ dashboard review
-```
-
-这条链路跑通后，再补齐审批、安全、诊断和失败路径。

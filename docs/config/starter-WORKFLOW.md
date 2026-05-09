@@ -127,6 +127,8 @@ When implementation is ready:
 2. Create a `handoff.json` file.
 3. Run `symphony tool handoff --json ./handoff.json`.
 
+The handoff tool submits handoff data only. Do not assume the issue is in Human Review until the review-packet finalizer succeeds.
+
 The handoff JSON should include:
 - summary
 - changed_files

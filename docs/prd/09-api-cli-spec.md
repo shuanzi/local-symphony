@@ -1,99 +1,91 @@
-# v1 REST API 与 CLI 规格
+# v1 REST API 与 CLI 规格概览
 
-## 1. REST API 原则
+## 状态
 
-v1 API 前缀：
-
-```text
-/api/v1
-```
-
-API 分为：
+产品背景文档。具体 API 以以下文档为准：
 
 ```text
-Query API：读取状态
-Command API：有副作用动作
+docs/implementation/IS-003-openapi-v1.md
+docs/api/openapi-v1-outline.md
+api/openapi.yaml（实现后）
 ```
 
-Command API 需要：
+具体 CLI 与 Tool Gateway 以以下文档为准：
 
 ```text
-session token
-CSRF protection
+docs/implementation/IS-004-cli-tool-gateway.md
 ```
 
-## 2. 必须 API
+## REST API 原则
 
-### Health / State
+```text
+API prefix: /api/v1
+Query API 读取状态。
+Command API 执行副作用动作。
+Command API 需要 session token 和 CSRF protection。
+UI 只通过 REST/SSE 与 daemon 交互。
+```
+
+## v1 必须 API 组
 
 ```http
-GET /api/v1/health
-GET /api/v1/state
-GET /api/v1/events
-```
+GET  /api/v1/health
+GET  /api/v1/state
+GET  /api/v1/events
+GET  /api/v1/events/stream
 
-### Issues
+POST /api/v1/auth/exchange
+GET  /api/v1/auth/session
+POST /api/v1/auth/logout
 
-```http
 GET  /api/v1/issues
 POST /api/v1/issues
-GET  /api/v1/issues/:id
-POST /api/v1/issues/:id/transition
-POST /api/v1/issues/:id/comments
-POST /api/v1/issues/:id/dispatch
-```
+GET  /api/v1/issues/{issue_id}
+POST /api/v1/issues/{issue_id}/transition
+POST /api/v1/issues/{issue_id}/comments
+GET  /api/v1/issues/{issue_id}/blockers
+POST /api/v1/issues/{issue_id}/blockers
+DELETE /api/v1/issues/{issue_id}/blockers/{blocker_issue_id}
+POST /api/v1/issues/{issue_id}/dispatch
+POST /api/v1/issues/{issue_id}/dispatch-pause
+POST /api/v1/issues/{issue_id}/dispatch-resume
+GET  /api/v1/issues/{issue_id}/events/stream
 
-### Runs
-
-```http
 GET  /api/v1/runs
-GET  /api/v1/runs/:id
-GET  /api/v1/runs/:id/events
-POST /api/v1/runs/:id/cancel
-```
+GET  /api/v1/runs/{run_id}
+GET  /api/v1/runs/{run_id}/events
+GET  /api/v1/runs/{run_id}/events/stream
+POST /api/v1/runs/{run_id}/cancel
 
-### Approvals
-
-```http
 GET  /api/v1/approvals
-POST /api/v1/approvals/:id/decide
-```
+POST /api/v1/approvals/{approval_id}/decide
 
-### Reviews
+GET  /api/v1/reviews/{issue_id}
+POST /api/v1/reviews/{issue_id}/send-to-rework
+POST /api/v1/reviews/{issue_id}/mark-done
 
-```http
-GET  /api/v1/reviews/:issue_id
-POST /api/v1/reviews/:issue_id/send-to-rework
-POST /api/v1/reviews/:issue_id/mark-done
-```
+GET  /api/v1/artifacts/{artifact_id}
+GET  /api/v1/artifacts/{artifact_id}/content
 
-### Workflow
-
-```http
 GET  /api/v1/workflow
 POST /api/v1/workflow/reload
-```
 
-### Diagnostics
-
-```http
 GET  /api/v1/diagnostics
 POST /api/v1/diagnostics/export
 ```
 
-## 3. v1 暂缓 API
+## SSE 规则
 
-```http
-POST /api/v1/git/:issue_id/push
-POST /api/v1/git/:issue_id/create-pr
-POST /api/v1/workspaces/:issue_id/delete
-POST /api/v1/workspaces/:issue_id/snapshot
-POST /api/v1/db/backup
-POST /api/v1/db/migrate
-POST /api/v1/audit/export
+```text
+/api/v1/events 是 JSON query endpoint。
+/api/v1/events/stream 是全局 SSE endpoint。
+/api/v1/runs/{run_id}/events/stream 是 run-scoped SSE endpoint。
+/api/v1/issues/{issue_id}/events/stream 是 issue-scoped SSE endpoint。
 ```
 
-## 4. 统一错误格式
+SSE 只传 normalized event，不传大块 raw logs。
+
+## 统一错误格式
 
 ```json
 {
@@ -106,79 +98,87 @@ POST /api/v1/audit/export
 }
 ```
 
-## 5. SSE
-
-```http
-GET /api/v1/events
-GET /api/v1/runs/:id/events/stream
-GET /api/v1/issues/:id/events/stream
-```
-
-事件格式：
-
-```json
-{
-  "id": "evt_000123",
-  "type": "run.approval_requested",
-  "severity": "warning",
-  "project_id": "proj_abc",
-  "issue_id": "loc_123",
-  "issue_identifier": "LOC-123",
-  "run_id": "run_001",
-  "summary": "Command requires approval: npm install",
-  "created_at": "2026-05-08T10:00:00+08:00",
-  "data": {}
-}
-```
-
-## 6. CLI 必须命令
-
-### App
+## CLI 必须命令组
 
 ```bash
 symphony init
 symphony serve
 symphony open
 symphony status
-```
 
-### Issue
-
-```bash
 symphony issue create
 symphony issue list
 symphony issue show LOC-123
+symphony issue update LOC-123
 symphony issue transition LOC-123 Ready
 symphony issue comment LOC-123 --body "..."
-```
+symphony issue blocker add LOC-2 --blocked-by LOC-1
+symphony issue blocker remove LOC-2 --blocked-by LOC-1
+symphony issue dispatch LOC-123
+symphony issue dispatch-pause LOC-123 --reason "..."
+symphony issue dispatch-resume LOC-123 --reason "..."
 
-### Run
-
-```bash
 symphony run LOC-123
 symphony run list
 symphony run show run_001
-symphony run cancel run_001
-```
+symphony run events run_001 --follow
+symphony run cancel run_001 --reason "..."
 
-### Review / Workflow / Diagnostics
+symphony approval list
+symphony approval decide appr_001 --approve-once
+symphony approval decide appr_001 --deny --reason "..."
 
-```bash
 symphony review LOC-123
+symphony review send-to-rework LOC-123 --reason "..."
+symphony review mark-done LOC-123 --reason "..."
+symphony review path LOC-123
+
 symphony workflow validate
+symphony workflow reload
+symphony workflow show
+
+symphony diagnostics
 symphony diagnostics export
 ```
 
-### Agent tool
+## Agent tool CLI
 
 ```bash
 symphony tool issue get
-symphony tool issue comment
-symphony tool artifact attach
-symphony tool handoff
+symphony tool issue comment --body "..."
+symphony tool issue block --reason "..."
+symphony tool artifact attach <path> --type test-output
+symphony tool followup create --json ./followup.json
+symphony tool handoff --json ./handoff.json
 ```
 
-## 7. v1 暂不实现 CLI
+所有 `symphony tool` 命令只输出 JSON。
+
+成功示例：
+
+```json
+{
+  "success": true,
+  "tool": "handoff",
+  "issue_identifier": "LOC-123",
+  "handoff_status": "received",
+  "next_step": "review_packet_finalizer"
+}
+```
+
+`handoff_status=received` 不代表 issue 已进入 `Human Review`。`Human Review` 只由 run finalizer 在 review packet 生成成功后设置。
+
+## v1 暂不实现
+
+```http
+POST /api/v1/git/{issue_id}/push
+POST /api/v1/git/{issue_id}/create-pr
+POST /api/v1/workspaces/{issue_id}/delete
+POST /api/v1/workspaces/{issue_id}/snapshot
+POST /api/v1/db/backup
+POST /api/v1/db/migrate
+POST /api/v1/audit/export
+```
 
 ```bash
 symphony db backup
@@ -186,29 +186,4 @@ symphony db migrate
 symphony db restore
 symphony audit export
 symphony pr create
-```
-
-## 8. Tool CLI 输出
-
-所有 `symphony tool` 默认输出 JSON。
-
-成功：
-
-```json
-{
-  "success": true,
-  "tool": "handoff",
-  "issue_identifier": "LOC-123",
-  "state": "Human Review"
-}
-```
-
-失败：
-
-```json
-{
-  "success": false,
-  "error_code": "permission_denied",
-  "message": "This run cannot transition terminal states."
-}
 ```

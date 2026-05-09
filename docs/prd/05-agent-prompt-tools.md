@@ -188,9 +188,12 @@ symphony tool handoff --json ./handoff.json
   "success": true,
   "tool": "handoff",
   "issue_identifier": "LOC-123",
-  "state": "Human Review"
+  "handoff_status": "received",
+  "handoff_id": "handoff_123"
 }
 ```
+
+`handoff_status=received` 只表示 tool gateway 已接受 handoff。issue 只有在 run finalizer 成功生成 review packet 后才进入 `Human Review`。
 
 失败：
 
@@ -218,7 +221,7 @@ project_id + issue_id + run_id
 read current issue
 comment current issue
 attach current run artifact
-handoff to Human Review
+submit handoff for current run
 create follow-up issue
 set Blocked with reason
 ```
@@ -236,7 +239,7 @@ workspace delete
 
 ## 10. Handoff
 
-handoff 是原子工具。
+handoff 是两阶段流程。`symphony tool handoff` 本身是原子化的 submit 工具，但它不直接把 issue 移动到 `Human Review`。Human Review transition 由 run finalizer 在 review packet 成功生成后完成。
 
 命令：
 
@@ -266,7 +269,7 @@ symphony tool handoff --json ./handoff.json
     "Create issue",
     "Move to Ready",
     "Dispatch run",
-    "Check Human Review handoff"
+    "Check review packet and Human Review transition"
   ],
   "followups": [
     {
@@ -277,16 +280,38 @@ symphony tool handoff --json ./handoff.json
 }
 ```
 
-原子流程：
+Tool submit 原子流程：
 
 ```text
 Validate token scope
 Validate issue belongs to run
-Validate target state is allowed
-Attach summary/tests/risks artifacts
-Add issue comment
+Validate handoff payload
+Store handoff payload
+Attach declared artifacts, if any
+Add issue comment with handoff summary
+Record tool_call row
 Record handoff row
+Emit handoff.submitted run event
+Return JSON result with handoff_status=received
+```
+
+Run finalizer 流程：
+
+```text
+Read latest handoff for run
+Generate review packet
+Insert review_packet.status = generated
+Set run.status = completed
 Transition issue → Human Review
-Emit run event
-Return JSON result
+Clear dispatch pause
+Emit review.packet_generated run event
+```
+
+如果 review packet 生成失败：
+
+```text
+run.status = failed
+issue 不进入 Human Review
+issue.dispatch_paused = true
+failure_code = review_packet_failed
 ```

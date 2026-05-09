@@ -32,7 +32,7 @@
 | ADR-016 | 每 issue 一个 git worktree |
 | ADR-017 | 每 issue 一个稳定 branch |
 | ADR-018 | workspace 默认在 `~/.symphony/workspaces/` |
-| ADR-019 | 同 issue workspace 跨 retry / Rework 复用 |
+| ADR-019 | 同 issue workspace 跨 operator re-dispatch / Rework 复用 |
 | ADR-020 | 不自动 reset / rebase dirty workspace |
 | ADR-021 | agent 默认不 commit、不 push、不 PR |
 | ADR-022 | publish 由 UI / CLI 人工触发 |
@@ -43,10 +43,10 @@
 |---|---|
 | ADR-023 | v1 只支持 Codex app-server |
 | ADR-024 | 每 run 一个 Codex subprocess |
-| ADR-025 | Codex transport 默认 stdio JSONL |
+| ADR-025 | Codex adapter version-aware；transport/framing 是 adapter detail |
 | ADR-026 | prompt = Runtime Envelope + WORKFLOW Prompt + Context Pack |
 | ADR-027 | 每 run 保存 redacted prompt snapshot |
-| ADR-028 | handoff 使用原子化 `symphony tool handoff` |
+| ADR-028 | handoff tool 原子提交；review-packet finalizer 负责 Human Review 转换 |
 | ADR-029 | dynamic tools / MCP 后移 |
 | ADR-030 | 默认最多一个 handoff continuation |
 
@@ -80,7 +80,7 @@
 
 | ADR | 决策 |
 |---|---|
-| ADR-047 | v1 主路径是 issue → Codex run → handoff → review packet → Human Review |
+| ADR-047 | v1 主路径是 issue → Codex run → handoff.submit → review packet → Human Review |
 | ADR-048 | v1 不做桌面壳、自动 PR、自动备份、migration、crash recovery、完整 audit |
 | ADR-049 | v1 里程碑按 M0–M8 推进 |
 | ADR-050 | v1.1 优先补 migration、backup、crash recovery、audit |

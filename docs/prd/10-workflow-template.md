@@ -1,39 +1,45 @@
 # WORKFLOW.md v1 模板
 
-下面是 v1 默认 `WORKFLOW.md` 模板。
+## 状态
+
+产品背景文档。默认模板的唯一实现源是：
+
+```text
+docs/config/starter-WORKFLOW.md
+```
+
+配置字段、默认值、校验规则和插值规则的权威说明是：
+
+```text
+docs/config/workflow-reference-v1.md
+docs/implementation/IS-005-workflow-prompt.md
+```
+
+## 关键规则
+
+```text
+YAML front matter 是配置。
+Markdown body 是 agent prompt。
+配置字段不支持 {{ ... }} Liquid 插值。
+只有 prompt body 支持 Liquid-style variables。
+workspace.root 未显式配置时，默认由实现解析为全局 workspace root 下的 <project_id> 目录。
+git.base_ref 默认是 auto。
+```
+
+不要在配置 front matter 中使用 Liquid 变量拼接 workspace root。类似“workspace root 加 project id 变量”的写法是无效配置，因为 config 不支持 Liquid 插值。
+
+## 默认模板摘要
+
+默认模板采用：
 
 ```yaml
----
 tracker:
   kind: local
-  project: default
-  active_states:
-    - Ready
-    - Working
-    - Rework
-  terminal_states:
-    - Done
-    - Cancelled
-    - Duplicate
-
-workspace:
-  root: ~/.symphony/workspaces/{{ project.id }}
-  cleanup:
-    done_retention_days: 14
-    require_snapshot_before_delete: false
 
 git:
   enabled: true
   mode: worktree
-  repo_root: .
-  base_ref: origin/main
-  branch_prefix: symphony
-  agent_commit: manual
-  auto_push: false
-  auto_rebase: false
-  submodules: false
-  provider:
-    kind: none
+  base_ref: auto
 
 agent:
   max_turns_per_run: 2
@@ -42,128 +48,26 @@ agent:
   handoff_state: Human Review
   pause_on_missing_handoff: true
 
-codex:
-  command: codex app-server
-  transport: stdio
-  turn_timeout_ms: 3600000
-  stall_timeout_ms: 300000
-  experimental_api: false
-
-approvals:
-  mode: balanced
-  network:
-    default: deny
-    allowlist: []
-  protected_paths:
-    - ".env"
-    - ".env.*"
-    - "**/*.pem"
-    - "**/*.key"
-
 tools:
   gateway: cli
   require_handoff_tool: true
   allow_dynamic_tools: false
   allow_mcp: false
-  agent_can_create_followups: true
-  agent_can_set_blocked: true
   agent_can_set_terminal_state: false
-
-security:
-  mode: balanced-secure
-  require_loopback_api: true
-  allow_remote_api: false
-  require_session_token: true
-  require_csrf: true
-
-observability:
-  structured_logs: true
-  log_level: info
-  redact_secrets: true
-  raw_codex_log_retention_days: 30
----
-You are working on local issue {{ issue.identifier }}.
-
-Use only the current workspace.
-
-Do not push branches.
-Do not create pull requests.
-Do not mark the issue Done.
-
-When implementation is ready:
-1. Run relevant tests.
-2. Summarize changed files.
-3. Record risks and verification steps.
-4. Call `symphony tool handoff`.
 ```
 
-## 配置说明
+完整模板必须从 `docs/config/starter-WORKFLOW.md` 复制或由 `symphony init` 写入，本文档不再维护重复模板内容。
 
-### tracker
+## Handoff 提示要求
 
-定义本地 tracker 类型、active states 和 terminal states。
-
-### workspace
-
-定义 workspace root。v1 默认代码 workspace 放在全局 `~/.symphony/workspaces/<project_id>/`，不放在 repo 内。
-
-### git
-
-定义 worktree 模式、base ref、branch prefix 与发布策略。
-
-v1 默认：
+默认 prompt 必须告诉 agent：
 
 ```text
-agent 不 commit
-agent 不 push
-agent 不 rebase
-Git provider = none
+1. 只在当前 workspace 工作。
+2. 不 push branch。
+3. 不创建 PR。
+4. 不标记 issue Done。
+5. 完成后写 handoff.json。
+6. 运行 symphony tool handoff --json ./handoff.json。
+7. handoff tool 只提交 handoff 数据；Human Review 由 review-packet finalizer 成功后转换。
 ```
-
-### agent
-
-定义 run turn 数、handoff 策略和 missing handoff 行为。
-
-### codex
-
-定义 Codex app-server 启动方式。
-
-v1 默认：
-
-```text
-stdio transport
-experimental_api = false
-```
-
-### approvals
-
-定义审批策略。
-
-v1 默认：
-
-```text
-mode = balanced
-network default deny
-protected paths enabled
-```
-
-### tools
-
-定义本地工具策略。
-
-v1 默认：
-
-```text
-CLI gateway
-dynamic tools disabled
-MCP disabled
-agent cannot set terminal state
-```
-
-### security
-
-定义本地安全基线。
-
-### observability
-
-定义日志和 redaction 策略。

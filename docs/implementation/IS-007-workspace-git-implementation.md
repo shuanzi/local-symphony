@@ -120,9 +120,11 @@ Failure semantics:
 ```text
 after_create failed → workspace_prepare_failed
 before_run failed → run failed
-after_run failed → log only
+after_run failed → log/event only
 before_remove unused in v1 because destructive cleanup is deferred
 ```
+
+`after_run` is a worker finally-step hook. If a workspace exists, it runs for completed, failed, cancelled, timeout, missing-handoff, and review-packet-failure outcomes. It is best-effort and cannot change the primary run outcome.
 
 ## Git command execution
 

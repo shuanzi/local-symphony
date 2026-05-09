@@ -234,6 +234,8 @@ WorkflowValidation
 Diagnostics
 ```
 
+`Issue` follows `docs/schema/normalized-issue-v1.md` unless an endpoint explicitly documents a smaller projection.
+
 ## Frozen decisions
 
 | ID | Decision |
@@ -253,7 +255,7 @@ Diagnostics
 | IS3-013 | workflow reload supports dry_run |
 | IS3-014 | redacted diagnostics export only |
 | IS3-015 | SSE replay via run_events.seq |
-| IS3-016 | OpenAPI schemas for core DTOs |
+| IS3-016 | OpenAPI schemas for core DTOs; Issue follows normalized issue DTO |
 | IS3-017 | cursor pagination; events use after_seq |
 | IS3-018 | no generic idempotency key in v1 |
 | IS3-019 | no publish/backup/migration/audit/destructive/secrets API |

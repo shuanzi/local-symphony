@@ -4,6 +4,10 @@
 
 Frozen.
 
+## Authority
+
+`starter-WORKFLOW.md` is the only maintained default template. PRD documents may summarize it but must not copy a divergent full template.
+
 ## Format
 
 ```markdown
@@ -49,6 +53,41 @@ prompt: {}
 
 Unknown keys warn. Wrong type, invalid enum, or missing required field errors block dispatch.
 
+Local v1 intentionally extends the upstream Symphony workflow schema. Core upstream keys remain compatible where applicable; Local v1 extension keys are documented here and must not be silently interpreted as Linear-specific settings.
+
+
+## Compatibility aliases
+
+Local v1 prefers these local field names:
+
+```yaml
+agent:
+  max_turns_per_run: 2
+```
+
+For compatibility with upstream Symphony-style config, the loader may accept:
+
+```yaml
+agent:
+  max_turns: 2
+```
+
+If both are present, `max_turns_per_run` wins and the loader emits a warning. This alias does not change Local v1 continuation semantics: one main turn plus at most `max_handoff_continuations` handoff continuation turns.
+
+## Local default overrides
+
+Local v1 intentionally uses these defaults instead of upstream SPEC defaults where they differ:
+
+```text
+tracker.kind = local
+hooks.timeout_ms = 300000
+agent.max_turns_per_run = 2
+workspace.root = <global-workspace-root>/<project_id>
+git.base_ref = auto
+failure behavior = dispatch pause; no automatic retry queue/timers
+workspace cleanup = retained in v1; no terminal cleanup
+```
+
 ## Prompt variables
 
 Root:
@@ -91,4 +130,4 @@ Unknown variables and filters fail rendering.
 
 ## Default starter
 
-See `starter-WORKFLOW.md` in this directory.
+See `starter-WORKFLOW.md` in this directory. It is the only default template authority; PRD documents must not duplicate a divergent template.

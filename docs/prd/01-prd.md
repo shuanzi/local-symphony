@@ -21,7 +21,7 @@ GitHub Issues 替代品
 本地 issue tracker
 + agent scheduler / runner
 + git workspace manager
-+ handoff / review system
++ two-stage handoff / review system
 + local dashboard
 ```
 
@@ -72,9 +72,9 @@ Run Detail 可看到执行 timeline
 
 ```text
 agent 调用 symphony tool handoff
-handoff 写入 comment / artifact
+handoff 写入 handoff row / comment / tool call record
 review packet 生成
-issue state = Human Review
+review packet status = generated 后 issue state = Human Review
 Review 页面展示 summary、diff、tests、risks、commands
 ```
 
@@ -110,12 +110,12 @@ Diagnostics 展示 Codex、Git、workflow、DB 状态
 | 模块 | v1 范围 |
 |---|---|
 | Local Tracker | issue CRUD、状态机、priority、labels、comments、blockers |
-| Orchestrator | poll、manual dispatch、claim、run status、cancel、retry 基础结构 |
+| Orchestrator | poll、manual dispatch、claim、run status、cancel、failure pause/resume；不实现自动 retry queue/timers |
 | Workspace / Git | 每 issue 一个 `git worktree` + branch，workspace 复用 |
-| Codex Runner | 每 run 一个 `codex app-server` 子进程，stdio JSONL |
+| Codex Runner | 每 run 一个 `codex app-server` 子进程；adapter 隔离目标 Codex protocol |
 | Prompt | Runtime Envelope + WORKFLOW Prompt + Context Pack |
 | Tool Gateway | `symphony tool` CLI + 本地 IPC + run-scoped token |
-| Handoff | 原子化 `symphony tool handoff`，进入 `Human Review` |
+| Handoff | `symphony tool handoff` 原子提交数据；review-packet finalizer 成功后进入 `Human Review` |
 | Review Packet | diff、changed files、summary、tests、risks、commands、tool calls |
 | UI | React Dashboard：Overview、Board、Issue、Run、Approval、Review、Workflow、Diagnostics |
 | API | `/api/v1` REST + SSE |

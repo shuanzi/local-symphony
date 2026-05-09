@@ -64,7 +64,7 @@ components:
     SuccessEnvelope: {}
     ErrorEnvelope: {}
     Pagination: {}
-    Issue: {}
+    Issue: {}  # see docs/schema/normalized-issue-v1.md
     IssueState: {}
     RunAttempt: {}
     RunStatus: {}

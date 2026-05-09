@@ -93,7 +93,7 @@ workspace 位于 ~/.symphony/workspaces/...
 
 ```text
 codex app-server subprocess manager
-stdio JSONL adapter
+version-aware Codex protocol adapter
 run_attempts table
 run_events table
 prompt builder
@@ -139,7 +139,7 @@ handoff continuation
 agent run 内能执行 symphony tool issue get
 错误 token 无法访问
 错 issue token 无法修改其他 issue
-symphony tool handoff 能写 comment、attach summary、状态转 Human Review
+symphony tool handoff 能写 handoff/comment/tool_call；review-packet finalizer 成功后 issue 才进入 Human Review
 没有 handoff 时最多追加一次 continuation
 仍无 handoff 时 run 标记 completed_without_handoff
 ```

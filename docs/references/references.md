@@ -40,8 +40,8 @@ Used for:
 
 ```text
 codex app-server
-stdio JSONL transport
-JSON-RPC style communication
+target app-server transport/framing
+JSON-RPC style communication where supported by the selected Codex version
 approvals
 experimental WebSocket / dynamic tools caveats
 ```

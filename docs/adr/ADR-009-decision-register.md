@@ -32,7 +32,7 @@ This register summarizes the frozen decisions across product, architecture, impl
 | D14 | Orchestrator is single authoritative actor. |
 | D15 | Global app DB + project DB. |
 | D16 | Persist run metadata; v1 later narrowed to no full crash recovery. |
-| D17 | Codex adapter is version-aware and stdio JSONL by default. |
+| D17 | Codex adapter is version-aware; protocol framing/schema are isolated inside `internal/agent/codex`. |
 | D18 | Tool gateway uses CLI + local IPC + run-scoped token. |
 | D19 | REST + SSE API. |
 | D20 | Structured logs + durable events + dashboard timeline. |
@@ -72,7 +72,7 @@ This register summarizes the frozen decisions across product, architecture, impl
 | D44 | each run stores redacted prompt snapshot. |
 | D45 | tool gateway v1 is `symphony tool` CLI + local IPC. |
 | D46 | tool auth uses run-scoped capability token. |
-| D47 | handoff is atomic tool. |
+| D47 | handoff is an atomic submission tool; review-packet finalizer performs Human Review transition. |
 | D48 | tool registry defines schemas, permissions, and logging. |
 | D49 | approval mode defaults to balanced. |
 | D50 | network default deny. |
@@ -140,7 +140,7 @@ This register summarizes the frozen decisions across product, architecture, impl
 | ID | Decision |
 |---|---|
 | D99 | v1 MVP is local tracker + worktree + Codex run + handoff + review packet + dashboard. |
-| D100 | v1 main path is issue → Ready → dispatch → Codex → handoff → Human Review → Done/Rework. |
+| D100 | v1 main path is issue → Ready → dispatch → Codex → handoff → review packet → Human Review → Done/Rework. |
 | D101 | milestones M0–M8. |
 | D102 | non-goals are explicitly documented. |
 | D103 | v1 data model covers tracker, runs, events, approvals, tools, handoff, review, workflow/prompt snapshots. |

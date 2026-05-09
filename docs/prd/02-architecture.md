@@ -10,7 +10,7 @@
                        │ REST + SSE
                        ▼
 ┌──────────────────────────────────────────────┐
-│               Go symphonyd                   │
+│        Go backend: cmd/symphony serve          │
 │                                              │
 │  HTTP API / SSE                              │
 │  Orchestrator Actor                          │
@@ -69,7 +69,7 @@ agent tool 通过 scoped token 连接 daemon
 | UI 形态 | v1 localhost dashboard；v2 Tauri + Go sidecar |
 | 数据库 | SQLite |
 | Agent runtime | Codex app-server |
-| Codex transport | stdio JSONL |
+| Codex transport | selected Codex app-server stdio target; protocol isolated in adapter |
 | Realtime | SSE |
 | CLI | `symphony` |
 | 本地 tool | `symphony tool` CLI + local IPC |
@@ -90,8 +90,8 @@ blocker filtering
 dispatch
 claim / release
 run cancellation
-retry 基础结构
-handoff 后状态衔接
+manual failure pause/resume; no automatic retry timers in v1
+handoff finalizer 状态衔接
 事件写入
 ```
 
@@ -107,8 +107,10 @@ handoff 后状态衔接
 
 ## 5. 进程模型
 
+`cmd/symphony` 是单 binary。`symphony serve` 启动 daemon/server mode。
+
 ```text
-symphonyd
+symphony serve
 ├── embedded HTTP server
 ├── orchestrator loop
 ├── SQLite connection pool

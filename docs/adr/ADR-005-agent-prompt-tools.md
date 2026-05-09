@@ -6,7 +6,7 @@ Frozen.
 
 ## Decision
 
-v1 supports Codex app-server only. Each run starts one Codex app-server subprocess using stdio JSONL. The agent receives a generated prompt composed of:
+v1 supports Codex app-server only. Each run starts one Codex app-server subprocess. The Codex adapter is version-aware and keeps protocol framing/schema details isolated from the orchestrator. The agent receives a generated prompt composed of:
 
 ```text
 Runtime Envelope
