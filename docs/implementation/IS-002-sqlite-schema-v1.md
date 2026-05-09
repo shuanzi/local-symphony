@@ -130,7 +130,14 @@ target_issue_id = B
 relation_type = blocks
 ```
 
-B is ineligible while A is not terminal.
+Other relation directions:
+
+```text
+duplicates: source_issue_id is duplicate, target_issue_id is canonical
+followup_of: source_issue_id is follow-up, target_issue_id is original issue
+```
+
+B is ineligible while A is not terminal. Agent tools may only create `followup_of` relations through `followup.create`.
 
 Terminal blocker states are:
 
@@ -282,7 +289,7 @@ Important assembly rules:
 ```text
 labels are lowercased and sorted
 blocked_by is derived from issue_relations where relation_type = blocks
-branch_name/workspace_path/base_ref/base_sha come from workspaces, not issues, and are exposed as top-level compatibility aliases
+branch_name/workspace_path/base_ref/base_ref_config/base_sha come from workspaces, not issues, and are exposed as top-level compatibility aliases
 url is a local dashboard URL when available, otherwise null
 ```
 
@@ -347,7 +354,7 @@ PRAGMA synchronous = NORMAL;
 | IS2-006 | UTC RFC3339 TEXT timestamps |
 | IS2-007 | JSON stored as TEXT, Go validated |
 | IS2-008 | tracker source: issues + labels/comments/relations/history; surfaces use NormalizedIssue DTO |
-| IS2-009 | one workspace per issue |
+| IS2-009 | one workspace per issue; workspace stores configured base ref and resolved base ref/base SHA |
 | IS2-010 | run_attempts record v1 run facts; no recovery leases |
 | IS2-011 | run_events.seq is SSE replay ID |
 | IS2-012 | single approval_requests table |

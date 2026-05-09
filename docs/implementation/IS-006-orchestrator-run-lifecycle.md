@@ -77,6 +77,7 @@ Upstream terminal outcome mapping:
 | Stalled | `failed` | `stall_timeout` |
 | CanceledByReconciliation | `cancelled` | `issue_state_changed` or `canceled_by_reconciliation` |
 | Operator cancel | `cancelled` | `operator_cancelled` |
+| Approval decision `cancel_run` | `cancelled` | `operator_cancelled` |
 | Agent blocked current issue | `cancelled` | `agent_blocked` |
 
 Flow:
@@ -212,13 +213,45 @@ Specific codes:
 
 | Trigger | Local status | failure_code |
 |---|---|---|
-| Operator `POST /runs/{id}/cancel` | `cancelled` | `operator_cancelled` |
+| Operator `POST /runs/{id}/cancel` or CLI `symphony run cancel` | `cancelled` | `operator_cancelled` |
+| Approval decision `cancel_run` | `cancelled` | `operator_cancelled` |
 | Issue transitioned to `Blocked` by agent `issue.block` | `cancelled` | `agent_blocked` |
 | Issue transitioned to inactive/terminal by operator | `cancelled` | `issue_state_changed` |
 | Reconciliation finds active run for terminal issue | `cancelled` | `canceled_by_reconciliation` |
 | Daemon restart finds active DB rows but no process ownership | `failed` | `daemon_restarted_run_interrupted` |
 
 State changes do not delete workspace state. Review packet generation is not attempted for reconciliation-cancelled runs unless a successful handoff already exists and the worker has reached the finalizer step.
+
+## Cancellation behavior
+
+Operator-initiated cancellation is terminal and pauses redispatch. This applies to:
+
+```text
+POST /api/v1/runs/{run_id}/cancel
+symphony run cancel run_...
+approval decision = cancel_run
+```
+
+Required side effects:
+
+```text
+run_attempt.status = cancelled
+run_attempt.failure_code = operator_cancelled
+run_attempt.failure_message = <operator or approval reason>
+run_attempt.ended_at = now
+issues.dispatch_paused = true
+issues.dispatch_pause_reason = operator_cancelled
+issues.dispatch_paused_at = now
+issue.state remains unchanged unless a separate operator transition command changes it
+revoke run-scoped tool tokens
+run_event = run.cancelled
+scheduler.paused event
+system comment with cancellation summary
+```
+
+A cancelled run must not be automatically redispatched on the next tick. The operator must explicitly call dispatch-resume, and then dispatch again or allow the scheduler to claim the issue if it remains in an active-dispatch-eligible state.
+
+Agent-driven `issue.block` cancellation uses the same no-automatic-redispatch rule, but with `failure_code=agent_blocked` and `dispatch_pause_reason=agent_blocked`.
 
 ## Failure behavior
 
@@ -244,6 +277,7 @@ Canonical failure codes:
 | `workflow_validation_failed` | Workflow reload/validation failed for a specific operation. |
 | `prompt_render_failed` | Strict prompt rendering failed. |
 | `workspace_prepare_failed` | Worktree preparation failed before hook-specific classification. |
+| `workspace_conflict` | Existing workspace path, branch, or DB metadata conflicts with the current issue/workspace ownership. |
 | `after_create_failed` | `hooks.after_create` failed. |
 | `before_run_failed` | `hooks.before_run` failed. |
 | `codex_startup_failed` | Codex process could not start or failed startup handshake. |
@@ -252,6 +286,9 @@ Canonical failure codes:
 | `turn_timeout` | Turn exceeded `codex.turn_timeout_ms`. |
 | `stall_timeout` | No protocol progress within `codex.stall_timeout_ms`. |
 | `approval_timeout` | Pending approval expired. |
+| `command_denied` | Command policy denied a command required for the run to proceed. |
+| `network_denied` | Network policy denied an egress request required for the run to proceed. |
+| `protected_path_denied` | Protected path policy denied file read/write/artifact access required for the run to proceed. |
 | `tool_gateway_failed` | Required tool call failed for daemon/gateway reasons. |
 | `missing_handoff` | Required handoff missing after allowed continuation. |
 | `review_packet_failed` | Review packet finalizer failed. |
@@ -327,7 +364,7 @@ failure_code = review_packet_failed
 
 ## Issue state transitions
 
-Issue state transitions must use `/api/v1/issues/{issue_id}/transition` or the equivalent CLI/operator command, except orchestrator-owned dispatch/finalizer transitions.
+Issue state transitions must use `/api/v1/issues/{issue_ref}/transition` or the equivalent CLI/operator command, except orchestrator-owned dispatch/finalizer transitions.
 
 | From | To | Actor | Guard / side effect |
 |---|---|---|---|
@@ -371,8 +408,8 @@ G4 freezes this behavior.
 G1 adds command endpoints and CLI:
 
 ```http
-POST /api/v1/issues/{issue_id}/dispatch-pause
-POST /api/v1/issues/{issue_id}/dispatch-resume
+POST /api/v1/issues/{issue_ref}/dispatch-pause
+POST /api/v1/issues/{issue_ref}/dispatch-resume
 ```
 
 ```bash
@@ -395,8 +432,9 @@ Resume only clears pause. It does not change state and does not override blocker
 | IS6-007 | startup marks stale runs; no crash recovery |
 | IS6-008 | dispatch pause/resume API and CLI required |
 | IS6-009 | active run reconciliation cancels runs whose issues leave active states |
-| IS6-010 | canonical failure code table is the source for run/API/dashboard error naming |
+| IS6-010 | canonical failure code table is the source for run terminal reasons, dispatch pause reasons, and dashboard run labels |
 | IS6-011 | issue transition matrix defines allowed state changes and active-run side effects |
+| IS6-012 | operator cancellation and approval `cancel_run` pause dispatch and require explicit resume before redispatch |
 | G1 | pause/resume added |
 | G3 | failures pause dispatch |
 | G4 | stale active runs marked interrupted |

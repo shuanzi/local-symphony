@@ -156,5 +156,10 @@ This register summarizes the frozen decisions across product, architecture, impl
 |---|---|
 | G1 | Add dispatch pause/resume API and CLI. |
 | G2 | starter `git.base_ref` becomes `auto`. |
-| G3 | failed runs set `dispatch_paused=true` by default; operator resumes. |
-| G4 | startup marks stale runs as interrupted; no crash recovery. |
+| G3 | v1 run failure sets `dispatch_paused=true` by default; operator must resume. |
+| G4 | startup marks stale running runs as interrupted; no crash recovery. |
+| G5 | Handoff is two-stage: tool submission first, review-packet finalizer transitions to Human Review. |
+| G6 | PRD files are product context; implementation/schema/config/API documents are authoritative. |
+| G7 | Active run reconciliation is required; non-active issue transitions cancel active runs. |
+| G8 | v1 only supports `Human Review` as the handoff target state. |
+| G9 | NormalizedIssue keeps upstream-compatible top-level git/workspace aliases. |

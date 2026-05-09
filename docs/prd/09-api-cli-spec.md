@@ -1,5 +1,8 @@
 # v1 REST API 与 CLI 规格概览
 
+> 产品背景说明：本文件仅保留产品上下文。若与 `docs/implementation/`、`docs/schema/`、`docs/config/` 或 `docs/api/` 冲突，后者为准；不要从本 PRD 复制实现级 enum、schema、命令策略或模板。
+
+
 ## 状态
 
 产品背景文档。具体 API 以以下文档为准：
@@ -28,6 +31,8 @@ UI 只通过 REST/SSE 与 daemon 交互。
 
 ## v1 必须 API 组
 
+`{issue_ref}` 可接受内部 id（如 `iss_...`）或人类可读 identifier（如 `LOC-1`）；实现以 IS-003 为准。
+
 ```http
 GET  /api/v1/health
 GET  /api/v1/state
@@ -40,16 +45,16 @@ POST /api/v1/auth/logout
 
 GET  /api/v1/issues
 POST /api/v1/issues
-GET  /api/v1/issues/{issue_id}
-POST /api/v1/issues/{issue_id}/transition
-POST /api/v1/issues/{issue_id}/comments
-GET  /api/v1/issues/{issue_id}/blockers
-POST /api/v1/issues/{issue_id}/blockers
-DELETE /api/v1/issues/{issue_id}/blockers/{blocker_issue_id}
-POST /api/v1/issues/{issue_id}/dispatch
-POST /api/v1/issues/{issue_id}/dispatch-pause
-POST /api/v1/issues/{issue_id}/dispatch-resume
-GET  /api/v1/issues/{issue_id}/events/stream
+GET  /api/v1/issues/{issue_ref}
+POST /api/v1/issues/{issue_ref}/transition
+POST /api/v1/issues/{issue_ref}/comments
+GET  /api/v1/issues/{issue_ref}/blockers
+POST /api/v1/issues/{issue_ref}/blockers
+DELETE /api/v1/issues/{issue_ref}/blockers/{blocker_issue_ref}
+POST /api/v1/issues/{issue_ref}/dispatch
+POST /api/v1/issues/{issue_ref}/dispatch-pause
+POST /api/v1/issues/{issue_ref}/dispatch-resume
+GET  /api/v1/issues/{issue_ref}/events/stream
 
 GET  /api/v1/runs
 GET  /api/v1/runs/{run_id}
@@ -60,9 +65,9 @@ POST /api/v1/runs/{run_id}/cancel
 GET  /api/v1/approvals
 POST /api/v1/approvals/{approval_id}/decide
 
-GET  /api/v1/reviews/{issue_id}
-POST /api/v1/reviews/{issue_id}/send-to-rework
-POST /api/v1/reviews/{issue_id}/mark-done
+GET  /api/v1/reviews/{issue_ref}
+POST /api/v1/reviews/{issue_ref}/send-to-rework
+POST /api/v1/reviews/{issue_ref}/mark-done
 
 GET  /api/v1/artifacts/{artifact_id}
 GET  /api/v1/artifacts/{artifact_id}/content
@@ -80,7 +85,7 @@ POST /api/v1/diagnostics/export
 /api/v1/events 是 JSON query endpoint。
 /api/v1/events/stream 是全局 SSE endpoint。
 /api/v1/runs/{run_id}/events/stream 是 run-scoped SSE endpoint。
-/api/v1/issues/{issue_id}/events/stream 是 issue-scoped SSE endpoint。
+/api/v1/issues/{issue_ref}/events/stream 是 issue-scoped SSE endpoint。
 ```
 
 SSE 只传 normalized event，不传大块 raw logs。
@@ -171,10 +176,10 @@ symphony tool handoff --json ./handoff.json
 ## v1 暂不实现
 
 ```http
-POST /api/v1/git/{issue_id}/push
-POST /api/v1/git/{issue_id}/create-pr
-POST /api/v1/workspaces/{issue_id}/delete
-POST /api/v1/workspaces/{issue_id}/snapshot
+POST /api/v1/git/{issue_ref}/push
+POST /api/v1/git/{issue_ref}/create-pr
+POST /api/v1/workspaces/{issue_ref}/delete
+POST /api/v1/workspaces/{issue_ref}/snapshot
 POST /api/v1/db/backup
 POST /api/v1/db/migrate
 POST /api/v1/audit/export

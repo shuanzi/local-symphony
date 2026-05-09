@@ -26,6 +26,8 @@ API prefix:
 
 All business JSON APIs use OpenAPI. SSE uses a documented event schema.
 
+M0 must produce a machine-readable `api/openapi.yaml` from this contract and `docs/api/openapi-v1-outline.md` before frontend generated types are considered complete. Until that file exists, this implementation spec and the outline are the API authority.
+
 ## Response envelopes
 
 Success:
@@ -89,7 +91,7 @@ GET /api/v1/events
 GET /api/v1/events/stream
 GET /api/v1/runs/{run_id}/events
 GET /api/v1/runs/{run_id}/events/stream
-GET /api/v1/issues/{issue_id}/events/stream
+GET /api/v1/issues/{issue_ref}/events/stream
 ```
 
 SSE uses:
@@ -107,15 +109,25 @@ Reconnect uses `Last-Event-ID`. Large payloads are fetched via Artifact API.
 ```http
 GET    /api/v1/issues
 POST   /api/v1/issues
-GET    /api/v1/issues/{issue_id}
-PATCH  /api/v1/issues/{issue_id}
-POST   /api/v1/issues/{issue_id}/transition
-POST   /api/v1/issues/{issue_id}/comments
-POST   /api/v1/issues/{issue_id}/blockers
-DELETE /api/v1/issues/{issue_id}/blockers/{blocker_issue_id}
-POST   /api/v1/issues/{issue_id}/dispatch
-POST   /api/v1/issues/{issue_id}/dispatch-pause
-POST   /api/v1/issues/{issue_id}/dispatch-resume
+GET    /api/v1/issues/{issue_ref}
+PATCH  /api/v1/issues/{issue_ref}
+POST   /api/v1/issues/{issue_ref}/transition
+POST   /api/v1/issues/{issue_ref}/comments
+POST   /api/v1/issues/{issue_ref}/blockers
+DELETE /api/v1/issues/{issue_ref}/blockers/{blocker_issue_ref}
+POST   /api/v1/issues/{issue_ref}/dispatch
+POST   /api/v1/issues/{issue_ref}/dispatch-pause
+POST   /api/v1/issues/{issue_ref}/dispatch-resume
+```
+
+Resource reference rules:
+
+```text
+{issue_ref} accepts either internal id `iss_...` or human identifier such as `LOC-1`.
+{blocker_issue_ref} follows the same rule.
+The server resolves refs before authorization, state checks, and transactions.
+Ambiguous, missing, or malformed refs return `not_found` or `invalid_request` with no partial mutation.
+Responses always include both `id` and `identifier`.
 ```
 
 Rules:
@@ -159,6 +171,8 @@ POST /api/v1/runs/{run_id}/cancel
 
 No arbitrary run mutation endpoint.
 
+`POST /api/v1/runs/{run_id}/cancel` applies the cancellation behavior in IS-006: terminal `cancelled`, `failure_code=operator_cancelled`, issue dispatch paused with `dispatch_pause_reason=operator_cancelled`, and no automatic redispatch.
+
 ## Approval API
 
 ```http
@@ -176,14 +190,14 @@ deny
 cancel_run
 ```
 
-Only pending approvals can be decided. Approval responses must expose `requested_at`, `timeout_ms`, `expires_at`, and `resolved_at` so UI can show expiry consistently after daemon restart.
+Only pending approvals can be decided. Approval responses must expose `requested_at`, `timeout_ms`, `expires_at`, and `resolved_at` so UI can show expiry consistently after daemon restart. Decision `cancel_run` has the same side effect as operator run cancel: run `cancelled`, `failure_code=operator_cancelled`, issue dispatch paused, and no automatic redispatch.
 
 ## Review API
 
 ```http
-GET  /api/v1/reviews/{issue_id}
-POST /api/v1/reviews/{issue_id}/send-to-rework
-POST /api/v1/reviews/{issue_id}/mark-done
+GET  /api/v1/reviews/{issue_ref}
+POST /api/v1/reviews/{issue_ref}/send-to-rework
+POST /api/v1/reviews/{issue_ref}/mark-done
 ```
 
 Mark Done requires:
@@ -225,12 +239,12 @@ Diagnostics export is redacted only. `include_raw_logs=true` returns unsupported
 Do not expose:
 
 ```http
-POST /api/v1/git/:issue_id/push
-POST /api/v1/git/:issue_id/create-pr
+POST /api/v1/git/:issue_ref/push
+POST /api/v1/git/:issue_ref/create-pr
 POST /api/v1/db/backup
 POST /api/v1/db/migrate
 GET  /api/v1/audit
-POST /api/v1/workspaces/:issue_id/delete
+POST /api/v1/workspaces/:issue_ref/delete
 POST /api/v1/secrets
 ```
 
@@ -250,7 +264,21 @@ failed
 cancelled
 ```
 
-Terminal reasons are communicated by `failure_code`, not extra status values. API `error.code`, `run_attempt.failure_code`, dispatch pause reasons, and dashboard labels must use the canonical names in IS-006.
+Terminal run reasons and dispatch pause reasons use `FailureCode` from IS-006. API error envelopes use `ApiErrorCode`. An API error code may equal a `FailureCode` when the API operation exposes or causes that run failure, but protocol/auth/request errors are not run failure codes.
+
+Required mapping:
+
+| Situation | API `error.code` | Run `failure_code` / pause reason |
+|---|---|---|
+| command policy terminates a run | `command_denied` | `command_denied` |
+| network policy terminates a run | `network_denied` | `network_denied` |
+| protected path policy terminates a run | `protected_path_denied` | `protected_path_denied` |
+| workspace ownership/path conflict | `workspace_conflict` | `workspace_conflict` or `workspace_prepare_failed` if lower-level failure |
+| invalid browser/CLI auth | `unauthorized` / `forbidden` | none |
+| invalid CSRF | `csrf_required` | none |
+| invalid transition request | `invalid_state_transition` | none unless reconciliation cancels an active run |
+
+Dashboard labels for terminal runs and dispatch pauses must use the canonical `FailureCode` names in IS-006.
 
 ## Core schemas
 
@@ -259,13 +287,21 @@ OpenAPI components must include:
 ```text
 SuccessEnvelope
 ErrorEnvelope
+ApiErrorCode
 Pagination
+IssueRef
 Issue
 IssueState
+IssueCreateRequest
+IssueUpdateRequest
+IssueTransitionRequest
+IssueDispatchRequest
+DispatchPauseRequest
 RunAttempt
 RunStatus
 RunEvent
 ApprovalRequest
+ApprovalDecisionRequest
 ReviewPacket
 Artifact
 WorkflowValidation
@@ -287,7 +323,7 @@ FailureCode
 | IS3-006 | health vs state distinction |
 | IS3-007 | JSON events and SSE events separated |
 | IS3-008 | issue state/dispatch/blocker use command endpoints |
-| IS3-009 | run API read/cancel only; cancel records `operator_cancelled` |
+| IS3-009 | run API read/cancel only; cancel records `operator_cancelled` and pauses redispatch for active-state issues |
 | IS3-010 | approval decision is final once |
 | IS3-011 | review API is Human Review decision entrypoint |
 | IS3-011a | issue transition matrix and active-run reconciliation notification required |
@@ -302,6 +338,9 @@ FailureCode
 | IS3-020 | frontend types generated from OpenAPI |
 | IS3-021 | state transitions that make active runs ineligible trigger reconciliation cancel |
 | IS3-022 | approval schemas expose timeout/expiry fields |
-| IS3-023 | API error codes share canonical failure-code naming with IS-006 |
+| IS3-023 | API error codes are split from run `FailureCode`, with explicit mapping where policy/API errors terminate runs |
+| IS3-024 | issue path refs accept either internal id or human identifier and resolve server-side |
+| IS3-025 | concrete `api/openapi.yaml` is required before generated frontend types and contract tests |
 | G1 | dispatch-pause and dispatch-resume endpoints added |
+| G3 | run failure/cancellation pause semantics are API-visible |
 | G7 | active run reconciliation side effects are API-visible |

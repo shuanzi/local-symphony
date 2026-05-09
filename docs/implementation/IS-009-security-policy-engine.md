@@ -87,7 +87,15 @@ pytest
 npm test
 pnpm test
 cargo test
+symphony tool issue get
+symphony tool issue comment
+symphony tool issue block
+symphony tool artifact attach
+symphony tool followup create
+symphony tool handoff
 ```
+
+`symphony tool ...` commands are allowed only as the agent Tool Gateway entrypoint. They still require `SYMPHONY_TOOL_TOKEN`, run scope validation, cwd-under-workspace validation, daemon-side schema validation, and the fixed tool registry checks in IS-004. This allow rule prevents the shell command policy from blocking the required handoff path; it does not grant operator API privileges to the agent.
 
 Default review:
 
@@ -121,6 +129,16 @@ docker run --privileged
 
 v1 uses pattern/prefix classification, not deep supply-chain analysis.
 
+Policy outcomes map to canonical failure codes when they terminate a run:
+
+| Policy outcome | Approval row | Run failure code when terminal |
+|---|---|---|
+| command auto-denied or denied | `auto_denied` or `denied` | `command_denied` |
+| network denied | `auto_denied` or `denied` | `network_denied` |
+| protected path denied | `auto_denied` or `denied` | `protected_path_denied` |
+
+If the Codex protocol can continue after a denied request, the run may continue and the denial remains an approval/tool event. If the adapter reports turn failure or no handoff is possible because of the denial, the terminal run uses the corresponding failure code above.
+
 ## Network policy
 
 Default:
@@ -143,8 +161,12 @@ Default protected:
 .env.*
 **/*.pem
 **/*.key
+**/*_rsa
+**/*_ed25519
 .ssh/**
 .aws/**
+.gcp/**
+.azure/**
 .kube/**
 .npmrc
 .pypirc
@@ -211,3 +233,5 @@ These are operational records, not a compliance-grade audit log.
 | IS9-006 | redaction before UI/log/artifact exposure |
 | IS9-007 | security records exist, no full audit log |
 | IS9-008 | remote dashboard unsupported |
+| IS9-009 | required `symphony tool ...` commands are command-policy allowed but still fully validated by Tool Gateway token and schema checks |
+| IS9-010 | command, network, and protected-path denials map to canonical terminal failure codes when they end a run |

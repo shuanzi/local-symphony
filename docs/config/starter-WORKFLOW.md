@@ -53,6 +53,7 @@ codex:
   startup_timeout_ms: 60000
   turn_timeout_ms: 3600000
   stall_timeout_ms: 300000
+  read_timeout_ms: 5000
   experimental_api: false
 
 approvals:
@@ -65,8 +66,12 @@ approvals:
     - ".env.*"
     - "**/*.pem"
     - "**/*.key"
+    - "**/*_rsa"
+    - "**/*_ed25519"
     - ".ssh/**"
     - ".aws/**"
+    - ".gcp/**"
+    - ".azure/**"
     - ".kube/**"
     - ".npmrc"
     - ".pypirc"

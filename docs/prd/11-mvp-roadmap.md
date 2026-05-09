@@ -1,5 +1,8 @@
 # MVP 路线图：M0–M8
 
+> 产品背景说明：本文件仅保留产品上下文。若与 `docs/implementation/`、`docs/schema/`、`docs/config/` 或 `docs/api/` 冲突，后者为准；不要从本 PRD 复制实现级 enum、schema、命令策略或模板。
+
+
 ## M0：项目骨架
 
 目标：建立后端、前端、数据库、CLI 的基本工程结构。

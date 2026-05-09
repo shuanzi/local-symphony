@@ -47,9 +47,10 @@ Daemon resolution:
 ```text
 --api-url
 runtime descriptor
-app DB runtime metadata
 error
 ```
+
+The runtime descriptor is the v1 daemon endpoint source of truth. The app DB does not store mutable daemon runtime endpoint metadata in v1.
 
 ## Output
 
@@ -80,7 +81,7 @@ Exit codes:
 ~/.symphony/runtime/<project_id>.json
 ```
 
-The descriptor contains API URL and tool endpoint. It contains no secrets or session tokens.
+The descriptor contains project id, repo root, API URL, Tool Gateway endpoint, daemon pid, and start time. It contains no secrets or session tokens.
 
 ## Normal CLI
 
@@ -142,6 +143,7 @@ symphony run cancel run_... --reason "..."
 symphony approval list
 symphony approval decide appr_... --approve-once
 symphony approval decide appr_... --deny --reason "..."
+symphony approval decide appr_... --cancel-run --reason "..."
 ```
 
 ### review
@@ -197,8 +199,10 @@ Transport schemes:
 ```text
 unix://<path>
 npipe://<name>
-http://127.0.0.1:<port>/tool
+http://127.0.0.1:<port>
 ```
+
+`SYMPHONY_TOOL_ENDPOINT` is the transport base endpoint. For HTTP it is the base origin, for example `http://127.0.0.1:<port>`, not a path-specific URL. The tool call path is appended by the client.
 
 Injected environment:
 
@@ -215,10 +219,12 @@ SYMPHONY_WORKSPACE_PATH
 Protocol:
 
 ```http
-POST /tool/v1/call
+POST {SYMPHONY_TOOL_ENDPOINT}/tool/v1/call
 Authorization: Bearer <SYMPHONY_TOOL_TOKEN>
 Content-Type: application/json
 ```
+
+For Unix socket and Windows named pipe transports, the request path is still `/tool/v1/call`; only the transport base changes.
 
 Tool registry:
 
@@ -231,7 +237,123 @@ followup.create
 handoff.submit
 ```
 
+`symphony tool ...` shell commands are default-allowed by IS-009 command policy so the agent can reach this gateway, but each tool operation is still authorized by token, scope, cwd, schema, and registry checks.
+
 No tool provides issue delete, Done, arbitrary state, project settings, workspace delete, git push, PR, or secret read.
+
+### Tool schemas and transaction semantics
+
+All tool inputs are JSON objects. Unknown fields are rejected. Successful tools return a JSON object with `success=true`, `tool`, `issue_id`, `issue_identifier`, and tool-specific fields. Failed tools return `success=false`, `error.code`, and `error.message`; attributable failures are persisted in `tool_calls`.
+
+#### issue.get
+
+Input:
+
+```json
+{}
+```
+
+Returns the current issue as `NormalizedIssue`. The agent cannot request another issue by id.
+
+#### issue.comment
+
+Input:
+
+```json
+{
+  "body": "What changed or what was discovered."
+}
+```
+
+Creates an agent-authored comment on the current issue, associated with the current run. Empty or whitespace-only comments are rejected.
+
+#### issue.block
+
+Input:
+
+```json
+{
+  "reason": "Why the current issue cannot proceed.",
+  "details": "Optional supporting detail."
+}
+```
+
+Blocks only the current issue. It does not create blocker relations. See the dedicated semantics below.
+
+#### artifact.attach
+
+Input:
+
+```json
+{
+  "path": "relative/path/from/workspace.log",
+  "kind": "test_output",
+  "description": "Optional short description."
+}
+```
+
+Rules:
+
+```text
+path must resolve under the workspace
+absolute paths and path traversal are rejected
+protected paths are rejected
+size must be <= tools.artifact_max_bytes
+artifact row path is project-local relative under .symphony/artifacts
+```
+
+#### followup.create
+
+Input:
+
+```json
+{
+  "title": "Follow-up work title",
+  "description": "Optional description",
+  "acceptance_criteria": ["Optional criterion"],
+  "labels": ["optional-label"],
+  "priority": 3
+}
+```
+
+Semantics:
+
+```text
+creates a new issue in Inbox
+created_by_type = agent
+created_by_run_id = current run
+creates relation: new_issue followup_of current_issue
+agent cannot set the follow-up to Ready, Working, Human Review, Done, Cancelled, Duplicate, or Blocked
+agent cannot create blocks or duplicates relations
+```
+
+#### handoff.submit
+
+Input:
+
+```json
+{
+  "summary": "What was completed.",
+  "changed_files": ["workspace-relative/path.ts"],
+  "tests": ["Test command and result"],
+  "risks": ["Known risk or empty"],
+  "verification": ["Manual verification step"],
+  "followups": ["Optional follow-up summary"],
+  "target_state": "Human Review"
+}
+```
+
+`target_state` is optional; if present it must equal `Human Review`. The first successful handoff for a run wins. A repeated submission with the same payload hash is idempotent; a different payload after a successful handoff returns a state conflict.
+
+### Relation direction
+
+`issue_relations` directions are fixed:
+
+| relation_type | source_issue_id | target_issue_id | Agent permission |
+|---|---|---|---|
+| `blocks` | blocker issue | blocked issue | not via tool gateway |
+| `duplicates` | duplicate issue | canonical issue | not via tool gateway |
+| `followup_of` | follow-up issue | original/current issue | only through `followup.create` |
 
 ### issue.block semantics
 
@@ -311,15 +433,18 @@ All attributable tool calls are recorded in `tool_calls` and `run_events`, succe
 | IS4-015 | no backup/migration/audit/publish/destructive/secret CLI |
 | IS4-016 | tool gateway internal IPC API |
 | IS4-017 | tool endpoint via env |
-| IS4-018 | unified `/tool/v1/call` JSON protocol |
+| IS4-018 | unified `/tool/v1/call` JSON protocol with `SYMPHONY_TOOL_ENDPOINT` as transport base |
 | IS4-019 | v1 tool registry fixed |
 | IS4-020 | two-stage handoff |
 | IS4-020a | `issue.block` only blocks current issue; it does not create arbitrary blocker relations |
 | IS4-020b | `issue.block` cancels the current active run through reconciliation with `agent_blocked` |
 | IS4-020c | handoff target state is fixed to `Human Review` in v1 |
+| IS4-020d | `followup.create` creates an Inbox issue with `new_issue followup_of current_issue`; agents cannot create blocker or duplicate relations |
+| IS4-020e | `symphony tool ...` shell commands are command-policy allowed but still tool-gateway authorized |
 | IS4-021 | token scope validated every call |
 | IS4-022 | tool calls persisted if attributable |
 | IS4-023 | CLI preflight + daemon final path validation |
 | IS4-024 | tool CLI timeout 30s |
 | IS4-025 | prompt tool manifest generated from registry |
+| IS4-026 | runtime descriptor, not app DB runtime metadata, is the v1 daemon endpoint discovery source |
 | G1 | dispatch pause/resume CLI added |

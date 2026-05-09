@@ -31,7 +31,8 @@ workspace key sanitization
 command policy
 protected path matching
 redaction
-error code mapping
+error code mapping for split ApiErrorCode vs FailureCode
+agent turn-count/handoff hard constraints
 ```
 
 ## Integration tests
@@ -46,7 +47,7 @@ worktree create/reuse
 hook lifecycle: after_create then before_run on first run, before_run on reuse
 tool gateway token validation
 artifact attach containment
-review packet generation
+review packet generation, including untracked new-file content in changes.patch
 SSE replay from run_events.seq
 ```
 
@@ -60,10 +61,15 @@ missing handoff → continuation → handoff
 missing handoff twice → dispatch_paused
 tool token invalid
 approval pending → approve → continue
-command denied → failed
+command denied → failed with command_denied
+network denied → failed with network_denied
+protected path denied → failed with protected_path_denied
+operator run cancel → cancelled + dispatch_paused + no automatic redispatch
+approval cancel_run → cancelled + dispatch_paused + no automatic redispatch
 workflow invalid → dispatch blocked
-workspace conflict → failed
+workspace conflict → failed with workspace_conflict
 review packet failure → no Human Review
+untracked file created by agent → review packet changes.patch includes file content
 active run issue transition → reconciliation cancel
 agent issue.block → Blocked + cancelled with agent_blocked
 stale running run on startup → interrupted + dispatch_paused
@@ -85,8 +91,11 @@ Required before release candidate, but not every local test run.
 OpenAPI validates all response schemas
 Go handlers conform to OpenAPI
 frontend generated types compile
+api/openapi.yaml exists before generated frontend types are committed
 error envelope consistent
+IssueRef path parameters accept both `iss_...` and `LOC-...`
 state-transition side_effects for active-run reconciliation
+run cancel and approval cancel_run side effects are schema-covered
 ```
 
 ## Security regression tests
@@ -99,6 +108,7 @@ tool token invalid/expired/wrong scope
 workspace boundary
 protected path
 command allow/review/deny
+`symphony tool handoff` and other fixed tool commands allowed by command policy but rejected without valid tool token
 network deny
 redaction
 artifact containment
@@ -175,3 +185,5 @@ WORKFLOW.md reference is config source of truth
 | IS12-007 | Markdown docs become source of truth |
 | IS12-008 | no implementation without docs/ADR alignment |
 | IS12-009 | tests must cover active run reconciliation, hook lifecycle, aliases, and fixed handoff target |
+| IS12-010 | tests must cover cancellation pause/no-redispatch semantics and untracked review-packet content |
+| IS12-011 | API contract tests require generated `api/openapi.yaml` before frontend type generation |

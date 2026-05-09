@@ -21,7 +21,8 @@ Rules:
 ```text
 issue_identifier is sanitized
 workspace path must be under workspace.root
-workspace.root cannot be repo root
+workspace.root cannot equal repo root
+workspace.root cannot be inside repo root
 workspace.root cannot be inside .git
 existing path must belong to the same issue workspace
 ```
@@ -93,10 +94,10 @@ For a new workspace:
 
 ```text
 1. Resolve repo root.
-2. Resolve base ref and base SHA.
+2. Resolve base ref config, resolved base ref, and base SHA.
 3. Generate branch name.
 4. Create worktree with new branch.
-5. Insert/update workspaces row.
+5. Insert/update workspaces row with `base_ref_config`, resolved `base_ref`, and `base_sha`.
 6. Run after_create hook if configured.
 7. Run before_run hook if configured.
 ```
@@ -107,10 +108,11 @@ For a reused workspace:
 1. Check workspace path exists.
 2. Check path belongs to same issue.
 3. Check branch matches DB.
-4. Do not reset.
-5. Do not clean.
-6. Do not rebase.
-7. Run before_run hook if configured.
+4. Preserve stored `base_ref_config`, resolved `base_ref`, and `base_sha`; do not silently rebase to a newer base.
+5. Do not reset.
+6. Do not clean.
+7. Do not rebase.
+8. Run before_run hook if configured.
 ```
 
 `before_run` therefore runs before every run attempt, including the first run immediately after `after_create` on a newly created worktree.
@@ -131,6 +133,7 @@ Failure semantics:
 ```text
 after_create failed → run failed with failure_code=after_create_failed
 before_run failed → run failed with failure_code=before_run_failed
+workspace ownership/path/branch conflict → failure_code=workspace_conflict
 general workspace failure before hooks → failure_code=workspace_prepare_failed
 after_run failed → log/event only
 before_remove unused in v1 because destructive cleanup is deferred
@@ -174,6 +177,19 @@ git diff --name-only <base_sha> -- .
 git ls-files --others --exclude-standard
 ```
 
+Untracked files must be included in the review packet. Because `git diff <base_sha>` does not include ordinary untracked files, the generator must add their content without relying on the agent to stage files. The v1 rule is:
+
+```text
+1. Collect untracked files with git ls-files --others --exclude-standard.
+2. Validate each path is under the workspace and not protected by IS-009.
+3. Add each untracked path to changed-files.txt.
+4. Record path, size, sha256, and patch_included=true in untracked-files.json.
+5. Append a binary-safe new-file patch for each untracked file to changes.patch.
+6. Do not stage, commit, reset, clean, or mutate the index as part of review generation.
+```
+
+The untracked patch may be produced with Git-compatible no-index/new-file diff generation, but paths in the final patch must be normalized to workspace-relative `a/<path>` / `b/<path>` entries.
+
 Outputs:
 
 ```text
@@ -199,13 +215,14 @@ submodule recursive init
 
 | ID | Decision |
 |---|---|
-| IS7-001 | workspace path defaults to global workspace root by project/issue |
-| IS7-002 | `git.base_ref` default is `auto` |
-| IS7-003 | explicit base_ref missing → fail |
+| IS7-001 | workspace path defaults to global workspace root by project/issue and must stay outside the repository root |
+| IS7-002 | `git.base_ref` default is `auto`; workspace stores both configured value and resolved ref |
+| IS7-003 | explicit base_ref missing → fail; resolved base_ref differs from base_ref_config when config uses auto |
 | IS7-004 | worktree reuse never reset/clean/rebase automatically |
 | IS7-005 | hooks run in workspace with timeout/output limits; `before_run` runs every attempt |
 | IS7-006 | all Git commands centralized in `internal/gitx` |
-| IS7-007 | review packet diff based on workspace `base_sha` |
+| IS7-007 | review packet diff based on workspace `base_sha` and includes untracked new-file content |
 | IS7-008 | v1 does not implement publish, cleanup, reset, or rebase |
+| IS7-009 | workspace metadata stores both `base_ref_config` and resolved `base_ref` |
 | G2 | starter base_ref changed to `auto` |
 | G7 | active run reconciliation retains workspace without reset/clean/delete |

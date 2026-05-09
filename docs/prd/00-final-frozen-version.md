@@ -1,5 +1,8 @@
 # Local Symphony App v1 最终冻结版本
 
+> 产品背景说明：本文件仅保留产品上下文。若与 `docs/implementation/`、`docs/schema/`、`docs/config/` 或 `docs/api/` 冲突，后者为准；不要从本 PRD 复制实现级 enum、schema、命令策略或模板。
+
+
 ## 1. 产品定义
 
 **Local Symphony App v1** 是一个本地运行的 agent engineering workflow control plane。

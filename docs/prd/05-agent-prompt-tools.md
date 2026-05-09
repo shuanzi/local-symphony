@@ -1,5 +1,8 @@
 # Agent、Prompt、Tool Gateway 与 Handoff
 
+> 产品背景说明：本文件仅保留产品上下文。若与 `docs/implementation/`、`docs/schema/`、`docs/config/` 或 `docs/api/` 冲突，后者为准；不要从本 PRD 复制实现级 enum、schema、命令策略或模板。
+
+
 ## 1. Agent runtime
 
 v1 只支持 Codex app-server。
@@ -145,7 +148,7 @@ invalid interpolation → template_render_error
 ├── context.json
 ├── rendered_prompt.redacted.md
 ├── prompt_meta.json
-└── tool_manifest.json
+└── tool_manifest.md
 ```
 
 保存：

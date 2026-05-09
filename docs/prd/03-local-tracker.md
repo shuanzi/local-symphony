@@ -1,5 +1,8 @@
 # 本地 Tracker、Issue 状态机与调度规则
 
+> 产品背景说明：本文件仅保留产品上下文。若与 `docs/implementation/`、`docs/schema/`、`docs/config/` 或 `docs/api/` 冲突，后者为准；不要从本 PRD 复制实现级 enum、schema、命令策略或模板。
+
+
 ## 1. Tracker source of truth
 
 v1 使用 SQLite 作为本地 tracker 的唯一 source of truth。

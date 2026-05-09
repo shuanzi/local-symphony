@@ -71,6 +71,9 @@ Rules:
 ~ expands to home
 relative paths are relative to WORKFLOW.md directory
 normalize to absolute path
+workspace.root must not equal git.repo_root
+workspace.root must not be inside git.repo_root
+workspace.root must not be inside .git
 no shell commands
 no URI
 no Liquid template interpolation
@@ -150,6 +153,16 @@ agent:
   pause_on_missing_handoff: true
 ```
 
+v1 hard constraints:
+
+```text
+agent.handoff_required must be true
+agent.pause_on_missing_handoff must be true
+agent.handoff_state must be Human Review
+agent.max_handoff_continuations must be 0 or 1
+agent.max_turns_per_run must equal 1 + agent.max_handoff_continuations when explicitly set
+```
+
 `agent.handoff_state` is fixed to `Human Review` in v1. Any other value is a workflow validation error. The field remains explicit so future versions can evaluate other handoff states without changing the prompt contract.
 
 ### codex
@@ -178,8 +191,12 @@ approvals:
     - ".env.*"
     - "**/*.pem"
     - "**/*.key"
+    - "**/*_rsa"
+    - "**/*_ed25519"
     - ".ssh/**"
     - ".aws/**"
+    - ".gcp/**"
+    - ".azure/**"
     - ".kube/**"
     - ".npmrc"
     - ".pypirc"
@@ -247,7 +264,7 @@ prompt:
 
 ## Compatibility aliases
 
-The parser accepts upstream-style `agent.max_turns` as a compatibility alias for `agent.max_turns_per_run`. If both are present, `agent.max_turns_per_run` wins and a warning is emitted. This alias does not enable upstream continuation semantics; Local v1 still uses one main turn plus bounded handoff continuations.
+The parser accepts upstream-style `agent.max_turns` as a compatibility alias for `agent.max_turns_per_run`. If both are present, `agent.max_turns_per_run` wins and a warning is emitted. This alias does not enable upstream continuation semantics; Local v1 still uses one main turn plus bounded handoff continuations. If the effective `max_turns_per_run` does not equal `1 + max_handoff_continuations`, validation fails.
 
 ## Reload
 
@@ -334,13 +351,13 @@ If main turn completes with no handoff, v1 sends one continuation prompt. It doe
 
 ## Prompt snapshots
 
-Every run saves:
+Every run saves prompt snapshot artifacts under the review/prompt artifact namespace:
 
 ```text
-context.json
-rendered_prompt.redacted.md
-prompt_meta.json
-tool_manifest.md
+prompt/context.json
+prompt/rendered_prompt.redacted.md
+prompt/prompt_meta.json
+prompt/tool_manifest.md
 ```
 
 DB stores only hashes and artifact paths, not full raw prompt. v1 has no raw prompt export.
@@ -352,7 +369,7 @@ DB stores only hashes and artifact paths, not full raw prompt. v1 has no raw pro
 | IS5-001 | optional front matter + prompt body; empty prompt blocks dispatch |
 | IS5-002 | unknown keys warning; type/enum/required errors block |
 | IS5-003 | defaults → env → path normalization → validation; no config interpolation |
-| IS5-004 | EffectiveConfig supports frozen sections and compatibility aliases |
+| IS5-004 | EffectiveConfig supports frozen sections and compatibility aliases with v1 hard constraints for handoff and turn counts |
 | IS5-005 | errors block dispatch; warnings do not |
 | IS5-006 | file watcher + manual reload + before-dispatch revalidate |
 | IS5-007 | Liquid-style prompt; unknown variable/filter fail |
@@ -361,7 +378,7 @@ DB stores only hashes and artifact paths, not full raw prompt. v1 has no raw pro
 | IS5-010 | fixed prompt composition |
 | IS5-011 | continuation prompt does not resend full prompt |
 | IS5-012 | prompt size limit with context degradation |
-| IS5-013 | redacted prompt snapshots every run |
+| IS5-013 | redacted prompt snapshots every run with prompt/context, rendered_prompt, prompt_meta, and tool_manifest files |
 | IS5-014 | workflow UI/prompt snapshot redacted; no raw export |
 | IS5-015 | valid/invalid workflow snapshots; only valid replaces config |
 | IS5-016 | starter uses Liquid prompt variables; no config interpolation |

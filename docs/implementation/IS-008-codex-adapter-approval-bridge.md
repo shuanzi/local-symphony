@@ -43,6 +43,15 @@ The adapter must validate framing/schema compatibility for the installed Codex v
 stderr is diagnostic only unless the selected Codex protocol explicitly documents otherwise.
 ```
 
+Versioned protocol fixtures are required before implementing or updating the adapter. Generate and commit fixtures for each supported Codex app-server version:
+
+```bash
+codex app-server generate-json-schema --out internal/agent/codex/testdata/schema/<codex-version>/
+codex app-server generate-ts --out internal/agent/codex/testdata/ts/<codex-version>/
+```
+
+If the installed Codex schema/version is not covered by committed fixtures, the adapter must fail before dispatch with `unsupported_codex_version`.
+
 Startup/version rules:
 
 ```text
@@ -123,8 +132,10 @@ approve_once        → accept
 approve_for_run     → acceptForSession or local run allow
 approve_for_session → acceptForSession
 deny                → decline
-cancel_run          → cancel
+cancel_run          → cancel and apply IS-006 operator_cancelled dispatch pause semantics
 ```
+
+If a command, network, or protected-path denial causes the turn or run to terminate, the adapter reports the corresponding canonical failure code: `command_denied`, `network_denied`, or `protected_path_denied`.
 
 ## Timeouts
 
@@ -173,6 +184,10 @@ missing_handoff_then_handoff
 missing_handoff_twice
 approval_requested
 command_denied
+network_denied
+protected_path_denied
+operator_cancel_no_redispatch
+approval_cancel_run_no_redispatch
 codex_startup_failed
 turn_timeout
 malformed_event
@@ -191,10 +206,10 @@ Real Codex tests are opt-in.
 | IS8-001 | one Codex subprocess per run |
 | IS8-002 | version-aware Codex protocol adapter; stdio target is adapter detail |
 | IS8-003 | adapter hides Codex protocol from orchestrator |
-| IS8-004 | approval bridge handles blocking/decision/writeback |
+| IS8-004 | approval bridge handles blocking/decision/writeback, including `cancel_run` pause semantics |
 | IS8-005 | raw Codex log diagnostic only |
 | IS8-006 | timeout failure pauses issue dispatch |
 | IS8-007 | handoff continuation reuses same session/thread |
 | IS8-008 | fake runner mandatory |
 | IS8-009 | Codex version capture and startup handshake timeout are required |
-| IS8-010 | protocol fixtures define supported Codex versions |
+| IS8-010 | protocol fixtures define supported Codex versions and unsupported installed schemas fail with `unsupported_codex_version` |

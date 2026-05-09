@@ -74,6 +74,18 @@ agent:
 
 If both are present, `max_turns_per_run` wins and the loader emits a warning. This alias does not change Local v1 continuation semantics: one main turn plus at most `max_handoff_continuations` handoff continuation turns.
 
+Hard v1 constraints:
+
+```text
+agent.handoff_required = true
+agent.pause_on_missing_handoff = true
+agent.handoff_state = Human Review
+agent.max_handoff_continuations ∈ {0, 1}
+agent.max_turns_per_run = 1 + agent.max_handoff_continuations
+```
+
+Violating these constraints is a workflow validation error, not a warning.
+
 ## Local default overrides
 
 Local v1 intentionally uses these defaults instead of upstream SPEC defaults where they differ:

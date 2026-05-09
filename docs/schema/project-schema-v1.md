@@ -121,6 +121,7 @@ CREATE TABLE workspaces (
   path TEXT NOT NULL UNIQUE,
   branch_name TEXT NOT NULL,
   base_ref TEXT NOT NULL,
+  base_ref_config TEXT NOT NULL DEFAULT 'auto',
   base_sha TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('planned','creating','ready','in_use','error','cleanup_pending','removed')),
   created_at TEXT NOT NULL,
@@ -278,7 +279,7 @@ CREATE TABLE artifacts (
   id TEXT PRIMARY KEY,
   issue_id TEXT NOT NULL,
   run_id TEXT,
-  kind TEXT NOT NULL CHECK (kind IN ('test_output','patch','changed_files','prompt_snapshot','codex_log','review_packet','agent_file','diagnostic','other')),
+  kind TEXT NOT NULL CHECK (kind IN ('test_output','patch','changed_files','untracked_files','prompt_snapshot','codex_log','review_packet','agent_file','diagnostic','other')),
   path TEXT NOT NULL,
   mime_type TEXT,
   size_bytes INTEGER,
@@ -303,6 +304,7 @@ CREATE TABLE review_packets (
   review_json_path TEXT,
   patch_path TEXT,
   changed_files_path TEXT,
+  untracked_files_path TEXT,
   handoff_id TEXT,
   prompt_snapshot_id TEXT,
   failure_code TEXT,
@@ -341,6 +343,7 @@ CREATE TABLE prompt_snapshots (
   rendered_prompt_hash TEXT NOT NULL,
   context_json_path TEXT,
   redacted_prompt_path TEXT,
+  prompt_meta_json_path TEXT,
   tool_manifest_path TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY (run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
@@ -350,6 +353,18 @@ CREATE TABLE prompt_snapshots (
 CREATE INDEX idx_prompt_snapshots_run ON prompt_snapshots(run_id);
 CREATE INDEX idx_prompt_snapshots_created ON prompt_snapshots(created_at);
 ```
+
+## Relation semantics
+
+`issue_relations` direction is fixed:
+
+| relation_type | source_issue_id | target_issue_id | Meaning |
+|---|---|---|---|
+| `blocks` | blocker issue | blocked issue | source blocks target dispatch/progress |
+| `duplicates` | duplicate issue | canonical issue | source is duplicate of target |
+| `followup_of` | follow-up issue | original issue | source was created as follow-up to target |
+
+Agent tools may only create `followup_of` through `followup.create`, and only from the new follow-up issue to the current issue. Blocker and duplicate relations are operator-controlled in v1.
 
 ## Initialization
 

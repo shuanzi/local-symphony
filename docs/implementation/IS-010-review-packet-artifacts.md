@@ -48,6 +48,7 @@ codex-events.redacted.jsonl
 prompt/context.json
 prompt/rendered_prompt.redacted.md
 prompt/prompt_meta.json
+prompt/tool_manifest.md
 ```
 
 ## Generation sequence
@@ -55,18 +56,20 @@ prompt/prompt_meta.json
 ```text
 1. Ensure artifact dir exists.
 2. Collect git status.
-3. Generate changed-files.txt.
-4. Generate changes.patch.
-5. Collect untracked files.
-6. Read handoff.
-7. Export tool calls.
-8. Export approvals.
-9. Export redacted run events.
-10. Write review.json.
-11. Write review.md.
-12. Insert artifacts rows.
-13. Insert review_packets row.
-14. Emit review.packet_generated.
+3. Collect tracked changed files and untracked files.
+4. Generate changed-files.txt with tracked and untracked workspace-relative paths.
+5. Generate changes.patch with tracked diffs plus untracked new-file patch content.
+6. Write untracked-files.json, even when empty.
+7. Read handoff.
+8. Export tool calls.
+9. Export approvals.
+10. Export redacted run events.
+11. Copy prompt snapshot metadata files, including tool_manifest.md when available.
+12. Write review.json.
+13. Write review.md.
+14. Insert artifacts rows.
+15. Insert review_packets row.
+16. Emit review.packet_generated.
 ```
 
 Critical files required for `status=generated`:
@@ -76,6 +79,7 @@ review.md
 review.json
 changes.patch
 changed-files.txt
+untracked-files.json
 ```
 
 Non-critical files:
@@ -84,7 +88,21 @@ Non-critical files:
 agent-final-message.md
 test-output.txt
 codex-events.redacted.jsonl
+prompt/context.json
+prompt/rendered_prompt.redacted.md
+prompt/prompt_meta.json
+prompt/tool_manifest.md
 ```
+
+Artifact rows must use these `kind` values for the core files:
+
+| File | artifact.kind | review_packets column |
+|---|---|---|
+| `review.md` / `review.json` | `review_packet` | `review_md_path` / `review_json_path` |
+| `changes.patch` | `patch` | `patch_path` |
+| `changed-files.txt` | `changed_files` | `changed_files_path` |
+| `untracked-files.json` | `untracked_files` | `untracked_files_path` |
+| `prompt/*` | `prompt_snapshot` | `prompt_snapshot_id` via `prompt_snapshots` |
 
 If a critical step fails:
 
@@ -95,6 +113,23 @@ issue does not enter Human Review
 issue.dispatch_paused = true
 failure_code = review_packet_failed
 ```
+
+## Untracked file guarantee
+
+A review packet with untracked files is not `generated` unless the untracked file contents are represented in `changes.patch`. `untracked-files.json` is always written and uses this shape:
+
+```json
+[
+  {
+    "path": "src/new-file.ts",
+    "size_bytes": 1234,
+    "sha256": "...",
+    "patch_included": true
+  }
+]
+```
+
+Protected paths, path traversal, or files outside the workspace must fail review generation with `review_packet_failed`; they must not be silently omitted from the packet.
 
 ## review.json shape
 
@@ -111,7 +146,8 @@ failure_code = review_packet_failed
   },
   "git": {
     "branch_name": "symphony/LOC-1-...",
-    "base_ref": "auto",
+    "base_ref": "origin/main",
+    "base_ref_config": "auto",
     "base_sha": "...",
     "head_sha": "...",
     "dirty": true
@@ -128,7 +164,8 @@ failure_code = review_packet_failed
   "tool_calls": [],
   "prompt_snapshot": {
     "id": "prm_...",
-    "rendered_prompt_hash": "..."
+    "rendered_prompt_hash": "...",
+    "tool_manifest_path": "prompt/tool_manifest.md"
   }
 }
 ```
@@ -185,6 +222,7 @@ Artifact content endpoint must ensure:
 artifact path is project-local relative path
 resolved path under .symphony/artifacts or .symphony/exports
 no path traversal
+protected path access denied
 no raw prompt export
 no raw Codex log export in v1
 ```
@@ -196,9 +234,11 @@ no raw Codex log export in v1
 | IS10-001 | review packet generation is finalizer responsibility |
 | IS10-002 | critical files required for generated status |
 | IS10-003 | review.md and review.json both required |
-| IS10-004 | Git diff generated against workspace base_sha |
+| IS10-004 | Git diff generated against workspace base_sha and includes untracked new-file content |
 | IS10-005 | Mark Done requires latest generated review packet |
 | IS10-006 | partial packets are view-only |
 | IS10-007 | artifact endpoint requires containment checks |
 | IS10-008 | no raw prompt/raw Codex export in v1 |
 | IS10-009 | finalizer only supports `Human Review` target state in v1 |
+| IS10-010 | review.json stores resolved `base_ref` plus `base_ref_config` when config used `auto` |
+| IS10-011 | prompt snapshot files use the `prompt/` subdirectory and include `tool_manifest.md` when available |

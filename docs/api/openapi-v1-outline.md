@@ -1,6 +1,6 @@
 # OpenAPI v1 Outline
 
-This file is a Markdown outline for the future `api/openapi.yaml`. The actual OpenAPI YAML should use this structure.
+This file is a Markdown outline for the future `api/openapi.yaml`. The actual OpenAPI YAML should use this structure. M0 must generate and commit a machine-readable `api/openapi.yaml` before frontend type generation is treated as complete.
 
 ## Server
 
@@ -25,15 +25,15 @@ paths:
   /events: {}
   /events/stream: {}
   /issues: {}
-  /issues/{issue_id}: {}
-  /issues/{issue_id}/transition: {}
-  /issues/{issue_id}/comments: {}
-  /issues/{issue_id}/blockers: {}
-  /issues/{issue_id}/blockers/{blocker_issue_id}: {}
-  /issues/{issue_id}/dispatch: {}
-  /issues/{issue_id}/dispatch-pause: {}
-  /issues/{issue_id}/dispatch-resume: {}
-  /issues/{issue_id}/events/stream: {}
+  /issues/{issue_ref}: {}
+  /issues/{issue_ref}/transition: {}
+  /issues/{issue_ref}/comments: {}
+  /issues/{issue_ref}/blockers: {}
+  /issues/{issue_ref}/blockers/{blocker_issue_ref}: {}
+  /issues/{issue_ref}/dispatch: {}
+  /issues/{issue_ref}/dispatch-pause: {}
+  /issues/{issue_ref}/dispatch-resume: {}
+  /issues/{issue_ref}/events/stream: {}
   /runs: {}
   /runs/{run_id}: {}
   /runs/{run_id}/events: {}
@@ -41,9 +41,9 @@ paths:
   /runs/{run_id}/cancel: {}
   /approvals: {}
   /approvals/{approval_id}/decide: {}
-  /reviews/{issue_id}: {}
-  /reviews/{issue_id}/send-to-rework: {}
-  /reviews/{issue_id}/mark-done: {}
+  /reviews/{issue_ref}: {}
+  /reviews/{issue_ref}/send-to-rework: {}
+  /reviews/{issue_ref}/mark-done: {}
   /artifacts/{artifact_id}: {}
   /artifacts/{artifact_id}/content: {}
   /workflow: {}
@@ -63,18 +63,34 @@ components:
   schemas:
     SuccessEnvelope: {}
     ErrorEnvelope: {}
+    ApiErrorCode: {}
     Pagination: {}
+    IssueRef: {}
     Issue: {}  # see docs/schema/normalized-issue-v1.md
     IssueState: {}
+    IssueCreateRequest: {}
+    IssueUpdateRequest: {}
+    IssueTransitionRequest: {}
+    IssueDispatchRequest: {}
+    DispatchPauseRequest: {}
     RunAttempt: {}
     RunStatus: {}
     RunEvent: {}
     ApprovalRequest: {}
+    ApprovalDecisionRequest: {}
     ReviewPacket: {}
     Artifact: {}
     WorkflowValidation: {}
     Diagnostics: {}
     FailureCode: {}
+```
+
+## Path parameter refs
+
+```text
+issue_ref accepts internal id `iss_...` or human identifier `LOC-...`.
+blocker_issue_ref follows the same rule.
+Responses always include both id and identifier.
 ```
 
 ## Key enums
@@ -124,6 +140,7 @@ workflow_invalid
 workflow_validation_failed
 prompt_render_failed
 workspace_prepare_failed
+workspace_conflict
 after_create_failed
 before_run_failed
 codex_startup_failed
@@ -132,6 +149,9 @@ codex_protocol_error
 turn_timeout
 stall_timeout
 approval_timeout
+command_denied
+network_denied
+protected_path_denied
 tool_gateway_failed
 missing_handoff
 review_packet_failed
@@ -141,6 +161,10 @@ issue_state_changed
 canceled_by_reconciliation
 daemon_restarted_run_interrupted
 ```
+
+## ApiErrorCode vs FailureCode
+
+`FailureCode` is the terminal run/pause reason enum from IS-006. `ApiErrorCode` includes protocol, auth, request, and product errors. Codes may overlap only when an API operation exposes or causes a terminal run failure.
 
 ## Error envelope
 
@@ -190,6 +214,7 @@ issue_state_changed
 canceled_by_reconciliation
 command_denied
 network_denied
+protected_path_denied
 raw_log_access_not_supported
 internal_error
 ```

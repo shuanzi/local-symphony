@@ -18,6 +18,7 @@ basic HTTP server
 health endpoint
 SQLite init stubs
 WORKFLOW parser skeleton
+api/openapi.yaml generated from IS-003 and docs/api/openapi-v1-outline.md
 ```
 
 Frontend:
@@ -47,6 +48,7 @@ GET /api/v1/health works
 dashboard opens
 project DB created
 WORKFLOW.md parsed/validated
+api/openapi.yaml validates and can generate frontend types
 ```
 
 ## M1 — Local Tracker MVP
@@ -154,7 +156,7 @@ Manual dispatch starts Codex
 Codex cwd is issue workspace
 Prompt includes issue/workspace/git/tools
 Run Detail shows events
-Cancel terminates subprocess
+Cancel terminates subprocess and pauses dispatch without automatic redispatch
 ```
 
 ## M4 — Tool Gateway + Handoff MVP
@@ -191,6 +193,7 @@ Correct token reads current issue
 Wrong token denied
 Agent cannot edit unrelated issue
 Handoff is persisted
+`symphony tool handoff` is command-policy allowed only with valid run token
 No handoff triggers at most one continuation
 ```
 
@@ -224,6 +227,7 @@ Acceptance:
 Handoff generates review packet
 Issue enters Human Review after packet generated
 Review UI shows diff and summary
+Untracked new files appear in changes.patch and changed-files.txt
 Can Send to Rework
 Can Mark Done only with generated packet
 ```
@@ -259,6 +263,7 @@ git status auto allowed
 git push denied
 npm install enters review
 network default denied/reviewed
+protected path access fails with protected_path_denied when terminal
 .env not shown raw
 unauthenticated command API rejected
 ```
@@ -305,6 +310,10 @@ full E2E main path
 invalid WORKFLOW
 tool token denied
 command denied
+network denied
+protected path denied
+run cancel no redispatch
+approval cancel_run no redispatch
 approval timeout
 missing handoff
 workspace already exists
