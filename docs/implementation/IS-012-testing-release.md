@@ -27,6 +27,7 @@ effective config defaults
 Liquid strict rendering
 path normalization
 branch naming
+workspace key sanitization
 command policy
 protected path matching
 redaction
@@ -42,6 +43,7 @@ SQLite schema init
 issue create transaction
 blocker eligibility query
 worktree create/reuse
+hook lifecycle: after_create then before_run on first run, before_run on reuse
 tool gateway token validation
 artifact attach containment
 review packet generation
@@ -62,6 +64,8 @@ command denied → failed
 workflow invalid → dispatch blocked
 workspace conflict → failed
 review packet failure → no Human Review
+active run issue transition → reconciliation cancel
+agent issue.block → Blocked + cancelled with agent_blocked
 stale running run on startup → interrupted + dispatch_paused
 ```
 
@@ -82,6 +86,7 @@ OpenAPI validates all response schemas
 Go handlers conform to OpenAPI
 frontend generated types compile
 error envelope consistent
+state-transition side_effects for active-run reconciliation
 ```
 
 ## Security regression tests
@@ -141,6 +146,8 @@ No full audit log
 No supply-chain deep policy
 No desktop shell
 No automatic PR/merge
+No automatic retry queue/timers
+No automatic workspace cleanup/delete/reset
 ```
 
 ## Documentation authority
@@ -167,3 +174,4 @@ WORKFLOW.md reference is config source of truth
 | IS12-006 | known limitations must be documented |
 | IS12-007 | Markdown docs become source of truth |
 | IS12-008 | no implementation without docs/ADR alignment |
+| IS12-009 | tests must cover active run reconciliation, hook lifecycle, aliases, and fixed handoff target |

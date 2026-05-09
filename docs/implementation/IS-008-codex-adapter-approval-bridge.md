@@ -43,6 +43,20 @@ The adapter must validate framing/schema compatibility for the installed Codex v
 stderr is diagnostic only unless the selected Codex protocol explicitly documents otherwise.
 ```
 
+Startup/version rules:
+
+```text
+capture `codex --version` before process launch when available
+store version in run_attempts.codex_version
+startup handshake must complete within codex.startup_timeout_ms, default 60000
+missing binary or launch failure → codex_startup_failed
+unsupported selected protocol fixture → unsupported_codex_version
+handshake framing/schema mismatch → codex_protocol_error
+unsupported installed version → unsupported_codex_version
+```
+
+The documentation does not hard-code a semantic Codex minimum version. The minimum is the first version covered by the selected adapter protocol fixture in `internal/agent/codex/testdata`.
+
 Each run has a separate process group. Cancel first attempts graceful shutdown, then kills process group.
 
 ## Adapter interface
@@ -118,6 +132,7 @@ cancel_run          → cancel
 turn_timeout_ms: whole turn max duration
 stall_timeout_ms: max duration without protocol event
 approval timeout: default 30 minutes
+startup_timeout_ms: app-server launch/handshake max duration
 read_timeout_ms: protocol read heartbeat/blocking guard
 ```
 
@@ -125,7 +140,7 @@ Timeout results:
 
 ```text
 run failed
-failure_code = turn_timeout / stall_timeout / approval_timeout
+failure_code = codex_startup_failed / turn_timeout / stall_timeout / approval_timeout
 issue.dispatch_paused = true
 ```
 
@@ -143,10 +158,11 @@ Do not resend full prompt.
 
 ## Fake runner
 
-Required test module:
+Required test modules:
 
 ```text
 internal/agent/fake
+internal/agent/codex/testdata/protocol-fixtures
 ```
 
 Scenarios:
@@ -160,7 +176,10 @@ command_denied
 codex_startup_failed
 turn_timeout
 malformed_event
+unsupported_codex_version
+startup_handshake_timeout
 review_packet_failure
+active_run_reconciliation_cancel
 ```
 
 Real Codex tests are opt-in.
@@ -177,3 +196,5 @@ Real Codex tests are opt-in.
 | IS8-006 | timeout failure pauses issue dispatch |
 | IS8-007 | handoff continuation reuses same session/thread |
 | IS8-008 | fake runner mandatory |
+| IS8-009 | Codex version capture and startup handshake timeout are required |
+| IS8-010 | protocol fixtures define supported Codex versions |

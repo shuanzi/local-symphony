@@ -85,7 +85,9 @@ agent.max_turns_per_run = 2
 workspace.root = <global-workspace-root>/<project_id>
 git.base_ref = auto
 failure behavior = dispatch pause; no automatic retry queue/timers
+handoff target state = Human Review only
 workspace cleanup = retained in v1; no terminal cleanup
+protected_paths = full IS-009 default list
 ```
 
 ## Prompt variables
@@ -110,6 +112,7 @@ Examples:
 {{ issue.title }}
 {{ issue.acceptance_criteria | bullet_list }}
 {{ git.branch_name }}
+{{ issue.branch_name }}
 ```
 
 ## Filters
@@ -126,7 +129,16 @@ short_hash
 markdown_quote
 ```
 
-Unknown variables and filters fail rendering.
+Unknown variables and filters fail rendering. `issue.branch_name` and `git.branch_name` are both required aliases when workspace metadata exists.
+
+## Reload semantics
+
+```text
+running attempts keep the workflow snapshot captured at dispatch time
+new attempts use the latest valid workflow snapshot
+invalid reload preserves the last valid effective config
+if no valid config exists, dispatch is blocked while UI/diagnostics remain available
+```
 
 ## Default starter
 

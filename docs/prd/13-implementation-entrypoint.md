@@ -148,3 +148,19 @@ failure -> issues.dispatch_paused = true
 operator dispatch-resume clears the pause
 next dispatch may use dispatch_reason=retry or rework depending on command/context
 ```
+
+
+## Implementation package hygiene
+
+When handing these documents to an implementation agent, the package should contain only source documents and intended project files.
+
+Exclude:
+
+```text
+.git/
+*.patch
+stale diffs
+uncommitted local scratch files
+```
+
+If Git history is intentionally included, hand off a clean commit/tag and state that current HEAD is the only implementation source.

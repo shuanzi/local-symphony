@@ -150,12 +150,15 @@ agent:
   pause_on_missing_handoff: true
 ```
 
+`agent.handoff_state` is fixed to `Human Review` in v1. Any other value is a workflow validation error. The field remains explicit so future versions can evaluate other handoff states without changing the prompt contract.
+
 ### codex
 
 ```yaml
 codex:
   command: codex app-server
   transport: stdio
+  startup_timeout_ms: 60000
   turn_timeout_ms: 3600000
   stall_timeout_ms: 300000
   read_timeout_ms: 5000
@@ -175,6 +178,12 @@ approvals:
     - ".env.*"
     - "**/*.pem"
     - "**/*.key"
+    - ".ssh/**"
+    - ".aws/**"
+    - ".kube/**"
+    - ".npmrc"
+    - ".pypirc"
+    - ".netrc"
 ```
 
 ### tools
@@ -253,6 +262,16 @@ before-dispatch revalidate
 
 Invalid reload preserves last valid effective config. If no last valid config exists, daemon may serve UI/diagnostics but dispatch is blocked.
 
+Reload behavior:
+
+```text
+running run attempts keep their captured workflow_snapshot_id and effective config
+new dispatch attempts use the latest valid workflow snapshot
+invalid reload creates an invalid workflow_snapshot row for diagnostics, but does not replace effective config
+if no valid snapshot exists, dispatch is blocked and UI shows workflow invalid
+manual dry-run validation never replaces effective config
+```
+
 ## Template syntax
 
 Prompt body uses Liquid-style syntax:
@@ -261,6 +280,7 @@ Prompt body uses Liquid-style syntax:
 {{ issue.identifier }}
 {{ issue.acceptance_criteria | bullet_list }}
 {{ git.branch_name }}
+{{ issue.branch_name }}
 ```
 
 Unknown variables and unknown filters fail render.
@@ -348,4 +368,7 @@ DB stores only hashes and artifact paths, not full raw prompt. v1 has no raw pro
 | IS5-017 | validation error model: code/path/message |
 | IS5-018 | fixture-driven tests required |
 | IS5-019 | `internal/config` owns parser/config/prompt/snapshot |
+| IS5-020 | v1 rejects any handoff target other than `Human Review` |
+| IS5-021 | running attempts use captured workflow snapshots; new attempts use latest valid config |
 | G2 | starter `git.base_ref` changed to `auto` |
+| G8 | fixed v1 handoff target state |

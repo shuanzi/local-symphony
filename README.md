@@ -94,7 +94,8 @@ docs/
 │   ├── IS-009-security-policy-engine.md
 │   ├── IS-010-review-packet-artifacts.md
 │   ├── IS-011-frontend-dashboard.md
-│   └── IS-012-testing-release.md
+│   ├── IS-012-testing-release.md
+│   └── IS-013-local-vs-upstream-resolution.md
 ├── backlog/
 │   └── m0-m8-mvp-backlog.md
 ├── config/
@@ -119,7 +120,7 @@ docs/
 3. docs/schema/*.md
 4. docs/config/starter-WORKFLOW.md and docs/config/workflow-reference-v1.md
 5. docs/api/openapi-v1-outline.md until api/openapi.yaml exists
-6. docs/references/spec-conformance-matrix.md for upstream SPEC vs local v1 ambiguity
+6. docs/implementation/IS-013-local-vs-upstream-resolution.md and docs/references/spec-conformance-matrix.md for upstream SPEC vs local v1 ambiguity
 7. docs/adr/*.md
 8. docs/prd/*.md as product context only
 9. docs/backlog/*.md
@@ -161,3 +162,6 @@ The following implementation amendments are frozen:
 | G4 | startup marks stale running runs as interrupted; no crash recovery. |
 | G5 | Handoff is two-stage: tool submission first, review-packet finalizer transitions to Human Review. |
 | G6 | PRD files are product context; implementation/schema/config/API documents are authoritative. |
+| G7 | Active run reconciliation is required; non-active issue transitions cancel active runs. |
+| G8 | v1 only supports `Human Review` as the handoff target state. |
+| G9 | NormalizedIssue keeps upstream-compatible top-level git/workspace aliases. |

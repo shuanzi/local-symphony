@@ -50,6 +50,7 @@ agent:
 codex:
   command: codex app-server
   transport: stdio
+  startup_timeout_ms: 60000
   turn_timeout_ms: 3600000
   stall_timeout_ms: 300000
   experimental_api: false
@@ -64,6 +65,12 @@ approvals:
     - ".env.*"
     - "**/*.pem"
     - "**/*.key"
+    - ".ssh/**"
+    - ".aws/**"
+    - ".kube/**"
+    - ".npmrc"
+    - ".pypirc"
+    - ".netrc"
 
 tools:
   gateway: cli

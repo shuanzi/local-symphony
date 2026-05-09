@@ -47,6 +47,38 @@ failed
 cancelled
 ```
 
+Active run statuses:
+
+```text
+pending
+preparing_workspace
+rendering_prompt
+starting_agent
+running
+```
+
+Terminal run statuses:
+
+```text
+completed
+completed_without_handoff
+failed
+cancelled
+```
+
+Upstream terminal outcome mapping:
+
+| Upstream concept | Local status | Local `failure_code` / reason |
+|---|---|---|
+| Succeeded with handoff | `completed` | null |
+| Succeeded without handoff | `completed_without_handoff` | `missing_handoff` |
+| Failed | `failed` | canonical failure code |
+| TimedOut | `failed` | `turn_timeout` |
+| Stalled | `failed` | `stall_timeout` |
+| CanceledByReconciliation | `cancelled` | `issue_state_changed` or `canceled_by_reconciliation` |
+| Operator cancel | `cancelled` | `operator_cancelled` |
+| Agent blocked current issue | `cancelled` | `agent_blocked` |
+
 Flow:
 
 ```text
@@ -74,8 +106,8 @@ Within one transaction:
 2. Validate state in active_states.
 3. Validate dispatch_paused = false.
 4. Validate no active blockers.
-5. Validate no running run.
-6. Create run_attempt with status=pending.
+5. Validate no active run for the same issue.
+6. Create run_attempt with status=pending. This pending row is the local claim.
 7. If issue.state != Working, transition issue to Working.
 8. Insert issue_state_history if transitioned.
 9. Insert scheduler.dispatch_claimed run_event.
@@ -87,7 +119,7 @@ Workspace preparation and Codex launch run outside the transaction.
 
 ```text
 1. status → preparing_workspace
-2. WorkspaceManager.Prepare(issue)
+2. WorkspaceManager.Prepare(issue): create/reuse worktree, run `after_create` if new, then always run `before_run`
 3. status → rendering_prompt
 4. PromptBuilder.Build(run)
 5. Create run-scoped tool token
@@ -106,14 +138,15 @@ Workspace preparation and Codex launch run outside the transaction.
 Each tick:
 
 ```text
-1. If workflow invalid and no last valid config, skip dispatch.
-2. Before-dispatch revalidate WORKFLOW.md.
-3. Compute available concurrency slots.
-4. Query eligible issues.
-5. Sort by priority ASC, created_at ASC, identifier ASC.
-6. Claim issues until slots exhausted.
-7. Launch run workers.
-8. Emit scheduler events.
+1. Reconcile active runs against current issue state and process liveness.
+2. If workflow invalid and no last valid config, skip dispatch.
+3. Before-dispatch revalidate WORKFLOW.md.
+4. Compute available concurrency slots.
+5. Query eligible issues.
+6. Sort by priority ASC, created_at ASC, identifier ASC.
+7. Claim issues until slots exhausted.
+8. Launch run workers.
+9. Emit scheduler events.
 ```
 
 ## Retry strategy
@@ -128,6 +161,64 @@ dispatch_reason = retry
 ```
 
 `dispatch_reason = retry` is reserved for an operator-initiated redispatch of a previously failed or paused issue. It must not imply an automatic retry timer, retry queue, or exponential backoff scheduler in v1.
+
+
+## Active run reconciliation
+
+Active run reconciliation is required in v1.
+
+A run is active when its status is one of:
+
+```text
+pending
+preparing_workspace
+rendering_prompt
+starting_agent
+running
+```
+
+An issue is active-dispatch eligible only when its state is in:
+
+```text
+Ready
+Working
+Rework
+```
+
+Reconciliation triggers:
+
+```text
+orchestrator tick
+issue transition command
+operator run cancel
+agent issue.block tool
+startup stale-run guard
+```
+
+Rules:
+
+```text
+If an issue with an active run leaves Ready/Working/Rework:
+  1. send CancelRun to the orchestrator actor
+  2. terminate the Codex process group if it exists
+  3. set run_attempt.status = cancelled
+  4. set failure_code = issue_state_changed unless a more specific code applies
+  5. set ended_at
+  6. emit run.cancelled and scheduler.reconciled events
+  7. retain workspace without reset/clean/delete
+```
+
+Specific codes:
+
+| Trigger | Local status | failure_code |
+|---|---|---|
+| Operator `POST /runs/{id}/cancel` | `cancelled` | `operator_cancelled` |
+| Issue transitioned to `Blocked` by agent `issue.block` | `cancelled` | `agent_blocked` |
+| Issue transitioned to inactive/terminal by operator | `cancelled` | `issue_state_changed` |
+| Reconciliation finds active run for terminal issue | `cancelled` | `canceled_by_reconciliation` |
+| Daemon restart finds active DB rows but no process ownership | `failed` | `daemon_restarted_run_interrupted` |
+
+State changes do not delete workspace state. Review packet generation is not attempted for reconciliation-cancelled runs unless a successful handoff already exists and the worker has reached the finalizer step.
 
 ## Failure behavior
 
@@ -145,24 +236,30 @@ system comment with failure summary
 
 G3 freezes failure → dispatch pause behavior.
 
-Common failure codes:
+Canonical failure codes:
 
-```text
-workflow_validation_failed
-prompt_render_error
-workspace_prepare_failed
-hook_failed
-codex_startup_failed
-codex_protocol_error
-turn_timeout
-stall_timeout
-approval_timeout
-tool_gateway_failed
-handoff_missing
-review_packet_failed
-operator_cancelled
-daemon_restarted_run_interrupted
-```
+| Code | Meaning |
+|---|---|
+| `workflow_invalid` | Effective workflow config is invalid and blocks dispatch. |
+| `workflow_validation_failed` | Workflow reload/validation failed for a specific operation. |
+| `prompt_render_failed` | Strict prompt rendering failed. |
+| `workspace_prepare_failed` | Worktree preparation failed before hook-specific classification. |
+| `after_create_failed` | `hooks.after_create` failed. |
+| `before_run_failed` | `hooks.before_run` failed. |
+| `codex_startup_failed` | Codex process could not start or failed startup handshake. |
+| `unsupported_codex_version` | Installed Codex version is incompatible with selected adapter fixture. |
+| `codex_protocol_error` | Codex protocol framing/schema mismatch. |
+| `turn_timeout` | Turn exceeded `codex.turn_timeout_ms`. |
+| `stall_timeout` | No protocol progress within `codex.stall_timeout_ms`. |
+| `approval_timeout` | Pending approval expired. |
+| `tool_gateway_failed` | Required tool call failed for daemon/gateway reasons. |
+| `missing_handoff` | Required handoff missing after allowed continuation. |
+| `review_packet_failed` | Review packet finalizer failed. |
+| `operator_cancelled` | Operator cancelled run. |
+| `agent_blocked` | Agent blocked the current issue through `issue.block`. |
+| `issue_state_changed` | Issue left an active state while run was active. |
+| `canceled_by_reconciliation` | Reconciliation cancelled a stale/ineligible active run. |
+| `daemon_restarted_run_interrupted` | Startup found active DB row from previous daemon process. |
 
 ## Missing handoff
 
@@ -213,7 +310,7 @@ If handoff exists:
 1. Generate review packet.
 2. Insert review_packet.status = generated.
 3. run.status = completed.
-4. issue.state → Human Review.
+4. issue.state → Human Review. This is the only supported v1 handoff target state.
 5. issue.dispatch_paused = false.
 6. Insert issue_state_history.
 7. Emit review.packet_generated.
@@ -227,6 +324,34 @@ issue remains not Human Review
 issue.dispatch_paused = true
 failure_code = review_packet_failed
 ```
+
+## Issue state transitions
+
+Issue state transitions must use `/api/v1/issues/{issue_id}/transition` or the equivalent CLI/operator command, except orchestrator-owned dispatch/finalizer transitions.
+
+| From | To | Actor | Guard / side effect |
+|---|---|---|---|
+| `Inbox` | `Ready` | operator | Required issue fields valid. |
+| `Ready` | `Working` | orchestrator | Dispatch claim transaction succeeds. |
+| `Rework` | `Working` | orchestrator | Dispatch claim transaction succeeds. |
+| `Working` | `Human Review` | run finalizer | Handoff exists and review packet status is `generated`. |
+| `Human Review` | `Rework` | operator | Reviewer supplies reason or feedback comment. |
+| `Human Review` | `Done` | operator | Latest review packet status is `generated`; no active run. |
+| any non-terminal | `Blocked` | operator or agent tool | If active run exists, reconciliation cancels it. Agent tool also sets `dispatch_paused=true`. |
+| any non-terminal | `Cancelled` | operator | If active run exists, reconciliation cancels it. |
+| any non-terminal | `Duplicate` | operator | If active run exists, reconciliation cancels it. Duplicate target is recommended and may be required by UI. |
+| `Blocked` | `Ready` | operator | Block reason resolved; blockers inactive or removed. |
+| `Done` / `Cancelled` / `Duplicate` | non-terminal | operator | Allowed only through explicit reopen command; does not reuse old active runs. |
+
+Terminal states:
+
+```text
+Done
+Cancelled
+Duplicate
+```
+
+`Human Review` is not terminal. Workspaces are retained for all states in v1.
 
 ## Startup stale-run guard
 
@@ -269,6 +394,11 @@ Resume only clears pause. It does not change state and does not override blocker
 | IS6-006 | review packet success required for Human Review |
 | IS6-007 | startup marks stale runs; no crash recovery |
 | IS6-008 | dispatch pause/resume API and CLI required |
+| IS6-009 | active run reconciliation cancels runs whose issues leave active states |
+| IS6-010 | canonical failure code table is the source for run/API/dashboard error naming |
+| IS6-011 | issue transition matrix defines allowed state changes and active-run side effects |
 | G1 | pause/resume added |
 | G3 | failures pause dispatch |
 | G4 | stale active runs marked interrupted |
+| G7 | non-active issue transitions cancel active runs |
+| G8 | `Human Review` is the only supported v1 handoff target |

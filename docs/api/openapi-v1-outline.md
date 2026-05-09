@@ -74,6 +74,7 @@ components:
     Artifact: {}
     WorkflowValidation: {}
     Diagnostics: {}
+    FailureCode: {}
 ```
 
 ## Key enums
@@ -116,6 +117,31 @@ deny
 cancel_run
 ```
 
+FailureCode:
+
+```text
+workflow_invalid
+workflow_validation_failed
+prompt_render_failed
+workspace_prepare_failed
+after_create_failed
+before_run_failed
+codex_startup_failed
+unsupported_codex_version
+codex_protocol_error
+turn_timeout
+stall_timeout
+approval_timeout
+tool_gateway_failed
+missing_handoff
+review_packet_failed
+operator_cancelled
+agent_blocked
+issue_state_changed
+canceled_by_reconciliation
+daemon_restarted_run_interrupted
+```
+
 ## Error envelope
 
 ```json
@@ -138,16 +164,30 @@ csrf_required
 invalid_request
 not_found
 unsupported_db_version
+workflow_invalid
 workflow_validation_failed
+prompt_render_failed
 invalid_state_transition
 issue_blocked
 issue_dispatch_paused
 issue_already_running
 workspace_conflict
-codex_unavailable
+workspace_prepare_failed
+after_create_failed
+before_run_failed
+codex_startup_failed
+unsupported_codex_version
+codex_protocol_error
 approval_not_pending
+approval_timeout
 review_packet_required
+review_packet_failed
 tool_token_invalid
+tool_gateway_failed
+operator_cancelled
+agent_blocked
+issue_state_changed
+canceled_by_reconciliation
 command_denied
 network_denied
 raw_log_access_not_supported

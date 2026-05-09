@@ -10,7 +10,7 @@ Path:
 
 ```sql
 CREATE TABLE schema_version (
-  version INTEGER NOT NULL,
+  version INTEGER PRIMARY KEY CHECK (version = 1),
   created_at TEXT NOT NULL
 );
 
@@ -49,7 +49,7 @@ CREATE TABLE local_sessions (
 ## Rules
 
 ```text
-schema_version must equal 1.
+schema_version must contain exactly one row with version = 1.
 registered_projects.repo_root is absolute path.
 Only token hashes are stored.
 No third-party secrets are stored.

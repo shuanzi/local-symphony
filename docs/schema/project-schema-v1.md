@@ -10,7 +10,7 @@ Path:
 
 ```sql
 CREATE TABLE schema_version (
-  version INTEGER NOT NULL,
+  version INTEGER PRIMARY KEY CHECK (version = 1),
   created_at TEXT NOT NULL
 );
 
@@ -42,7 +42,7 @@ CREATE TABLE issues (
   description TEXT NOT NULL DEFAULT '',
   acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
   state TEXT NOT NULL CHECK (state IN ('Inbox','Ready','Working','Rework','Blocked','Human Review','Done','Cancelled','Duplicate')),
-  priority INTEGER NOT NULL DEFAULT 3,
+  priority INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 4),
   estimate TEXT,
   external_ref TEXT,
   dispatch_paused INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_paused IN (0, 1)),
@@ -76,7 +76,8 @@ CREATE TABLE issue_comments (
   author_id TEXT,
   body TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+  FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY (run_id) REFERENCES run_attempts(id) ON DELETE SET NULL
 );
 
 CREATE INDEX idx_issue_comments_issue_created ON issue_comments(issue_id, created_at);
@@ -91,6 +92,7 @@ CREATE TABLE issue_relations (
   created_at TEXT NOT NULL,
   FOREIGN KEY (source_issue_id) REFERENCES issues(id) ON DELETE CASCADE,
   FOREIGN KEY (target_issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY (created_by_run_id) REFERENCES run_attempts(id) ON DELETE SET NULL,
   UNIQUE (source_issue_id, target_issue_id, relation_type)
 );
 
@@ -107,7 +109,8 @@ CREATE TABLE issue_state_history (
   run_id TEXT,
   reason TEXT,
   created_at TEXT NOT NULL,
-  FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+  FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY (run_id) REFERENCES run_attempts(id) ON DELETE SET NULL
 );
 
 CREATE INDEX idx_issue_state_history_issue_created ON issue_state_history(issue_id, created_at);
@@ -145,6 +148,7 @@ CREATE TABLE run_attempts (
   thread_id TEXT,
   turn_id TEXT,
   session_id TEXT,
+  workflow_snapshot_id TEXT,
   failure_code TEXT,
   failure_message TEXT,
   started_at TEXT,
@@ -153,6 +157,7 @@ CREATE TABLE run_attempts (
   updated_at TEXT NOT NULL,
   FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
   FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL,
+  FOREIGN KEY (workflow_snapshot_id) REFERENCES workflow_snapshots(id) ON DELETE SET NULL,
   UNIQUE (issue_id, attempt_no)
 );
 
@@ -200,6 +205,8 @@ CREATE TABLE approval_requests (
   decision_reason TEXT,
   decided_by TEXT,
   requested_at TEXT NOT NULL,
+  timeout_ms INTEGER NOT NULL DEFAULT 1800000,
+  expires_at TEXT NOT NULL,
   resolved_at TEXT,
   FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
   FOREIGN KEY (run_id) REFERENCES run_attempts(id) ON DELETE CASCADE
@@ -258,7 +265,7 @@ CREATE TABLE handoffs (
   risks_json TEXT NOT NULL DEFAULT '[]',
   verification_json TEXT NOT NULL DEFAULT '[]',
   followups_json TEXT NOT NULL DEFAULT '[]',
-  target_state TEXT NOT NULL DEFAULT 'Human Review',
+  target_state TEXT NOT NULL DEFAULT 'Human Review' CHECK (target_state = 'Human Review'),
   submitted_at TEXT NOT NULL,
   FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
   FOREIGN KEY (run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
@@ -349,6 +356,7 @@ CREATE INDEX idx_prompt_snapshots_created ON prompt_snapshots(created_at);
 Initialize:
 
 ```sql
+INSERT INTO schema_version (version, created_at) VALUES (1, '<RFC3339 UTC now>');
 INSERT INTO counters (key, value) VALUES ('issue_sequence', 0);
 ```
 

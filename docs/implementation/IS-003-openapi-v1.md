@@ -126,7 +126,27 @@ State changes use /transition.
 Dispatch uses /dispatch.
 Blockers use blocker command endpoints.
 G1 adds dispatch pause/resume endpoints.
+If a transition moves an issue with an active run out of Ready/Working/Rework, the API command must enqueue orchestrator reconciliation cancel and return the updated issue plus reconciliation metadata.
 ```
+
+## Issue transition response side effects
+
+Transition commands return the normalized issue and may include side effects:
+
+```json
+{
+  "data": {
+    "issue": {},
+    "side_effects": {
+      "active_run_cancelled": true,
+      "run_id": "run_...",
+      "failure_code": "issue_state_changed"
+    }
+  }
+}
+```
+
+If no active run exists, `active_run_cancelled=false` or `side_effects` may be omitted.
 
 ## Run API
 
@@ -156,7 +176,7 @@ deny
 cancel_run
 ```
 
-Only pending approvals can be decided.
+Only pending approvals can be decided. Approval responses must expose `requested_at`, `timeout_ms`, `expires_at`, and `resolved_at` so UI can show expiry consistently after daemon restart.
 
 ## Review API
 
@@ -214,6 +234,24 @@ POST /api/v1/workspaces/:issue_id/delete
 POST /api/v1/secrets
 ```
 
+## Run status and error code contract
+
+`RunStatus` uses the local enum from IS-006:
+
+```text
+pending
+preparing_workspace
+rendering_prompt
+starting_agent
+running
+completed
+completed_without_handoff
+failed
+cancelled
+```
+
+Terminal reasons are communicated by `failure_code`, not extra status values. API `error.code`, `run_attempt.failure_code`, dispatch pause reasons, and dashboard labels must use the canonical names in IS-006.
+
 ## Core schemas
 
 OpenAPI components must include:
@@ -232,6 +270,7 @@ ReviewPacket
 Artifact
 WorkflowValidation
 Diagnostics
+FailureCode
 ```
 
 `Issue` follows `docs/schema/normalized-issue-v1.md` unless an endpoint explicitly documents a smaller projection.
@@ -248,9 +287,10 @@ Diagnostics
 | IS3-006 | health vs state distinction |
 | IS3-007 | JSON events and SSE events separated |
 | IS3-008 | issue state/dispatch/blocker use command endpoints |
-| IS3-009 | run API read/cancel only |
+| IS3-009 | run API read/cancel only; cancel records `operator_cancelled` |
 | IS3-010 | approval decision is final once |
 | IS3-011 | review API is Human Review decision entrypoint |
+| IS3-011a | issue transition matrix and active-run reconciliation notification required |
 | IS3-012 | artifact API with containment checks |
 | IS3-013 | workflow reload supports dry_run |
 | IS3-014 | redacted diagnostics export only |
@@ -260,4 +300,8 @@ Diagnostics
 | IS3-018 | no generic idempotency key in v1 |
 | IS3-019 | no publish/backup/migration/audit/destructive/secrets API |
 | IS3-020 | frontend types generated from OpenAPI |
+| IS3-021 | state transitions that make active runs ineligible trigger reconciliation cancel |
+| IS3-022 | approval schemas expose timeout/expiry fields |
+| IS3-023 | API error codes share canonical failure-code naming with IS-006 |
 | G1 | dispatch-pause and dispatch-resume endpoints added |
+| G7 | active run reconciliation side effects are API-visible |

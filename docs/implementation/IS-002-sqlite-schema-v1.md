@@ -43,6 +43,7 @@ tool_<id>
 hand_<id>
 art_<id>
 rev_<id>
+ws_<id>
 wf_<id>
 prm_<id>
 sess_<id>
@@ -109,7 +110,7 @@ title
 description
 acceptance_criteria_json
 state
-priority
+priority  # integer 1 highest through 4 lowest
 dispatch_paused
 dispatch_pause_reason
 created_at
@@ -131,6 +132,14 @@ relation_type = blocks
 
 B is ineligible while A is not terminal.
 
+Terminal blocker states are:
+
+```text
+Done
+Cancelled
+Duplicate
+```
+
 ### run_attempts
 
 Statuses:
@@ -149,6 +158,25 @@ cancelled
 
 v1 stores process IDs for current lifecycle only. No crash recovery leases.
 
+Active statuses:
+
+```text
+pending
+preparing_workspace
+rendering_prompt
+starting_agent
+running
+```
+
+Terminal statuses:
+
+```text
+completed
+completed_without_handoff
+failed
+cancelled
+```
+
 ### run_events
 
 `seq INTEGER PRIMARY KEY AUTOINCREMENT` is the SSE replay ID. `id` is a business event ID. UI timelines are rendered from durable `run_events`.
@@ -164,6 +192,8 @@ Handoff is two-stage:
 ```
 
 Mark Done requires latest `review_packets.status = generated`.
+
+`handoffs.target_state` is retained for future compatibility but v1 enforces exactly `Human Review`.
 
 ## Transaction rules
 
@@ -184,10 +214,13 @@ Transaction:
 
 ```text
 validate transition
+if transition leaves active states and an active run exists, enqueue reconciliation cancel
 update issue state
 insert state_history
 insert issue.transitioned event
 ```
+
+The allowed transition matrix is defined in `docs/implementation/IS-006-orchestrator-run-lifecycle.md`.
 
 ### Dispatch claim
 
@@ -197,7 +230,7 @@ Transaction:
 validate active state
 validate not paused
 validate no active blockers
-validate no running run
+validate no active run
 create run_attempt pending
 transition issue to Working if needed
 insert scheduler.dispatch_claimed event
@@ -249,7 +282,7 @@ Important assembly rules:
 ```text
 labels are lowercased and sorted
 blocked_by is derived from issue_relations where relation_type = blocks
-branch_name/workspace_path/base_ref/base_sha come from workspaces, not issues
+branch_name/workspace_path/base_ref/base_sha come from workspaces, not issues, and are exposed as top-level compatibility aliases
 url is a local dashboard URL when available, otherwise null
 ```
 
@@ -268,7 +301,27 @@ WHERE i.state IN ('Ready', 'Working', 'Rework')
       AND r.relation_type = 'blocks'
       AND blocker.state NOT IN ('Done', 'Cancelled', 'Duplicate')
   )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM run_attempts r
+    WHERE r.issue_id = i.id
+      AND r.status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running')
+  )
 ORDER BY i.priority ASC, i.created_at ASC, i.identifier ASC;
+```
+
+## Required schema constraints
+
+Generated SQL must include these constraints or equivalent Go-side validation plus tests:
+
+```text
+schema_version.version primary key with CHECK version = 1
+issues.priority CHECK priority BETWEEN 1 AND 4
+issue_comments.run_id optional FK to run_attempts
+issue_relations.created_by_run_id optional FK to run_attempts
+issue_state_history.run_id optional FK to run_attempts
+approval_requests.timeout_ms and expires_at for pending expiry
+handoffs.target_state CHECK target_state = 'Human Review'
 ```
 
 ## PRAGMA
@@ -304,3 +357,7 @@ PRAGMA synchronous = NORMAL;
 | IS2-016 | workflow_snapshots |
 | IS2-017 | prompt_snapshots store hash/path only |
 | IS2-018 | no backup/migration/recovery/audit/supply-chain tables |
+| IS2-019 | schema constraints include priority bounds, run FKs, approval expiry, and fixed handoff target |
+| IS2-020 | eligibility query excludes issues with active run attempts |
+| G8 | v1 handoff target state is fixed to `Human Review` |
+| G9 | NormalizedIssue exposes upstream-compatible git/workspace aliases |

@@ -151,6 +151,20 @@ failure_code = review_packet_failed
 ## How to Continue
 ```
 
+## Human Review transition
+
+The finalizer transitions the issue to `Human Review` only when:
+
+```text
+handoff exists for run
+handoff.target_state = Human Review
+critical review packet files are written
+review_packets.status = generated
+run terminal outcome is otherwise successful
+```
+
+Any other handoff target is invalid in v1 and must fail before finalizer transition.
+
 ## Mark Done gating
 
 `review mark-done` requires:
@@ -187,3 +201,4 @@ no raw Codex log export in v1
 | IS10-006 | partial packets are view-only |
 | IS10-007 | artifact endpoint requires containment checks |
 | IS10-008 | no raw prompt/raw Codex export in v1 |
+| IS10-009 | finalizer only supports `Human Review` target state in v1 |
