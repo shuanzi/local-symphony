@@ -1,12 +1,19 @@
-# Local Symphony App v1 — Frozen Product & Implementation Docs
+# Local Symphony App v1
 
-**Status:** Frozen for v1 implementation
-**Freeze date:** 2026-05-09
-**Document authority:** `docs/AGENT_IMPLEMENTATION_GUIDE.md` defines the implementation-time source-of-truth order. `api/openapi.yaml` and `db/schema/*.sql` are now the executable API and database contracts. PRDs and ADRs provide product context and decision rationale only.
+**状态**：v1 合并版文档入口  
+**更新日期**：2026-05-10  
+**文档用途**：作为 agent、开发者和 reviewer 使用本方案文档的入口说明。  
+**权威文档**：本包只保留一套产品方案文档和一套技术方案文档。
 
-## Product definition
+---
 
-Local Symphony App v1 is a local-first agent engineering workflow control plane inspired by the OpenAI Symphony SPEC. It is **not** a byte-for-byte implementation of that SPEC: `tracker.kind: local`, git worktrees, the local dashboard/API, the CLI tool gateway, review packets, and manual failure pause/resume are intentional Local v1 extensions or deviations. See `docs/references/spec-conformance-matrix.md` before implementing.
+## 1. 项目摘要
+
+Local Symphony App v1 是一个 **local-first agent engineering workflow control plane**。它在本地 Git 仓库中运行，把本地工程任务转化为可以由 Codex 执行、由 operator 观察、审批、复核、返工和归档的完整工程流程。
+
+v1 的目标不是最大化自动化，而是建立一条可靠、可观察、可审查、可恢复的本地 agent 工程工作流。
+
+核心形态：
 
 ```text
 Go daemon
@@ -16,181 +23,283 @@ Go daemon
 + Codex app-server runner
 + CLI/IPC tool gateway
 + two-stage handoff submit/finalize
-+ review packet
++ review packet generator
 + REST/SSE API
 + balanced-secure local security baseline
 ```
 
-The v1 goal is to establish a reliable, observable, reviewable local agent workflow, not maximum automation.
+---
 
-## Implementation entrypoint for agents
+## 2. 文档结构
 
-Implementation agents must start here:
-
-```text
-docs/AGENT_IMPLEMENTATION_GUIDE.md
-```
-
-That file defines the authoritative document order, forbidden upstream behaviors, phase sequence, acceptance gate, and conflict-resolution rules for implementation work. Do not implement directly from `docs/prd/*.md`.
-
-## Relationship to upstream Symphony SPEC
-
-Local Symphony App v1 is **not** a direct implementation of upstream `openai/symphony` `SPEC.md`. It is a local-first implementation inspired by the SPEC, with documented extensions and deviations: local SQLite tracker, git worktree workspaces, localhost dashboard/API, CLI/IPC tool gateway, review packet finalization, and manual failure pause/resume.
-
-Use `docs/references/spec-conformance-matrix.md` to distinguish:
+当前合并版文档只包含以下核心文件：
 
 ```text
-SPEC-compatible behavior
-intentional Local v1 extension
-intentional Local v1 deviation
+README.md       # 文档入口和使用说明
+PRD.md          # 唯一产品方案文档
+TECH_SPEC.md    # 唯一技术方案文档
 ```
 
-## Frozen v1 main path
+### 2.1 PRD.md
+
+`PRD.md` 是 Local Symphony App v1 的唯一产品需求文档，定义：
+
+```text
+产品定位
+目标用户
+核心场景
+v1 目标和非目标
+端到端主流程
+产品模块范围
+issue 状态机的业务语义
+Human Review / Rework / Done 规则
+Dashboard / CLI / API 的产品要求
+安全与运维的产品原则
+v1 验收标准
+后续路线
+```
+
+### 2.2 TECH_SPEC.md
+
+`TECH_SPEC.md` 是 Local Symphony App v1 的唯一技术规格文档，定义：
+
+```text
+实现边界
+架构和进程模型
+Go / frontend / package layout
+核心模块职责
+SQLite 数据模型
+REST API 合同
+SSE 合同
+CLI 合同
+Tool Gateway 合同
+WORKFLOW.md 合同
+Codex adapter 合同
+orchestrator run lifecycle
+workspace / git 生命周期
+review packet 和 rework 语义
+安全模型
+错误码和 failure_code
+测试策略
+验收测试
+Definition of Done
+M0-M8 实施阶段
+```
+
+原始文档包中的 `api/openapi.yaml`、`db/schema/*.sql`、`docs/implementation/*`、`docs/schema/*`、`docs/config/*`、`docs/security/*`、`docs/agent/*`、`docs/backlog/*` 等内容已经被合并、去重并吸收到 `TECH_SPEC.md`。它们不再作为独立 source of truth 使用。
+
+---
+
+## 3. 文档权威关系
+
+使用本项目文档时，按以下规则处理：
+
+```text
+1. 产品目标、用户场景、范围和业务语义以 PRD.md 为准。
+2. API、DB、CLI、状态机、模块职责、安全、测试和发布合同以 TECH_SPEC.md 为准。
+3. README.md 只作为入口说明，不覆盖 PRD.md 或 TECH_SPEC.md。
+4. 不再使用原始多文档 source-of-truth 层级。
+5. 不根据 upstream Symphony SPEC 或旧文档自行恢复 Linear、PR 自动化或其他 v1 非目标能力。
+```
+
+当 `PRD.md` 和 `TECH_SPEC.md` 出现表面冲突时：
+
+```text
+产品意图以 PRD.md 为准。
+实现合同以 TECH_SPEC.md 为准。
+不能确定时，优先保持 Local v1 的本地、安全、可复核、人工决策边界。
+```
+
+---
+
+## 4. 与 upstream Symphony SPEC 的关系
+
+Local Symphony App v1 受 OpenAI Symphony SPEC 启发，但不是 upstream SPEC 的逐字实现，也不是简单的 “upstream Symphony 去掉 Linear”。
+
+v1 继承的核心理念包括：
+
+```text
+daemon-style orchestrator
+repo-owned workflow config
+per-issue isolated workspace
+bounded concurrency
+agent runner abstraction
+status / logging / observability surface
+active run reconciliation
+```
+
+v1 的本地化决策包括：
+
+```text
+tracker.kind = local only
+SQLite project DB is local tracker source of truth
+no Linear dependency
+one issue → one git worktree
+localhost dashboard/API
+CLI/IPC Tool Gateway
+two-stage handoff
+review packet finalizer
+manual failure pause/resume
+```
+
+---
+
+## 5. Frozen v1 main path
+
+v1 的主流程固定如下：
 
 ```text
 symphony init
   ↓
-Create local issue
+创建本地 issue
   ↓
 Issue → Ready
   ↓
-Manual or orchestrator dispatch
+手动或 orchestrator dispatch
   ↓
-Create git worktree + branch
+创建 / 复用 git worktree + branch
   ↓
-Start Codex app-server
+启动 Codex app-server
   ↓
-Codex works inside workspace
+Codex 在 issue workspace 内工作
   ↓
-Codex calls symphony tool handoff
+Codex 调用 symphony tool handoff
   ↓
-Run after_run hook executes if workspace exists
+执行 after_run hook
   ↓
-Run finalizer generates review packet
+生成 review packet
   ↓
 Issue → Human Review
   ↓
-Human review
+人工复核
   ├── Send to Rework
   └── Mark Done
 ```
 
-## Document map
+关键规则：
 
 ```text
-api/
-└── openapi.yaml                         # executable API contract
-
-db/
-└── schema/
-    ├── app_v1.sql                       # executable app DB contract
-    └── project_v1.sql                   # executable project DB contract
-
-docs/
-├── AGENT_IMPLEMENTATION_GUIDE.md        # implementation entrypoint
-├── agent/
-│   ├── ACCEPTANCE.md
-│   ├── DEFINITION_OF_DONE.md
-│   └── TASKS.yaml
-├── implementation/
-│   ├── IS-001-repo-structure.md
-│   ├── IS-002-sqlite-schema-v1.md
-│   ├── IS-003-openapi-v1.md
-│   ├── IS-004-cli-tool-gateway.md
-│   ├── IS-005-workflow-prompt.md
-│   ├── IS-006-orchestrator-run-lifecycle.md
-│   ├── IS-007-workspace-git-implementation.md
-│   ├── IS-008-codex-adapter-approval-bridge.md
-│   ├── IS-009-security-policy-engine.md
-│   ├── IS-010-review-packet-artifacts.md
-│   ├── IS-011-frontend-dashboard.md
-│   ├── IS-012-testing-release.md
-│   ├── IS-013-local-vs-upstream-resolution.md
-│   ├── IS-014-store-contract.md
-│   ├── IS-015-codex-protocol-fixture.md
-│   └── IS-016-rework-flow.md
-├── security/
-│   └── SECURITY_MODEL.md
-├── user/
-│   ├── QUICKSTART.md
-│   └── KNOWN_LIMITATIONS.md
-├── backlog/
-│   └── m0-m8-mvp-backlog.md
-├── config/
-│   ├── workflow-reference-v1.md
-│   └── starter-WORKFLOW.md
-├── api/
-│   └── openapi-v1-outline.md            # historical outline; do not supersede api/openapi.yaml
-├── schema/
-│   ├── app-schema-v1.md
-│   ├── project-schema-v1.md
-│   └── normalized-issue-v1.md
-├── references/
-│   ├── references.md
-│   └── spec-conformance-matrix.md
-├── adr/
-│   └── ...
-└── prd/
-    └── ...                              # product background only
+handoff.submit 不直接把 issue 变成 Human Review。
+review packet finalizer 成功后，issue 才能进入 Human Review。
+Done 只能由 operator 触发。
+Rework 必须复用同一个 workspace / branch。
+Done 不触发 commit、push、merge、PR、cleanup 或 workspace 删除。
 ```
 
-## Source-of-truth hierarchy
+---
 
-Use this order for all implementation decisions:
+## 6. v1 核心约束
+
+实现 agent 必须遵守以下约束：
 
 ```text
-1. api/openapi.yaml
-2. db/schema/*.sql
-3. docs/AGENT_IMPLEMENTATION_GUIDE.md
-4. docs/implementation/*.md
-5. docs/schema/*.md
-6. docs/config/*.md
-7. docs/security/SECURITY_MODEL.md
-8. docs/agent/*.md and docs/agent/TASKS.yaml
-9. docs/references/spec-conformance-matrix.md and docs/implementation/IS-013-local-vs-upstream-resolution.md
-10. docs/adr/*.md
-11. docs/prd/*.md as product context only
-12. docs/backlog/*.md
-13. chat history as historical input only
+tracker.kind = local only
+SQLite project DB 是 issue / run / review 的本地 source of truth
+Linear adapter、Linear credential、Linear API 调用都禁止实现
+每个 issue 一个 git worktree
+run 必须有 active run reconciliation
+run failure 默认暂停该 issue 的 dispatch
+operator cancel / approval cancel_run / agent issue.block 都会暂停 dispatch
+v1 没有自动 retry queue 或 retry timers
+v1 不自动删除、reset、clean、rebase workspace
+v1 不自动 push、create PR、merge、publish
+v1 不允许 agent 自动 commit
+Human Review 是 v1 唯一 handoff target
+real Codex tests 是 opt-in；默认 CI 使用 fake runner
 ```
 
-When two documents conflict, implement the highest-ranked document above. PRD documents are retained for product context and must not override implementation, schema, config, API, security, or acceptance documents.
+---
 
-## Frozen v1 non-goals
+## 7. v1 非目标
 
-v1 intentionally does **not** include:
+v1 明确不实现：
 
 ```text
+Linear tracker dependency or adapter
 Tauri desktop shell
-automatic PR / merge
+remote dashboard
+multi-tenant RBAC
+automatic PR creation
+git push / merge / publish automation
 agent automatic commit
 automatic SQLite backup
-production migration / rollback flow
-automatic retry queue/timers
-crash recovery
-full audit log
-supply-chain deep risk policy
+database migration / rollback framework
+automatic retry queue or timers
+crash recovery beyond startup stale-run interruption
+full compliance-grade audit log
+supply-chain deep risk scoring
 dynamic tools / MCP
-multi-tenant RBAC
-remote dashboard
-Linear tracker dependency
+automatic workspace cleanup/delete/reset/rebase
+raw prompt or raw Codex log export through v1 API
 ```
 
-## Accepted final amendments
+---
 
-The following implementation amendments are frozen:
+## 8. 给 implementation agent 的使用方式
 
-| ID | Amendment |
-|---|---|
-| G1 | Add dispatch pause/resume API and CLI. |
-| G2 | Change starter `git.base_ref` to `auto`. |
-| G3 | v1 run failure sets `dispatch_paused=true` by default; operator must resume. |
-| G4 | startup marks stale running runs as interrupted; no crash recovery. |
-| G5 | Handoff is two-stage: tool submission first, after_run hook, review-packet finalizer, then Human Review. |
-| G6 | PRD files are product context; implementation/schema/config/API/security/acceptance documents are authoritative. |
-| G7 | Active run reconciliation is required; non-active issue transitions cancel active runs. |
-| G8 | v1 only supports `Human Review` as the handoff target state. |
-| G9 | NormalizedIssue keeps upstream-compatible top-level git/workspace aliases. |
-| G10 | `api/openapi.yaml` and `db/schema/*.sql` are executable contracts and must be used for generated types, handlers, migrations, and contract tests. |
-| G11 | Codex app-server integration is version-fixture gated; unsupported versions fail before dispatch. |
-| G12 | Rework review packets are cumulative from workspace `base_sha` and previous packets remain immutable. |
+实现本项目时，建议按以下顺序读取：
+
+```text
+1. README.md
+2. PRD.md
+3. TECH_SPEC.md
+```
+
+实际开发时，以 `TECH_SPEC.md` 为实现主文档。`PRD.md` 用于理解产品意图、用户场景、范围和验收口径。
+
+建议执行方式：
+
+```text
+1. 先建立 repo / package / app shell。
+2. 实现 SQLite app DB 和 project DB。
+3. 实现 local tracker、issue state machine 和 dispatch pause/resume。
+4. 实现 WORKFLOW.md parser、prompt renderer 和 fake runner。
+5. 实现 orchestrator、workspace manager 和 git worktree flow。
+6. 实现 Tool Gateway、handoff、after_run 和 review packet finalizer。
+7. 实现 REST API、SSE、CLI 和 dashboard。
+8. 实现 security policy、diagnostics、tests 和 release packaging。
+9. 按 TECH_SPEC.md 的 M0-M8 和 Definition of Done 做验收。
+```
+
+不要从旧的 upstream 行为或原始多文档结构中补回未声明能力。
+
+---
+
+## 9. 验收口径摘要
+
+v1 完成时必须至少满足：
+
+```text
+可以初始化本地项目。
+可以创建、编辑、评论、转态、阻塞、dispatch 本地 issue。
+Ready issue 可以被 orchestrator 或手动 dispatch。
+每个 issue 在独立 git worktree 和 branch 内运行。
+fake runner E2E 默认可通过。
+Codex app-server integration 有 fixture/version gate。
+agent 可以通过固定 Tool Gateway registry 提交 artifact、follow-up、block 和 handoff。
+handoff 后必须执行 after_run 并生成 review packet。
+review packet 成功后 issue 才进入 Human Review。
+operator 可以 Send to Rework 或 Mark Done。
+失败、取消、block、missing handoff 等情况会暂停 dispatch 并保留诊断信息。
+Dashboard、CLI、REST、SSE 能反映 issue、run、approval、review packet 和 diagnostics 状态。
+安全模型覆盖 loopback API、browser session、CSRF、CLI bearer、run-scoped tool token、protected path、redaction、artifact containment、command/network policy。
+默认测试不依赖真实 Codex；真实 Codex 测试只在显式 opt-in 时运行。
+```
+
+完整验收标准以 `TECH_SPEC.md` 的测试、验收和 Definition of Done 章节为准。
+
+---
+
+## 10. 变更原则
+
+后续修改文档时，遵守以下原则：
+
+```text
+产品范围变化先改 PRD.md。
+技术合同变化先改 TECH_SPEC.md。
+README.md 只同步入口说明和高层摘要。
+不要重新引入多文档 source-of-truth 层级。
+不要让 README.md 成为第三份权威文档。
+不要新增与 v1 非目标冲突的实现要求，除非同时明确版本升级。
+```
+
