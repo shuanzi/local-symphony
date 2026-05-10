@@ -2,7 +2,7 @@
 
 **Status:** Frozen for v1 implementation
 **Freeze date:** 2026-05-09
-**Document authority:** `docs/implementation`, `docs/schema`, `docs/config`, and `docs/api` are the implementation contract for Local Symphony App v1 until generated `api/openapi.yaml` and `db/schema/*.sql` exist. PRDs and ADRs provide product context and decision rationale. Chat history is historical input, not implementation authority.
+**Document authority:** `docs/AGENT_IMPLEMENTATION_GUIDE.md` defines the implementation-time source-of-truth order. `api/openapi.yaml` and `db/schema/*.sql` are now the executable API and database contracts. PRDs and ADRs provide product context and decision rationale only.
 
 ## Product definition
 
@@ -23,6 +23,16 @@ Go daemon
 
 The v1 goal is to establish a reliable, observable, reviewable local agent workflow, not maximum automation.
 
+## Implementation entrypoint for agents
+
+Implementation agents must start here:
+
+```text
+docs/AGENT_IMPLEMENTATION_GUIDE.md
+```
+
+That file defines the authoritative document order, forbidden upstream behaviors, phase sequence, acceptance gate, and conflict-resolution rules for implementation work. Do not implement directly from `docs/prd/*.md`.
+
 ## Relationship to upstream Symphony SPEC
 
 Local Symphony App v1 is **not** a direct implementation of upstream `openai/symphony` `SPEC.md`. It is a local-first implementation inspired by the SPEC, with documented extensions and deviations: local SQLite tracker, git worktree workspaces, localhost dashboard/API, CLI/IPC tool gateway, review packet finalization, and manual failure pause/resume.
@@ -34,7 +44,6 @@ SPEC-compatible behavior
 intentional Local v1 extension
 intentional Local v1 deviation
 ```
-
 
 ## Frozen v1 main path
 
@@ -55,6 +64,8 @@ Codex works inside workspace
   ↓
 Codex calls symphony tool handoff
   ↓
+Run after_run hook executes if workspace exists
+  ↓
 Run finalizer generates review packet
   ↓
 Issue → Human Review
@@ -67,21 +78,20 @@ Human review
 ## Document map
 
 ```text
+api/
+└── openapi.yaml                         # executable API contract
+
+db/
+└── schema/
+    ├── app_v1.sql                       # executable app DB contract
+    └── project_v1.sql                   # executable project DB contract
+
 docs/
-├── prd/
-│   ├── 00-final-frozen-version.md
-│   ├── 01-prd.md
-│   └── ...
-├── adr/
-│   ├── ADR-001-product-scope.md
-│   ├── ADR-002-local-tracker.md
-│   ├── ADR-003-runtime-architecture.md
-│   ├── ADR-004-workspace-git.md
-│   ├── ADR-005-agent-prompt-tools.md
-│   ├── ADR-006-ui-api-observability.md
-│   ├── ADR-007-security-baseline.md
-│   ├── ADR-008-v1-scope-and-non-goals.md
-│   └── ADR-009-decision-register.md
+├── AGENT_IMPLEMENTATION_GUIDE.md        # implementation entrypoint
+├── agent/
+│   ├── ACCEPTANCE.md
+│   ├── DEFINITION_OF_DONE.md
+│   └── TASKS.yaml
 ├── implementation/
 │   ├── IS-001-repo-structure.md
 │   ├── IS-002-sqlite-schema-v1.md
@@ -95,41 +105,56 @@ docs/
 │   ├── IS-010-review-packet-artifacts.md
 │   ├── IS-011-frontend-dashboard.md
 │   ├── IS-012-testing-release.md
-│   └── IS-013-local-vs-upstream-resolution.md
+│   ├── IS-013-local-vs-upstream-resolution.md
+│   ├── IS-014-store-contract.md
+│   ├── IS-015-codex-protocol-fixture.md
+│   └── IS-016-rework-flow.md
+├── security/
+│   └── SECURITY_MODEL.md
+├── user/
+│   ├── QUICKSTART.md
+│   └── KNOWN_LIMITATIONS.md
 ├── backlog/
 │   └── m0-m8-mvp-backlog.md
 ├── config/
 │   ├── workflow-reference-v1.md
 │   └── starter-WORKFLOW.md
 ├── api/
-│   └── openapi-v1-outline.md
+│   └── openapi-v1-outline.md            # historical outline; do not supersede api/openapi.yaml
 ├── schema/
 │   ├── app-schema-v1.md
 │   ├── project-schema-v1.md
 │   └── normalized-issue-v1.md
-└── references/
-    ├── references.md
-    └── spec-conformance-matrix.md
+├── references/
+│   ├── references.md
+│   └── spec-conformance-matrix.md
+├── adr/
+│   └── ...
+└── prd/
+    └── ...                              # product background only
 ```
 
 ## Source-of-truth hierarchy
 
+Use this order for all implementation decisions:
+
 ```text
-1. api/openapi.yaml and db/schema/*.sql when implemented
-2. docs/implementation/*.md
-3. docs/schema/*.md
-4. docs/config/starter-WORKFLOW.md and docs/config/workflow-reference-v1.md
-5. docs/api/openapi-v1-outline.md until api/openapi.yaml exists
-6. docs/implementation/IS-013-local-vs-upstream-resolution.md and docs/references/spec-conformance-matrix.md for upstream SPEC vs local v1 ambiguity
-7. docs/adr/*.md
-8. docs/prd/*.md as product context only
-9. docs/backlog/*.md
-10. chat history is historical input only
+1. api/openapi.yaml
+2. db/schema/*.sql
+3. docs/AGENT_IMPLEMENTATION_GUIDE.md
+4. docs/implementation/*.md
+5. docs/schema/*.md
+6. docs/config/*.md
+7. docs/security/SECURITY_MODEL.md
+8. docs/agent/*.md and docs/agent/TASKS.yaml
+9. docs/references/spec-conformance-matrix.md and docs/implementation/IS-013-local-vs-upstream-resolution.md
+10. docs/adr/*.md
+11. docs/prd/*.md as product context only
+12. docs/backlog/*.md
+13. chat history as historical input only
 ```
 
-Implementation agents should treat old PRD files as context unless a PRD section explicitly matches the frozen implementation specs.
-
-PRD documents are retained for product context. When a PRD conflicts with implementation/schema/config/API docs, the implementation/schema/config/API docs win.
+When two documents conflict, implement the highest-ranked document above. PRD documents are retained for product context and must not override implementation, schema, config, API, security, or acceptance documents.
 
 ## Frozen v1 non-goals
 
@@ -148,6 +173,7 @@ supply-chain deep risk policy
 dynamic tools / MCP
 multi-tenant RBAC
 remote dashboard
+Linear tracker dependency
 ```
 
 ## Accepted final amendments
@@ -160,8 +186,11 @@ The following implementation amendments are frozen:
 | G2 | Change starter `git.base_ref` to `auto`. |
 | G3 | v1 run failure sets `dispatch_paused=true` by default; operator must resume. |
 | G4 | startup marks stale running runs as interrupted; no crash recovery. |
-| G5 | Handoff is two-stage: tool submission first, review-packet finalizer transitions to Human Review. |
-| G6 | PRD files are product context; implementation/schema/config/API documents are authoritative. |
+| G5 | Handoff is two-stage: tool submission first, after_run hook, review-packet finalizer, then Human Review. |
+| G6 | PRD files are product context; implementation/schema/config/API/security/acceptance documents are authoritative. |
 | G7 | Active run reconciliation is required; non-active issue transitions cancel active runs. |
 | G8 | v1 only supports `Human Review` as the handoff target state. |
 | G9 | NormalizedIssue keeps upstream-compatible top-level git/workspace aliases. |
+| G10 | `api/openapi.yaml` and `db/schema/*.sql` are executable contracts and must be used for generated types, handlers, migrations, and contract tests. |
+| G11 | Codex app-server integration is version-fixture gated; unsupported versions fail before dispatch. |
+| G12 | Rework review packets are cumulative from workspace `base_sha` and previous packets remain immutable. |

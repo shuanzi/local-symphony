@@ -6,7 +6,7 @@ Frozen.
 
 ## Goal
 
-Define the v1 Codex app-server integration, version-aware protocol adapter, event normalization, approval handling, timeouts, cancellation, and fake runner test strategy.
+Define the v1 Codex app-server integration, version-aware protocol adapter, event normalization, approval handling, timeouts, cancellation, and fake runner test strategy. `docs/implementation/IS-015-codex-protocol-fixture.md` is the detailed fixture-gated protocol contract and must be implemented together with this file.
 
 ## Process launch
 
@@ -43,7 +43,7 @@ The adapter must validate framing/schema compatibility for the installed Codex v
 stderr is diagnostic only unless the selected Codex protocol explicitly documents otherwise.
 ```
 
-Versioned protocol fixtures are required before implementing or updating the adapter. Generate and commit fixtures for each supported Codex app-server version:
+Versioned protocol fixtures are required before implementing or updating the adapter. The exact fixture policy, transcript requirements, and logical initialize/thread/turn flow are frozen in IS-015. Generate and commit fixtures for each supported Codex app-server version:
 
 ```bash
 codex app-server generate-json-schema --out internal/agent/codex/testdata/schema/<codex-version>/
@@ -213,3 +213,4 @@ Real Codex tests are opt-in.
 | IS8-008 | fake runner mandatory |
 | IS8-009 | Codex version capture and startup handshake timeout are required |
 | IS8-010 | protocol fixtures define supported Codex versions and unsupported installed schemas fail with `unsupported_codex_version` |
+| IS8-011 | IS-015 is the protocol fixture and adapter contract for concrete Codex method flow, transcript fixtures, and fake-runner parity |

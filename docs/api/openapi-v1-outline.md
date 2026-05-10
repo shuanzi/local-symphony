@@ -1,6 +1,6 @@
 # OpenAPI v1 Outline
 
-This file is a Markdown outline for the future `api/openapi.yaml`. The actual OpenAPI YAML should use this structure. M0 must generate and commit a machine-readable `api/openapi.yaml` before frontend type generation is treated as complete.
+This file is a historical Markdown outline. The executable API contract now lives at `../../api/openapi.yaml` and is the source of truth for handlers, generated frontend types, CLI clients, and contract tests. Keep this outline only as a human-readable index; do not implement from placeholder `{}` path entries.
 
 ## Server
 
@@ -14,6 +14,8 @@ servers:
 ```
 
 ## Paths
+
+The authoritative path definitions, request bodies, responses, and schemas are in `../../api/openapi.yaml`.
 
 ```yaml
 paths:

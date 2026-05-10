@@ -16,6 +16,12 @@ API contract
 security regression
 ```
 
+## Acceptance command contract
+
+`docs/agent/ACCEPTANCE.md` defines the required acceptance scenarios and expected command names. The implementation may wrap these in Make, Taskfile, npm, or shell scripts, but CI must expose equivalent default commands.
+
+Default CI must not run real Codex tests. Real Codex tests require `SYMPHONY_TEST_CODEX=1`.
+
 ## Unit tests
 
 Required coverage:
@@ -33,6 +39,8 @@ protected path matching
 redaction
 error code mapping for split ApiErrorCode vs FailureCode
 agent turn-count/handoff hard constraints
+handoff canonical payload hashing
+run outcome precedence and finalizer/cancel race handling
 ```
 
 ## Integration tests
@@ -40,14 +48,14 @@ agent turn-count/handoff hard constraints
 Required coverage:
 
 ```text
-SQLite schema init
+SQLite schema init from db/schema/app_v1.sql and db/schema/project_v1.sql
 issue create transaction
 blocker eligibility query
 worktree create/reuse
 hook lifecycle: after_create then before_run on first run, before_run on reuse
 tool gateway token validation
 artifact attach containment
-review packet generation, including untracked new-file content in changes.patch
+review packet generation after after_run, including untracked new-file content in changes.patch
 SSE replay from run_events.seq
 ```
 
@@ -71,6 +79,7 @@ workspace conflict → failed with workspace_conflict
 review packet failure → no Human Review
 untracked file created by agent → review packet changes.patch includes file content
 active run issue transition → reconciliation cancel
+Working issue with no active run and dispatch_paused=true is not scheduler-redispatched
 agent issue.block → Blocked + cancelled with agent_blocked
 stale running run on startup → interrupted + dispatch_paused
 ```
@@ -91,7 +100,7 @@ Required before release candidate, but not every local test run.
 OpenAPI validates all response schemas
 Go handlers conform to OpenAPI
 frontend generated types compile
-api/openapi.yaml exists before generated frontend types are committed
+api/openapi.yaml is the source for generated frontend types and handler contract tests
 error envelope consistent
 IssueRef path parameters accept both `iss_...` and `LOC-...`
 state-transition side_effects for active-run reconciliation
@@ -162,13 +171,13 @@ No automatic workspace cleanup/delete/reset
 
 ## Documentation authority
 
-After implementation begins:
+Use the source-of-truth order in `docs/AGENT_IMPLEMENTATION_GUIDE.md`. For release validation, the most important executable contracts are:
 
 ```text
-docs/implementation/*.md are implementation source of truth
-docs/adr/*.md record irreversible decisions
-api/openapi.yaml is API source of truth when implemented
-db/schema/*.sql is DB source of truth when implemented
+api/openapi.yaml is API source of truth
+db/schema/*.sql is DB source of truth
+docs/agent/ACCEPTANCE.md is acceptance source of truth
+docs/security/SECURITY_MODEL.md is security enforcement source of truth
 WORKFLOW.md reference is config source of truth
 ```
 
@@ -186,4 +195,6 @@ WORKFLOW.md reference is config source of truth
 | IS12-008 | no implementation without docs/ADR alignment |
 | IS12-009 | tests must cover active run reconciliation, hook lifecycle, aliases, and fixed handoff target |
 | IS12-010 | tests must cover cancellation pause/no-redispatch semantics and untracked review-packet content |
-| IS12-011 | API contract tests require generated `api/openapi.yaml` before frontend type generation |
+| IS12-011 | API contract tests require `api/openapi.yaml` as the source for frontend type generation and handler conformance |
+| IS12-012 | acceptance scenarios are centralized in `docs/agent/ACCEPTANCE.md` |
+| IS12-013 | security enforcement regression cases are centralized in `docs/security/SECURITY_MODEL.md` |

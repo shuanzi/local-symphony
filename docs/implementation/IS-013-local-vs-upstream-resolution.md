@@ -15,14 +15,18 @@ This document exists because Local v1 is intentionally a local-first product var
 When implementing Local v1, use this priority order:
 
 ```text
-1. Generated api/openapi.yaml and db/schema/*.sql, once implemented
-2. docs/implementation/*.md, including this document
-3. docs/schema/*.md
-4. docs/config/*.md
-5. docs/references/spec-conformance-matrix.md for upstream-vs-local ambiguity
-6. docs/adr/*.md
-7. docs/prd/*.md as product context only
-8. Upstream SPEC for compatible behavior not overridden above
+1. api/openapi.yaml
+2. db/schema/*.sql
+3. docs/AGENT_IMPLEMENTATION_GUIDE.md
+4. docs/implementation/*.md, including this document
+5. docs/schema/*.md
+6. docs/config/*.md
+7. docs/security/SECURITY_MODEL.md
+8. docs/agent/*.md and docs/agent/TASKS.yaml
+9. docs/references/spec-conformance-matrix.md for upstream-vs-local ambiguity
+10. docs/adr/*.md
+11. docs/prd/*.md as product context only
+12. Upstream SPEC for compatible behavior not overridden above
 ```
 
 If upstream SPEC and Local v1 conflict, implement Local v1 only when the difference is marked as compatible extension, product extension, intentional restriction, or intentional deviation in `docs/references/spec-conformance-matrix.md`.
@@ -50,10 +54,16 @@ If upstream SPEC and Local v1 conflict, implement Local v1 only when the differe
 | Workflow reload | Upstream dynamic reload keeps service running. | Running attempts use their captured workflow snapshot. New dispatch uses latest valid config. Invalid reload preserves last valid config; if none exists, dispatch is blocked. | Invalid reload does not crash; active run continues with old snapshot. |
 | Clean handoff package | Not specified. | Agent implementation input must not include `.git/`, stale patches, or uncommitted diff artifacts unless explicitly part of the task. | Release/documentation packaging excludes `.git/` and `*.patch`. |
 
+| OpenAPI contract | Upstream does not define Local v1 dashboard API. | `api/openapi.yaml` is the executable source for API shapes; `docs/api/openapi-v1-outline.md` is historical only. | OpenAPI validation and handler/frontend conformance tests. |
+| DB schema contract | Upstream does not define Local v1 SQLite schema. | `db/schema/*.sql` is the executable source for DB initialization; Markdown schema is explanatory. | In-memory schema init and unsupported version tests. |
+| Rework diff semantics | Upstream does not define local review packet versioning. | Rework reuses workspace and branch; review packet diff is cumulative from `base_sha`, not incremental. | Human Review → Rework → Human Review creates new immutable cumulative packet. |
+| Security enforcement boundary | Upstream leaves implementation safety controls to product. | Local v1 distinguishes hard daemon enforcement, Codex-mediated enforcement, and detection-only surfaces. | Security regression suite from `docs/security/SECURITY_MODEL.md`. |
+
 ## Implementation guardrails
 
 ```text
 Do not implement Linear.
+Do not implement from PRD files when executable contracts or implementation specs define different behavior.
 Do not add automatic PR creation, git push, merge, backup, migration, or destructive workspace cleanup.
 Do not infer behavior from old PRD sections when implementation/schema/config/API docs define a different rule.
 Do not treat `handoff.submit` as issue completion.
@@ -73,3 +83,6 @@ Do not treat dashboard/API as the orchestrator source of truth.
 | IS13-007 | operator cancellation pauses redispatch when the issue remains active-state. |
 | IS13-008 | review packet diffs must include untracked new-file content. |
 | IS13-009 | `symphony tool ...` commands are default-allowed but tool operations remain daemon-authorized. |
+| IS13-010 | executable OpenAPI and SQL contracts outrank Markdown explanations. |
+| IS13-011 | rework packets are immutable and cumulative from `base_sha`. |
+| IS13-012 | security enforcement boundaries must be explicit and tested. |

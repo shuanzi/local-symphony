@@ -3,11 +3,11 @@
 版本：v1 最终冻结版
 冻结日期：2026-05-09
 语言：中文
-状态：产品背景文档已冻结；实现以 `docs/implementation/`、`docs/schema/`、`docs/config/`、`docs/api/` 为准
+状态：产品背景文档已冻结；实现以 `docs/AGENT_IMPLEMENTATION_GUIDE.md`、`api/openapi.yaml`、`db/schema/*.sql`、`docs/implementation/`、`docs/schema/`、`docs/config/`、`docs/security/`、`docs/agent/` 为准
 
 ## 权威性说明
 
-本目录保留 PRD 和产品背景。若本目录内容与 implementation/schema/config/API 文档冲突，以后者为准。旧草案文件已在文件顶部标记 superseded 或 product context。若 upstream SPEC 与 Local v1 文档存在歧义，按 `docs/references/spec-conformance-matrix.md` 处理。
+本目录保留 PRD 和产品背景。**不要从本目录直接实现 API、DB schema、CLI、状态机、安全或测试合同。** 若本目录内容与高优先级文档冲突，以 `docs/AGENT_IMPLEMENTATION_GUIDE.md` 的 source-of-truth 顺序为准。若 upstream SPEC 与 Local v1 文档存在歧义，按 `docs/references/spec-conformance-matrix.md` 和 `docs/implementation/IS-013-local-vs-upstream-resolution.md` 处理。
 
 ## 文档目录
 
@@ -22,7 +22,7 @@
 | `06-ui-api-observability.md` | UI、API、SSE、日志与可观测性 |
 | `07-security-operations.md` | 安全、权限、Secrets、Sandbox 与 v1 后移项 |
 | `08-data-model.md` | 数据模型概念说明；具体 schema 已由 `docs/implementation/IS-002-sqlite-schema-v1.md` 和 `docs/schema/project-schema-v1.md` 取代 |
-| `09-api-cli-spec.md` | API/CLI 产品概览；具体 API 以 `IS-003` / `docs/api/openapi-v1-outline.md` 为准，具体 CLI 以 `IS-004` 为准 |
+| `09-api-cli-spec.md` | API/CLI 产品概览；具体 API 以根目录 `api/openapi.yaml` 为准，具体 CLI 以 `IS-004` 为准 |
 | `10-workflow-template.md` | 默认模板说明；唯一模板源为 `docs/config/starter-WORKFLOW.md` |
 | `11-mvp-roadmap.md` | M0–M8 MVP 里程碑与验收标准 |
 | `12-adr.md` | 架构决策记录 ADR |

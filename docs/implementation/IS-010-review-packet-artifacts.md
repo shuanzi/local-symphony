@@ -6,9 +6,11 @@ Frozen.
 
 ## Goal
 
-Define the Human Review deliverable: review packet files, generation sequence, database records, Mark Done gating, and artifact safety.
+Define the Human Review deliverable: review packet files, generation sequence, database records, Mark Done gating, rework packet versioning, and artifact safety.
 
 ## Inputs
+
+Review generator runs after `hooks.after_run` has been attempted when a workspace exists. This ensures formatter output, test reports, and after-run diagnostics can be captured in the review packet.
 
 Review generator receives:
 
@@ -52,6 +54,8 @@ prompt/tool_manifest.md
 ```
 
 ## Generation sequence
+
+Use the file/DB atomicity rules in `docs/implementation/IS-014-store-contract.md`: write into a temporary artifact directory, rename into place, then insert DB rows.
 
 ```text
 1. Ensure artifact dir exists.
@@ -163,7 +167,7 @@ Protected paths, path traversal, or files outside the workspace must fail review
   "approvals": [],
   "tool_calls": [],
   "prompt_snapshot": {
-    "id": "prm_...",
+    "id": "ps_...",
     "rendered_prompt_hash": "...",
     "tool_manifest_path": "prompt/tool_manifest.md"
   }
@@ -187,6 +191,13 @@ Protected paths, path traversal, or files outside the workspace must fail review
 ## Git
 ## How to Continue
 ```
+
+
+## Rework review packets
+
+Review packets are immutable. Rework creates a new packet instead of overwriting the previous one.
+
+For first review and rework reviews alike, `changes.patch`, `changed-files.txt`, and `untracked-files.json` are cumulative from the workspace `base_sha` to the current workspace tree. They are not incremental from the previous review packet. See `docs/implementation/IS-016-rework-flow.md`.
 
 ## Human Review transition
 
@@ -242,3 +253,6 @@ no raw Codex log export in v1
 | IS10-009 | finalizer only supports `Human Review` target state in v1 |
 | IS10-010 | review.json stores resolved `base_ref` plus `base_ref_config` when config used `auto` |
 | IS10-011 | prompt snapshot files use the `prompt/` subdirectory and include `tool_manifest.md` when available |
+| IS10-012 | review packet generation occurs after `hooks.after_run` so the packet captures after-run workspace/artifact output |
+| IS10-013 | rework review packets are immutable and cumulative from `base_sha`, not incremental from the prior packet |
+| IS10-014 | file/DB atomicity follows IS-014 temp-write then rename then DB transaction rules |

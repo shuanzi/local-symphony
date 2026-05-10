@@ -4,9 +4,9 @@
 
 Frozen.
 
-## M0 — Project skeleton
+## M0 — Contracts and project skeleton
 
-Goal: establish backend, frontend, DB, API, CLI skeleton.
+Goal: establish executable contracts, backend, frontend, DB, API, and CLI skeleton.
 
 Backend:
 
@@ -16,9 +16,11 @@ cmd/symphony/main.go
 internal/app bootstrap
 basic HTTP server
 health endpoint
-SQLite init stubs
+SQLite init from db/schema/app_v1.sql and db/schema/project_v1.sql
 WORKFLOW parser skeleton
-api/openapi.yaml generated from IS-003 and docs/api/openapi-v1-outline.md
+api/openapi.yaml validation and generated types
+store contract tests from IS-014
+Codex fixture-gate fake adapter scaffold from IS-015
 ```
 
 Frontend:
@@ -46,9 +48,11 @@ symphony init works
 symphony serve starts localhost API
 GET /api/v1/health works
 dashboard opens
-project DB created
+project DB created from db/schema/project_v1.sql
+app DB created from db/schema/app_v1.sql
 WORKFLOW.md parsed/validated
 api/openapi.yaml validates and can generate frontend types
+unsupported DB version fails safely
 ```
 
 ## M1 — Local Tracker MVP
@@ -131,8 +135,9 @@ Main repo not modified
 Backend:
 
 ```text
-Codex process manager
-version-aware Codex protocol parser
+fake runner E2E harness
+Codex process manager scaffold
+version-aware Codex protocol parser fixture gate
 run_attempts
 run_events
 prompt builder
@@ -152,7 +157,8 @@ cancel button
 Acceptance:
 
 ```text
-Manual dispatch starts Codex
+Manual dispatch starts fake runner by default in tests
+Real Codex path is opt-in and fixture-gated
 Codex cwd is issue workspace
 Prompt includes issue/workspace/git/tools
 Run Detail shows events
@@ -192,7 +198,7 @@ Acceptance:
 Correct token reads current issue
 Wrong token denied
 Agent cannot edit unrelated issue
-Handoff is persisted
+Handoff is persisted with canonical payload_hash
 `symphony tool handoff` is command-policy allowed only with valid run token
 No handoff triggers at most one continuation
 ```
@@ -202,7 +208,7 @@ No handoff triggers at most one continuation
 Backend:
 
 ```text
-review packet generator
+review packet generator after after_run
 review.md
 review.json
 changes.patch
@@ -228,7 +234,7 @@ Handoff generates review packet
 Issue enters Human Review after packet generated
 Review UI shows diff and summary
 Untracked new files appear in changes.patch and changed-files.txt
-Can Send to Rework
+Can Send to Rework; rework packet is cumulative from base_sha
 Can Mark Done only with generated packet
 ```
 
@@ -328,6 +334,9 @@ Docs:
 README
 Quickstart
 security model
+agent implementation guide
+acceptance tests
+definition of done
 known limitations
 CLI help
 starter WORKFLOW.md

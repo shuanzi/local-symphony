@@ -1,5 +1,8 @@
 # 产品决策索引（非物理 ADR 文件清单）
 
+> **Implementation warning:** This PRD file is product background only. Do not implement API, DB schema, CLI, state-machine, security, or test contracts from this file. Start from `../AGENT_IMPLEMENTATION_GUIDE.md`; executable contracts are `../../api/openapi.yaml` and `../../db/schema/*.sql`.
+
+
 > 产品背景说明：本文件仅保留产品上下文。若与 `docs/implementation/`、`docs/schema/`、`docs/config/` 或 `docs/api/` 冲突，后者为准；不要从本 PRD 复制实现级 enum、schema、命令策略或模板。
 
 本文件中的 `ADR-001` 到 `ADR-051` 是早期产品决策索引编号，不表示 `docs/adr/` 下存在同名物理 ADR 文件。v1 的物理 ADR 文件只有 `docs/adr/ADR-001` 到 `docs/adr/ADR-009`，完整冻结决策以 `docs/adr/ADR-009-decision-register.md` 的 D0–D108 与 G1–G9 为准。

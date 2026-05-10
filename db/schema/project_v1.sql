@@ -1,18 +1,12 @@
-# Project DB Schema v1
+-- Local Symphony Project DB schema v1
+-- Path: <repo>/.symphony/symphony.db
+-- Source of truth for local tracker, run lifecycle, approvals, artifacts, and review packets.
 
-Path:
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
 
-```text
-<repo>/.symphony/symphony.db
-```
-
-## Source of truth
-
-`db/schema/project_v1.sql` is the executable schema source. This Markdown file is explanatory and must match the SQL file.
-
-## SQL
-
-```sql
 CREATE TABLE schema_version (
   version INTEGER PRIMARY KEY CHECK (version = 1),
   created_at TEXT NOT NULL
@@ -37,6 +31,21 @@ CREATE TABLE counters (
   key TEXT PRIMARY KEY,
   value INTEGER NOT NULL
 );
+
+CREATE TABLE workflow_snapshots (
+  id TEXT PRIMARY KEY,
+  workflow_path TEXT NOT NULL,
+  workflow_sha TEXT NOT NULL,
+  config_hash TEXT NOT NULL,
+  prompt_template_hash TEXT NOT NULL,
+  validation_status TEXT NOT NULL CHECK (validation_status IN ('valid', 'invalid')),
+  effective_config_json TEXT NOT NULL DEFAULT '{}',
+  validation_errors_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_workflow_snapshots_created ON workflow_snapshots(created_at);
+CREATE INDEX idx_workflow_snapshots_sha ON workflow_snapshots(workflow_sha);
 
 CREATE TABLE issues (
   id TEXT PRIMARY KEY,
@@ -71,53 +80,6 @@ CREATE TABLE issue_labels (
 );
 
 CREATE INDEX idx_issue_labels_label ON issue_labels(label);
-
-CREATE TABLE issue_comments (
-  id TEXT PRIMARY KEY,
-  issue_id TEXT NOT NULL,
-  run_id TEXT,
-  author_type TEXT NOT NULL CHECK (author_type IN ('operator', 'agent', 'system')),
-  author_id TEXT,
-  body TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
-  FOREIGN KEY (run_id) REFERENCES run_attempts(id) ON DELETE SET NULL
-);
-
-CREATE INDEX idx_issue_comments_issue_created ON issue_comments(issue_id, created_at);
-
-CREATE TABLE issue_relations (
-  id TEXT PRIMARY KEY,
-  source_issue_id TEXT NOT NULL,
-  target_issue_id TEXT NOT NULL,
-  relation_type TEXT NOT NULL CHECK (relation_type IN ('blocks', 'duplicates', 'followup_of')),
-  created_by_type TEXT NOT NULL CHECK (created_by_type IN ('operator', 'agent', 'system')),
-  created_by_run_id TEXT,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (source_issue_id) REFERENCES issues(id) ON DELETE CASCADE,
-  FOREIGN KEY (target_issue_id) REFERENCES issues(id) ON DELETE CASCADE,
-  FOREIGN KEY (created_by_run_id) REFERENCES run_attempts(id) ON DELETE SET NULL,
-  UNIQUE (source_issue_id, target_issue_id, relation_type)
-);
-
-CREATE INDEX idx_issue_relations_source ON issue_relations(source_issue_id, relation_type);
-CREATE INDEX idx_issue_relations_target ON issue_relations(target_issue_id, relation_type);
-
-CREATE TABLE issue_state_history (
-  id TEXT PRIMARY KEY,
-  issue_id TEXT NOT NULL,
-  from_state TEXT,
-  to_state TEXT NOT NULL,
-  actor_type TEXT NOT NULL CHECK (actor_type IN ('operator', 'agent', 'system', 'orchestrator')),
-  actor_id TEXT,
-  run_id TEXT,
-  reason TEXT,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
-  FOREIGN KEY (run_id) REFERENCES run_attempts(id) ON DELETE SET NULL
-);
-
-CREATE INDEX idx_issue_state_history_issue_created ON issue_state_history(issue_id, created_at);
 
 CREATE TABLE workspaces (
   id TEXT PRIMARY KEY,
@@ -169,6 +131,53 @@ CREATE TABLE run_attempts (
 CREATE INDEX idx_run_attempts_issue_created ON run_attempts(issue_id, created_at);
 CREATE INDEX idx_run_attempts_status ON run_attempts(status);
 CREATE INDEX idx_run_attempts_session ON run_attempts(session_id);
+
+CREATE TABLE issue_comments (
+  id TEXT PRIMARY KEY,
+  issue_id TEXT NOT NULL,
+  run_id TEXT,
+  author_type TEXT NOT NULL CHECK (author_type IN ('operator', 'agent', 'system')),
+  author_id TEXT,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY (run_id) REFERENCES run_attempts(id) ON DELETE SET NULL
+);
+
+CREATE INDEX idx_issue_comments_issue_created ON issue_comments(issue_id, created_at);
+
+CREATE TABLE issue_relations (
+  id TEXT PRIMARY KEY,
+  source_issue_id TEXT NOT NULL,
+  target_issue_id TEXT NOT NULL,
+  relation_type TEXT NOT NULL CHECK (relation_type IN ('blocks', 'duplicates', 'followup_of')),
+  created_by_type TEXT NOT NULL CHECK (created_by_type IN ('operator', 'agent', 'system')),
+  created_by_run_id TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (source_issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY (target_issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY (created_by_run_id) REFERENCES run_attempts(id) ON DELETE SET NULL,
+  UNIQUE (source_issue_id, target_issue_id, relation_type)
+);
+
+CREATE INDEX idx_issue_relations_source ON issue_relations(source_issue_id, relation_type);
+CREATE INDEX idx_issue_relations_target ON issue_relations(target_issue_id, relation_type);
+
+CREATE TABLE issue_state_history (
+  id TEXT PRIMARY KEY,
+  issue_id TEXT NOT NULL,
+  from_state TEXT,
+  to_state TEXT NOT NULL,
+  actor_type TEXT NOT NULL CHECK (actor_type IN ('operator', 'agent', 'system', 'orchestrator')),
+  actor_id TEXT,
+  run_id TEXT,
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY (run_id) REFERENCES run_attempts(id) ON DELETE SET NULL
+);
+
+CREATE INDEX idx_issue_state_history_issue_created ON issue_state_history(issue_id, created_at);
 
 CREATE TABLE run_events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -301,6 +310,26 @@ CREATE INDEX idx_artifacts_issue_created ON artifacts(issue_id, created_at);
 CREATE INDEX idx_artifacts_run_created ON artifacts(run_id, created_at);
 CREATE INDEX idx_artifacts_kind ON artifacts(kind);
 
+CREATE TABLE prompt_snapshots (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  workflow_snapshot_id TEXT,
+  runtime_envelope_version TEXT NOT NULL,
+  tool_manifest_version TEXT NOT NULL,
+  context_hash TEXT NOT NULL,
+  rendered_prompt_hash TEXT NOT NULL,
+  context_json_path TEXT,
+  redacted_prompt_path TEXT,
+  prompt_meta_json_path TEXT,
+  tool_manifest_path TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
+  FOREIGN KEY (workflow_snapshot_id) REFERENCES workflow_snapshots(id) ON DELETE SET NULL
+);
+
+CREATE INDEX idx_prompt_snapshots_run ON prompt_snapshots(run_id);
+CREATE INDEX idx_prompt_snapshots_created ON prompt_snapshots(created_at);
+
 CREATE TABLE review_packets (
   id TEXT PRIMARY KEY,
   issue_id TEXT NOT NULL,
@@ -326,72 +355,6 @@ CREATE TABLE review_packets (
 CREATE INDEX idx_review_packets_issue_created ON review_packets(issue_id, created_at);
 CREATE INDEX idx_review_packets_run ON review_packets(run_id);
 
-CREATE TABLE workflow_snapshots (
-  id TEXT PRIMARY KEY,
-  workflow_path TEXT NOT NULL,
-  workflow_sha TEXT NOT NULL,
-  config_hash TEXT NOT NULL,
-  prompt_template_hash TEXT NOT NULL,
-  validation_status TEXT NOT NULL CHECK (validation_status IN ('valid', 'invalid')),
-  effective_config_json TEXT NOT NULL DEFAULT '{}',
-  validation_errors_json TEXT NOT NULL DEFAULT '[]',
-  created_at TEXT NOT NULL
-);
-
-CREATE INDEX idx_workflow_snapshots_created ON workflow_snapshots(created_at);
-CREATE INDEX idx_workflow_snapshots_sha ON workflow_snapshots(workflow_sha);
-
-CREATE TABLE prompt_snapshots (
-  id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
-  workflow_snapshot_id TEXT,
-  runtime_envelope_version TEXT NOT NULL,
-  tool_manifest_version TEXT NOT NULL,
-  context_hash TEXT NOT NULL,
-  rendered_prompt_hash TEXT NOT NULL,
-  context_json_path TEXT,
-  redacted_prompt_path TEXT,
-  prompt_meta_json_path TEXT,
-  tool_manifest_path TEXT,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
-  FOREIGN KEY (workflow_snapshot_id) REFERENCES workflow_snapshots(id) ON DELETE SET NULL
-);
-
-CREATE INDEX idx_prompt_snapshots_run ON prompt_snapshots(run_id);
-CREATE INDEX idx_prompt_snapshots_created ON prompt_snapshots(created_at);
-```
-
-## Relation semantics
-
-`issue_relations` direction is fixed:
-
-| relation_type | source_issue_id | target_issue_id | Meaning |
-|---|---|---|---|
-| `blocks` | blocker issue | blocked issue | source blocks target dispatch/progress |
-| `duplicates` | duplicate issue | canonical issue | source is duplicate of target |
-| `followup_of` | follow-up issue | original issue | source was created as follow-up to target |
-
-Agent tools may only create `followup_of` through `followup.create`, and only from the new follow-up issue to the current issue. Blocker and duplicate relations are operator-controlled in v1.
-
-## Handoff payload hash
-
-`handoffs.payload_hash` is the SHA-256 hex hash of the canonical accepted handoff JSON payload. It is the durable idempotency source for `handoff.submit`; `tool_calls.input_hash` is not sufficient by itself. See `docs/implementation/IS-014-store-contract.md`.
-
-## Initialization
-
-Initialize:
-
-```sql
-INSERT INTO schema_version (version, created_at) VALUES (1, '<RFC3339 UTC now>');
-INSERT INTO counters (key, value) VALUES ('issue_sequence', 0);
-```
-
-## PRAGMA
-
-```sql
-PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-```
+-- Required initialization statements for a new project DB:
+-- INSERT INTO schema_version (version, created_at) VALUES (1, '<RFC3339 UTC now>');
+-- INSERT INTO counters (key, value) VALUES ('issue_sequence', 0);

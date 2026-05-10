@@ -24,9 +24,9 @@ API prefix:
 /api/v1
 ```
 
-All business JSON APIs use OpenAPI. SSE uses a documented event schema.
+All business JSON APIs use OpenAPI. SSE uses the `RunEvent` schema documented in `api/openapi.yaml`.
 
-M0 must produce a machine-readable `api/openapi.yaml` from this contract and `docs/api/openapi-v1-outline.md` before frontend generated types are considered complete. Until that file exists, this implementation spec and the outline are the API authority.
+`api/openapi.yaml` is now the API source of truth. This implementation spec explains semantics that cannot be fully expressed in OpenAPI. If request/response shape conflicts, update this document to match `api/openapi.yaml`. `docs/api/openapi-v1-outline.md` is retained only as a historical outline.
 
 ## Response envelopes
 
@@ -340,7 +340,7 @@ FailureCode
 | IS3-022 | approval schemas expose timeout/expiry fields |
 | IS3-023 | API error codes are split from run `FailureCode`, with explicit mapping where policy/API errors terminate runs |
 | IS3-024 | issue path refs accept either internal id or human identifier and resolve server-side |
-| IS3-025 | concrete `api/openapi.yaml` is required before generated frontend types and contract tests |
+| IS3-025 | `api/openapi.yaml` is the executable API contract for generated frontend types, handler conformance, CLI clients, and contract tests |
 | G1 | dispatch-pause and dispatch-resume endpoints added |
 | G3 | run failure/cancellation pause semantics are API-visible |
 | G7 | active run reconciliation side effects are API-visible |

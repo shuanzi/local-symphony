@@ -1,18 +1,12 @@
-# App DB Schema v1
+-- Local Symphony App DB schema v1
+-- Path: ~/.symphony/app.db
+-- Source of truth for application-level registration/session storage.
 
-Path:
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
 
-```text
-~/.symphony/app.db
-```
-
-## Source of truth
-
-`db/schema/app_v1.sql` is the executable schema source. This Markdown file is explanatory and must match the SQL file.
-
-## SQL
-
-```sql
 CREATE TABLE schema_version (
   version INTEGER PRIMARY KEY CHECK (version = 1),
   created_at TEXT NOT NULL
@@ -48,13 +42,9 @@ CREATE TABLE local_sessions (
   expires_at TEXT NOT NULL,
   revoked_at TEXT
 );
-```
 
-## Rules
+CREATE INDEX idx_local_sessions_expires
+ON local_sessions(expires_at);
 
-```text
-schema_version must contain exactly one row with version = 1.
-registered_projects.repo_root is absolute path.
-Only token hashes are stored.
-No third-party secrets are stored.
-```
+CREATE INDEX idx_local_sessions_kind
+ON local_sessions(kind, revoked_at);

@@ -6,9 +6,21 @@ Frozen.
 
 ## Goal
 
-Define v1 security mechanisms: session token, CSRF, run-scoped tool token, command policy, network policy, protected paths, redaction, and artifact containment.
+Define v1 security mechanisms: session token, CSRF, run-scoped tool token, command policy, network policy, protected paths, redaction, and artifact containment. `docs/security/SECURITY_MODEL.md` is the enforcement-source contract and must be kept aligned with this file.
 
 v1 does not implement full audit log, secret manager, supply-chain risk scoring, remote dashboard, or RBAC.
+
+## Enforcement boundary
+
+Security policy evaluation is not sufficient by itself unless the execution path is actually mediated by the daemon, Tool Gateway, or Codex approval/sandbox protocol. Implementations must distinguish:
+
+```text
+hard daemon enforcement: API auth, CSRF, Tool Gateway scope, artifact containment, diagnostics export
+Codex-mediated enforcement: shell command approvals, file change approvals, network approvals
+detection/diagnostic only: events observed after a command already executed
+```
+
+Do not describe network deny, protected-path deny, or command deny as OS-level isolation in v1. See `docs/security/SECURITY_MODEL.md` for the enforcement matrix and required tests.
 
 ## Session auth
 
@@ -235,3 +247,4 @@ These are operational records, not a compliance-grade audit log.
 | IS9-008 | remote dashboard unsupported |
 | IS9-009 | required `symphony tool ...` commands are command-policy allowed but still fully validated by Tool Gateway token and schema checks |
 | IS9-010 | command, network, and protected-path denials map to canonical terminal failure codes when they end a run |
+| IS9-011 | enforcement boundaries are explicit: daemon-hard controls, Codex-mediated controls, and detection-only surfaces are not conflated |

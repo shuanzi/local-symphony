@@ -343,7 +343,20 @@ Input:
 }
 ```
 
-`target_state` is optional; if present it must equal `Human Review`. The first successful handoff for a run wins. A repeated submission with the same payload hash is idempotent; a different payload after a successful handoff returns a state conflict.
+`target_state` is optional; if present it must equal `Human Review`. The first successful handoff for a run wins. A repeated submission with the same payload hash is idempotent; a different payload after a successful handoff returns a state conflict. The durable idempotency source is `handoffs.payload_hash`; `tool_calls.input_hash` alone is not sufficient.
+
+
+Canonical payload hash rules:
+
+```text
+validate input schema first
+canonicalize accepted JSON with sorted object keys and no insignificant whitespace
+arrays preserve order
+omit absent optional fields
+include explicit nulls only if accepted by schema
+payload_hash = lowercase hex SHA-256(canonical JSON bytes)
+persist payload_hash and redacted accepted payload in handoffs
+```
 
 ### Relation direction
 
@@ -441,6 +454,7 @@ All attributable tool calls are recorded in `tool_calls` and `run_events`, succe
 | IS4-020c | handoff target state is fixed to `Human Review` in v1 |
 | IS4-020d | `followup.create` creates an Inbox issue with `new_issue followup_of current_issue`; agents cannot create blocker or duplicate relations |
 | IS4-020e | `symphony tool ...` shell commands are command-policy allowed but still tool-gateway authorized |
+| IS4-020f | handoff idempotency uses canonical JSON SHA-256 stored in `handoffs.payload_hash` |
 | IS4-021 | token scope validated every call |
 | IS4-022 | tool calls persisted if attributable |
 | IS4-023 | CLI preflight + daemon final path validation |

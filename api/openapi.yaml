@@ -1,0 +1,1444 @@
+openapi: 3.1.0
+info:
+  title: Local Symphony API
+  version: 0.1.0
+  description: |
+    Executable v1 REST/SSE contract for Local Symphony App.
+    This file is the API source of truth for handlers, generated frontend types, CLI clients, and contract tests.
+servers:
+  - url: /api/v1
+security:
+  - sessionCookie: []
+    csrfHeader: []
+  - bearerAuth: []
+
+tags:
+  - name: Auth
+  - name: Health
+  - name: Events
+  - name: Issues
+  - name: Runs
+  - name: Approvals
+  - name: Reviews
+  - name: Artifacts
+  - name: Workflow
+  - name: Diagnostics
+
+paths:
+  /auth/exchange:
+    post:
+      tags: [Auth]
+      summary: Exchange a one-time dashboard open token for a browser session.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthExchangeRequest'
+      responses:
+        '200':
+          description: Browser session created. Session cookie is set by the server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthExchangeEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/session:
+    get:
+      tags: [Auth]
+      summary: Return current authenticated session.
+      responses:
+        '200':
+          description: Current session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke current browser or CLI session.
+      responses:
+        '200':
+          description: Logged out.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /health:
+    get:
+      tags: [Health]
+      summary: Machine-readable daemon health.
+      security: []
+      responses:
+        '200':
+          description: Health status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthEnvelope'
+  /state:
+    get:
+      tags: [Health]
+      summary: Dashboard overview snapshot.
+      responses:
+        '200':
+          description: Dashboard snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StateEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /events:
+    get:
+      tags: [Events]
+      summary: List run and scheduler events.
+      parameters:
+        - $ref: '#/components/parameters/AfterSeq'
+        - $ref: '#/components/parameters/Limit'
+        - name: issue_ref
+          in: query
+          required: false
+          schema: { type: string }
+        - name: run_id
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunEventListEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /events/stream:
+    get:
+      tags: [Events]
+      summary: Stream global events with SSE.
+      parameters:
+        - $ref: '#/components/parameters/AfterSeq'
+      responses:
+        '200':
+          description: SSE stream. `id` is `run_events.seq`; `event` is `RunEvent.type`; `data` is serialized `RunEvent`.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /issues:
+    get:
+      tags: [Issues]
+      summary: List local issues.
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/IssueState' }
+          style: form
+          explode: false
+        - name: label
+          in: query
+          required: false
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: false
+        - name: dispatch_paused
+          in: query
+          required: false
+          schema: { type: boolean }
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [priority_created, updated_desc, created_desc, identifier_asc]
+            default: priority_created
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Issues.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueListEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Issues]
+      summary: Create a local issue in Inbox unless request supplies another allowed initial state.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueCreateRequest'
+      responses:
+        '201':
+          description: Created issue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /issues/{issue_ref}:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+    get:
+      tags: [Issues]
+      summary: Get an issue by internal id or human identifier.
+      responses:
+        '200':
+          description: Issue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Issues]
+      summary: Update mutable issue fields. State changes are not allowed here.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueUpdateRequest'
+      responses:
+        '200':
+          description: Updated issue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /issues/{issue_ref}/transition:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+    post:
+      tags: [Issues]
+      summary: Transition issue state through the v1 state machine.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueTransitionRequest'
+      responses:
+        '200':
+          description: Transition result and any reconciliation side effects.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueTransitionEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /issues/{issue_ref}/comments:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+    post:
+      tags: [Issues]
+      summary: Add an operator comment to an issue.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueCommentCreateRequest'
+      responses:
+        '201':
+          description: Created comment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueCommentEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /issues/{issue_ref}/blockers:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+    post:
+      tags: [Issues]
+      summary: Add a blocker relation where another issue blocks this issue.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueBlockerAddRequest'
+      responses:
+        '200':
+          description: Updated issue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /issues/{issue_ref}/blockers/{blocker_issue_ref}:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+      - $ref: '#/components/parameters/BlockerIssueRef'
+    delete:
+      tags: [Issues]
+      summary: Remove a blocker relation.
+      responses:
+        '200':
+          description: Updated issue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /issues/{issue_ref}/dispatch:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+    post:
+      tags: [Issues]
+      summary: Manually request dispatch of an issue.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueDispatchRequest'
+      responses:
+        '202':
+          description: Dispatch claimed or queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueDispatchEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /issues/{issue_ref}/dispatch-pause:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+    post:
+      tags: [Issues]
+      summary: Pause dispatch for an issue.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DispatchPauseRequest'
+      responses:
+        '200':
+          description: Paused issue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /issues/{issue_ref}/dispatch-resume:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+    post:
+      tags: [Issues]
+      summary: Clear dispatch pause without changing issue state or blockers.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DispatchResumeRequest'
+      responses:
+        '200':
+          description: Resumed issue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /issues/{issue_ref}/events/stream:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+      - $ref: '#/components/parameters/AfterSeq'
+    get:
+      tags: [Events]
+      summary: Stream events for one issue with SSE.
+      responses:
+        '200':
+          description: SSE stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /runs:
+    get:
+      tags: [Runs]
+      summary: List run attempts.
+      parameters:
+        - name: issue_ref
+          in: query
+          required: false
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          schema: { type: array, items: { $ref: '#/components/schemas/RunStatus' } }
+          style: form
+          explode: false
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Runs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunAttemptListEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /runs/{run_id}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [Runs]
+      summary: Get one run attempt.
+      responses:
+        '200':
+          description: Run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunAttemptEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /runs/{run_id}/events:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [Runs, Events]
+      summary: List events for a run.
+      parameters:
+        - $ref: '#/components/parameters/AfterSeq'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Run events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunEventListEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /runs/{run_id}/events/stream:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/AfterSeq'
+    get:
+      tags: [Runs, Events]
+      summary: Stream events for one run with SSE.
+      responses:
+        '200':
+          description: SSE stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /runs/{run_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [Runs]
+      summary: Cancel an active run and pause redispatch.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunCancelRequest'
+      responses:
+        '200':
+          description: Cancelled run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunAttemptEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /approvals:
+    get:
+      tags: [Approvals]
+      summary: List approval requests.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [pending, auto_approved, auto_denied, approved, denied, cancelled, expired] }
+        - name: run_id
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Approvals.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalRequestListEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /approvals/{approval_id}/decide:
+    parameters:
+      - $ref: '#/components/parameters/ApprovalId'
+    post:
+      tags: [Approvals]
+      summary: Decide a pending approval.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApprovalDecisionRequest'
+      responses:
+        '200':
+          description: Updated approval.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalRequestEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /reviews/{issue_ref}:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+    get:
+      tags: [Reviews]
+      summary: Get latest review packet and review state for an issue.
+      responses:
+        '200':
+          description: Review details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /reviews/{issue_ref}/send-to-rework:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+    post:
+      tags: [Reviews]
+      summary: Send a Human Review issue back to Rework.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewDecisionRequest'
+      responses:
+        '200':
+          description: Issue moved to Rework.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /reviews/{issue_ref}/mark-done:
+    parameters:
+      - $ref: '#/components/parameters/IssueRef'
+    post:
+      tags: [Reviews]
+      summary: Mark a Human Review issue Done. Requires latest generated review packet.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewDecisionRequest'
+      responses:
+        '200':
+          description: Issue marked Done.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /artifacts/{artifact_id}:
+    parameters:
+      - $ref: '#/components/parameters/ArtifactId'
+    get:
+      tags: [Artifacts]
+      summary: Get artifact metadata.
+      responses:
+        '200':
+          description: Artifact metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /artifacts/{artifact_id}/content:
+    parameters:
+      - $ref: '#/components/parameters/ArtifactId'
+    get:
+      tags: [Artifacts]
+      summary: Get contained artifact content. Raw prompt and raw Codex logs are unsupported in v1.
+      parameters:
+        - name: range_start
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+        - name: range_end
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          description: Artifact content.
+          content:
+            text/plain:
+              schema: { type: string }
+            application/json:
+              schema: true
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
+
+  /workflow:
+    get:
+      tags: [Workflow]
+      summary: Get current workflow config and validation state.
+      responses:
+        '200':
+          description: Workflow state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /workflow/reload:
+    post:
+      tags: [Workflow]
+      summary: Reload WORKFLOW.md. `dry_run=true` validates without replacing the effective config.
+      parameters:
+        - name: dry_run
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Reload or validation result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /diagnostics:
+    get:
+      tags: [Diagnostics]
+      summary: Get redacted diagnostics.
+      responses:
+        '200':
+          description: Diagnostics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiagnosticsEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /diagnostics/export:
+    post:
+      tags: [Diagnostics]
+      summary: Create a redacted diagnostics export. Raw logs are unsupported in v1.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiagnosticsExportRequest'
+      responses:
+        '201':
+          description: Export artifact.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: symphony_session
+    csrfHeader:
+      type: apiKey
+      in: header
+      name: X-Symphony-CSRF
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  parameters:
+    IssueRef:
+      name: issue_ref
+      in: path
+      required: true
+      description: Internal issue id (`iss_...`) or human identifier (`LOC-1`).
+      schema: { type: string, minLength: 1 }
+    BlockerIssueRef:
+      name: blocker_issue_ref
+      in: path
+      required: true
+      description: Internal issue id or human identifier for the blocker issue.
+      schema: { type: string, minLength: 1 }
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^run_' }
+    ApprovalId:
+      name: approval_id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^appr_' }
+    ArtifactId:
+      name: artifact_id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^art_' }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    AfterSeq:
+      name: after_seq
+      in: query
+      required: false
+      schema: { type: integer, minimum: 0 }
+
+  responses:
+    BadRequest:
+      description: Invalid request.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Unauthorized:
+      description: Missing or invalid authentication.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Forbidden:
+      description: Authenticated but not allowed, CSRF missing, or policy denial.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Conflict:
+      description: State conflict.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    RangeNotSatisfiable:
+      description: Invalid artifact content range.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+    Meta:
+      type: object
+      required: [request_id, server_time]
+      properties:
+        request_id: { type: string }
+        server_time: { type: string, format: date-time }
+    EmptyEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+        meta: { $ref: '#/components/schemas/Meta' }
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code: { $ref: '#/components/schemas/ApiErrorCode' }
+            message: { type: string }
+            details:
+              type: object
+              additionalProperties: true
+            request_id: { type: string }
+    ApiErrorCode:
+      type: string
+      enum:
+        - unauthorized
+        - forbidden
+        - csrf_required
+        - invalid_request
+        - not_found
+        - unsupported_db_version
+        - workflow_invalid
+        - workflow_validation_failed
+        - prompt_render_failed
+        - invalid_state_transition
+        - issue_blocked
+        - issue_dispatch_paused
+        - issue_already_running
+        - workspace_conflict
+        - workspace_prepare_failed
+        - after_create_failed
+        - before_run_failed
+        - codex_startup_failed
+        - unsupported_codex_version
+        - codex_protocol_error
+        - approval_not_pending
+        - approval_timeout
+        - review_packet_required
+        - review_packet_failed
+        - tool_token_invalid
+        - tool_gateway_failed
+        - operator_cancelled
+        - agent_blocked
+        - issue_state_changed
+        - canceled_by_reconciliation
+        - command_denied
+        - network_denied
+        - protected_path_denied
+        - raw_log_access_not_supported
+        - internal_error
+    FailureCode:
+      type: string
+      enum:
+        - workflow_invalid
+        - workflow_validation_failed
+        - prompt_render_failed
+        - workspace_prepare_failed
+        - workspace_conflict
+        - after_create_failed
+        - before_run_failed
+        - codex_startup_failed
+        - unsupported_codex_version
+        - codex_protocol_error
+        - turn_timeout
+        - stall_timeout
+        - approval_timeout
+        - command_denied
+        - network_denied
+        - protected_path_denied
+        - tool_gateway_failed
+        - missing_handoff
+        - review_packet_failed
+        - operator_cancelled
+        - agent_blocked
+        - issue_state_changed
+        - canceled_by_reconciliation
+        - daemon_restarted_run_interrupted
+    Pagination:
+      type: object
+      required: [limit, next_cursor]
+      properties:
+        limit: { type: integer }
+        next_cursor: { type: [string, 'null'] }
+    IssueState:
+      type: string
+      enum: [Inbox, Ready, Working, Rework, Blocked, Human Review, Done, Cancelled, Duplicate]
+    Issue:
+      type: object
+      required: [id, identifier, sequence_no, title, description, acceptance_criteria, state, priority, labels, dispatch_paused, created_at, updated_at]
+      properties:
+        id: { type: string, pattern: '^iss_' }
+        identifier: { type: string, example: LOC-1 }
+        sequence_no: { type: integer, minimum: 1 }
+        title: { type: string }
+        description: { type: string }
+        acceptance_criteria:
+          type: array
+          items: { type: string }
+        state: { $ref: '#/components/schemas/IssueState' }
+        priority: { type: integer, minimum: 1, maximum: 4 }
+        estimate: { type: [string, 'null'] }
+        external_ref: { type: [string, 'null'] }
+        labels:
+          type: array
+          items: { type: string }
+        dispatch_paused: { type: boolean }
+        dispatch_pause_reason: { type: [string, 'null'] }
+        dispatch_paused_at: { type: [string, 'null'], format: date-time }
+        branch_name: { type: [string, 'null'] }
+        workspace_path: { type: [string, 'null'] }
+        base_ref: { type: [string, 'null'] }
+        base_ref_config: { type: [string, 'null'] }
+        base_sha: { type: [string, 'null'] }
+        workspace: { $ref: '#/components/schemas/WorkspaceSummary' }
+        git: { $ref: '#/components/schemas/GitSummary' }
+        active_run_id: { type: [string, 'null'] }
+        latest_review_packet_id: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        completed_at: { type: [string, 'null'], format: date-time }
+        archived_at: { type: [string, 'null'], format: date-time }
+    WorkspaceSummary:
+      type: object
+      properties:
+        id: { type: [string, 'null'] }
+        path: { type: [string, 'null'] }
+        branch_name: { type: [string, 'null'] }
+        base_ref: { type: [string, 'null'] }
+        base_ref_config: { type: [string, 'null'] }
+        base_sha: { type: [string, 'null'] }
+        status: { type: [string, 'null'] }
+    GitSummary:
+      type: object
+      properties:
+        branch_name: { type: [string, 'null'] }
+        base_ref: { type: [string, 'null'] }
+        base_ref_config: { type: [string, 'null'] }
+        base_sha: { type: [string, 'null'] }
+    IssueCreateRequest:
+      type: object
+      required: [title]
+      additionalProperties: false
+      properties:
+        title: { type: string, minLength: 1 }
+        description: { type: string, default: '' }
+        acceptance_criteria:
+          type: array
+          items: { type: string }
+          default: []
+        labels:
+          type: array
+          items: { type: string }
+          default: []
+        priority: { type: integer, minimum: 1, maximum: 4, default: 3 }
+        estimate: { type: string }
+        external_ref: { type: string }
+        initial_state:
+          type: string
+          enum: [Inbox, Ready]
+          default: Inbox
+    IssueUpdateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        title: { type: string, minLength: 1 }
+        description: { type: string }
+        acceptance_criteria:
+          type: array
+          items: { type: string }
+        labels:
+          type: array
+          items: { type: string }
+        priority: { type: integer, minimum: 1, maximum: 4 }
+        estimate: { type: [string, 'null'] }
+        external_ref: { type: [string, 'null'] }
+    IssueTransitionRequest:
+      type: object
+      required: [target_state]
+      additionalProperties: false
+      properties:
+        target_state: { $ref: '#/components/schemas/IssueState' }
+        reason: { type: string }
+        duplicate_of: { type: string, description: Required by UI when target_state is Duplicate. }
+    IssueDispatchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          enum: [manual, retry, rework]
+          default: manual
+        comment: { type: string }
+    DispatchPauseRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: string }
+    DispatchResumeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: string }
+    IssueCommentCreateRequest:
+      type: object
+      required: [body]
+      additionalProperties: false
+      properties:
+        body: { type: string, minLength: 1 }
+    IssueBlockerAddRequest:
+      type: object
+      required: [blocked_by]
+      additionalProperties: false
+      properties:
+        blocked_by:
+          type: string
+          description: Internal id or identifier of the blocker issue.
+        reason: { type: string }
+    IssueComment:
+      type: object
+      required: [id, issue_id, author_type, body, created_at]
+      properties:
+        id: { type: string }
+        issue_id: { type: string }
+        run_id: { type: [string, 'null'] }
+        author_type: { type: string, enum: [operator, agent, system] }
+        author_id: { type: [string, 'null'] }
+        body: { type: string }
+        created_at: { type: string, format: date-time }
+    RunStatus:
+      type: string
+      enum: [pending, preparing_workspace, rendering_prompt, starting_agent, running, completed, completed_without_handoff, failed, cancelled]
+    RunAttempt:
+      type: object
+      required: [id, issue_id, attempt_no, status, dispatch_reason, agent_runtime, created_at, updated_at]
+      properties:
+        id: { type: string, pattern: '^run_' }
+        issue_id: { type: string }
+        issue_identifier: { type: string }
+        workspace_id: { type: [string, 'null'] }
+        attempt_no: { type: integer, minimum: 1 }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        dispatch_reason: { type: string, enum: [manual, scheduler, retry, rework] }
+        agent_runtime: { type: string, enum: [codex] }
+        codex_version: { type: [string, 'null'] }
+        process_pid: { type: [integer, 'null'] }
+        process_group_id: { type: [integer, 'null'] }
+        thread_id: { type: [string, 'null'] }
+        turn_id: { type: [string, 'null'] }
+        session_id: { type: [string, 'null'] }
+        workflow_snapshot_id: { type: [string, 'null'] }
+        failure_code: { anyOf: [ { $ref: '#/components/schemas/FailureCode' }, { type: 'null' } ] }
+        failure_message: { type: [string, 'null'] }
+        started_at: { type: [string, 'null'], format: date-time }
+        ended_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    RunCancelRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: string }
+    RunEvent:
+      type: object
+      required: [seq, id, type, severity, summary, data, created_at]
+      properties:
+        seq: { type: integer, minimum: 1 }
+        id: { type: string, pattern: '^evt_' }
+        issue_id: { type: [string, 'null'] }
+        run_id: { type: [string, 'null'] }
+        type: { type: string }
+        severity: { type: string, enum: [debug, info, warning, error] }
+        summary: { type: string }
+        data:
+          type: object
+          additionalProperties: true
+        raw_ref: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+    ApprovalRequest:
+      type: object
+      required: [id, issue_id, run_id, type, status, risk_level, requested_at, timeout_ms, expires_at]
+      properties:
+        id: { type: string, pattern: '^appr_' }
+        issue_id: { type: string }
+        run_id: { type: string }
+        type: { type: string, enum: [command, file_change, network] }
+        status: { type: string, enum: [pending, auto_approved, auto_denied, approved, denied, cancelled, expired] }
+        risk_level: { type: string, enum: [low, medium, high, critical] }
+        command: { type: [string, 'null'] }
+        cwd: { type: [string, 'null'] }
+        file_path: { type: [string, 'null'] }
+        file_action: { type: [string, 'null'] }
+        network_host: { type: [string, 'null'] }
+        network_protocol: { type: [string, 'null'] }
+        network_port: { type: [integer, 'null'] }
+        reason: { type: [string, 'null'] }
+        policy_match: { type: [string, 'null'] }
+        decision: { type: [string, 'null'] }
+        decision_reason: { type: [string, 'null'] }
+        decided_by: { type: [string, 'null'] }
+        requested_at: { type: string, format: date-time }
+        timeout_ms: { type: integer }
+        expires_at: { type: string, format: date-time }
+        resolved_at: { type: [string, 'null'], format: date-time }
+    ApprovalDecisionRequest:
+      type: object
+      required: [decision]
+      additionalProperties: false
+      properties:
+        decision:
+          type: string
+          enum: [approve_once, approve_for_run, approve_for_session, deny, cancel_run]
+        reason: { type: string }
+    ReviewPacket:
+      type: object
+      required: [id, issue_id, run_id, status, root_path, created_at]
+      properties:
+        id: { type: string, pattern: '^rp_' }
+        issue_id: { type: string }
+        run_id: { type: string }
+        status: { type: string, enum: [generated, partial, failed] }
+        root_path: { type: string }
+        review_md_path: { type: [string, 'null'] }
+        review_json_path: { type: [string, 'null'] }
+        patch_path: { type: [string, 'null'] }
+        changed_files_path: { type: [string, 'null'] }
+        untracked_files_path: { type: [string, 'null'] }
+        artifact_ids:
+          type: object
+          additionalProperties: { type: string }
+          description: Optional artifact id mapping keyed by logical file name.
+        handoff_id: { type: [string, 'null'] }
+        prompt_snapshot_id: { type: [string, 'null'] }
+        failure_code: { anyOf: [ { $ref: '#/components/schemas/FailureCode' }, { type: 'null' } ] }
+        failure_message: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+    Artifact:
+      type: object
+      required: [id, issue_id, kind, path, redacted, created_at]
+      properties:
+        id: { type: string, pattern: '^art_' }
+        issue_id: { type: string }
+        run_id: { type: [string, 'null'] }
+        kind:
+          type: string
+          enum: [test_output, patch, changed_files, untracked_files, prompt_snapshot, codex_log, review_packet, agent_file, diagnostic, other]
+        path: { type: string }
+        mime_type: { type: [string, 'null'] }
+        size_bytes: { type: [integer, 'null'] }
+        sha256: { type: [string, 'null'] }
+        redacted: { type: boolean }
+        created_at: { type: string, format: date-time }
+    WorkflowValidation:
+      type: object
+      required: [validation_status, validation_errors, effective_config, created_at]
+      properties:
+        workflow_snapshot_id: { type: [string, 'null'] }
+        workflow_path: { type: string }
+        workflow_sha: { type: [string, 'null'] }
+        validation_status: { type: string, enum: [valid, invalid] }
+        validation_errors:
+          type: array
+          items: { type: string }
+        validation_warnings:
+          type: array
+          items: { type: string }
+        effective_config:
+          type: object
+          additionalProperties: true
+        last_valid_snapshot_id: { type: [string, 'null'] }
+        dispatch_blocked: { type: boolean }
+        created_at: { type: string, format: date-time }
+    Diagnostics:
+      type: object
+      required: [project_id, repo_root, db, workflow, daemon, redaction]
+      properties:
+        project_id: { type: string }
+        repo_root: { type: string }
+        db:
+          type: object
+          additionalProperties: true
+        workflow: { $ref: '#/components/schemas/WorkflowValidation' }
+        daemon:
+          type: object
+          additionalProperties: true
+        redaction:
+          type: object
+          required: [applied]
+          properties:
+            applied: { type: boolean, const: true }
+            rules_version: { type: string }
+        warnings:
+          type: array
+          items: { type: string }
+    DiagnosticsExportRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        include_raw_logs:
+          type: boolean
+          default: false
+          description: Must be false in v1. true returns raw_log_access_not_supported.
+    AuthExchangeRequest:
+      type: object
+      required: [open_token]
+      additionalProperties: false
+      properties:
+        open_token: { type: string }
+    AuthExchangeResponse:
+      type: object
+      required: [session, csrf_token]
+      properties:
+        session: { $ref: '#/components/schemas/Session' }
+        csrf_token: { type: string }
+    Session:
+      type: object
+      required: [id, kind, created_at, expires_at]
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [browser, cli, desktop] }
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: [string, 'null'], format: date-time }
+        expires_at: { type: string, format: date-time }
+    Health:
+      type: object
+      required: [status, project_id, db_schema_version, started_at]
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        project_id: { type: string }
+        db_schema_version: { type: integer, enum: [1] }
+        started_at: { type: string, format: date-time }
+        warnings:
+          type: array
+          items: { type: string }
+    StateSnapshot:
+      type: object
+      required: [project, counts, running, approvals, recent_events, workflow]
+      properties:
+        project:
+          type: object
+          required: [id, name, repo_root]
+          properties:
+            id: { type: string }
+            name: { type: string }
+            repo_root: { type: string }
+        counts:
+          type: object
+          additionalProperties: { type: integer }
+        running:
+          type: array
+          items: { $ref: '#/components/schemas/RunAttempt' }
+        approvals:
+          type: array
+          items: { $ref: '#/components/schemas/ApprovalRequest' }
+        recent_events:
+          type: array
+          items: { $ref: '#/components/schemas/RunEvent' }
+        workflow: { $ref: '#/components/schemas/WorkflowValidation' }
+    IssueTransitionResult:
+      type: object
+      required: [issue]
+      properties:
+        issue: { $ref: '#/components/schemas/Issue' }
+        side_effects:
+          type: object
+          properties:
+            active_run_cancelled: { type: boolean }
+            run_id: { type: [string, 'null'] }
+            failure_code: { anyOf: [ { $ref: '#/components/schemas/FailureCode' }, { type: 'null' } ] }
+    IssueDispatchResult:
+      type: object
+      required: [issue]
+      properties:
+        issue: { $ref: '#/components/schemas/Issue' }
+        run: { anyOf: [ { $ref: '#/components/schemas/RunAttempt' }, { type: 'null' } ] }
+        dispatch_status:
+          type: string
+          enum: [claimed, queued, already_running]
+    ReviewDetails:
+      type: object
+      required: [issue, latest_packet, packets]
+      properties:
+        issue: { $ref: '#/components/schemas/Issue' }
+        latest_packet: { anyOf: [ { $ref: '#/components/schemas/ReviewPacket' }, { type: 'null' } ] }
+        packets:
+          type: array
+          items: { $ref: '#/components/schemas/ReviewPacket' }
+    ReviewDecisionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: string }
+    WorkflowEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/WorkflowValidation' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    DiagnosticsEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/Diagnostics' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    AuthExchangeEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/AuthExchangeResponse' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    SessionEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/Session' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    HealthEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/Health' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    StateEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/StateSnapshot' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    IssueEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/Issue' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    IssueListEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: object
+          required: [items, pagination]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Issue' }
+            pagination: { $ref: '#/components/schemas/Pagination' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    IssueCommentEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/IssueComment' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    IssueTransitionEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/IssueTransitionResult' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    IssueDispatchEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/IssueDispatchResult' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    RunAttemptEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/RunAttempt' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    RunAttemptListEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: object
+          required: [items, pagination]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/RunAttempt' }
+            pagination: { $ref: '#/components/schemas/Pagination' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    RunEventListEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: object
+          required: [items, pagination]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/RunEvent' }
+            pagination: { $ref: '#/components/schemas/Pagination' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    ApprovalRequestEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/ApprovalRequest' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    ApprovalRequestListEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: object
+          required: [items, pagination]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/ApprovalRequest' }
+            pagination: { $ref: '#/components/schemas/Pagination' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    ReviewEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/ReviewDetails' }
+        meta: { $ref: '#/components/schemas/Meta' }
+    ArtifactEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/Artifact' }
+        meta: { $ref: '#/components/schemas/Meta' }

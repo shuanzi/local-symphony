@@ -129,8 +129,8 @@ Workspace preparation and Codex launch run outside the transaction.
 8. status → running
 9. Wait for turn complete/fail/cancel
 10. If missing handoff, run at most one continuation
-11. If handoff exists, generate review packet
-12. Run hooks.after_run best-effort in a finally path if workspace exists
+11. Run hooks.after_run best-effort in a finally path if workspace exists
+12. If handoff exists and the run was not cancelled by a higher-precedence outcome, generate review packet
 13. Return outcome to actor
 ```
 
@@ -149,6 +149,26 @@ Each tick:
 8. Launch run workers.
 9. Emit scheduler events.
 ```
+
+
+## Dispatch eligibility
+
+The scheduler normally claims only issues in:
+
+```text
+Ready
+Rework
+```
+
+`Working` is an active-dispatch-eligible state for reconciliation purposes, but it is not a normal scheduler candidate. A `Working` issue with no active run must not be redispatched automatically unless one of these explicit recovery paths applies:
+
+```text
+operator manually dispatches the issue after clearing dispatch pause
+startup/interruption handling deliberately leaves issue Working and operator requests retry
+future continuation/recovery feature explicitly records dispatch_reason=retry
+```
+
+This rule prevents accidental redispatch of stale `Working` rows. Tests must cover a `Working` issue with no active run and `dispatch_paused=true` staying idle across ticks.
 
 ## Retry strategy
 
@@ -178,13 +198,15 @@ starting_agent
 running
 ```
 
-An issue is active-dispatch eligible only when its state is in:
+An issue is active-dispatch eligible for reconciliation only when its state is in:
 
 ```text
 Ready
 Working
 Rework
 ```
+
+This set is broader than normal scheduler claim eligibility; see Dispatch eligibility above.
 
 Reconciliation triggers:
 
@@ -317,7 +339,7 @@ still no handoff:
 
 ## after_run hook guarantee
 
-If a workspace was prepared, the worker must attempt `hooks.after_run` in a `finally` path for all terminal worker outcomes:
+If a workspace was prepared, the worker must attempt `hooks.after_run` in a `finally` path for all terminal worker outcomes before any successful handoff review packet is generated:
 
 ```text
 completed
@@ -325,10 +347,9 @@ completed_without_handoff
 failed
 cancelled
 timeout-derived failure
-review_packet_failed
 ```
 
-`after_run` failure is recorded as hook events and diagnostics. It does not hide the original run outcome and does not automatically move the issue to Human Review.
+`after_run` failure is recorded as hook events and diagnostics. It does not hide the original run outcome and does not automatically move the issue to Human Review. If `after_run` writes test reports, formatting changes, or diagnostics into the workspace/artifact area before a successful handoff finalizer, the review packet must capture the resulting workspace state.
 
 Events:
 
@@ -341,16 +362,17 @@ hook.after_run.timeout
 
 ## Handoff finalizer
 
-If handoff exists:
+If handoff exists and no higher-precedence cancellation/failure has already won:
 
 ```text
-1. Generate review packet.
-2. Insert review_packet.status = generated.
-3. run.status = completed.
-4. issue.state → Human Review. This is the only supported v1 handoff target state.
-5. issue.dispatch_paused = false.
-6. Insert issue_state_history.
-7. Emit review.packet_generated.
+1. Confirm hooks.after_run has already been attempted if workspace exists.
+2. Generate review packet from current workspace state.
+3. Insert review_packet.status = generated.
+4. run.status = completed.
+5. issue.state → Human Review. This is the only supported v1 handoff target state.
+6. issue.dispatch_paused = false.
+7. Insert issue_state_history.
+8. Emit review.packet_generated.
 ```
 
 If review packet fails:
@@ -361,6 +383,31 @@ issue remains not Human Review
 issue.dispatch_paused = true
 failure_code = review_packet_failed
 ```
+
+
+## Run outcome precedence
+
+When multiple outcomes race, apply this precedence before writing terminal state:
+
+| Priority | Outcome | Final status/code | Notes |
+|---:|---|---|---|
+| 1 | Operator run cancel or approval `cancel_run` before finalizer commit | `cancelled` / `operator_cancelled` | Cancels process group, revokes tool token, pauses dispatch. |
+| 2 | Issue leaves active-dispatch-eligible state before finalizer commit | `cancelled` / `issue_state_changed` or `agent_blocked` | Reconciliation wins unless finalizer transaction already committed Human Review. |
+| 3 | Startup stale active run guard | `failed` / `daemon_restarted_run_interrupted` | Applies only before a live worker owns the process. |
+| 4 | Codex/runner/protocol/workspace/prompt failure | `failed` / canonical failure code | Pauses dispatch. |
+| 5 | Missing handoff after continuation | `completed_without_handoff` / `missing_handoff` | Pauses dispatch. |
+| 6 | Handoff exists but review packet fails | `failed` / `review_packet_failed` | Issue must not enter Human Review. |
+| 7 | Handoff exists and review packet generated | `completed` / null | Transitions issue to Human Review. |
+
+The finalizer must commit run status, issue state, dispatch pause fields, review packet row, and state history in a single DB transaction where possible. Once that transaction commits `issue.state=Human Review` and `run.status=completed`, a later operator action must use a separate state transition or review command rather than rewriting the completed run.
+
+| Current phase | Concurrent event | Required result |
+|---|---|---|
+| running, no handoff | operator cancel | `cancelled/operator_cancelled`; no review packet. |
+| running, handoff submitted, finalizer not committed | operator cancel | `cancelled/operator_cancelled`; handoff row remains diagnostic; no Human Review. |
+| after_run executing | issue transitioned Blocked/Cancelled/Duplicate | reconciliation cancel wins; no Human Review. |
+| review packet files writing, DB not committed | operator cancel | cancellation wins; packet may be `partial`/`failed`, not `generated`. |
+| finalizer DB transaction committed | later operator cancel request | reject as not active; operator must use review/state command. |
 
 ## Issue state transitions
 
@@ -435,6 +482,9 @@ Resume only clears pause. It does not change state and does not override blocker
 | IS6-010 | canonical failure code table is the source for run terminal reasons, dispatch pause reasons, and dashboard run labels |
 | IS6-011 | issue transition matrix defines allowed state changes and active-run side effects |
 | IS6-012 | operator cancellation and approval `cancel_run` pause dispatch and require explicit resume before redispatch |
+| IS6-013 | normal scheduler claims only `Ready` and `Rework`; `Working` is for active-run reconciliation and explicit recovery, not ordinary redispatch |
+| IS6-014 | `hooks.after_run` runs before successful handoff review packet generation so packet captures after-run workspace changes |
+| IS6-015 | run outcome precedence table resolves cancel/finalizer/state-change races |
 | G1 | pause/resume added |
 | G3 | failures pause dispatch |
 | G4 | stale active runs marked interrupted |

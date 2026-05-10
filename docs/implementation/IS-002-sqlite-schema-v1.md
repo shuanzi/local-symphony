@@ -4,6 +4,17 @@
 
 Frozen.
 
+## Executable schema source
+
+The SQL files below are the database source of truth and must be used for initialization and schema contract tests:
+
+```text
+db/schema/app_v1.sql
+db/schema/project_v1.sql
+```
+
+This document explains schema intent. If SQL and Markdown conflict, SQL wins and this document must be corrected. See `docs/implementation/IS-014-store-contract.md` for transaction, ID, file/DB atomicity, and daemon ownership rules.
+
 ## Database layout
 
 v1 uses two SQLite DBs:
@@ -39,13 +50,17 @@ iss_<id>
 run_<id>
 evt_<id>
 appr_<id>
-tool_<id>
+tok_<id>
+tc_<id>
 hand_<id>
 art_<id>
-rev_<id>
+rp_<id>
 ws_<id>
 wf_<id>
-prm_<id>
+ps_<id>
+cmt_<id>
+rel_<id>
+hist_<id>
 sess_<id>
 ```
 
@@ -200,7 +215,7 @@ Handoff is two-stage:
 
 Mark Done requires latest `review_packets.status = generated`.
 
-`handoffs.target_state` is retained for future compatibility but v1 enforces exactly `Human Review`.
+`handoffs.target_state` is retained for future compatibility but v1 enforces exactly `Human Review`. `handoffs.payload_hash` is required and is the durable idempotency source for repeated `handoff.submit` calls.
 
 ## Transaction rules
 
@@ -328,7 +343,9 @@ issue_comments.run_id optional FK to run_attempts
 issue_relations.created_by_run_id optional FK to run_attempts
 issue_state_history.run_id optional FK to run_attempts
 approval_requests.timeout_ms and expires_at for pending expiry
+handoffs.payload_hash required for idempotency
 handoffs.target_state CHECK target_state = 'Human Review'
+review_packets.prompt_snapshot_id FK to prompt_snapshots when available
 ```
 
 ## PRAGMA
@@ -366,5 +383,7 @@ PRAGMA synchronous = NORMAL;
 | IS2-018 | no backup/migration/recovery/audit/supply-chain tables |
 | IS2-019 | schema constraints include priority bounds, run FKs, approval expiry, and fixed handoff target |
 | IS2-020 | eligibility query excludes issues with active run attempts |
+| IS2-021 | handoff idempotency uses `handoffs.payload_hash` |
+| IS2-022 | SQL files are authoritative over Markdown schema explanations |
 | G8 | v1 handoff target state is fixed to `Human Review` |
 | G9 | NormalizedIssue exposes upstream-compatible git/workspace aliases |
