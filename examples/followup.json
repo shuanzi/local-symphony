@@ -1,0 +1,11 @@
+{
+  "title": "Add regression test for edge case",
+  "description": "Follow-up discovered during agent run.",
+  "acceptance_criteria": [
+    "Regression test fails before the fix and passes after."
+  ],
+  "labels": [
+    "follow-up"
+  ],
+  "priority": 3
+}

@@ -1,9 +1,9 @@
 # Local Symphony App v1
 
-**状态**：v1 合并版文档入口  
-**更新日期**：2026-05-10  
-**文档用途**：作为 agent、开发者和 reviewer 使用本方案文档的入口说明。  
-**权威文档**：本包只保留一套产品方案文档和一套技术方案文档。
+**状态**：v1 agent-executable 文档包  
+**更新日期**：2026-05-11  
+**文档用途**：作为 implementation agent、review agent、test agent 和人工 reviewer 使用的完整产品/技术/验收输入。  
+**权威文档**：`PRD.md` 与 `TECH_SPEC.md` 是解释性权威；`api/`、`db/`、`schemas/`、`examples/`、`docs/agent_work_orders/` 是可执行合同与验收材料。
 
 ---
 
@@ -32,61 +32,45 @@ Go daemon
 
 ## 2. 文档结构
 
-当前合并版文档只包含以下核心文件：
-
 ```text
-README.md       # 文档入口和使用说明
-PRD.md          # 唯一产品方案文档
-TECH_SPEC.md    # 唯一技术方案文档
+README.md                       # 文档入口和使用说明
+PRD.md                          # 产品目标、范围、用户流程和验收口径
+TECH_SPEC.md                    # 技术架构、状态机、模块职责、安全、测试和发布合同
+api/openapi.yaml                # REST/SSE API 可机器校验合同
+db/schema/v1_app.sql            # app-level SQLite DDL
+db/schema/v1_project.sql        # project-level SQLite DDL
+schemas/*.schema.json           # WORKFLOW、RunEvent、Tool Gateway、Review Packet、Diagnostics JSON Schema
+examples/WORKFLOW.default.md    # 默认 WORKFLOW.md 模板
+examples/handoff.json           # agent handoff 输入示例
+examples/followup.json          # agent followup 输入示例
+docs/agent_work_orders/*.md     # M0-M8 可执行开发任务包
+docs/testing/ACCEPTANCE.md      # 端到端验收场景和命令
+docs/testing/FAILURE_CODE_MATRIX.md
+docs/codex/ADAPTER_MAPPING.md   # Codex app-server → Symphony 映射
+docs/codex/FIXTURE_POLICY.md    # Codex fixture-gated 策略
 ```
 
-### 2.1 PRD.md
+### 2.1 `PRD.md`
 
-`PRD.md` 是 Local Symphony App v1 的唯一产品需求文档，定义：
+`PRD.md` 定义产品定位、目标用户、核心场景、v1 目标/非目标、端到端主流程、状态机业务语义、Human Review / Rework / Done 规则、Dashboard / CLI / API 产品要求、安全与运维产品原则、成功指标和验收标准。
 
-```text
-产品定位
-目标用户
-核心场景
-v1 目标和非目标
-端到端主流程
-产品模块范围
-issue 状态机的业务语义
-Human Review / Rework / Done 规则
-Dashboard / CLI / API 的产品要求
-安全与运维的产品原则
-v1 验收标准
-后续路线
-```
+### 2.2 `TECH_SPEC.md`
 
-### 2.2 TECH_SPEC.md
+`TECH_SPEC.md` 定义实现边界、架构和进程模型、Go/frontend/package layout、SQLite 数据模型、REST/SSE、CLI、Tool Gateway、WORKFLOW.md、Codex adapter、orchestrator lifecycle、workspace/git、review packet、安全模型、failure_code、测试策略、M0-M8 实施阶段和 Definition of Done。
 
-`TECH_SPEC.md` 是 Local Symphony App v1 的唯一技术规格文档，定义：
+### 2.3 Contract artifacts
+
+以下文件是 implementation agent 必须消费的可执行合同：
 
 ```text
-实现边界
-架构和进程模型
-Go / frontend / package layout
-核心模块职责
-SQLite 数据模型
-REST API 合同
-SSE 合同
-CLI 合同
-Tool Gateway 合同
-WORKFLOW.md 合同
-Codex adapter 合同
-orchestrator run lifecycle
-workspace / git 生命周期
-review packet 和 rework 语义
-安全模型
-错误码和 failure_code
-测试策略
-验收测试
-Definition of Done
-M0-M8 实施阶段
+api/openapi.yaml
+schemas/*.schema.json
+db/schema/*.sql
+docs/testing/*.md
+docs/agent_work_orders/*.md
 ```
 
-原始文档包中的 `api/openapi.yaml`、`db/schema/*.sql`、`docs/implementation/*`、`docs/schema/*`、`docs/config/*`、`docs/security/*`、`docs/agent/*`、`docs/backlog/*` 等内容已经被合并、去重并吸收到 `TECH_SPEC.md`。它们不再作为独立 source of truth 使用。
+它们不是新的产品 source of truth，而是 `TECH_SPEC.md` 的机器可读落地形态。实现时不得只读 PRD/TECH_SPEC 后自行发明 API、DB 或 JSON shape。
 
 ---
 
@@ -97,24 +81,27 @@ M0-M8 实施阶段
 ```text
 1. 产品目标、用户场景、范围和业务语义以 PRD.md 为准。
 2. API、DB、CLI、状态机、模块职责、安全、测试和发布合同以 TECH_SPEC.md 为准。
-3. README.md 只作为入口说明，不覆盖 PRD.md 或 TECH_SPEC.md。
-4. 不再使用原始多文档 source-of-truth 层级。
-5. 不根据 upstream Symphony SPEC 或旧文档自行恢复 Linear、PR 自动化或其他 v1 非目标能力。
+3. api/openapi.yaml、db/schema/*.sql、schemas/*.json 是 TECH_SPEC.md 的可执行合同。
+4. docs/agent_work_orders/*.md 是开发 agent 的 milestone 任务拆解。
+5. docs/testing/*.md 是 test/review agent 的验收输入。
+6. README.md 只作为入口说明，不覆盖 PRD.md 或 TECH_SPEC.md。
+7. 不根据 upstream Symphony SPEC 或旧文档自行恢复 Linear、PR 自动化或其他 v1 非目标能力。
 ```
 
-当 `PRD.md` 和 `TECH_SPEC.md` 出现表面冲突时：
+当文件之间出现冲突时：
 
 ```text
-产品意图以 PRD.md 为准。
-实现合同以 TECH_SPEC.md 为准。
-不能确定时，优先保持 Local v1 的本地、安全、可复核、人工决策边界。
+产品意图冲突：以 PRD.md 为准。
+实现合同冲突：以 TECH_SPEC.md 为准，并同步修正 api/db/schemas。
+机器合同与 TECH_SPEC.md 冲突：先修文档，再改合同或实现。
+不能确定时：优先保持 Local v1 的本地、安全、可复核、人工决策边界。
 ```
 
 ---
 
 ## 4. 与 upstream Symphony SPEC 的关系
 
-Local Symphony App v1 受 OpenAI Symphony SPEC 启发，但不是 upstream SPEC 的逐字实现，也不是简单的 “upstream Symphony 去掉 Linear”。
+Local Symphony App v1 受 OpenAI Symphony SPEC 启发，但不是 upstream SPEC 的逐字实现，也不是简单的“upstream Symphony 去掉 Linear”。
 
 v1 继承的核心理念包括：
 
@@ -159,11 +146,11 @@ Issue → Ready
   ↓
 创建 / 复用 git worktree + branch
   ↓
-启动 Codex app-server
+启动 Codex app-server 或 fake runner
   ↓
-Codex 在 issue workspace 内工作
+agent 在 issue workspace 内工作
   ↓
-Codex 调用 symphony tool handoff
+agent 调用 symphony tool handoff submit --json ./handoff.json
   ↓
 执行 after_run hook
   ↓
@@ -184,6 +171,8 @@ review packet finalizer 成功后，issue 才能进入 Human Review。
 Done 只能由 operator 触发。
 Rework 必须复用同一个 workspace / branch。
 Done 不触发 commit、push、merge、PR、cleanup 或 workspace 删除。
+失败后 issue 回到 dispatch 前来源状态 Ready/Rework，并设置 dispatch_paused=true。
+dispatch-resume 只清除 pause，不自动删除 blocker，不自动修改 issue 内容。
 ```
 
 ---
@@ -206,6 +195,7 @@ v1 不自动 push、create PR、merge、publish
 v1 不允许 agent 自动 commit
 Human Review 是 v1 唯一 handoff target
 real Codex tests 是 opt-in；默认 CI 使用 fake runner
+Codex adapter 必须 fixture-gated；无 fixture 的 Codex protocol version dispatch 前失败
 ```
 
 ---
@@ -237,42 +227,64 @@ raw prompt or raw Codex log export through v1 API
 
 ## 8. 给 implementation agent 的使用方式
 
-实现本项目时，建议按以下顺序读取：
+推荐读取顺序：
 
 ```text
 1. README.md
 2. PRD.md
 3. TECH_SPEC.md
+4. api/openapi.yaml
+5. db/schema/v1_app.sql + db/schema/v1_project.sql
+6. schemas/*.schema.json
+7. docs/agent_work_orders/README.md
+8. docs/testing/ACCEPTANCE.md
+9. docs/codex/*.md
 ```
 
-实际开发时，以 `TECH_SPEC.md` 为实现主文档。`PRD.md` 用于理解产品意图、用户场景、范围和验收口径。
-
-建议执行方式：
+推荐执行顺序：
 
 ```text
-1. 先建立 repo / package / app shell。
-2. 实现 SQLite app DB 和 project DB。
-3. 实现 local tracker、issue state machine 和 dispatch pause/resume。
-4. 实现 WORKFLOW.md parser、prompt renderer 和 fake runner。
-5. 实现 orchestrator、workspace manager 和 git worktree flow。
-6. 实现 Tool Gateway、handoff、after_run 和 review packet finalizer。
-7. 实现 REST API、SSE、CLI 和 dashboard。
-8. 实现 security policy、diagnostics、tests 和 release packaging。
-9. 按 TECH_SPEC.md 的 M0-M8 和 Definition of Done 做验收。
+M0  Contracts and scaffold
+M1  Local tracker and store
+M2  Workflow, prompt, workspace and git
+M3  Orchestrator and fake runner
+M4  Tool Gateway and handoff
+M5  Review packet and Human Review gate
+M6  API, CLI, dashboard, auth and security
+M7  Codex adapter
+M8  Release hardening
 ```
 
-不要从旧的 upstream 行为或原始多文档结构中补回未声明能力。
+每个 milestone 必须满足对应 `docs/agent_work_orders/M*.md` 的验收命令后再进入下一阶段。
 
 ---
 
-## 9. 验收口径摘要
+## 9. Agent 禁止事项
+
+Implementation agent MUST NOT：
+
+```text
+实现 Linear、GitHub Issues、PR 创建、push、merge、publish。
+实现自动 retry timer、retry queue 或后台重试策略。
+实现 workspace cleanup/delete/reset/rebase。
+暴露 raw prompt 或 raw Codex logs 到 API/dashboard/diagnostics export。
+新增 dynamic tools、MCP、remote dashboard、多租户 RBAC。
+改变 issue 状态机而不同时更新 PRD.md、TECH_SPEC.md、api/db/schemas 和测试。
+发明未写入 api/openapi.yaml、db/schema/*.sql 或 schemas/*.json 的 API/DB/JSON shape。
+在 M0-M8 之外扩展 v1 非目标能力。
+```
+
+---
+
+## 10. 验收口径摘要
 
 v1 完成时必须至少满足：
 
 ```text
 可以初始化本地项目。
 可以创建、编辑、评论、转态、阻塞、dispatch 本地 issue。
-Ready issue 可以被 orchestrator 或手动 dispatch。
+Ready/Rework issue 可以被 orchestrator 或手动 dispatch。
+失败后 issue 回到 dispatch 前来源状态并 pause，resume 后可以重新调度。
 每个 issue 在独立 git worktree 和 branch 内运行。
 fake runner E2E 默认可通过。
 Codex app-server integration 有 fixture/version gate。
@@ -286,20 +298,21 @@ Dashboard、CLI、REST、SSE 能反映 issue、run、approval、review packet �
 默认测试不依赖真实 Codex；真实 Codex 测试只在显式 opt-in 时运行。
 ```
 
-完整验收标准以 `TECH_SPEC.md` 的测试、验收和 Definition of Done 章节为准。
+完整验收标准以 `docs/testing/ACCEPTANCE.md`、`TECH_SPEC.md` 的测试章节和 Definition of Done 为准。
 
 ---
 
-## 10. 变更原则
+## 11. 变更原则
 
 后续修改文档时，遵守以下原则：
 
 ```text
 产品范围变化先改 PRD.md。
 技术合同变化先改 TECH_SPEC.md。
+API 变化必须同步 api/openapi.yaml。
+DB 变化必须同步 db/schema/*.sql。
+JSON shape 变化必须同步 schemas/*.schema.json。
+验收变化必须同步 docs/testing/ACCEPTANCE.md 与相关 work order。
 README.md 只同步入口说明和高层摘要。
-不要重新引入多文档 source-of-truth 层级。
-不要让 README.md 成为第三份权威文档。
 不要新增与 v1 非目标冲突的实现要求，除非同时明确版本升级。
 ```
-

@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-symphony.dev/schemas/review_packet.schema.json",
+  "title": "Review Packet",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "issue",
+    "run",
+    "packet_no",
+    "status",
+    "files",
+    "handoff",
+    "created_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^rev_"
+    },
+    "issue": {
+      "type": "object",
+      "required": [
+        "id",
+        "identifier",
+        "title"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "identifier": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "required": [
+        "id",
+        "source_issue_state"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "source_issue_state": {
+          "enum": [
+            "Ready",
+            "Rework"
+          ]
+        }
+      }
+    },
+    "packet_no": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "enum": [
+        "generated",
+        "failed"
+      ]
+    },
+    "files": {
+      "type": "object",
+      "required": [
+        "review_md",
+        "review_json",
+        "changes_patch",
+        "changed_files",
+        "untracked_files"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "review_md": {
+          "type": "string"
+        },
+        "review_json": {
+          "type": "string"
+        },
+        "changes_patch": {
+          "type": "string"
+        },
+        "changed_files": {
+          "type": "string"
+        },
+        "untracked_files": {
+          "type": "string"
+        },
+        "diffstat": {
+          "type": "string"
+        }
+      }
+    },
+    "handoff": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "verification": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

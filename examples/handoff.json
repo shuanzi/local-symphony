@@ -1,0 +1,17 @@
+{
+  "summary": "Implemented the requested change and verified it with the configured test command.",
+  "changed_files": [
+    "internal/example/file.go"
+  ],
+  "tests": [
+    "go test ./...: pass"
+  ],
+  "risks": [
+    "No known risks."
+  ],
+  "verification": [
+    "Review changes.patch and run go test ./..."
+  ],
+  "followups": [],
+  "target_state": "Human Review"
+}

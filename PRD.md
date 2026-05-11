@@ -1,8 +1,8 @@
 # Local Symphony App v1 PRD
 
 **状态**：v1 产品方案合并版  
-**生成日期**：2026-05-10  
-**来源**：`local-symphony 2.zip` 原始文档包合并精简  
+**更新日期**：2026-05-11  
+**来源**：`local-symphony.zip` 原始文档包经 agent-executable hardening 后更新  
 **文档权威性**：本文档是 Local Symphony App v1 的唯一产品需求文档。技术实现、API、DB、CLI、安全、测试与发布细节以 `TECH_SPEC.md` 为准。
 
 ---
@@ -28,7 +28,7 @@ issue → Ready
   ↓
 Codex 在 issue workspace 内工作
   ↓
-Codex 调用 symphony tool handoff
+Codex 调用 symphony tool handoff submit submit
   ↓
 执行 after_run hook
   ↓
@@ -240,7 +240,7 @@ v1 默认 prompt 必须告诉 agent：
 不创建 PR
 不标记 issue Done
 完成后写 handoff.json
-运行 symphony tool handoff --json ./handoff.json
+运行 symphony tool handoff submit --json ./handoff.json
 handoff 只提交数据，Human Review 由 finalizer 成功后转换
 ```
 
@@ -360,6 +360,23 @@ redacted diagnostics export only
 
 产品文案必须诚实说明：network deny 和 protected path enforcement 依赖 Codex approval/sandbox surfacing，不是 OS-level firewall 或完整文件系统沙箱。
 
+## 8A. v1 可执行合同交付物
+
+为了让 implementation agent 能基于文档完成开发、测试和验证，v1 文档包除 PRD / TECH_SPEC 外，还必须包含以下可执行合同：
+
+| 类别 | 文件 | 用途 |
+|---|---|---|
+| REST/SSE API | `api/openapi.yaml` | 生成 API client、handler stub、contract tests。 |
+| App DB | `db/schema/v1_app.sql` | daemon/app 级项目注册、session、open token、runtime 元数据。 |
+| Project DB | `db/schema/v1_project.sql` | issue、run、event、approval、tool、handoff、review packet 本地 source of truth。 |
+| JSON Schema | `schemas/*.schema.json` | 校验 WORKFLOW config、RunEvent、Tool Gateway、Review Packet、Diagnostics。 |
+| 默认模板 | `examples/WORKFLOW.default.md` | `symphony init` 默认生成的 repo-owned workflow。 |
+| 开发任务包 | `docs/agent_work_orders/M0-M8` | 将 v1 拆成可验收 milestone，避免 agent 自行发散。 |
+| 验收材料 | `docs/testing/*` | 给 test/review agent 执行端到端验证。 |
+| Codex 映射 | `docs/codex/*` | 固定 Codex app-server protocol fixture gate 和事件映射。 |
+
+这些文件不取代 PRD/TECH_SPEC，但 implementation agent MUST 以它们作为实现、生成类型、写测试和验收的输入。
+
 ## 9. Issue 状态机与业务规则
 
 v1 issue states：
@@ -382,9 +399,9 @@ Duplicate
 |---|---|
 | Inbox | 新建任务，尚未准备 dispatch。 |
 | Ready | operator 确认可由 scheduler 或手动 dispatch。 |
-| Working | orchestrator 已 claim，run 正在或曾经处于执行路径。 |
+| Working | orchestrator 已 claim，run 正在执行；只用于 active run reconciliation，不是普通 tick 的自动候选状态。 |
 | Rework | review 后要求返工，可再次 dispatch。 |
-| Blocked | 当前任务被阻塞，需要 operator 处理。 |
+| Blocked | 当前任务被 operator 或 agent 明确标记为阻塞，需要人工处理。 |
 | Human Review | review packet 已生成，等待人工复核。 |
 | Done | operator 接受结果。 |
 | Cancelled | operator 取消任务。 |
@@ -395,15 +412,16 @@ Duplicate
 | From | To | Actor | Guard / Side effect |
 |---|---|---|---|
 | Inbox | Ready | operator | 必要 issue 字段有效。 |
-| Ready | Working | orchestrator | dispatch claim 成功。 |
-| Rework | Working | orchestrator | rework dispatch claim 成功。 |
+| Ready | Working | orchestrator | dispatch claim 成功，并在 run_attempt 记录 `source_issue_state=Ready`。 |
+| Rework | Working | orchestrator | rework dispatch claim 成功，并在 run_attempt 记录 `source_issue_state=Rework`。 |
 | Working | Human Review | finalizer | handoff 存在且 review packet generated。 |
-| Human Review | Rework | operator | reviewer 提供 reason/feedback。 |
+| Working | Ready/Rework | finalizer/orchestrator | run failure、missing handoff、review packet failure、operator cancel、startup stale run 等失败路径；回到 `run_attempt.source_issue_state` 并设置 `dispatch_paused=true`。 |
+| Human Review | Rework | operator | reviewer 提供 reason/feedback；workspace/branch 保留。 |
 | Human Review | Done | operator | latest review packet generated 且无 active run。 |
 | any non-terminal | Blocked | operator 或 agent tool | 若有 active run，reconciliation cancel；agent block 会 pause dispatch。 |
 | any non-terminal | Cancelled | operator | 若有 active run，reconciliation cancel。 |
-| any non-terminal | Duplicate | operator | 若有 active run，reconciliation cancel。 |
-| Blocked | Ready | operator | 阻塞解除，且 active blockers 不存在。 |
+| any non-terminal | Duplicate | operator | 若有 active run，reconciliation cancel；如指定 canonical issue，记录 duplicate relation。 |
+| Blocked | Ready | operator | 阻塞解除，且 active blocker relations 不存在。 |
 | Done/Cancelled/Duplicate | non-terminal | operator | 只允许显式 reopen，不复用旧 active run。 |
 
 Terminal states：
@@ -415,6 +433,16 @@ Duplicate
 ```
 
 `Human Review` 不是 terminal。workspace 在所有状态都保留。
+
+Blocked 与 blocker relation 的关系：
+
+```text
+Blocked state 表示当前 issue 被显式阻塞，解除需要 operator transition。
+issue_relations.blocks 表示依赖型 blocker，会影响 dispatch eligibility。
+添加 active blocker relation 不自动改变 issue.state，但会使 Ready/Rework issue 不可 dispatch。
+移除最后一个 blocker relation 不自动从 Blocked 转 Ready；operator 仍需显式 transition。
+agent issue.block 只设置当前 issue state=Blocked 与 dispatch_paused=true，不创建 blocker relation。
+```
 
 ## 10. Dispatch 与 pause/resume 规则
 
@@ -432,10 +460,17 @@ Issue 可 dispatch 的必要条件：
 ```text
 state ∈ Ready/Rework
 not dispatch_paused
-no active blockers
+no active blocker relations
 no active run
 workflow valid or last valid config available according to reload semantics
 available concurrency slot
+```
+
+Dispatch claim 必须把来源状态写入 run attempt：
+
+```text
+Ready  → Working, run_attempt.source_issue_state = Ready
+Rework → Working, run_attempt.source_issue_state = Rework
 ```
 
 会设置 `dispatch_paused=true` 的情况：
@@ -448,9 +483,27 @@ approval cancel_run
 agent issue.block
 startup stale active run interruption
 review packet failure
+security auto-deny
 ```
 
-Resume 只清除 pause，不改变 issue state，不移除 blockers，不自动 dispatch。
+失败或取消路径的 issue state 规则：
+
+```text
+若 run_attempt.source_issue_state ∈ Ready/Rework：
+  issue.state = run_attempt.source_issue_state
+  issue.dispatch_paused = true
+
+若 issue 已被 operator 显式转到 Blocked/Cancelled/Duplicate：
+  保留 operator 目标状态
+  issue.dispatch_paused = true
+```
+
+Resume 只清除 pause，不改变 issue 内容，不移除 blockers，不自动切换 Blocked，不自动创建新 run。Resume 后，如果 issue 已处于 Ready/Rework 且满足 eligibility，下一次 tick 可以正常 claim。若 operator 需要立即运行，应使用：
+
+```bash
+symphony issue dispatch-resume LOC-1 --reason "..."
+symphony issue dispatch LOC-1
+```
 
 ## 11. Review / Rework / Done 规则
 

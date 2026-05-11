@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-symphony.dev/schemas/workflow_config.schema.json",
+  "title": "Local Symphony Workflow Config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "tracker",
+    "workspace",
+    "git",
+    "agent",
+    "tools",
+    "security"
+  ],
+  "properties": {
+    "tracker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "dispatch_candidate_states",
+        "reconciliation_active_states",
+        "terminal_states"
+      ],
+      "properties": {
+        "kind": {
+          "const": "local"
+        },
+        "project": {
+          "type": "string"
+        },
+        "dispatch_candidate_states": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "Ready",
+              "Rework"
+            ]
+          },
+          "minItems": 1
+        },
+        "reconciliation_active_states": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "Ready",
+              "Working",
+              "Rework"
+            ]
+          },
+          "minItems": 1
+        },
+        "terminal_states": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "Done",
+              "Cancelled",
+              "Duplicate"
+            ]
+          },
+          "minItems": 3
+        }
+      }
+    },
+    "polling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "interval_ms": {
+          "type": "integer",
+          "minimum": 1000
+        }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "root"
+      ],
+      "properties": {
+        "root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cleanup": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "const": false
+            }
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "after_create": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "before_run": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "after_run": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "before_remove": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "enabled",
+        "mode",
+        "repo_root",
+        "base_ref",
+        "branch_prefix"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "const": "worktree"
+        },
+        "repo_root": {
+          "type": "string"
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "branch_prefix": {
+          "type": "string"
+        },
+        "agent_commit": {
+          "const": "manual"
+        },
+        "auto_push": {
+          "const": false
+        },
+        "auto_rebase": {
+          "const": false
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "max_concurrent_agents",
+        "handoff_required",
+        "handoff_state"
+      ],
+      "properties": {
+        "max_concurrent_agents": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_turns_per_run": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_handoff_continuations": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "handoff_required": {
+          "const": true
+        },
+        "handoff_state": {
+          "const": "Human Review"
+        },
+        "pause_on_missing_handoff": {
+          "const": true
+        }
+      }
+    },
+    "codex": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "transport": {
+          "enum": [
+            "stdio",
+            "websocket",
+            "unix"
+          ]
+        },
+        "experimental_api": {
+          "type": "boolean"
+        },
+        "require_committed_fixture": {
+          "const": true
+        }
+      }
+    },
+    "approvals": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "require_handoff_tool",
+        "allow_dynamic_tools",
+        "allow_mcp"
+      ],
+      "properties": {
+        "gateway": {
+          "enum": [
+            "cli",
+            "ipc"
+          ]
+        },
+        "require_handoff_tool": {
+          "const": true
+        },
+        "allow_dynamic_tools": {
+          "const": false
+        },
+        "allow_mcp": {
+          "const": false
+        },
+        "agent_can_set_terminal_state": {
+          "const": false
+        },
+        "artifact_max_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "require_loopback_api",
+        "allow_remote_api",
+        "require_session_token",
+        "require_csrf"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "require_loopback_api": {
+          "const": true
+        },
+        "allow_remote_api": {
+          "const": false
+        },
+        "require_session_token": {
+          "const": true
+        },
+        "require_csrf": {
+          "const": true
+        }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "prompt": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

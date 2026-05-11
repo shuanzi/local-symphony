@@ -1,9 +1,9 @@
 # Local Symphony App v1 Tech SPEC
 
 **状态**：v1 技术方案合并版  
-**生成日期**：2026-05-10  
-**来源**：`local-symphony 2.zip` 原始文档包合并精简  
-**文档权威性**：本文档是 Local Symphony App v1 的唯一技术规格文档，合并并替代原始 `api/openapi.yaml`、`db/schema/*.sql`、`docs/implementation/*`、`docs/schema/*`、`docs/config/*`、`docs/security/*`、`docs/agent/*`、`docs/backlog/*` 中的技术合同说明。产品目标、用户场景和非技术范围以 `PRD.md` 为准。
+**更新日期**：2026-05-11  
+**来源**：`local-symphony.zip` 原始文档包经 agent-executable hardening 后更新  
+**文档权威性**：本文档是 Local Symphony App v1 的解释性技术规格文档。`api/openapi.yaml`、`db/schema/*.sql`、`schemas/*.schema.json`、`docs/agent_work_orders/*.md` 与 `docs/testing/*.md` 是本文的可执行合同与验收材料。产品目标、用户场景和非技术范围以 `PRD.md` 为准。
 
 ---
 
@@ -61,19 +61,39 @@ MAY       可选实现
 
 实现可以在代码仓库中生成或维护 OpenAPI、SQL schema、CLI help、test manifests 等文件，但这些文件必须与本文合同一致。
 
+### 2.1 Executable contract artifacts
+
+实现 agent MUST 同时消费以下合同文件：
+
+```text
+api/openapi.yaml
+db/schema/v1_app.sql
+db/schema/v1_project.sql
+schemas/workflow_config.schema.json
+schemas/run_event.schema.json
+schemas/tool_gateway.schema.json
+schemas/review_packet.schema.json
+schemas/diagnostics.schema.json
+docs/agent_work_orders/*.md
+docs/testing/*.md
+docs/codex/*.md
+```
+
+这些文件必须与本文保持一致。若发现冲突，implementation agent MUST 先提交文档/合同修正，再继续实现，不得在代码中自行发明第三套 API、DB 或 JSON shape。
+
 ## 3. 实现边界
 
 ### 3.1 MUST implement
 
 ```text
 local SQLite tracker
-project/app SQLite DB initialization and version guard
+project/app SQLite DB initialization and version guard backed by db/schema/v1_*.sql
 WORKFLOW.md parser and strict prompt renderer
 git worktree workspace manager
 single-actor orchestrator
 fake runner E2E path
 Codex app-server adapter with fixture gate
-REST API and SSE event stream
+REST API and SSE event stream backed by api/openapi.yaml
 operator CLI
 tool gateway IPC + fixed registry
 run-scoped tool token
@@ -183,6 +203,17 @@ Required behavior:
 ```
 
 The lock SHOULD be an OS file lock or equivalent single-host mechanism. PID file alone is insufficient.
+
+## 4A. Supported platform scope
+
+v1 supported platforms:
+
+```text
+macOS arm64/x64
+Linux x64
+```
+
+Windows support is best-effort only in v1. If implementation chooses to support Windows, it MUST define and test named pipe transport, process group termination, CRLF patch behavior, and path normalization.
 
 ## 5. Repository and package layout
 
@@ -334,7 +365,8 @@ workspace:
 tracker:
   kind: local
   project: default
-  active_states: [Ready, Working, Rework]
+  dispatch_candidate_states: [Ready, Rework]
+  reconciliation_active_states: [Ready, Working, Rework]
   terminal_states: [Done, Cancelled, Duplicate]
 
 polling:
@@ -343,14 +375,14 @@ polling:
 workspace:
   root: <global-workspace-root>/<project_id>
   cleanup:
-    done_retention_days: 14
-    require_snapshot_before_delete: false
+    enabled: false
+    note: "v1 never deletes, resets, cleans, rebases, or removes workspaces automatically"
 
 hooks:
   after_create: null
   before_run: null
   after_run: null
-  before_remove: null
+  before_remove: null  # future-compatible only; MUST NOT be executed in v1
   timeout_ms: 300000
   max_output_bytes: 65536
 
@@ -383,6 +415,7 @@ codex:
   stall_timeout_ms: 300000
   read_timeout_ms: 5000
   experimental_api: false
+  require_committed_fixture: true
 
 approvals:
   mode: balanced
@@ -426,7 +459,7 @@ observability:
   structured_logs: true
   log_level: info
   redact_secrets: true
-  raw_codex_log_retention_days: 30
+  raw_codex_log_retention_days: 0  # v1 default: do not persist raw Codex logs
 
 server:
   host: 127.0.0.1
@@ -443,6 +476,8 @@ prompt:
   include_tool_manifest: true
   save_prompt_snapshot: redacted
 ```
+
+`dispatch_candidate_states` MUST be used for normal scheduler eligibility. `reconciliation_active_states` MUST be used only to decide whether an already-active run is still valid. `Working` MUST NOT be included in normal dispatch candidates.
 
 ### 6.3 Hard validation constraints
 
@@ -630,6 +665,19 @@ IDs are opaque strings with stable prefixes:
 
 Implementation MAY use ULID, UUIDv7, or another collision-resistant sortable ID. IDs MUST NOT encode secrets, absolute paths, or raw prompt content.
 
+### 7.4A Executable SQL schema
+
+The normative SQLite DDL is maintained in:
+
+```text
+db/schema/v1_app.sql
+db/schema/v1_project.sql
+```
+
+Implementation MUST initialize databases from these files or from byte-identical embedded copies. Field lists in the subsections below are explanatory; if a field is missing from the SQL DDL, the DDL and this document MUST be fixed before implementation continues.
+
+All timestamps MUST be RFC3339 UTC strings. Boolean values MUST be stored as INTEGER with `CHECK(value IN (0,1))`. JSON columns MUST contain valid JSON text.
+
 ### 7.5 App DB contract
 
 Tables:
@@ -738,22 +786,21 @@ Duplicate
 
 #### workspaces
 
+Normative fields are defined in `db/schema/v1_project.sql`.
+
 ```text
 id
 issue_id UNIQUE
 path UNIQUE
 branch_name
-base_ref              # resolved ref
-base_ref_config       # configured value, e.g. auto
+base_ref
 base_sha
-status ∈ planned|creating|ready|in_use|error|cleanup_pending|removed
+status ∈ prepared|conflict|missing
 created_at
 updated_at
-last_used_at
-removed_at
 ```
 
-v1 never automatically sets workspace to removed via cleanup. Cleanup statuses are future-compatible.
+v1 never automatically sets workspace to removed via cleanup. Removed/cleanup states are not part of v1 DDL.
 
 #### run_attempts
 
@@ -790,20 +837,20 @@ failed
 cancelled
 ```
 
-Other key fields:
+Key fields:
 
 ```text
-attempt_no UNIQUE per issue
-dispatch_reason ∈ manual|scheduler|retry|rework
-agent_runtime = codex
-codex_command
-codex_version
-process_pid
-process_group_id
-thread_id
-turn_id
-session_id
+id
+issue_id
+workspace_id
 workflow_snapshot_id
+status
+dispatch_reason ∈ manual|scheduler|manual_recovery
+source_issue_state ∈ Ready|Rework
+runner_kind ∈ fake|codex
+base_ref
+base_sha
+branch_name
 failure_code
 failure_message
 started_at
@@ -812,9 +859,26 @@ created_at
 updated_at
 ```
 
+`source_issue_state` is mandatory for dispatched runs and is used to restore the issue to Ready/Rework on failure, cancellation, missing handoff, or review packet failure.
+
 #### run_events
 
 `run_events.seq INTEGER PRIMARY KEY AUTOINCREMENT` is the SSE replay ID. `id` is a business event ID. UI timelines MUST render from durable normalized `run_events`, not raw Codex logs.
+
+Normative fields:
+
+```text
+seq
+id
+project_id
+issue_id
+run_id
+event_type
+actor_type ∈ system|operator|agent|codex|hook
+data_json
+redacted
+created_at
+```
 
 #### approval_requests
 
@@ -822,18 +886,12 @@ updated_at
 id
 issue_id
 run_id
-type ∈ command|file_change|network
-status ∈ pending|auto_approved|auto_denied|approved|denied|cancelled|expired
-risk_level ∈ low|medium|high|critical
-command/cwd OR file_path/file_action OR network_host/protocol/port
+kind ∈ command|file_change|network
+status ∈ pending|approved_once|approved_always|denied|auto_denied|cancelled|timeout
+request_json
+decision_json
 reason
-policy_match
-decision
-decision_reason
-decided_by
-requested_at
-timeout_ms DEFAULT 1800000
-expires_at
+created_at
 resolved_at
 ```
 
@@ -1275,9 +1333,21 @@ Ready
 Rework
 ```
 
-`Working` is active-dispatch-eligible for reconciliation only. A `Working` issue with no active run MUST NOT be redispatched automatically unless an explicit recovery path records `dispatch_reason=retry` or operator manually dispatches after clearing pause.
+`Working` is not a normal scheduler candidate. It is valid only while a run is active and during reconciliation. A `Working` issue with no active run MUST NOT be redispatched automatically.
 
-No automatic retry queue/timers exist in v1. `dispatch_reason=retry` is reserved for operator-initiated redispatch of a previously failed/paused issue.
+Dispatch claim transaction MUST:
+
+```text
+1. verify issue.state in Ready/Rework
+2. verify not dispatch_paused
+3. verify no active blocker relation
+4. verify no active run
+5. create run_attempt with source_issue_state = current issue.state
+6. set issue.state = Working
+7. emit run.claimed and issue.state_changed events
+```
+
+No automatic retry queue/timers exist in v1. Manual redispatch is represented by an operator command after pause is cleared, not by a background retry scheduler.
 
 ### 8.8 Active run reconciliation
 
@@ -1291,7 +1361,7 @@ starting_agent
 running
 ```
 
-Active-dispatch-eligible issue states for reconciliation:
+Reconciliation-valid issue states:
 
 ```text
 Ready
@@ -1317,8 +1387,9 @@ If an issue with an active run leaves `Ready`/`Working`/`Rework`:
 3. set run_attempt.status = cancelled
 4. set failure_code = issue_state_changed unless a more specific code applies
 5. set ended_at
-6. emit run.cancelled and scheduler.reconciled events
-7. retain workspace without reset/clean/delete
+6. revoke run-scoped tool tokens
+7. emit run.cancelled and scheduler.reconciled events
+8. retain workspace without reset/clean/delete
 ```
 
 Specific codes:
@@ -1349,10 +1420,10 @@ run_attempt.status = cancelled
 run_attempt.failure_code = operator_cancelled
 run_attempt.failure_message = reason
 run_attempt.ended_at = now
+issue.state = run_attempt.source_issue_state when source_issue_state is Ready/Rework, unless operator separately transitioned the issue to Blocked/Cancelled/Duplicate
 issues.dispatch_paused = true
 issues.dispatch_pause_reason = operator_cancelled
 issues.dispatch_paused_at = now
-issue.state remains unchanged unless separate transition occurs
 revoke run-scoped tool tokens
 emit run.cancelled
 emit scheduler.paused
@@ -1369,11 +1440,17 @@ On run failure:
 run_attempt.status = failed
 run_attempt.failure_code = <code>
 run_attempt.failure_message = <message>
+run_attempt.ended_at = now
+if run_attempt.source_issue_state in Ready/Rework:
+  issue.state = run_attempt.source_issue_state
 issues.dispatch_paused = true
 issues.dispatch_pause_reason = <code>
+issues.dispatch_paused_at = now
 run_event = run.failed
 system comment with failure summary
 ```
+
+This state restoration is mandatory. Without it, `dispatch-resume` would leave the issue in `Working`, while the normal scheduler only claims `Ready/Rework`.
 
 Canonical `FailureCode`:
 
@@ -1416,6 +1493,7 @@ if continuation unused: send one handoff continuation
 still no handoff:
   run.status = completed_without_handoff
   run.failure_code = missing_handoff
+  issue.state = run_attempt.source_issue_state
   issue.dispatch_paused = true
   dispatch_pause_reason = missing_handoff
   system comment
@@ -1653,27 +1731,46 @@ exec.Command("git", ...)
 
 ### 9.7 Diff and patch generation
 
-Review packet generation uses:
+Review packet generation MUST include tracked, deleted, renamed, mode-changed, and untracked files without mutating the real Git index.
 
-```text
-git status --porcelain=v1
-git diff --binary <base_sha> -- .
-git diff --name-only <base_sha> -- .
-git ls-files --others --exclude-standard
+Recommended algorithm:
+
+```bash
+TMP_INDEX="<artifact-temp-dir>/review.index"
+export GIT_INDEX_FILE="$TMP_INDEX"
+git read-tree <base_sha>
+git add -A -- <workspace-pathspecs>
+git diff --cached --binary <base_sha> -- > changes.patch
+git diff --cached --name-only <base_sha> -- > changed-files.txt
+git diff --cached --numstat <base_sha> -- > diffstat.txt
+unset GIT_INDEX_FILE
 ```
 
-Untracked files MUST be included:
+Required guards:
 
 ```text
-1. collect untracked files
-2. validate under workspace and not protected
-3. add each path to changed-files.txt
-4. record path, size, sha256, patch_included=true in untracked-files.json
-5. append binary-safe new-file patch for each untracked file to changes.patch
-6. do not stage, commit, reset, clean, or mutate index
+GIT_INDEX_FILE MUST point outside the real repo .git/index.
+The real working tree index MUST NOT be staged, reset, cleaned, committed, or mutated.
+All paths MUST be workspace-relative in review artifacts.
+Absolute paths and path traversal MUST be rejected.
+Symlink targets escaping workspace MUST fail review generation.
+Protected paths MUST fail review generation with review_packet_failed/protected_path_denied according to source.
+Files over artifact_max_bytes MUST be listed with patch_included=false unless binary diff is explicitly allowed by policy.
 ```
 
-Patch paths MUST be normalized to workspace-relative `a/<path>` / `b/<path>` entries.
+`untracked-files.json` MUST still be written. For each untracked file it MUST include:
+
+```json
+{
+  "path": "relative/path",
+  "size_bytes": 123,
+  "sha256": "...",
+  "patch_included": true,
+  "reason": null
+}
+```
+
+Patch paths MUST be normalized to Git-style `a/<path>` / `b/<path>` entries.
 
 ## 10. Codex adapter and fake runner
 
@@ -1713,44 +1810,31 @@ Minimal host environment SHOULD be used. Stderr is diagnostic only unless the se
 
 ### 10.2 Fixture-gated support
 
-Implementation MUST NOT infer support for arbitrary Codex app-server versions at runtime.
-
-A Codex version is supported only when repo contains committed fixtures:
+Real Codex adapter support is fixture-gated. Implementation MUST NOT claim a Codex protocol version is supported unless committed fixtures exist under:
 
 ```text
 internal/agent/codex/testdata/schema/<codex-version>/
-internal/agent/codex/testdata/ts/<codex-version>/
 internal/agent/codex/testdata/transcripts/<codex-version>/
 ```
 
-Unsupported installed versions fail before dispatch:
+This document package also includes adapter policy docs:
 
 ```text
-run_attempts.status = failed
-failure_code = unsupported_codex_version
-issues.dispatch_paused = true
+docs/codex/ADAPTER_MAPPING.md
+docs/codex/FIXTURE_POLICY.md
 ```
 
-Fixture generation commands:
-
-```bash
-codex app-server generate-json-schema --out internal/agent/codex/testdata/schema/<codex-version>/
-codex app-server generate-ts --out internal/agent/codex/testdata/ts/<codex-version>/
-```
-
-Representative transcripts:
+Startup behavior:
 
 ```text
-initialize_success.jsonl
-turn_success_with_handoff.jsonl
-approval_command_pending.jsonl
-approval_file_change_pending.jsonl
-approval_network_pending.jsonl
-turn_failed.jsonl
-malformed_event.jsonl
+1. detect installed `codex app-server` version and generated protocol/schema version
+2. look up committed fixture for that version
+3. if no fixture exists, fail before dispatch with unsupported_codex_version
+4. emit codex.version_checked event
+5. only then launch the real adapter
 ```
 
-Fixtures MUST NOT contain secrets, absolute user paths, raw private prompts, or real access tokens.
+Default CI MUST use `internal/agent/fake`. Real Codex tests MUST be opt-in through `SYMPHONY_TEST_CODEX=1`.
 
 ### 10.3 Runner interface
 
@@ -2199,7 +2283,7 @@ agent cannot create blocks or duplicates relations
 ```json
 {
   "success": true,
-  "tool": "handoff",
+  "tool": "handoff.submit",
   "issue_identifier": "LOC-123",
   "handoff_status": "received",
   "handoff_id": "hand_..."
@@ -2276,15 +2360,32 @@ HTTP status communicates protocol result; `error.code` communicates product sema
 POST /api/v1/auth/exchange
 GET  /api/v1/auth/session
 POST /api/v1/auth/logout
+POST /api/v1/auth/open-token
+POST /api/v1/auth/cli-token/rotate
 ```
 
-`symphony open` generates a one-time open token and opens:
+Auth bootstrap rules:
+
+```text
+1. symphony init creates no browser session and no raw browser token.
+2. symphony serve creates or rotates a CLI token for the current OS user when no valid token exists.
+3. raw CLI token is written to ~/.symphony/cli-session.json with owner-only permissions where supported.
+4. token hash is stored in app DB local_sessions.
+5. runtime descriptor never contains secrets.
+6. symphony open reads the CLI bearer token and calls POST /api/v1/auth/open-token.
+7. serve --open may create an open token in-process after successful daemon startup.
+8. React exchanges the one-time open token through POST /api/v1/auth/exchange.
+```
+
+Open URL:
 
 ```text
 http://127.0.0.1:<port>/?open_token=<token>
 ```
 
-React exchanges it for browser session. Browser uses HttpOnly SameSite cookie plus CSRF header for command APIs. CLI uses bearer token.
+Browser uses HttpOnly SameSite=Lax cookie plus `X-Symphony-CSRF` for command APIs. CLI uses bearer token. Open token is one-time, short TTL, hash-only at rest, and reuse returns `401 unauthorized`.
+
+If `~/.symphony/cli-session.json` is missing but a daemon is running, user MUST run an explicit local login/rotate command from the same OS account. Implementation MUST NOT print existing raw tokens from DB because only hashes are stored.
 
 ### 12.4 Health/state/events
 
@@ -2558,7 +2659,7 @@ CLI token file readable only by current user where OS supports modes
 Open token:
 
 ```text
-created by symphony open
+created by symphony open or serve --open
 one-time
 short TTL, recommended max 5 minutes
 stored as hash only
@@ -2601,17 +2702,25 @@ review
 deny
 ```
 
+v1 command classification MUST be layered:
+
+```text
+1. command verb/prefix classification
+2. argument and path extraction where feasible
+3. protected-path override
+4. network-policy override
+5. final allow/review/deny decision
+```
+
+Protected-path override wins over generic allow. For example, `cat .env`, `grep -R AWS_SECRET_ACCESS_KEY .`, and `find . -name "*.pem" -exec cat {} \;` MUST NOT be allowed merely because `cat`, `grep`, or `find` appeared in a broad allow list.
+
 Default allow:
 
 ```text
 git status
 git diff
 git log
-rg
-grep
-find
-ls
-cat
+rg with protected-path exclusion applied
 go test ./...
 pytest
 npm test
@@ -2622,14 +2731,16 @@ symphony tool issue comment
 symphony tool issue block
 symphony tool artifact attach
 symphony tool followup create
-symphony tool handoff
+symphony tool handoff submit
 ```
-
-`symphony tool ...` is allowed only as the shell entrypoint; operation authority still comes from Tool Gateway token/scope/cwd/schema/registry checks.
 
 Default review:
 
 ```text
+cat
+grep
+find
+ls
 npm install
 pnpm install
 yarn install
@@ -2657,7 +2768,9 @@ scp
 docker run --privileged
 ```
 
-v1 uses pattern/prefix classification, not deep supply-chain analysis.
+`symphony tool ...` is allowed only as the shell entrypoint; operation authority still comes from Tool Gateway token/scope/cwd/schema/registry checks.
+
+v1 uses pattern/prefix classification plus path/protected-path extraction, not deep supply-chain analysis.
 
 Policy outcomes mapping:
 
@@ -2666,6 +2779,8 @@ Policy outcomes mapping:
 | command auto-denied/denied | `auto_denied` or `denied` | `command_denied` |
 | network denied | `auto_denied` or `denied` | `network_denied` |
 | protected path denied | `auto_denied` or `denied` | `protected_path_denied` |
+
+Security auto-deny MUST terminate the current run in v1. Operator denial MAY either deny the single action or cancel the run if the UI/CLI decision explicitly uses `cancel_run`; if this distinction is not implemented, all deny decisions MUST terminate the run and set the matching failure code.
 
 ### 13.5 Network policy
 
@@ -2824,21 +2939,24 @@ Non-critical files may be absent without preventing generation if failure is rec
 
 ```text
 1. ensure artifact dir exists
-2. collect git status
-3. collect tracked changed files and untracked files
-4. generate changed-files.txt
-5. generate changes.patch with tracked diffs + untracked new-file patches
-6. write untracked-files.json, even when empty
-7. read handoff
-8. export tool calls
-9. export approvals
-10. export redacted run events
-11. copy prompt snapshot metadata files
-12. write review.json
-13. write review.md
-14. insert artifacts rows
-15. insert review_packets row
-16. emit review.packet_generated
+2. validate workspace containment and protected-path policy
+3. create temporary Git index outside the real .git/index
+4. read base tree into temporary index
+5. add current workspace contents to temporary index
+6. generate changes.patch with git diff --cached --binary
+7. generate changed-files.txt with git diff --cached --name-only
+8. generate diffstat.txt with git diff --cached --numstat
+9. generate untracked-files.json, even when empty
+10. read handoff
+11. export tool calls
+12. export approvals
+13. export redacted run events
+14. copy prompt snapshot metadata files only, not raw prompt unless redacted policy allows
+15. write review.json
+16. write review.md
+17. insert artifacts rows
+18. insert immutable review_packets row
+19. emit review.packet_generated
 ```
 
 Artifact kinds:
@@ -2849,7 +2967,10 @@ Artifact kinds:
 | `changes.patch` | `patch` | `patch_path` |
 | `changed-files.txt` | `changed_files` | `changed_files_path` |
 | `untracked-files.json` | `untracked_files` | `untracked_files_path` |
+| `diffstat.txt` | `diffstat` | `diffstat_path` |
 | `prompt/*` | `prompt_snapshot` | `prompt_snapshot_id` via `prompt_snapshots` |
+
+`review_packets` MUST be immutable. Rework creates a new packet with `packet_no = previous packet_no + 1` for the issue and `UNIQUE(run_id)`.
 
 ### 14.4 review.json shape
 
@@ -2989,7 +3110,8 @@ emit review.sent_to_rework
 Dispatch from Rework:
 
 ```text
-dispatch_reason = rework
+run_attempt.source_issue_state = Rework
+dispatch_reason = scheduler or manual according to trigger
 same workspace row reused
 same branch reused
 same base_sha retained
@@ -3297,6 +3419,19 @@ approval cancel_run side effects schema-covered
 SSE id equals run_events.seq
 Last-Event-ID / after_seq replay works
 artifact content enforces containment and rejects raw prompt/raw Codex log
+```
+
+### 18.7 Contract artifact validation
+
+Default CI MUST validate:
+
+```text
+JSON schemas parse as valid JSON Schema documents
+SQLite DDL executes on empty app/project databases
+OpenAPI document parses and contains every route listed in TECH_SPEC.md
+example WORKFLOW.default.md passes strict config validation
+example handoff/followup payloads pass Tool Gateway schemas
+agent work orders reference only v1 in-scope capabilities
 ```
 
 ## 19. Implementation phases M0–M8
