@@ -34,6 +34,32 @@ def load_json(rel: str) -> Any:
     return json.loads((ROOT / rel).read_text(encoding="utf-8"))
 
 
+def ref_name(ref: str) -> str:
+    return ref.rsplit("/", 1)[-1]
+
+
+def assert_required_and_props_match(
+    normalized_schema: dict[str, Any],
+    openapi_schema: dict[str, Any],
+    normalized_name: str,
+    openapi_name: str,
+) -> None:
+    normalized_defs = normalized_schema["$defs"]
+    openapi_components = openapi_schema["components"]["schemas"]
+    normalized = normalized_defs[normalized_name]
+    openapi = openapi_components[openapi_name]
+    normalized_required = set(normalized.get("required", []))
+    openapi_required = set(openapi.get("required", []))
+    if normalized_required != openapi_required:
+        fail(
+            f"NormalizedIssue {normalized_name} required fields must match OpenAPI {openapi_name}: "
+            f"{sorted(normalized_required ^ openapi_required)}"
+        )
+    missing_props = normalized_required - set(openapi.get("properties", {}))
+    if missing_props:
+        fail(f"OpenAPI {openapi_name} missing required NormalizedIssue properties: {sorted(missing_props)}")
+
+
 def validate_json() -> None:
     schema_paths = sorted((ROOT / "schemas").rglob("*.json"))
     example_paths = sorted((ROOT / "examples").glob("*.json"))
@@ -207,6 +233,38 @@ def validate_openapi() -> None:
     missing_issue_props = normalized_issue_required - set(openapi_issue.get("properties", {}))
     if missing_issue_props:
         fail(f"OpenAPI Issue schema missing NormalizedIssue properties: {sorted(missing_issue_props)}")
+
+    expected_refs = {
+        "blocked_by": "IssueRefSummary",
+        "blocks": "IssueRefSummary",
+        "workspace": "WorkspaceSummary",
+        "git": "GitSummary",
+        "latest_run": "RunSummary",
+        "latest_review_packet": "IssueReviewPacketSummary",
+    }
+    for prop, expected_ref in expected_refs.items():
+        schema = openapi_issue["properties"][prop]
+        if prop in {"blocked_by", "blocks"}:
+            actual_ref = schema.get("items", {}).get("$ref", "")
+        else:
+            actual_ref = next((item.get("$ref", "") for item in schema.get("anyOf", []) if "$ref" in item), "")
+        if ref_name(actual_ref) != expected_ref:
+            fail(f"OpenAPI Issue.{prop} must reference {expected_ref}, got {actual_ref or 'none'}")
+
+    summary_pairs = [
+        ("issueRef", "IssueRefSummary"),
+        ("workspaceSummary", "WorkspaceSummary"),
+        ("gitSummary", "GitSummary"),
+        ("runSummary", "RunSummary"),
+        ("reviewPacketSummary", "IssueReviewPacketSummary"),
+    ]
+    for normalized_name, openapi_name in summary_pairs:
+        assert_required_and_props_match(normalized_issue_schema, data, normalized_name, openapi_name)
+
+    normalized_states = normalized_issue_schema["$defs"]["issueState"]["enum"]
+    openapi_states = data["components"]["schemas"]["IssueState"]["enum"]
+    if normalized_states != openapi_states:
+        fail("NormalizedIssue issueState enum must match OpenAPI IssueState enum")
 
     run_event_schema = load_json("schemas/run_event.schema.json")
     if "seq" not in run_event_schema.get("required", []):
