@@ -216,12 +216,19 @@ def validate_openapi() -> None:
         fail("ApprovalDecisionRequest enum drifted from TECH_SPEC")
 
     failure_schema = load_json("schemas/failure_codes.schema.json")
+    expected_failure_codes = set(failure_schema["$defs"]["failureCode"]["enum"])
+    openapi_failure_codes = set(data["components"]["schemas"]["FailureCode"]["enum"])
+    if expected_failure_codes != openapi_failure_codes:
+        fail(f"FailureCode mismatch: {sorted(expected_failure_codes ^ openapi_failure_codes)}")
     expected_api_errors = set(failure_schema["$defs"]["apiErrorCode"]["enum"])
     openapi_api_errors = set(data["components"]["schemas"]["ApiErrorCode"]["enum"])
     if expected_api_errors != openapi_api_errors:
         fail(f"ApiErrorCode mismatch: {sorted(expected_api_errors ^ openapi_api_errors)}")
 
     normalized_issue_schema = load_json("schemas/normalized_issue.schema.json")
+    normalized_failure_codes = set(normalized_issue_schema["$defs"]["failureCode"]["enum"])
+    if expected_failure_codes != normalized_failure_codes:
+        fail(f"NormalizedIssue failureCode mismatch: {sorted(expected_failure_codes ^ normalized_failure_codes)}")
     normalized_issue_required = set(normalized_issue_schema["required"])
     openapi_issue = data["components"]["schemas"]["Issue"]
     openapi_issue_required = set(openapi_issue.get("required", []))
@@ -269,6 +276,18 @@ def validate_openapi() -> None:
     ]
     for normalized_name, openapi_name in summary_pairs:
         assert_required_and_props_match(normalized_issue_schema, data, normalized_name, openapi_name)
+
+    normalized_failure_code = normalized_issue_schema["$defs"]["runSummary"]["properties"]["failure_code"]
+    normalized_failure_refs = {item.get("$ref", "") for item in normalized_failure_code.get("anyOf", [])}
+    normalized_failure_null = any(item.get("type") == "null" for item in normalized_failure_code.get("anyOf", []))
+    if "#/$defs/failureCode" not in normalized_failure_refs or not normalized_failure_null:
+        fail("NormalizedIssue runSummary.failure_code must be failureCode or null")
+
+    openapi_failure_code = data["components"]["schemas"]["RunSummary"]["properties"]["failure_code"]
+    openapi_failure_refs = {item.get("$ref", "") for item in openapi_failure_code.get("anyOf", [])}
+    openapi_failure_null = any(item.get("type") == "null" for item in openapi_failure_code.get("anyOf", []))
+    if "#/components/schemas/FailureCode" not in openapi_failure_refs or not openapi_failure_null:
+        fail("OpenAPI RunSummary.failure_code must be FailureCode or null")
 
     normalized_states = normalized_issue_schema["$defs"]["issueState"]["enum"]
     openapi_states = data["components"]["schemas"]["IssueState"]["enum"]
