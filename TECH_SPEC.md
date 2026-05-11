@@ -70,6 +70,7 @@ api/openapi.yaml
 db/schema/v1_app.sql
 db/schema/v1_project.sql
 schemas/workflow_config.schema.json
+schemas/normalized_issue.schema.json
 schemas/run_event.schema.json
 schemas/tool_gateway.schema.json
 schemas/tools/*.input.schema.json
@@ -1098,6 +1099,14 @@ handoff.missing event
 
 `NormalizedIssue` is the stable shape used by orchestrator, prompt rendering, API, dashboard, and review metadata.
 
+The normative JSON Schema for this DTO is:
+
+```text
+schemas/normalized_issue.schema.json
+```
+
+The OpenAPI `Issue` schema MUST expose the same required field set as `schemas/normalized_issue.schema.json`. If prompt aliases, dashboard fields, or tool responses need new issue fields, update `TECH_SPEC.md`, `schemas/normalized_issue.schema.json`, and `api/openapi.yaml` in the same change.
+
 Required fields:
 
 ```text
@@ -1846,7 +1855,7 @@ Startup behavior:
 ```text
 1. detect installed `codex app-server` version and generated protocol/schema version
 2. look up committed fixture for that version
-3. if no fixture exists, fail before dispatch with unsupported_codex_version
+3. if no fixture exists, fail before launching the real Codex process with unsupported_codex_version
 4. emit codex.version_checked event
 5. only then launch the real adapter
 ```
@@ -2179,6 +2188,17 @@ followup.create
 handoff.submit
 ```
 
+Tool Gateway registry names are dot-separated. The agent-facing CLI uses grouped subcommands and MUST map them exactly as follows:
+
+| Registry tool | CLI command | Input schema |
+|---|---|---|
+| `issue.get` | `symphony tool issue get` | `schemas/tools/issue_get.input.schema.json` |
+| `issue.comment` | `symphony tool issue comment --json <file>` | `schemas/tools/issue_comment.input.schema.json` |
+| `issue.block` | `symphony tool issue block --json <file>` | `schemas/tools/issue_block.input.schema.json` |
+| `artifact.attach` | `symphony tool artifact attach --json <file>` | `schemas/tools/artifact_attach.input.schema.json` |
+| `followup.create` | `symphony tool followup create --json <file>` | `schemas/tools/followup_create.input.schema.json` |
+| `handoff.submit` | `symphony tool handoff submit --json <file>` | `schemas/tools/handoff_submit.input.schema.json` |
+
 No tool provides issue delete, Done, arbitrary state, project settings, workspace delete, git push, PR, secret read, or remote publish.
 
 Every tool call validates:
@@ -2205,7 +2225,7 @@ Normative tool input schemas are maintained under `schemas/tools/*.input.schema.
 {}
 ```
 
-Returns current issue as `NormalizedIssue`. Agent cannot request another issue.
+Returns current issue as `NormalizedIssue` validated against `schemas/normalized_issue.schema.json`. Agent cannot request another issue.
 
 `issue.comment` input:
 
@@ -2443,6 +2463,8 @@ POST   /api/v1/issues/{issue_ref}/dispatch
 POST   /api/v1/issues/{issue_ref}/dispatch-pause
 POST   /api/v1/issues/{issue_ref}/dispatch-resume
 ```
+
+Issue responses MUST use `NormalizedIssue` and therefore validate against both the OpenAPI `Issue` schema and `schemas/normalized_issue.schema.json`.
 
 Resource refs:
 
@@ -3331,7 +3353,7 @@ Diagnostics export is redacted-only. `include_raw_logs=true` MUST return `raw_lo
 | Cleanup | Never auto delete/reset/clean workspaces. | Terminal issue keeps workspace. |
 | Tool CLI policy | `symphony tool ...` allowed but gateway-authorized. | Wrong token denied. |
 | Issue refs | Path refs accept `iss_...` and `LOC-...`. | Both return same issue. |
-| Codex fixtures | Unsupported version fails before dispatch. | Unsupported fake version test. |
+| Codex fixtures | Unsupported version fails before launching the real Codex process, records `unsupported_codex_version`, and pauses dispatch. | Unsupported fake version test. |
 | Workflow reload | Active runs keep snapshot; invalid reload preserves last valid config. | Invalid reload does not crash active run. |
 | OpenAPI/DB | API/DB contracts are implemented from this Tech SPEC. | Contract tests and schema init tests. |
 | Rework | Same workspace/branch/base_sha; cumulative packet. | Human Review → Rework → Human Review creates immutable cumulative packet. |
@@ -3470,6 +3492,8 @@ Default CI MUST validate:
 JSON schemas parse as valid JSON Schema documents
 SQLite DDL executes on empty app/project databases
 OpenAPI document parses and contains every route listed in TECH_SPEC.md
+OpenAPI Issue schema required fields match schemas/normalized_issue.schema.json
+RunEvent schema requires seq for SSE replay IDs
 example WORKFLOW.default.md passes strict config validation
 example handoff/followup payloads pass their standalone Tool Gateway input schemas and wrapped Tool Gateway call schemas
 agent work orders reference only v1 in-scope capabilities
@@ -3594,7 +3618,7 @@ Deliver fixture-gated Codex adapter, process manager, protocol parser, approval 
 Acceptance:
 
 ```text
-unsupported Codex version fails before dispatch
+unsupported Codex version fails before launching the real Codex process
 approval bridge maps decisions correctly
 timeout and cancellation semantics match run lifecycle
 real Codex tests opt-in only

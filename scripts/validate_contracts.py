@@ -34,6 +34,32 @@ def load_json(rel: str) -> Any:
     return json.loads((ROOT / rel).read_text(encoding="utf-8"))
 
 
+def ref_name(ref: str) -> str:
+    return ref.rsplit("/", 1)[-1]
+
+
+def assert_required_and_props_match(
+    normalized_schema: dict[str, Any],
+    openapi_schema: dict[str, Any],
+    normalized_name: str,
+    openapi_name: str,
+) -> None:
+    normalized_defs = normalized_schema["$defs"]
+    openapi_components = openapi_schema["components"]["schemas"]
+    normalized = normalized_defs[normalized_name]
+    openapi = openapi_components[openapi_name]
+    normalized_required = set(normalized.get("required", []))
+    openapi_required = set(openapi.get("required", []))
+    if normalized_required != openapi_required:
+        fail(
+            f"NormalizedIssue {normalized_name} required fields must match OpenAPI {openapi_name}: "
+            f"{sorted(normalized_required ^ openapi_required)}"
+        )
+    missing_props = normalized_required - set(openapi.get("properties", {}))
+    if missing_props:
+        fail(f"OpenAPI {openapi_name} missing required NormalizedIssue properties: {sorted(missing_props)}")
+
+
 def validate_json() -> None:
     schema_paths = sorted((ROOT / "schemas").rglob("*.json"))
     example_paths = sorted((ROOT / "examples").glob("*.json"))
@@ -190,10 +216,87 @@ def validate_openapi() -> None:
         fail("ApprovalDecisionRequest enum drifted from TECH_SPEC")
 
     failure_schema = load_json("schemas/failure_codes.schema.json")
+    expected_failure_codes = set(failure_schema["$defs"]["failureCode"]["enum"])
+    openapi_failure_codes = set(data["components"]["schemas"]["FailureCode"]["enum"])
+    if expected_failure_codes != openapi_failure_codes:
+        fail(f"FailureCode mismatch: {sorted(expected_failure_codes ^ openapi_failure_codes)}")
     expected_api_errors = set(failure_schema["$defs"]["apiErrorCode"]["enum"])
     openapi_api_errors = set(data["components"]["schemas"]["ApiErrorCode"]["enum"])
     if expected_api_errors != openapi_api_errors:
         fail(f"ApiErrorCode mismatch: {sorted(expected_api_errors ^ openapi_api_errors)}")
+
+    normalized_issue_schema = load_json("schemas/normalized_issue.schema.json")
+    normalized_failure_codes = set(normalized_issue_schema["$defs"]["failureCode"]["enum"])
+    if expected_failure_codes != normalized_failure_codes:
+        fail(f"NormalizedIssue failureCode mismatch: {sorted(expected_failure_codes ^ normalized_failure_codes)}")
+    normalized_issue_required = set(normalized_issue_schema["required"])
+    openapi_issue = data["components"]["schemas"]["Issue"]
+    openapi_issue_required = set(openapi_issue.get("required", []))
+    if normalized_issue_required != openapi_issue_required:
+        fail(
+            "OpenAPI Issue required fields must match schemas/normalized_issue.schema.json: "
+            f"{sorted(normalized_issue_required ^ openapi_issue_required)}"
+        )
+    missing_issue_props = normalized_issue_required - set(openapi_issue.get("properties", {}))
+    if missing_issue_props:
+        fail(f"OpenAPI Issue schema missing NormalizedIssue properties: {sorted(missing_issue_props)}")
+
+    for prop in ("active_run_id", "latest_run_id", "latest_review_packet_id"):
+        normalized_pattern = normalized_issue_schema["properties"][prop].get("pattern")
+        openapi_pattern = openapi_issue["properties"][prop].get("pattern")
+        if normalized_pattern != openapi_pattern:
+            fail(
+                f"OpenAPI Issue.{prop} pattern must match schemas/normalized_issue.schema.json: "
+                f"expected {normalized_pattern!r}, got {openapi_pattern!r}"
+            )
+
+    expected_refs = {
+        "blocked_by": "IssueRefSummary",
+        "blocks": "IssueRefSummary",
+        "workspace": "WorkspaceSummary",
+        "git": "GitSummary",
+        "latest_run": "RunSummary",
+        "latest_review_packet": "IssueReviewPacketSummary",
+    }
+    for prop, expected_ref in expected_refs.items():
+        schema = openapi_issue["properties"][prop]
+        if prop in {"blocked_by", "blocks"}:
+            actual_ref = schema.get("items", {}).get("$ref", "")
+        else:
+            actual_ref = next((item.get("$ref", "") for item in schema.get("anyOf", []) if "$ref" in item), "")
+        if ref_name(actual_ref) != expected_ref:
+            fail(f"OpenAPI Issue.{prop} must reference {expected_ref}, got {actual_ref or 'none'}")
+
+    summary_pairs = [
+        ("issueRef", "IssueRefSummary"),
+        ("workspaceSummary", "WorkspaceSummary"),
+        ("gitSummary", "GitSummary"),
+        ("runSummary", "RunSummary"),
+        ("reviewPacketSummary", "IssueReviewPacketSummary"),
+    ]
+    for normalized_name, openapi_name in summary_pairs:
+        assert_required_and_props_match(normalized_issue_schema, data, normalized_name, openapi_name)
+
+    normalized_failure_code = normalized_issue_schema["$defs"]["runSummary"]["properties"]["failure_code"]
+    normalized_failure_refs = {item.get("$ref", "") for item in normalized_failure_code.get("anyOf", [])}
+    normalized_failure_null = any(item.get("type") == "null" for item in normalized_failure_code.get("anyOf", []))
+    if "#/$defs/failureCode" not in normalized_failure_refs or not normalized_failure_null:
+        fail("NormalizedIssue runSummary.failure_code must be failureCode or null")
+
+    openapi_failure_code = data["components"]["schemas"]["RunSummary"]["properties"]["failure_code"]
+    openapi_failure_refs = {item.get("$ref", "") for item in openapi_failure_code.get("anyOf", [])}
+    openapi_failure_null = any(item.get("type") == "null" for item in openapi_failure_code.get("anyOf", []))
+    if "#/components/schemas/FailureCode" not in openapi_failure_refs or not openapi_failure_null:
+        fail("OpenAPI RunSummary.failure_code must be FailureCode or null")
+
+    normalized_states = normalized_issue_schema["$defs"]["issueState"]["enum"]
+    openapi_states = data["components"]["schemas"]["IssueState"]["enum"]
+    if normalized_states != openapi_states:
+        fail("NormalizedIssue issueState enum must match OpenAPI IssueState enum")
+
+    run_event_schema = load_json("schemas/run_event.schema.json")
+    if "seq" not in run_event_schema.get("required", []):
+        fail("schemas/run_event.schema.json must require seq for SSE replay IDs")
     print("ok openapi api/openapi.yaml")
 
 

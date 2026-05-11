@@ -10,7 +10,7 @@
 | after_create_failed | after_create hook fails | failed | source_issue_state | true | If configured. |
 | before_run_failed | before_run hook fails | failed | source_issue_state | true | Runner not started. |
 | codex_startup_failed | codex process cannot start | failed | source_issue_state | true | Real adapter only. |
-| unsupported_codex_version | no committed fixture | failed | source_issue_state | true | Must fail before dispatch. |
+| unsupported_codex_version | no committed fixture | failed | source_issue_state | true | Must fail before launching real Codex process. |
 | codex_protocol_error | JSON-RPC/protocol mismatch | failed | source_issue_state | true | Include version info. |
 | turn_timeout | turn exceeds timeout | failed | source_issue_state | true | Terminate process group. |
 | stall_timeout | no events/progress | failed | source_issue_state | true | Terminate process group. |

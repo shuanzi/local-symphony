@@ -381,7 +381,7 @@ components:
       enum: [Inbox, Ready, Working, Rework, Blocked, Human Review, Done, Cancelled, Duplicate]
     Issue:
       type: object
-      required: [id, identifier, sequence_no, title, state, priority, dispatch_paused, created_at, updated_at]
+      required: [id, identifier, sequence_no, title, description, acceptance_criteria, priority, state, url, labels, blocked_by, blocks, dispatch_paused, dispatch_pause_reason, dispatch_paused_at, branch_name, workspace_path, base_ref, base_ref_config, base_sha, workspace, git, latest_run, active_run_id, latest_run_id, latest_review_packet, latest_review_packet_id, created_at, updated_at, completed_at, archived_at]
       properties:
         id: { type: string, pattern: "^iss_" }
         identifier: { type: string }
@@ -391,20 +391,71 @@ components:
         acceptance_criteria: { type: array, items: { type: string } }
         state: { $ref: '#/components/schemas/IssueState' }
         priority: { type: integer, minimum: 1, maximum: 5 }
+        url: { type: [string, 'null'] }
         labels: { type: array, items: { type: string } }
-        blocked_by: { type: array, items: { type: string } }
-        blocks: { type: array, items: { type: string } }
+        blocked_by: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
+        blocks: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
         dispatch_paused: { type: boolean }
         dispatch_pause_reason: { type: [string, 'null'] }
         dispatch_paused_at: { type: [string, 'null'], format: date-time }
         branch_name: { type: [string, 'null'] }
         workspace_path: { type: [string, 'null'] }
-        latest_run_id: { type: [string, 'null'] }
-        latest_review_packet_id: { type: [string, 'null'] }
+        base_ref: { type: [string, 'null'] }
+        base_ref_config: { type: [string, 'null'] }
+        base_sha: { type: [string, 'null'] }
+        workspace:
+          anyOf:
+            - { $ref: '#/components/schemas/WorkspaceSummary' }
+            - { type: 'null' }
+        git:
+          anyOf:
+            - { $ref: '#/components/schemas/GitSummary' }
+            - { type: 'null' }
+        latest_run:
+          anyOf:
+            - { $ref: '#/components/schemas/RunSummary' }
+            - { type: 'null' }
+        active_run_id: { type: [string, 'null'], pattern: "^run_" }
+        latest_run_id: { type: [string, 'null'], pattern: "^run_" }
+        latest_review_packet:
+          anyOf:
+            - { $ref: '#/components/schemas/IssueReviewPacketSummary' }
+            - { type: 'null' }
+        latest_review_packet_id: { type: [string, 'null'], pattern: "^rp_" }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         completed_at: { type: [string, 'null'], format: date-time }
         archived_at: { type: [string, 'null'], format: date-time }
+    IssueRefSummary:
+      type: object
+      required: [id, identifier, title, state]
+      additionalProperties: false
+      properties:
+        id: { type: string, pattern: "^iss_" }
+        identifier: { type: string }
+        title: { type: string }
+        state: { $ref: '#/components/schemas/IssueState' }
+    WorkspaceSummary:
+      type: object
+      required: [id, path, branch_name, base_ref, base_ref_config, base_sha, status]
+      additionalProperties: false
+      properties:
+        id: { type: string, pattern: "^ws_" }
+        path: { type: string }
+        branch_name: { type: string }
+        base_ref: { type: string }
+        base_ref_config: { type: string }
+        base_sha: { type: string }
+        status: { type: string, enum: [prepared, conflict, missing] }
+    GitSummary:
+      type: object
+      required: [branch_name, base_ref, base_ref_config, base_sha]
+      additionalProperties: false
+      properties:
+        branch_name: { type: [string, 'null'] }
+        base_ref: { type: [string, 'null'] }
+        base_ref_config: { type: [string, 'null'] }
+        base_sha: { type: [string, 'null'] }
     IssueEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Issue' } } } ]
     IssueListEnvelope:
@@ -485,6 +536,16 @@ components:
     RunStatus:
       type: string
       enum: [pending, preparing_workspace, rendering_prompt, starting_agent, running, completed, completed_without_handoff, failed, cancelled]
+    RunSummary:
+      type: object
+      required: [id, status, attempt_no, created_at]
+      additionalProperties: true
+      properties:
+        id: { type: string, pattern: "^run_" }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        attempt_no: { type: integer, minimum: 1 }
+        failure_code: { anyOf: [ { $ref: '#/components/schemas/FailureCode' }, { type: 'null' } ] }
+        created_at: { type: string, format: date-time }
     RunAttempt:
       type: object
       required: [id, issue_id, attempt_no, status, source_issue_state, created_at]
@@ -579,6 +640,16 @@ components:
         diffstat_path: { type: [string, 'null'] }
         failure_code: { type: [string, 'null'] }
         failure_message: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+    IssueReviewPacketSummary:
+      type: object
+      required: [id, run_id, packet_no, status, created_at]
+      additionalProperties: true
+      properties:
+        id: { type: string, pattern: "^rp_" }
+        run_id: { type: string, pattern: "^run_" }
+        packet_no: { type: integer, minimum: 1 }
+        status: { type: string, enum: [generated, partial, failed] }
         created_at: { type: string, format: date-time }
     ReviewPacketEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ReviewPacketSummary' } } } ]

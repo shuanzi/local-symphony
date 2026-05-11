@@ -5,6 +5,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "seq",
     "id",
     "project_id",
     "event_type",

@@ -218,7 +218,7 @@ workspace 在 Done、Cancelled、Duplicate、Blocked、failed、interrupted 和 
 
 ### 8.4 Codex Runner
 
-Codex Runner 使用 `codex app-server`。v1 要求 Codex adapter 是 version-fixture gated：只有有 committed fixture 的 Codex protocol version 才可运行；不支持的版本必须在 dispatch 前失败并给出 `unsupported_codex_version`。
+Codex Runner 使用 `codex app-server`。v1 要求 Codex adapter 是 version-fixture gated：只有有 committed fixture 的 Codex protocol version 才可运行；不支持的版本必须在启动真实 Codex process 前失败，并给出 `unsupported_codex_version`。
 
 默认测试使用 fake runner。Real Codex tests 只在显式设置 `SYMPHONY_TEST_CODEX=1` 时运行。
 
@@ -369,7 +369,7 @@ redacted diagnostics export only
 | REST/SSE API | `api/openapi.yaml` | 生成 API client、handler stub、contract tests。 |
 | App DB | `db/schema/v1_app.sql` | daemon/app 级项目注册、session、open token、runtime 元数据。 |
 | Project DB | `db/schema/v1_project.sql` | issue、run、event、approval、tool、handoff、review packet 本地 source of truth。 |
-| JSON Schema | `schemas/*.schema.json`、`schemas/tools/*.input.schema.json` | 校验 WORKFLOW config、RunEvent、Tool Gateway、各工具输入、Review Packet、Diagnostics、FailureCode。 |
+| JSON Schema | `schemas/*.schema.json`、`schemas/tools/*.input.schema.json` | 校验 WORKFLOW config、NormalizedIssue、RunEvent、Tool Gateway、各工具输入、Review Packet、Diagnostics、FailureCode。 |
 | 默认模板 | `examples/WORKFLOW.default.md` | `symphony init` 默认生成的 repo-owned workflow。 |
 | 开发任务包 | `docs/agent_work_orders/M0-M8` | 将 v1 拆成可验收 milestone，避免 agent 自行发散。 |
 | 验收材料 | `docs/testing/*` | 给 test/review agent 执行端到端验证。 |

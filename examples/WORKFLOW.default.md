@@ -85,6 +85,8 @@ Rules:
 symphony tool handoff submit --json ./handoff.json
 ```
 
+This command maps to Tool Gateway registry tool `handoff.submit`.
+
 Required handoff fields:
 
 ```json
