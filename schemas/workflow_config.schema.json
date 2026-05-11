@@ -82,7 +82,10 @@
       "properties": {
         "root": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "not": {
+            "pattern": "\\{\\{|\\}\\}"
+          }
         },
         "cleanup": {
           "type": "object",
@@ -151,7 +154,10 @@
           "const": "worktree"
         },
         "repo_root": {
-          "type": "string"
+          "type": "string",
+          "not": {
+            "pattern": "\\{\\{|\\}\\}"
+          }
         },
         "base_ref": {
           "type": "string"
@@ -176,7 +182,8 @@
       "required": [
         "max_concurrent_agents",
         "handoff_required",
-        "handoff_state"
+        "handoff_state",
+        "pause_on_missing_handoff"
       ],
       "properties": {
         "max_concurrent_agents": {
@@ -212,9 +219,7 @@
         },
         "transport": {
           "enum": [
-            "stdio",
-            "websocket",
-            "unix"
+            "stdio"
           ]
         },
         "experimental_api": {

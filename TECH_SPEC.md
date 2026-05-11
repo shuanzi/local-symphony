@@ -72,8 +72,10 @@ db/schema/v1_project.sql
 schemas/workflow_config.schema.json
 schemas/run_event.schema.json
 schemas/tool_gateway.schema.json
+schemas/tools/*.input.schema.json
 schemas/review_packet.schema.json
 schemas/diagnostics.schema.json
+schemas/failure_codes.schema.json
 docs/agent_work_orders/*.md
 docs/testing/*.md
 docs/codex/*.md
@@ -627,15 +629,16 @@ All timestamps are UTC RFC3339 `TEXT`. Booleans are `INTEGER CHECK (field IN (0,
 
 ### 7.3 Schema version handling
 
-Each DB MUST have exactly one `schema_version` row with `version = 1`.
+Each DB MUST have a `schema_meta` table containing exactly one `key = 'schema_version'` row with `value = '1'`.
 
 | Condition | Behavior |
 |---|---|
 | DB missing | Initialize schema v1. |
-| `schema_version` missing | Fail with `unsupported_db_version`; do not mutate. |
-| `schema_version.version = 1` | Continue. |
-| `schema_version.version > 1` | Fail with `unsupported_db_version`; do not mutate. |
-| `schema_version.version < 1` | Fail with `unsupported_db_version`; no migration in v1. |
+| `schema_meta` missing or `schema_version` key missing | Fail with `unsupported_db_version`; do not mutate. |
+| `schema_meta['schema_version'] = '1'` | Continue. |
+| `schema_meta['schema_version']` parses to a version greater than 1 | Fail with `unsupported_db_version`; do not mutate. |
+| `schema_meta['schema_version']` parses to a version less than 1 | Fail with `unsupported_db_version`; no migration in v1. |
+| `schema_meta['schema_version']` cannot be parsed | Fail with `unsupported_db_version`; do not mutate. |
 
 v1 has no production migration or rollback flow.
 
@@ -683,13 +686,15 @@ All timestamps MUST be RFC3339 UTC strings. Boolean values MUST be stored as INT
 Tables:
 
 ```text
-schema_version
-registered_projects
+schema_meta
+projects
 app_settings
 local_sessions
+open_tokens
+runtime_descriptors
 ```
 
-`registered_projects` fields:
+`projects` fields:
 
 ```text
 id
@@ -703,24 +708,29 @@ updated_at
 last_opened_at
 ```
 
-`local_sessions` stores only token hashes:
+`local_sessions` stores only token/CSRF hashes and local session metadata:
 
 ```text
 id
+project_id
 kind ∈ browser|cli|desktop
 token_hash UNIQUE
+csrf_hash
+user_label
 created_at
 last_seen_at
 expires_at
 revoked_at
 ```
 
+`open_tokens` are one-time browser bootstrap tokens stored hash-only. `runtime_descriptors` is a non-secret cache of daemon endpoint metadata; the authoritative runtime descriptor remains the file under `~/.symphony/runtime/`.
+
 ### 7.6 Project DB contract
 
 Tables:
 
 ```text
-schema_version
+schema_meta
 project_info
 project_settings
 counters
@@ -754,7 +764,7 @@ title
 description
 acceptance_criteria_json
 state ∈ Inbox|Ready|Working|Rework|Blocked|Human Review|Done|Cancelled|Duplicate
-priority INTEGER 1..4, where 1 is highest
+priority INTEGER 1..5, where 1 is highest and 3 is the default
 dispatch_paused 0/1
 dispatch_pause_reason
 dispatch_paused_at
@@ -793,6 +803,7 @@ id
 issue_id UNIQUE
 path UNIQUE
 branch_name
+base_ref_config
 base_ref
 base_sha
 status ∈ prepared|conflict|missing
@@ -842,12 +853,14 @@ Key fields:
 ```text
 id
 issue_id
+attempt_no
 workspace_id
 workflow_snapshot_id
 status
 dispatch_reason ∈ manual|scheduler|manual_recovery
 source_issue_state ∈ Ready|Rework
 runner_kind ∈ fake|codex
+base_ref_config
 base_ref
 base_sha
 branch_name
@@ -887,10 +900,12 @@ id
 issue_id
 run_id
 kind ∈ command|file_change|network
-status ∈ pending|approved_once|approved_always|denied|auto_denied|cancelled|timeout
+status ∈ pending|approved_once|approved_for_run|approved_for_session|denied|auto_denied|cancelled|timeout
 request_json
 decision_json
 reason
+timeout_ms
+expires_at
 created_at
 resolved_at
 ```
@@ -957,7 +972,7 @@ The first successful handoff for a run wins. Handoff idempotency source is `hand
 id
 issue_id
 run_id
-kind ∈ test_output|patch|changed_files|untracked_files|prompt_snapshot|codex_log|review_packet|agent_file|diagnostic|other
+kind ∈ test_output|patch|changed_files|untracked_files|diffstat|prompt_snapshot|codex_log|review_packet|agent_file|diagnostic|other
 path             # project-local relative only
 mime_type
 size_bytes
@@ -993,6 +1008,8 @@ Prompt snapshot files MUST be durable before inserting `prompt_snapshots`.
 id
 issue_id
 run_id
+handoff_id
+packet_no
 status ∈ generated|partial|failed
 root_path
 review_md_path
@@ -1000,14 +1017,14 @@ review_json_path
 patch_path
 changed_files_path
 untracked_files_path
-handoff_id
+diffstat_path
 prompt_snapshot_id
 failure_code
 failure_message
 created_at
 ```
 
-A `generated` row MUST NOT point to missing critical files.
+A `generated` row MUST NOT point to missing critical files. `partial` and `failed` rows may omit file-path columns, but cannot satisfy Mark Done guards.
 
 ### 7.7 Transaction rules
 
@@ -1016,7 +1033,7 @@ Create issue transaction:
 ```text
 increment counters.issue_sequence
 insert issue
-insert state_history
+insert issue_state_history
 insert issue.created event
 ```
 
@@ -1026,7 +1043,7 @@ Transition issue transaction:
 validate transition
 if transition leaves active states and an active run exists, enqueue reconciliation cancel
 update issue state
-insert state_history
+insert issue_state_history
 insert issue.transitioned event
 ```
 
@@ -1063,7 +1080,7 @@ insert review_packet status=generated
 run.status = completed
 issue.state = Human Review
 clear dispatch_paused
-insert state_history
+insert issue_state_history
 insert review.packet_generated event
 ```
 
@@ -2180,6 +2197,8 @@ input schema and unknown-field rejection
 
 ### 11.5 Tool schemas
 
+Normative tool input schemas are maintained under `schemas/tools/*.input.schema.json`; `schemas/tool_gateway.schema.json` defines the `{tool,input}` call envelope and embeds the same input constraints for lightweight validation.
+
 `issue.get` input:
 
 ```json
@@ -2519,6 +2538,7 @@ Content access MUST enforce containment under `.symphony/artifacts` or `.symphon
 
 ```http
 GET  /api/v1/workflow
+POST /api/v1/workflow/validate
 POST /api/v1/workflow/reload
 GET  /api/v1/diagnostics
 POST /api/v1/diagnostics/export
@@ -2595,6 +2615,8 @@ before_run_failed
 codex_startup_failed
 unsupported_codex_version
 codex_protocol_error
+turn_timeout
+stall_timeout
 approval_not_pending
 approval_timeout
 review_packet_required
@@ -2605,6 +2627,7 @@ operator_cancelled
 agent_blocked
 issue_state_changed
 canceled_by_reconciliation
+daemon_restarted_run_interrupted
 command_denied
 network_denied
 protected_path_denied
@@ -2974,16 +2997,23 @@ Artifact kinds:
 
 ### 14.4 review.json shape
 
+`review.json` is a file-level review packet document and MUST validate against `schemas/review_packet.schema.json`. It is not the same shape as the REST `ReviewPacketSummary`.
+
 ```json
 {
+  "id": "rp_...",
+  "packet_no": 1,
+  "status": "generated",
   "issue": {
     "id": "iss_...",
     "identifier": "LOC-1",
-    "title": "..."
+    "title": "...",
+    "acceptance_criteria": []
   },
   "run": {
     "id": "run_...",
-    "status": "completed"
+    "status": "completed",
+    "source_issue_state": "Ready"
   },
   "git": {
     "branch_name": "symphony/LOC-1-...",
@@ -2992,6 +3022,14 @@ Artifact kinds:
     "base_sha": "...",
     "head_sha": "...",
     "dirty": true
+  },
+  "files": {
+    "review_md_path": "review.md",
+    "review_json_path": "review.json",
+    "patch_path": "changes.patch",
+    "changed_files_path": "changed-files.txt",
+    "untracked_files_path": "untracked-files.json",
+    "diffstat_path": "diffstat.txt"
   },
   "handoff": {
     "summary": "...",
@@ -3007,7 +3045,10 @@ Artifact kinds:
     "id": "ps_...",
     "rendered_prompt_hash": "...",
     "tool_manifest_path": "prompt/tool_manifest.md"
-  }
+  },
+  "failure_code": null,
+  "failure_message": null,
+  "created_at": "2026-05-11T00:00:00Z"
 }
 ```
 
@@ -3102,7 +3143,7 @@ Side effects:
 issue.state = Rework
 issues.dispatch_paused = false
 clear dispatch pause reason/timestamp
-insert state_history Human Review → Rework
+insert issue_state_history Human Review → Rework
 insert operator/system comment with feedback
 emit review.sent_to_rework
 ```
@@ -3430,7 +3471,7 @@ JSON schemas parse as valid JSON Schema documents
 SQLite DDL executes on empty app/project databases
 OpenAPI document parses and contains every route listed in TECH_SPEC.md
 example WORKFLOW.default.md passes strict config validation
-example handoff/followup payloads pass Tool Gateway schemas
+example handoff/followup payloads pass their standalone Tool Gateway input schemas and wrapped Tool Gateway call schemas
 agent work orders reference only v1 in-scope capabilities
 ```
 

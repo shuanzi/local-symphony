@@ -39,7 +39,8 @@ TECH_SPEC.md                    # 技术架构、状态机、模块职责、安�
 api/openapi.yaml                # REST/SSE API 可机器校验合同
 db/schema/v1_app.sql            # app-level SQLite DDL
 db/schema/v1_project.sql        # project-level SQLite DDL
-schemas/*.schema.json           # WORKFLOW、RunEvent、Tool Gateway、Review Packet、Diagnostics JSON Schema
+schemas/*.schema.json           # WORKFLOW、RunEvent、Tool Gateway、Review Packet、Diagnostics、FailureCode JSON Schema
+schemas/tools/*.input.schema.json # Tool Gateway 各工具输入 schema
 examples/WORKFLOW.default.md    # 默认 WORKFLOW.md 模板
 examples/handoff.json           # agent handoff 输入示例
 examples/followup.json          # agent followup 输入示例
@@ -65,12 +66,18 @@ docs/codex/FIXTURE_POLICY.md    # Codex fixture-gated 策略
 ```text
 api/openapi.yaml
 schemas/*.schema.json
+schemas/tools/*.input.schema.json
 db/schema/*.sql
 docs/testing/*.md
 docs/agent_work_orders/*.md
 ```
 
 它们不是新的产品 source of truth，而是 `TECH_SPEC.md` 的机器可读落地形态。实现时不得只读 PRD/TECH_SPEC 后自行发明 API、DB 或 JSON shape。
+
+
+### 2.4 Historical patch files
+
+如文档包根目录中存在 `local-symphony-*.patch` 历史文件，它们只作为修订记录保存，不属于 v1 可执行合同；implementation agent 不得自动应用这些 patch，也不得以其中旧内容覆盖当前 PRD、Tech SPEC、OpenAPI、SQL 或 JSON Schema。
 
 ---
 
@@ -282,7 +289,7 @@ v1 完成时必须至少满足：
 
 ```text
 可以初始化本地项目。
-可以创建、编辑、评论、转态、阻塞、dispatch 本地 issue。
+可以创建、编辑、评论、状态流转、阻塞、dispatch 本地 issue。
 Ready/Rework issue 可以被 orchestrator 或手动 dispatch。
 失败后 issue 回到 dispatch 前来源状态并 pause，resume 后可以重新调度。
 每个 issue 在独立 git worktree 和 branch 内运行。
@@ -311,7 +318,7 @@ Dashboard、CLI、REST、SSE 能反映 issue、run、approval、review packet �
 技术合同变化先改 TECH_SPEC.md。
 API 变化必须同步 api/openapi.yaml。
 DB 变化必须同步 db/schema/*.sql。
-JSON shape 变化必须同步 schemas/*.schema.json。
+JSON shape 变化必须同步 schemas/*.schema.json 与 schemas/tools/*.input.schema.json。
 验收变化必须同步 docs/testing/ACCEPTANCE.md 与相关 work order。
 README.md 只同步入口说明和高层摘要。
 不要新增与 v1 非目标冲突的实现要求，除非同时明确版本升级。

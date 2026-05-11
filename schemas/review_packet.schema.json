@@ -1,23 +1,40 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://local-symphony.dev/schemas/review_packet.schema.json",
-  "title": "Review Packet",
+  "title": "Review Packet File",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "id",
-    "issue",
-    "run",
     "packet_no",
     "status",
+    "issue",
+    "run",
+    "git",
     "files",
     "handoff",
+    "changed_files",
+    "untracked_files",
+    "approvals",
+    "tool_calls",
+    "prompt_snapshot",
     "created_at"
   ],
   "properties": {
     "id": {
       "type": "string",
-      "pattern": "^rev_"
+      "pattern": "^rp_"
+    },
+    "packet_no": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "enum": [
+        "generated",
+        "partial",
+        "failed"
+      ]
     },
     "issue": {
       "type": "object",
@@ -29,13 +46,20 @@
       "additionalProperties": true,
       "properties": {
         "id": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^iss_"
         },
         "identifier": {
           "type": "string"
         },
         "title": {
           "type": "string"
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
@@ -43,12 +67,22 @@
       "type": "object",
       "required": [
         "id",
+        "status",
         "source_issue_state"
       ],
       "additionalProperties": true,
       "properties": {
         "id": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^run_"
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "failed",
+            "cancelled",
+            "completed_without_handoff"
+          ]
         },
         "source_issue_state": {
           "enum": [
@@ -58,72 +92,238 @@
         }
       }
     },
-    "packet_no": {
-      "type": "integer",
-      "minimum": 1
-    },
-    "status": {
-      "enum": [
-        "generated",
-        "failed"
-      ]
-    },
-    "files": {
+    "git": {
       "type": "object",
       "required": [
-        "review_md",
-        "review_json",
-        "changes_patch",
-        "changed_files",
-        "untracked_files"
+        "branch_name",
+        "base_ref",
+        "base_ref_config",
+        "base_sha"
       ],
       "additionalProperties": true,
       "properties": {
-        "review_md": {
+        "branch_name": {
           "type": "string"
         },
-        "review_json": {
+        "base_ref": {
           "type": "string"
         },
-        "changes_patch": {
+        "base_ref_config": {
           "type": "string"
         },
-        "changed_files": {
+        "base_sha": {
           "type": "string"
         },
-        "untracked_files": {
+        "head_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "type": "boolean"
+        }
+      }
+    },
+    "files": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "review_md_path": {
           "type": "string"
         },
-        "diffstat": {
+        "review_json_path": {
           "type": "string"
+        },
+        "patch_path": {
+          "type": "string"
+        },
+        "changed_files_path": {
+          "type": "string"
+        },
+        "untracked_files_path": {
+          "type": "string"
+        },
+        "diffstat_path": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
     "handoff": {
       "type": "object",
-      "additionalProperties": true
-    },
-    "tests": {
-      "type": "array",
-      "items": {
-        "type": "string"
+      "required": [
+        "summary",
+        "tests",
+        "risks",
+        "verification"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "summary": {
+          "type": "string"
+        },
+        "tests": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verification": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
       }
     },
-    "risks": {
+    "changed_files": {
       "type": "array",
       "items": {
-        "type": "string"
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "required": [
+              "path"
+            ],
+            "additionalProperties": true,
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "patch_included": {
+                "type": "boolean"
+              }
+            }
+          }
+        ]
       }
     },
-    "verification": {
+    "untracked_files": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "object",
+        "required": [
+          "path",
+          "size_bytes",
+          "sha256",
+          "patch_included"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "patch_included": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       }
+    },
+    "approvals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "tool_calls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "prompt_snapshot": {
+      "type": "object",
+      "required": [
+        "id",
+        "rendered_prompt_hash",
+        "tool_manifest_path"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^ps_"
+        },
+        "rendered_prompt_hash": {
+          "type": "string"
+        },
+        "tool_manifest_path": {
+          "type": "string"
+        }
+      }
+    },
+    "failure_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "failure_message": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "created_at": {
       "type": "string",
       "format": "date-time"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "generated"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "files": {
+            "required": [
+              "review_md_path",
+              "review_json_path",
+              "patch_path",
+              "changed_files_path",
+              "untracked_files_path"
+            ]
+          }
+        }
+      }
+    }
+  ]
 }

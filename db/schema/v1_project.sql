@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS project_info (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS project_settings (
+  key TEXT PRIMARY KEY,
+  value_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS counters (
   name TEXT PRIMARY KEY,
   value INTEGER NOT NULL CHECK (value >= 0)
@@ -37,7 +43,7 @@ CREATE TABLE IF NOT EXISTS workflow_snapshots (
 
 CREATE TABLE IF NOT EXISTS issues (
   id TEXT PRIMARY KEY,
-  sequence INTEGER NOT NULL UNIQUE CHECK (sequence > 0),
+  sequence_no INTEGER NOT NULL UNIQUE CHECK (sequence_no > 0),
   identifier TEXT NOT NULL UNIQUE,
   title TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
@@ -52,11 +58,28 @@ CREATE TABLE IF NOT EXISTS issues (
   created_by_type TEXT NOT NULL DEFAULT 'operator' CHECK (created_by_type IN ('operator','agent','system')),
   created_by_run_id TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  archived_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_issues_state_priority_created ON issues(state, priority, created_at, identifier);
 CREATE INDEX IF NOT EXISTS idx_issues_dispatch ON issues(state, dispatch_paused);
+
+CREATE TABLE IF NOT EXISTS issue_state_history (
+  id TEXT PRIMARY KEY,
+  issue_id TEXT NOT NULL,
+  from_state TEXT CHECK (from_state IS NULL OR from_state IN ('Inbox','Ready','Working','Rework','Blocked','Human Review','Done','Cancelled','Duplicate')),
+  to_state TEXT NOT NULL CHECK (to_state IN ('Inbox','Ready','Working','Rework','Blocked','Human Review','Done','Cancelled','Duplicate')),
+  actor_type TEXT NOT NULL CHECK (actor_type IN ('operator','agent','system','orchestrator')),
+  actor_id TEXT,
+  run_id TEXT,
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_issue_state_history_issue_created ON issue_state_history(issue_id, created_at);
 
 CREATE TABLE IF NOT EXISTS issue_labels (
   issue_id TEXT NOT NULL,
@@ -103,6 +126,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
   issue_id TEXT NOT NULL UNIQUE,
   path TEXT NOT NULL UNIQUE,
   branch_name TEXT NOT NULL,
+  base_ref_config TEXT NOT NULL DEFAULT 'auto',
   base_ref TEXT NOT NULL,
   base_sha TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('prepared','conflict','missing')),
@@ -114,12 +138,14 @@ CREATE TABLE IF NOT EXISTS workspaces (
 CREATE TABLE IF NOT EXISTS run_attempts (
   id TEXT PRIMARY KEY,
   issue_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
   workspace_id TEXT,
   workflow_snapshot_id TEXT,
   status TEXT NOT NULL CHECK (status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running','completed','completed_without_handoff','failed','cancelled')),
   dispatch_reason TEXT NOT NULL DEFAULT 'manual' CHECK (dispatch_reason IN ('manual','scheduler','manual_recovery')),
   source_issue_state TEXT NOT NULL CHECK (source_issue_state IN ('Ready','Rework')),
   runner_kind TEXT NOT NULL CHECK (runner_kind IN ('fake','codex')),
+  base_ref_config TEXT,
   base_ref TEXT,
   base_sha TEXT,
   branch_name TEXT,
@@ -131,7 +157,8 @@ CREATE TABLE IF NOT EXISTS run_attempts (
   updated_at TEXT NOT NULL,
   FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE,
   FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL,
-  FOREIGN KEY(workflow_snapshot_id) REFERENCES workflow_snapshots(id) ON DELETE SET NULL
+  FOREIGN KEY(workflow_snapshot_id) REFERENCES workflow_snapshots(id) ON DELETE SET NULL,
+  UNIQUE(issue_id, attempt_no)
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_attempts_issue_created ON run_attempts(issue_id, created_at DESC);
@@ -161,10 +188,12 @@ CREATE TABLE IF NOT EXISTS approval_requests (
   run_id TEXT NOT NULL,
   issue_id TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('command','file_change','network')),
-  status TEXT NOT NULL CHECK (status IN ('pending','approved_once','approved_always','denied','auto_denied','cancelled','timeout')),
+  status TEXT NOT NULL CHECK (status IN ('pending','approved_once','approved_for_run','approved_for_session','denied','auto_denied','cancelled','timeout')),
   request_json TEXT NOT NULL,
   decision_json TEXT,
   reason TEXT,
+  timeout_ms INTEGER CHECK (timeout_ms IS NULL OR timeout_ms > 0),
+  expires_at TEXT,
   created_at TEXT NOT NULL,
   resolved_at TEXT,
   FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
@@ -178,11 +207,11 @@ CREATE TABLE IF NOT EXISTS run_tool_tokens (
   run_id TEXT NOT NULL,
   issue_id TEXT NOT NULL,
   token_hash TEXT NOT NULL UNIQUE,
-  allowed_tools_json TEXT NOT NULL,
-  workspace_path TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  revoked_at TEXT,
+  scope_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  last_used_at TEXT,
+  revoked_at TEXT,
   FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
   FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE
 );
@@ -191,32 +220,40 @@ CREATE INDEX IF NOT EXISTS idx_run_tool_tokens_run ON run_tool_tokens(run_id);
 
 CREATE TABLE IF NOT EXISTS tool_calls (
   id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
   issue_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
   tool_name TEXT NOT NULL,
-  request_json TEXT NOT NULL,
-  response_json TEXT,
-  status TEXT NOT NULL CHECK (status IN ('succeeded','failed','rejected')),
-  failure_code TEXT,
-  created_at TEXT NOT NULL,
-  completed_at TEXT,
-  FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
-  FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE
+  status TEXT NOT NULL CHECK (status IN ('started','succeeded','failed')),
+  input_hash TEXT,
+  input_json_redacted TEXT,
+  output_hash TEXT,
+  output_json_redacted TEXT,
+  error_code TEXT,
+  error_message TEXT,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_tool_calls_run_created ON tool_calls(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_run_started ON tool_calls(run_id, started_at);
 
 CREATE TABLE IF NOT EXISTS handoffs (
   id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL UNIQUE,
   issue_id TEXT NOT NULL,
+  run_id TEXT NOT NULL UNIQUE,
   payload_hash TEXT NOT NULL,
-  payload_json TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('received','finalized','rejected')),
-  created_at TEXT NOT NULL,
-  finalized_at TEXT,
-  FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
-  FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE
+  payload_json_redacted TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  changed_files_json TEXT NOT NULL DEFAULT '[]',
+  tests_json TEXT NOT NULL DEFAULT '[]',
+  risks_json TEXT NOT NULL DEFAULT '[]',
+  verification_json TEXT NOT NULL DEFAULT '[]',
+  followups_json TEXT NOT NULL DEFAULT '[]',
+  target_state TEXT NOT NULL DEFAULT 'Human Review' CHECK (target_state = 'Human Review'),
+  submitted_at TEXT NOT NULL,
+  FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE CASCADE
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_handoffs_run_hash ON handoffs(run_id, payload_hash);
@@ -226,14 +263,17 @@ CREATE TABLE IF NOT EXISTS artifacts (
   issue_id TEXT,
   run_id TEXT,
   review_packet_id TEXT,
-  kind TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('test_output','patch','changed_files','untracked_files','diffstat','prompt_snapshot','codex_log','review_packet','agent_file','diagnostic','other')),
   path TEXT NOT NULL,
-  sha256 TEXT,
+  mime_type TEXT,
   size_bytes INTEGER CHECK (size_bytes IS NULL OR size_bytes >= 0),
+  sha256 TEXT,
+  redacted INTEGER NOT NULL DEFAULT 1 CHECK (redacted IN (0,1)),
   description TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE SET NULL,
-  FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE SET NULL
+  FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE SET NULL,
+  FOREIGN KEY(review_packet_id) REFERENCES review_packets(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_run_kind ON artifacts(run_id, kind);
@@ -243,10 +283,14 @@ CREATE TABLE IF NOT EXISTS prompt_snapshots (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL UNIQUE,
   workflow_snapshot_id TEXT,
+  runtime_envelope_version TEXT NOT NULL,
+  tool_manifest_version TEXT NOT NULL,
+  context_hash TEXT NOT NULL,
+  rendered_prompt_hash TEXT NOT NULL,
+  context_json_path TEXT NOT NULL,
   redacted_prompt_path TEXT NOT NULL,
-  raw_prompt_path TEXT,
-  prompt_sha256 TEXT NOT NULL,
-  metadata_json TEXT NOT NULL,
+  prompt_meta_json_path TEXT NOT NULL,
+  tool_manifest_path TEXT NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
   FOREIGN KEY(workflow_snapshot_id) REFERENCES workflow_snapshots(id) ON DELETE SET NULL
@@ -258,12 +302,13 @@ CREATE TABLE IF NOT EXISTS review_packets (
   run_id TEXT NOT NULL UNIQUE,
   handoff_id TEXT NOT NULL,
   packet_no INTEGER NOT NULL CHECK (packet_no > 0),
-  status TEXT NOT NULL CHECK (status IN ('generated','failed')),
-  review_md_path TEXT NOT NULL,
-  review_json_path TEXT NOT NULL,
-  patch_path TEXT NOT NULL,
-  changed_files_path TEXT NOT NULL,
-  untracked_files_path TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('generated','partial','failed')),
+  root_path TEXT NOT NULL,
+  review_md_path TEXT,
+  review_json_path TEXT,
+  patch_path TEXT,
+  changed_files_path TEXT,
+  untracked_files_path TEXT,
   diffstat_path TEXT,
   prompt_snapshot_id TEXT,
   failure_code TEXT,
@@ -273,7 +318,16 @@ CREATE TABLE IF NOT EXISTS review_packets (
   FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
   FOREIGN KEY(handoff_id) REFERENCES handoffs(id) ON DELETE CASCADE,
   FOREIGN KEY(prompt_snapshot_id) REFERENCES prompt_snapshots(id) ON DELETE SET NULL,
-  UNIQUE(issue_id, packet_no)
+  UNIQUE(issue_id, packet_no),
+  CHECK (
+    status <> 'generated' OR (
+      review_md_path IS NOT NULL AND
+      review_json_path IS NOT NULL AND
+      patch_path IS NOT NULL AND
+      changed_files_path IS NOT NULL AND
+      untracked_files_path IS NOT NULL
+    )
+  )
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_packets_issue_packet ON review_packets(issue_id, packet_no DESC);

@@ -13,7 +13,7 @@ Real Codex integration is not inferred from memory. It must be implemented only 
 | command approval request | insert `approval_requests(kind=command,status=pending)` |
 | file change approval request | insert `approval_requests(kind=file_change,status=pending)` |
 | network approval request | insert `approval_requests(kind=network,status=pending)` |
-| approval decision approve_once/approve_always | respond to Codex approval channel and update row |
+| approval decision approve_once/approve_for_run/approve_for_session | respond to Codex approval channel and update row; emulate run/session scope locally if Codex lacks it |
 | approval decision deny | respond deny; in v1 default terminates run unless action-only denial is implemented |
 | approval decision cancel_run | terminate run with `operator_cancelled` |
 | turn complete with handoff | run finalizer may generate review packet |

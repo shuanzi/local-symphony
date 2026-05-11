@@ -7,6 +7,7 @@
 ## 输入文件
 
 - `schemas/tool_gateway.schema.json`
+- `schemas/tools/*.input.schema.json`
 - `examples/handoff.json`
 - `TECH_SPEC.md §11`
 

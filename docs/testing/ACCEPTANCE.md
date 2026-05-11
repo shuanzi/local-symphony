@@ -13,7 +13,7 @@ OpenAPI parseable
 JSON schemas parseable
 SQLite app/project DDL can initialize empty databases
 examples/WORKFLOW.default.md validates
-examples/handoff.json and examples/followup.json validate against Tool Gateway schemas
+examples/handoff.json and examples/followup.json validate against schemas/tools/*.input.schema.json and wrapped Tool Gateway call schemas
 ```
 
 ## A1 Init and local tracker
@@ -32,7 +32,7 @@ Expected：issue identifier is `LOC-1`, state is `Ready`, dispatch_paused is fal
 ```bash
 symphony serve --project . --no-open
 symphony issue dispatch LOC-1
-symphony run events --follow LOC-1
+symphony run events run_<from-dispatch-response> --follow
 symphony review LOC-1
 ```
 
@@ -117,7 +117,7 @@ Expected：
 
 ```text
 API binds loopback only by default
-browser command APIs require CSRF
+cookie-authenticated browser command APIs require X-Symphony-CSRF
 CLI bearer works and can rotate
 runtime descriptor contains no secrets
 protected path access denies or requires review according to policy

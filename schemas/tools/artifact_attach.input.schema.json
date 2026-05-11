@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-symphony.dev/schemas/tools/artifact_attach.input.schema.json",
+  "title": "artifact.attach input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path", "kind"],
+  "properties": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "not": { "pattern": "(^/)|(^[A-Za-z]:)|(^|/)\\.\\.(/|$)" }
+    },
+    "kind": {
+      "enum": ["test_output", "patch", "changed_files", "untracked_files", "diffstat", "prompt_snapshot", "codex_log", "review_packet", "agent_file", "diagnostic", "other"]
+    },
+    "description": { "type": "string" }
+  }
+}

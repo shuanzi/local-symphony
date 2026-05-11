@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 """Validate Local Symphony v1 documentation contract artifacts.
 
-This script is intentionally lightweight so implementation agents can run it
-before code exists. It validates JSON syntax, SQLite DDL executability, and
-basic OpenAPI shape. If PyYAML is installed, it also parses OpenAPI YAML.
+This script is intentionally runnable before product code exists. It checks
+syntax plus a small set of cross-file drift rules that are easy for an
+implementation agent to accidentally miss.
 """
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def is_under(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def fail(msg: str) -> None:
@@ -20,22 +30,76 @@ def fail(msg: str) -> None:
     sys.exit(1)
 
 
+def load_json(rel: str) -> Any:
+    return json.loads((ROOT / rel).read_text(encoding="utf-8"))
+
+
 def validate_json() -> None:
-    for path in sorted((ROOT / "schemas").glob("*.json")) + sorted((ROOT / "examples").glob("*.json")):
+    schema_paths = sorted((ROOT / "schemas").rglob("*.json"))
+    example_paths = sorted((ROOT / "examples").glob("*.json"))
+    try:
+        from jsonschema import Draft202012Validator  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency for bootstrap environments
+        Draft202012Validator = None  # type: ignore[assignment]
+
+    for path in schema_paths + example_paths:
         try:
-            json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             fail(f"invalid JSON {path.relative_to(ROOT)}: {exc}")
+        if Draft202012Validator is not None and is_under(path, ROOT / "schemas"):
+            try:
+                Draft202012Validator.check_schema(data)
+            except Exception as exc:  # noqa: BLE001
+                fail(f"invalid JSON Schema {path.relative_to(ROOT)}: {exc}")
         print(f"ok json {path.relative_to(ROOT)}")
 
 
 def validate_sql() -> None:
-    for rel in ["db/schema/v1_app.sql", "db/schema/v1_project.sql"]:
+    required_columns = {
+        "db/schema/v1_app.sql": {
+            "schema_meta": {"key", "value"},
+            "projects": {"id", "repo_root", "project_db_path", "workflow_path", "last_opened_at"},
+            "app_settings": {"key", "value_json", "updated_at"},
+            "local_sessions": {"id", "project_id", "kind", "token_hash", "csrf_hash", "last_seen_at"},
+            "open_tokens": {"id", "project_id", "token_hash", "expires_at", "consumed_at"},
+            "runtime_descriptors": {"project_id", "api_url", "tool_gateway_endpoint", "daemon_pid"},
+        },
+        "db/schema/v1_project.sql": {
+            "schema_meta": {"key", "value"},
+            "project_settings": {"key", "value_json", "updated_at"},
+            "issues": {"id", "sequence_no", "identifier", "state", "priority", "completed_at", "archived_at"},
+            "issue_state_history": {"id", "issue_id", "from_state", "to_state", "actor_type"},
+            "workspaces": {"id", "issue_id", "path", "branch_name", "base_ref_config", "base_ref", "base_sha"},
+            "run_attempts": {"id", "issue_id", "attempt_no", "source_issue_state", "failure_code"},
+            "approval_requests": {"id", "status", "timeout_ms", "expires_at"},
+            "run_tool_tokens": {"id", "scope_json", "last_used_at"},
+            "tool_calls": {"id", "status", "input_hash", "input_json_redacted", "output_hash", "output_json_redacted"},
+            "handoffs": {"id", "payload_hash", "payload_json_redacted", "summary", "target_state", "submitted_at"},
+            "artifacts": {"id", "kind", "path", "mime_type", "redacted"},
+            "prompt_snapshots": {"id", "runtime_envelope_version", "rendered_prompt_hash", "context_json_path", "tool_manifest_path"},
+            "review_packets": {"id", "packet_no", "status", "root_path", "diffstat_path"},
+        },
+    }
+
+    for rel, table_columns in required_columns.items():
         path = ROOT / rel
         try:
             con = sqlite3.connect(":memory:")
             con.executescript(path.read_text(encoding="utf-8"))
+            rows = con.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchall()
+            if rows != [("1",)]:
+                fail(f"{rel} must contain schema_meta schema_version=1")
+            for table, expected_cols in table_columns.items():
+                actual_cols = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+                if not actual_cols:
+                    fail(f"{rel} missing table {table}")
+                missing = expected_cols - actual_cols
+                if missing:
+                    fail(f"{rel} table {table} missing columns: {sorted(missing)}")
             con.close()
+        except SystemExit:
+            raise
         except Exception as exc:  # noqa: BLE001
             fail(f"invalid SQLite DDL {rel}: {exc}")
         print(f"ok sql {rel}")
@@ -46,29 +110,153 @@ def validate_openapi() -> None:
     text = path.read_text(encoding="utf-8")
     if "openapi: 3.1.0" not in text:
         fail("api/openapi.yaml must declare openapi: 3.1.0")
-    if "paths:" not in text or "components:" not in text:
-        fail("api/openapi.yaml must include paths and components")
     try:
         import yaml  # type: ignore
-    except Exception:
-        print("warn openapi yaml parse skipped: PyYAML not installed")
-        return
+    except Exception as exc:  # noqa: BLE001
+        fail(f"PyYAML is required to validate OpenAPI and WORKFLOW examples: {exc}")
     try:
         data = yaml.safe_load(text)
     except Exception as exc:  # noqa: BLE001
         fail(f"invalid OpenAPI YAML: {exc}")
     if data.get("openapi") != "3.1.0":
         fail("unexpected OpenAPI version")
-    for route in ["/health", "/issues", "/runs", "/auth/exchange", "/diagnostics"]:
-        if route not in data.get("paths", {}):
-            fail(f"missing OpenAPI route {route}")
+
+    required_routes = {
+        "/health",
+        "/state",
+        "/events",
+        "/events/stream",
+        "/auth/exchange",
+        "/auth/session",
+        "/auth/logout",
+        "/auth/open-token",
+        "/auth/cli-token/rotate",
+        "/issues",
+        "/issues/{issue_ref}",
+        "/issues/{issue_ref}/transition",
+        "/issues/{issue_ref}/comments",
+        "/issues/{issue_ref}/blockers",
+        "/issues/{issue_ref}/blockers/{blocker_issue_ref}",
+        "/issues/{issue_ref}/dispatch",
+        "/issues/{issue_ref}/dispatch-pause",
+        "/issues/{issue_ref}/dispatch-resume",
+        "/issues/{issue_ref}/events/stream",
+        "/runs",
+        "/runs/{run_id}",
+        "/runs/{run_id}/events",
+        "/runs/{run_id}/events/stream",
+        "/runs/{run_id}/cancel",
+        "/approvals",
+        "/approvals/{approval_id}/decide",
+        "/reviews/{issue_ref}",
+        "/reviews/{issue_ref}/send-to-rework",
+        "/reviews/{issue_ref}/mark-done",
+        "/artifacts/{artifact_id}",
+        "/artifacts/{artifact_id}/content",
+        "/workflow",
+        "/workflow/validate",
+        "/workflow/reload",
+        "/diagnostics",
+        "/diagnostics/export",
+    }
+    paths = data.get("paths", {})
+    missing_routes = required_routes - set(paths)
+    if missing_routes:
+        fail(f"missing OpenAPI routes: {sorted(missing_routes)}")
+    if "/approvals/{approval_id}/decision" in paths:
+        fail("OpenAPI must use /approvals/{approval_id}/decide, not /decision")
+
+    # All non-error JSON 2xx responses must be enveloped.
+    for route, ops in paths.items():
+        for method, op in ops.items():
+            if method.startswith("x-"):
+                continue
+            for status, response in op.get("responses", {}).items():
+                if not str(status).startswith("2"):
+                    continue
+                content = response.get("content", {}) if isinstance(response, dict) else {}
+                if "application/json" not in content:
+                    continue
+                schema = content["application/json"].get("schema", {})
+                ref = schema.get("$ref", "") if isinstance(schema, dict) else ""
+                if ref.endswith("Envelope"):
+                    continue
+                if any((part.get("$ref", "").endswith("Envelope") for part in schema.get("allOf", []) if isinstance(part, dict))):
+                    continue
+                fail(f"{method.upper()} {route} {status} JSON response must use an envelope schema")
+
+    decision_enum = data["components"]["schemas"]["ApprovalDecisionRequest"]["properties"]["decision"]["enum"]
+    if decision_enum != ["approve_once", "approve_for_run", "approve_for_session", "deny", "cancel_run"]:
+        fail("ApprovalDecisionRequest enum drifted from TECH_SPEC")
+
+    failure_schema = load_json("schemas/failure_codes.schema.json")
+    expected_api_errors = set(failure_schema["$defs"]["apiErrorCode"]["enum"])
+    openapi_api_errors = set(data["components"]["schemas"]["ApiErrorCode"]["enum"])
+    if expected_api_errors != openapi_api_errors:
+        fail(f"ApiErrorCode mismatch: {sorted(expected_api_errors ^ openapi_api_errors)}")
     print("ok openapi api/openapi.yaml")
+
+
+def _extract_front_matter(text: str) -> dict[str, Any]:
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---", 4)
+    if end == -1:
+        fail("examples/WORKFLOW.default.md has unterminated YAML front matter")
+    import yaml  # type: ignore
+
+    parsed = yaml.safe_load(text[4:end])
+    if not isinstance(parsed, dict):
+        fail("examples/WORKFLOW.default.md front matter must be an object")
+    return parsed
+
+
+def validate_workflow_example() -> None:
+    workflow_path = ROOT / "examples/WORKFLOW.default.md"
+    config = _extract_front_matter(workflow_path.read_text(encoding="utf-8"))
+    for section, key in [("workspace", "root"), ("git", "repo_root")]:
+        value = config.get(section, {}).get(key)
+        if isinstance(value, str) and re.search(r"\{\{|\}\}", value):
+            fail(f"{workflow_path.relative_to(ROOT)} {section}.{key} must not contain Liquid interpolation")
+    try:
+        from jsonschema import Draft202012Validator  # type: ignore
+    except Exception:
+        print("warn workflow schema validation skipped: jsonschema not installed")
+        return
+    schema = load_json("schemas/workflow_config.schema.json")
+    errors = sorted(Draft202012Validator(schema).iter_errors(config), key=lambda e: e.path)
+    if errors:
+        first = errors[0]
+        fail(f"WORKFLOW.default.md does not validate: path={list(first.path)} error={first.message}")
+    print("ok workflow examples/WORKFLOW.default.md")
+
+
+def validate_tool_examples() -> None:
+    try:
+        from jsonschema import Draft202012Validator  # type: ignore
+    except Exception:
+        print("warn tool example schema validation skipped: jsonschema not installed")
+        return
+
+    example_schema_pairs = [
+        ("examples/handoff.json", "schemas/tools/handoff_submit.input.schema.json", "handoff.submit"),
+        ("examples/followup.json", "schemas/tools/followup_create.input.schema.json", "followup.create"),
+    ]
+    gateway_schema = load_json("schemas/tool_gateway.schema.json")
+    for example_rel, schema_rel, tool_name in example_schema_pairs:
+        payload = load_json(example_rel)
+        input_schema = load_json(schema_rel)
+        Draft202012Validator(input_schema).validate(payload)
+        Draft202012Validator(gateway_schema).validate({"tool": tool_name, "input": payload})
+        print(f"ok example {example_rel} -> {schema_rel}")
 
 
 def main() -> None:
     validate_json()
     validate_sql()
     validate_openapi()
+    validate_workflow_example()
+    validate_tool_examples()
     print("contract validation passed")
 
 

@@ -14,22 +14,30 @@ CREATE TABLE IF NOT EXISTS projects (
   name TEXT NOT NULL,
   repo_root TEXT NOT NULL UNIQUE,
   project_db_path TEXT NOT NULL,
+  workflow_path TEXT NOT NULL,
   issue_prefix TEXT NOT NULL DEFAULT 'LOC',
   created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_opened_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value_json TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS local_sessions (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('cli','browser')),
+  kind TEXT NOT NULL CHECK (kind IN ('cli','browser','desktop')),
   token_hash TEXT NOT NULL UNIQUE,
   csrf_hash TEXT,
   user_label TEXT,
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT,
   expires_at TEXT,
   revoked_at TEXT,
-  created_at TEXT NOT NULL,
-  last_used_at TEXT,
   FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 

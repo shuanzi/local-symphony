@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-symphony.dev/schemas/tools/issue_get.input.schema.json",
+  "title": "issue.get input",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}

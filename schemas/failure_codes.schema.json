@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-symphony.dev/schemas/failure_codes.schema.json",
+  "title": "Local Symphony Failure and API Error Codes",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["failure_codes", "api_error_codes"],
+  "properties": {
+    "failure_codes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/failureCode" }
+    },
+    "api_error_codes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/apiErrorCode" }
+    }
+  },
+  "$defs": {
+    "failureCode": {
+      "enum": [
+        "workflow_invalid",
+        "workflow_validation_failed",
+        "prompt_render_failed",
+        "workspace_prepare_failed",
+        "workspace_conflict",
+        "after_create_failed",
+        "before_run_failed",
+        "codex_startup_failed",
+        "unsupported_codex_version",
+        "codex_protocol_error",
+        "turn_timeout",
+        "stall_timeout",
+        "approval_timeout",
+        "command_denied",
+        "network_denied",
+        "protected_path_denied",
+        "tool_gateway_failed",
+        "missing_handoff",
+        "review_packet_failed",
+        "operator_cancelled",
+        "agent_blocked",
+        "issue_state_changed",
+        "canceled_by_reconciliation",
+        "daemon_restarted_run_interrupted"
+      ]
+    },
+    "apiErrorCode": {
+      "enum": [
+        "unauthorized",
+        "forbidden",
+        "csrf_required",
+        "invalid_request",
+        "not_found",
+        "unsupported_db_version",
+        "workflow_invalid",
+        "workflow_validation_failed",
+        "prompt_render_failed",
+        "invalid_state_transition",
+        "issue_blocked",
+        "issue_dispatch_paused",
+        "issue_already_running",
+        "workspace_conflict",
+        "workspace_prepare_failed",
+        "after_create_failed",
+        "before_run_failed",
+        "codex_startup_failed",
+        "unsupported_codex_version",
+        "codex_protocol_error",
+        "turn_timeout",
+        "stall_timeout",
+        "approval_not_pending",
+        "approval_timeout",
+        "review_packet_required",
+        "review_packet_failed",
+        "tool_token_invalid",
+        "tool_gateway_failed",
+        "operator_cancelled",
+        "agent_blocked",
+        "issue_state_changed",
+        "canceled_by_reconciliation",
+        "daemon_restarted_run_interrupted",
+        "command_denied",
+        "network_denied",
+        "protected_path_denied",
+        "raw_log_access_not_supported",
+        "internal_error"
+      ]
+    }
+  }
+}

@@ -2,12 +2,12 @@ openapi: 3.1.0
 info:
   title: Local Symphony App v1 API
   version: 1.0.0
-  description: REST/SSE API contract for Local Symphony App v1.
+  description: REST/SSE API contract for Local Symphony App v1. All business JSON success responses use the `{data, meta}` envelope.
 servers:
   - url: http://127.0.0.1:{port}/api/v1
     variables:
       port:
-        default: "0"
+        default: "18080"
 security:
   - bearerAuth: []
   - cookieAuth: []
@@ -16,20 +16,20 @@ paths:
     get:
       operationId: getHealth
       responses:
-        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/HealthResponse' } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/HealthEnvelope' } } } }
   /state:
     get:
       operationId: getState
       responses:
-        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AppState' } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AppStateEnvelope' } } } }
   /events:
     get:
       operationId: listEvents
       parameters:
-        - { name: after, in: query, schema: { type: integer, minimum: 0 } }
+        - { name: after_seq, in: query, schema: { type: integer, minimum: 0 } }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
       responses:
-        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunEventList' } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunEventPageEnvelope' } } } }
   /events/stream:
     get:
       operationId: streamEvents
@@ -43,28 +43,32 @@ paths:
         required: true
         content: { application/json: { schema: { type: object, required: [open_token], additionalProperties: false, properties: { open_token: { type: string, minLength: 16 } } } } }
       responses:
-        "200": { description: Browser session established, content: { application/json: { schema: { $ref: '#/components/schemas/AuthSession' } } } }
+        "200": { description: Browser session established, content: { application/json: { schema: { $ref: '#/components/schemas/AuthSessionEnvelope' } } } }
         "401": { $ref: '#/components/responses/Error' }
   /auth/session:
     get:
       operationId: getSession
       responses:
-        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AuthSession' } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AuthSessionEnvelope' } } } }
   /auth/logout:
     post:
       operationId: logout
+      parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       responses:
         "204": { description: Logged out }
   /auth/open-token:
     post:
       operationId: createOpenToken
       responses:
-        "200": { description: Open token, content: { application/json: { schema: { type: object, required: [open_token, expires_at], additionalProperties: false, properties: { open_token: { type: string }, expires_at: { type: string, format: date-time } } } } } }
+        "200": { description: Open token, content: { application/json: { schema: { $ref: '#/components/schemas/OpenTokenEnvelope' } } } }
   /auth/cli-token/rotate:
     post:
       operationId: rotateCliToken
+      parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       responses:
-        "200": { description: Rotated CLI token, content: { application/json: { schema: { type: object, required: [token, expires_at], additionalProperties: false, properties: { token: { type: string }, expires_at: { type: [string, 'null'], format: date-time } } } } } }
+        "200": { description: Rotated CLI token, content: { application/json: { schema: { $ref: '#/components/schemas/CliTokenEnvelope' } } } }
   /issues:
     get:
       operationId: listIssues
@@ -72,158 +76,194 @@ paths:
         - { name: state, in: query, schema: { $ref: '#/components/schemas/IssueState' } }
         - { name: q, in: query, schema: { type: string } }
       responses:
-        "200": { description: OK, content: { application/json: { schema: { type: object, required: [data], properties: { data: { type: array, items: { $ref: '#/components/schemas/Issue' } } } } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueListEnvelope' } } } }
     post:
       operationId: createIssue
+      parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       requestBody:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/IssueCreateRequest' } } }
       responses:
-        "201": { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Issue' } } } }
+        "201": { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
         "400": { $ref: '#/components/responses/Error' }
   /issues/{issue_ref}:
     get:
       operationId: getIssue
       parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
       responses:
-        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Issue' } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
         "404": { $ref: '#/components/responses/Error' }
     patch:
       operationId: updateIssue
-      parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
+      parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       requestBody:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/IssuePatchRequest' } } }
       responses:
-        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Issue' } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
   /issues/{issue_ref}/transition:
     post:
       operationId: transitionIssue
-      parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
+      parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       requestBody:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/IssueTransitionRequest' } } }
       responses:
-        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Issue' } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueTransitionEnvelope' } } } }
         "409": { $ref: '#/components/responses/Error' }
   /issues/{issue_ref}/comments:
     post:
       operationId: createIssueComment
-      parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
+      parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [body], additionalProperties: false, properties: { body: { type: string, minLength: 1 } } } } } }
       responses:
-        "201": { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/IssueComment' } } } }
+        "201": { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/IssueCommentEnvelope' } } } }
   /issues/{issue_ref}/dispatch:
     post:
       operationId: dispatchIssue
-      parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
+      parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       responses:
-        "202": { description: Dispatch accepted, content: { application/json: { schema: { $ref: '#/components/schemas/DispatchResponse' } } } }
+        "202": { description: Dispatch accepted, content: { application/json: { schema: { $ref: '#/components/schemas/DispatchEnvelope' } } } }
         "409": { $ref: '#/components/responses/Error' }
   /issues/{issue_ref}/dispatch-pause:
     post:
       operationId: pauseIssueDispatch
-      parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
+      parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1 } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Issue' } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
   /issues/{issue_ref}/dispatch-resume:
     post:
       operationId: resumeIssueDispatch
-      parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
+      parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { reason: { type: string } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Issue' } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
   /issues/{issue_ref}/blockers:
     post:
       operationId: addIssueBlocker
-      parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
+      parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [blocked_by], additionalProperties: false, properties: { blocked_by: { type: string } } } } } }
-      responses: { "201": { description: Created } }
-  /issues/{issue_ref}/blockers/{blocked_by_ref}:
+      responses: { "201": { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/IssueRelationEnvelope' } } } } }
+  /issues/{issue_ref}/blockers/{blocker_issue_ref}:
     delete:
       operationId: removeIssueBlocker
       parameters:
         - { $ref: '#/components/parameters/IssueRef' }
-        - { name: blocked_by_ref, in: path, required: true, schema: { type: string } }
+        - { name: blocker_issue_ref, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/SymphonyCSRF' }
+      x-csrf-required-for-cookie-auth: true
       responses: { "204": { description: Removed } }
+  /issues/{issue_ref}/events/stream:
+    get:
+      operationId: streamIssueEvents
+      parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
+      responses: { "200": { description: SSE stream, content: { text/event-stream: { schema: { type: string } } } } }
   /runs:
     get:
       operationId: listRuns
-      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, required: [data], properties: { data: { type: array, items: { $ref: '#/components/schemas/RunAttempt' } } } } } } } }
+      parameters:
+        - { name: issue_ref, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/RunStatus' } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunListEnvelope' } } } } }
   /runs/{run_id}:
     get:
       operationId: getRun
-      parameters: [ { name: run_id, in: path, required: true, schema: { type: string } } ]
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunAttempt' } } } } }
+      parameters: [ { $ref: '#/components/parameters/RunId' } ]
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunEnvelope' } } } } }
   /runs/{run_id}/events:
     get:
       operationId: listRunEvents
       parameters:
-        - { name: run_id, in: path, required: true, schema: { type: string } }
-        - { name: after, in: query, schema: { type: integer, minimum: 0 } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunEventList' } } } } }
+        - { $ref: '#/components/parameters/RunId' }
+        - { name: after_seq, in: query, schema: { type: integer, minimum: 0 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunEventPageEnvelope' } } } } }
   /runs/{run_id}/events/stream:
     get:
       operationId: streamRunEvents
-      parameters: [ { name: run_id, in: path, required: true, schema: { type: string } } ]
+      parameters: [ { $ref: '#/components/parameters/RunId' } ]
       responses: { "200": { description: SSE stream, content: { text/event-stream: { schema: { type: string } } } } }
   /runs/{run_id}/cancel:
     post:
       operationId: cancelRun
-      parameters: [ { name: run_id, in: path, required: true, schema: { type: string } } ]
+      parameters: [ { $ref: '#/components/parameters/RunId' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { reason: { type: string } } } } } }
-      responses: { "200": { description: Cancelled, content: { application/json: { schema: { $ref: '#/components/schemas/RunAttempt' } } } } }
+      responses: { "200": { description: Cancelled, content: { application/json: { schema: { $ref: '#/components/schemas/RunEnvelope' } } } } }
   /approvals:
     get:
       operationId: listApprovals
-      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, required: [data], properties: { data: { type: array, items: { $ref: '#/components/schemas/ApprovalRequest' } } } } } } } }
-  /approvals/{approval_id}/decision:
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalListEnvelope' } } } } }
+  /approvals/{approval_id}/decide:
     post:
       operationId: decideApproval
-      parameters: [ { name: approval_id, in: path, required: true, schema: { type: string } } ]
+      parameters: [ { $ref: '#/components/parameters/ApprovalId' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalRequest' } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalEnvelope' } } } } }
   /reviews/{issue_ref}:
     get:
       operationId: getLatestReview
       parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ReviewPacketSummary' } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ReviewPacketEnvelope' } } } } }
   /reviews/{issue_ref}/send-to-rework:
     post:
       operationId: sendToRework
-      parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
+      parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1 } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Issue' } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
   /reviews/{issue_ref}/mark-done:
     post:
       operationId: markDone
-      parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
+      parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
       requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { reason: { type: string } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Issue' } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
   /artifacts/{artifact_id}:
     get:
-      operationId: getArtifact
-      parameters: [ { name: artifact_id, in: path, required: true, schema: { type: string } } ]
-      responses: { "200": { description: Artifact content } }
-  /workflow/validate:
-    post:
-      operationId: validateWorkflow
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowStatus' } } } } }
-  /workflow/reload:
-    post:
-      operationId: reloadWorkflow
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowStatus' } } } } }
+      operationId: getArtifactMetadata
+      parameters: [ { $ref: '#/components/parameters/ArtifactId' } ]
+      responses: { "200": { description: Artifact metadata, content: { application/json: { schema: { $ref: '#/components/schemas/ArtifactEnvelope' } } } } }
+  /artifacts/{artifact_id}/content:
+    get:
+      operationId: getArtifactContent
+      parameters: [ { $ref: '#/components/parameters/ArtifactId' } ]
+      responses: { "200": { description: Artifact content, content: { application/octet-stream: { schema: { type: string, format: binary } } } }, "403": { $ref: '#/components/responses/Error' } }
   /workflow:
     get:
       operationId: getWorkflow
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowStatus' } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowStatusEnvelope' } } } } }
+  /workflow/validate:
+    post:
+      operationId: validateWorkflow
+      parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowStatusEnvelope' } } } } }
+  /workflow/reload:
+    post:
+      operationId: reloadWorkflow
+      parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
+      requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { dry_run: { type: boolean, default: false } } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowStatusEnvelope' } } } } }
   /diagnostics:
     get:
       operationId: getDiagnostics
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Diagnostics' } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/DiagnosticsEnvelope' } } } } }
   /diagnostics/export:
     post:
       operationId: exportDiagnostics
-      responses: { "200": { description: Export created, content: { application/json: { schema: { type: object, required: [artifact_id], properties: { artifact_id: { type: string } } } } } } }
+      parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
+      requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { include_raw_logs: { type: boolean, default: false } } } } } }
+      responses: { "200": { description: Export created, content: { application/json: { schema: { $ref: '#/components/schemas/DiagnosticsExportEnvelope' } } } } }
 components:
   securitySchemes:
     bearerAuth: { type: http, scheme: bearer }
@@ -234,11 +274,45 @@ components:
       in: path
       required: true
       schema: { type: string, description: Opaque issue id or human identifier like LOC-1 }
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^run_" }
+    ApprovalId:
+      name: approval_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^appr_" }
+    ArtifactId:
+      name: artifact_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^art_" }
+    SymphonyCSRF:
+      name: X-Symphony-CSRF
+      in: header
+      required: false
+      description: Required for cookie-authenticated command APIs. Bearer-token CLI calls do not use this header.
+      schema: { type: string }
   responses:
     Error:
       description: Error response
       content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' } } }
   schemas:
+    ResponseMeta:
+      type: object
+      required: [request_id, server_time]
+      additionalProperties: true
+      properties:
+        request_id: { type: string }
+        server_time: { type: string, format: date-time }
+    Envelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: {}
+        meta: { $ref: '#/components/schemas/ResponseMeta' }
     ApiError:
       type: object
       required: [error]
@@ -246,16 +320,25 @@ components:
       properties:
         error:
           type: object
-          required: [code, message]
+          required: [code, message, request_id]
           additionalProperties: false
           properties:
-            code: { type: string }
+            code: { $ref: '#/components/schemas/ApiErrorCode' }
             message: { type: string }
             details: { type: object, additionalProperties: true }
-    HealthResponse:
+            request_id: { type: string }
+    ApiErrorCode:
+      type: string
+      enum: [unauthorized, forbidden, csrf_required, invalid_request, not_found, unsupported_db_version, workflow_invalid, workflow_validation_failed, prompt_render_failed, invalid_state_transition, issue_blocked, issue_dispatch_paused, issue_already_running, workspace_conflict, workspace_prepare_failed, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_not_pending, approval_timeout, review_packet_required, review_packet_failed, tool_token_invalid, tool_gateway_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted, command_denied, network_denied, protected_path_denied, raw_log_access_not_supported, internal_error]
+    FailureCode:
+      type: string
+      enum: [workflow_invalid, workflow_validation_failed, prompt_render_failed, workspace_prepare_failed, workspace_conflict, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_timeout, command_denied, network_denied, protected_path_denied, tool_gateway_failed, missing_handoff, review_packet_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted]
+    Health:
       type: object
       required: [status, project_id]
       properties: { status: { type: string, enum: [ok] }, project_id: { type: string } }
+    HealthEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Health' } } } ]
     AppState:
       type: object
       required: [project_id, repo_root, daemon_pid]
@@ -264,33 +347,68 @@ components:
         repo_root: { type: string }
         daemon_pid: { type: integer }
         active_runs: { type: integer }
+    AppStateEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/AppState' } } } ]
     AuthSession:
       type: object
       required: [authenticated, csrf_token]
       properties:
         authenticated: { type: boolean }
         csrf_token: { type: string }
+        expires_at: { type: [string, 'null'], format: date-time }
+    AuthSessionEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/AuthSession' } } } ]
+    OpenToken:
+      type: object
+      required: [open_token, expires_at]
+      additionalProperties: false
+      properties:
+        open_token: { type: string }
+        expires_at: { type: string, format: date-time }
+    OpenTokenEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/OpenToken' } } } ]
+    CliToken:
+      type: object
+      required: [token, expires_at]
+      additionalProperties: false
+      properties:
+        token: { type: string }
+        expires_at: { type: [string, 'null'], format: date-time }
+    CliTokenEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/CliToken' } } } ]
     IssueState:
       type: string
       enum: [Inbox, Ready, Working, Rework, Blocked, Human Review, Done, Cancelled, Duplicate]
     Issue:
       type: object
-      required: [id, identifier, title, state, priority, dispatch_paused, created_at, updated_at]
+      required: [id, identifier, sequence_no, title, state, priority, dispatch_paused, created_at, updated_at]
       properties:
-        id: { type: string }
+        id: { type: string, pattern: "^iss_" }
         identifier: { type: string }
+        sequence_no: { type: integer, minimum: 1 }
         title: { type: string }
         description: { type: string }
         acceptance_criteria: { type: array, items: { type: string } }
         state: { $ref: '#/components/schemas/IssueState' }
         priority: { type: integer, minimum: 1, maximum: 5 }
         labels: { type: array, items: { type: string } }
+        blocked_by: { type: array, items: { type: string } }
+        blocks: { type: array, items: { type: string } }
         dispatch_paused: { type: boolean }
         dispatch_pause_reason: { type: [string, 'null'] }
+        dispatch_paused_at: { type: [string, 'null'], format: date-time }
+        branch_name: { type: [string, 'null'] }
+        workspace_path: { type: [string, 'null'] }
         latest_run_id: { type: [string, 'null'] }
         latest_review_packet_id: { type: [string, 'null'] }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        completed_at: { type: [string, 'null'], format: date-time }
+        archived_at: { type: [string, 'null'], format: date-time }
+    IssueEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Issue' } } } ]
+    IssueListEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Issue' } } } } ]
     IssueCreateRequest:
       type: object
       required: [title]
@@ -318,36 +436,84 @@ components:
         state: { $ref: '#/components/schemas/IssueState' }
         reason: { type: string }
         canonical_issue_ref: { type: string }
+    IssueTransitionResult:
+      type: object
+      required: [issue]
+      properties:
+        issue: { $ref: '#/components/schemas/Issue' }
+        side_effects:
+          type: object
+          additionalProperties: true
+          properties:
+            active_run_cancelled: { type: boolean }
+            run_id: { type: [string, 'null'] }
+            failure_code: { type: [string, 'null'] }
+    IssueTransitionEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/IssueTransitionResult' } } } ]
     IssueComment:
       type: object
       required: [id, issue_id, body, author_type, created_at]
-      properties: { id: { type: string }, issue_id: { type: string }, body: { type: string }, author_type: { type: string }, created_at: { type: string, format: date-time } }
+      properties:
+        id: { type: string, pattern: "^cmt_" }
+        issue_id: { type: string, pattern: "^iss_" }
+        run_id: { type: [string, 'null'] }
+        body: { type: string }
+        author_type: { type: string, enum: [operator, agent, system] }
+        created_at: { type: string, format: date-time }
+    IssueCommentEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/IssueComment' } } } ]
+    IssueRelation:
+      type: object
+      required: [id, source_issue_id, target_issue_id, relation_type]
+      properties:
+        id: { type: string, pattern: "^rel_" }
+        source_issue_id: { type: string }
+        target_issue_id: { type: string }
+        relation_type: { type: string, enum: [blocks, followup_of, duplicates] }
+    IssueRelationEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/IssueRelation' } } } ]
     DispatchResponse:
       type: object
       required: [accepted, issue_id]
-      properties: { accepted: { type: boolean }, issue_id: { type: string }, run_id: { type: [string, 'null'] }, reason: { type: [string, 'null'] } }
+      properties:
+        accepted: { type: boolean }
+        issue_id: { type: string }
+        run_id: { type: [string, 'null'] }
+        reason: { type: [string, 'null'] }
+    DispatchEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/DispatchResponse' } } } ]
     RunStatus:
       type: string
       enum: [pending, preparing_workspace, rendering_prompt, starting_agent, running, completed, completed_without_handoff, failed, cancelled]
     RunAttempt:
       type: object
-      required: [id, issue_id, status, source_issue_state, created_at]
+      required: [id, issue_id, attempt_no, status, source_issue_state, created_at]
       properties:
-        id: { type: string }
+        id: { type: string, pattern: "^run_" }
         issue_id: { type: string }
+        attempt_no: { type: integer, minimum: 1 }
+        workspace_id: { type: [string, 'null'] }
+        workflow_snapshot_id: { type: [string, 'null'] }
         status: { $ref: '#/components/schemas/RunStatus' }
+        dispatch_reason: { type: string, enum: [manual, scheduler, manual_recovery] }
         source_issue_state: { type: string, enum: [Ready, Rework] }
-        failure_code: { type: [string, 'null'] }
+        runner_kind: { type: string, enum: [fake, codex] }
+        failure_code: { anyOf: [ { $ref: '#/components/schemas/FailureCode' }, { type: 'null' } ] }
         failure_message: { type: [string, 'null'] }
         started_at: { type: [string, 'null'], format: date-time }
         ended_at: { type: [string, 'null'], format: date-time }
         created_at: { type: string, format: date-time }
+        updated_at: { type: [string, 'null'], format: date-time }
+    RunEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/RunAttempt' } } } ]
+    RunListEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/RunAttempt' } } } } ]
     RunEvent:
       type: object
-      required: [seq, id, event_type, actor_type, data, created_at]
+      required: [seq, id, project_id, event_type, actor_type, data, redacted, created_at]
       properties:
-        seq: { type: integer }
-        id: { type: string }
+        seq: { type: integer, minimum: 1 }
+        id: { type: string, pattern: "^evt_" }
         project_id: { type: string }
         issue_id: { type: [string, 'null'] }
         run_id: { type: [string, 'null'] }
@@ -356,55 +522,109 @@ components:
         data: { type: object, additionalProperties: true }
         redacted: { type: boolean }
         created_at: { type: string, format: date-time }
-    RunEventList:
+    RunEventPage:
       type: object
-      required: [data]
-      properties: { data: { type: array, items: { $ref: '#/components/schemas/RunEvent' } }, next_after: { type: [integer, 'null'] } }
+      required: [events]
+      properties:
+        events: { type: array, items: { $ref: '#/components/schemas/RunEvent' } }
+        next_after_seq: { type: [integer, 'null'] }
+    RunEventPageEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/RunEventPage' } } } ]
+    ApprovalStatus:
+      type: string
+      enum: [pending, approved_once, approved_for_run, approved_for_session, denied, auto_denied, cancelled, timeout]
     ApprovalRequest:
       type: object
-      required: [id, run_id, kind, status, created_at]
+      required: [id, run_id, issue_id, kind, status, requested_at, created_at]
       properties:
-        id: { type: string }
+        id: { type: string, pattern: "^appr_" }
         run_id: { type: string }
+        issue_id: { type: string }
         kind: { type: string, enum: [command, file_change, network] }
-        status: { type: string, enum: [pending, approved_once, approved_always, denied, auto_denied, cancelled, timeout] }
-        command: { type: [string, 'null'] }
-        path: { type: [string, 'null'] }
+        status: { $ref: '#/components/schemas/ApprovalStatus' }
+        request: { type: object, additionalProperties: true }
+        decision: { type: [object, 'null'], additionalProperties: true }
         reason: { type: [string, 'null'] }
         created_at: { type: string, format: date-time }
+        requested_at: { type: string, format: date-time }
+        timeout_ms: { type: [integer, 'null'] }
+        expires_at: { type: [string, 'null'], format: date-time }
+        resolved_at: { type: [string, 'null'], format: date-time }
     ApprovalDecisionRequest:
       type: object
       required: [decision]
       additionalProperties: false
       properties:
-        decision: { type: string, enum: [approve_once, approve_always, deny, cancel_run] }
+        decision: { type: string, enum: [approve_once, approve_for_run, approve_for_session, deny, cancel_run] }
         reason: { type: string }
+    ApprovalEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ApprovalRequest' } } } ]
+    ApprovalListEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/ApprovalRequest' } } } } ]
     ReviewPacketSummary:
       type: object
-      required: [id, issue_id, run_id, packet_no, status, review_md_path, review_json_path, created_at]
+      required: [id, issue_id, run_id, packet_no, status, root_path, created_at]
       properties:
-        id: { type: string }
+        id: { type: string, pattern: "^rp_" }
         issue_id: { type: string }
         run_id: { type: string }
-        packet_no: { type: integer }
-        status: { type: string, enum: [generated, failed] }
-        review_md_path: { type: string }
-        review_json_path: { type: string }
-        patch_path: { type: string }
-        changed_files_path: { type: string }
+        packet_no: { type: integer, minimum: 1 }
+        status: { type: string, enum: [generated, partial, failed] }
+        root_path: { type: string }
+        review_md_path: { type: [string, 'null'] }
+        review_json_path: { type: [string, 'null'] }
+        patch_path: { type: [string, 'null'] }
+        changed_files_path: { type: [string, 'null'] }
+        untracked_files_path: { type: [string, 'null'] }
+        diffstat_path: { type: [string, 'null'] }
+        failure_code: { type: [string, 'null'] }
+        failure_message: { type: [string, 'null'] }
         created_at: { type: string, format: date-time }
+    ReviewPacketEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ReviewPacketSummary' } } } ]
+    Artifact:
+      type: object
+      required: [id, kind, path, redacted, created_at]
+      properties:
+        id: { type: string, pattern: "^art_" }
+        issue_id: { type: [string, 'null'] }
+        run_id: { type: [string, 'null'] }
+        review_packet_id: { type: [string, 'null'] }
+        kind: { type: string, enum: [test_output, patch, changed_files, untracked_files, diffstat, prompt_snapshot, codex_log, review_packet, agent_file, diagnostic, other] }
+        path: { type: string }
+        mime_type: { type: [string, 'null'] }
+        size_bytes: { type: [integer, 'null'], minimum: 0 }
+        sha256: { type: [string, 'null'] }
+        redacted: { type: boolean }
+        created_at: { type: string, format: date-time }
+    ArtifactEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Artifact' } } } ]
     WorkflowStatus:
       type: object
       required: [valid]
       properties:
         valid: { type: boolean }
         errors: { type: array, items: { type: string } }
+        warnings: { type: array, items: { type: string } }
         effective_config: { type: object, additionalProperties: true }
+    WorkflowStatusEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/WorkflowStatus' } } } ]
     Diagnostics:
       type: object
-      required: [project_id, generated_at, redacted]
+      required: [project_id, generated_at, redacted, checks]
       properties:
         project_id: { type: string }
         generated_at: { type: string, format: date-time }
         redacted: { type: boolean }
         checks: { type: array, items: { type: object, additionalProperties: true } }
+        runtime: { type: object, additionalProperties: true }
+        security: { type: object, additionalProperties: true }
+    DiagnosticsEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Diagnostics' } } } ]
+    DiagnosticsExport:
+      type: object
+      required: [artifact_id]
+      properties:
+        artifact_id: { type: string, pattern: "^art_" }
+    DiagnosticsExportEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/DiagnosticsExport' } } } ]

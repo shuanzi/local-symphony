@@ -12,6 +12,7 @@
 - `api/openapi.yaml`
 - `db/schema/*.sql`
 - `schemas/*.schema.json`
+- `schemas/tools/*.input.schema.json`
 
 ## 必须创建/修改的组件
 

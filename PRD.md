@@ -28,7 +28,7 @@ issue → Ready
   ↓
 Codex 在 issue workspace 内工作
   ↓
-Codex 调用 symphony tool handoff submit submit
+Codex 调用 symphony tool handoff submit
   ↓
 执行 after_run hook
   ↓
@@ -108,7 +108,7 @@ v1 不是远程 SaaS、多租户平台、完整 CI/CD、通用 workflow engine �
 
 v1 必须达成以下产品目标：
 
-1. **本地 issue tracker 可用**：operator 能创建、编辑、评论、阻塞、转态、dispatch、pause/resume 本地 issue。
+1. **本地 issue tracker 可用**：operator 能创建、编辑、评论、阻塞、状态流转、dispatch、pause/resume 本地 issue。
 2. **Codex 执行可隔离**：每个 issue 在独立 git worktree 和 branch 内执行，不污染主 repo working tree。
 3. **调度可控**：orchestrator 负责 dispatch、并发、active run reconciliation、取消、失败分类和暂停。
 4. **agent 工具受控**：agent 只能通过固定 Tool Gateway registry 修改当前 issue、提交 artifact、创建 follow-up、提交 handoff 或 block 当前 issue。
@@ -257,7 +257,7 @@ followup.create
 handoff.submit
 ```
 
-agent 不能通过工具删除 issue、设置 Done、任意转态、修改其他 issue、读取 secrets、删除 workspace、push、create PR 或访问 project settings。
+agent 不能通过工具删除 issue、设置 Done、任意状态流转、修改其他 issue、读取 secrets、删除 workspace、push、create PR 或访问 project settings。
 
 ### 8.7 Handoff
 
@@ -369,7 +369,7 @@ redacted diagnostics export only
 | REST/SSE API | `api/openapi.yaml` | 生成 API client、handler stub、contract tests。 |
 | App DB | `db/schema/v1_app.sql` | daemon/app 级项目注册、session、open token、runtime 元数据。 |
 | Project DB | `db/schema/v1_project.sql` | issue、run、event、approval、tool、handoff、review packet 本地 source of truth。 |
-| JSON Schema | `schemas/*.schema.json` | 校验 WORKFLOW config、RunEvent、Tool Gateway、Review Packet、Diagnostics。 |
+| JSON Schema | `schemas/*.schema.json`、`schemas/tools/*.input.schema.json` | 校验 WORKFLOW config、RunEvent、Tool Gateway、各工具输入、Review Packet、Diagnostics、FailureCode。 |
 | 默认模板 | `examples/WORKFLOW.default.md` | `symphony init` 默认生成的 repo-owned workflow。 |
 | 开发任务包 | `docs/agent_work_orders/M0-M8` | 将 v1 拆成可验收 milestone，避免 agent 自行发散。 |
 | 验收材料 | `docs/testing/*` | 给 test/review agent 执行端到端验证。 |
@@ -407,7 +407,7 @@ Duplicate
 | Cancelled | operator 取消任务。 |
 | Duplicate | operator 标记重复。 |
 
-允许的核心转态：
+允许的核心状态流转：
 
 | From | To | Actor | Guard / Side effect |
 |---|---|---|---|
@@ -575,7 +575,7 @@ v1 产品验收必须覆盖：
 - 本地 tracker 无 Linear credentials/config/API/code path。
 - 主路径完整可运行并最终 Done。
 - Handoff target 固定 `Human Review`；其他 target workflow validation fail。
-- `handoff.submit` 只记录数据，不直接转态。
+- `handoff.submit` 只记录数据，不直接状态流转。
 - Review packet 生成失败时 issue 不进入 Human Review。
 - Missing handoff twice 后 run `completed_without_handoff`，issue dispatch paused。
 - Operator cancel / approval `cancel_run` 后 run `cancelled/operator_cancelled`，不自动 redispatch。
