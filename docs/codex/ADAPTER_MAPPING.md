@@ -27,4 +27,4 @@ Codex-specific payloads must be redacted before storing in `run_events.data_json
 
 ## Experimental API
 
-If `codex.experimental_api=true`, fixtures must explicitly include experimental fields. Otherwise dispatch fails with `unsupported_codex_version`.
+If `codex.experimental_api=true`, fixtures must explicitly include experimental fields. Otherwise the dispatch attempt fails with `unsupported_codex_version` before launching the real Codex process.

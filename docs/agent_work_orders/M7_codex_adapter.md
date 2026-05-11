@@ -20,6 +20,7 @@
 ```bash
 go test ./internal/agent/codex
 SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
+scripts/validate-contracts.sh
 ```
 
 ## 禁止事项
@@ -34,4 +35,5 @@ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
 - [ ] 相关合同文件已被测试消费。
 - [ ] 关键状态/错误路径有单元或集成测试。
 - [ ] 默认路径不依赖真实 Codex。
+- [ ] 无 committed fixture 的 Codex protocol version 在启动真实 Codex process 前失败，并记录 `unsupported_codex_version`。
 - [ ] 文档、CLI help、API schema 没有明显漂移。

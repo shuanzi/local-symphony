@@ -381,7 +381,7 @@ components:
       enum: [Inbox, Ready, Working, Rework, Blocked, Human Review, Done, Cancelled, Duplicate]
     Issue:
       type: object
-      required: [id, identifier, sequence_no, title, state, priority, dispatch_paused, created_at, updated_at]
+      required: [id, identifier, sequence_no, title, description, acceptance_criteria, priority, state, url, labels, blocked_by, blocks, dispatch_paused, dispatch_pause_reason, dispatch_paused_at, branch_name, workspace_path, base_ref, base_ref_config, base_sha, workspace, git, latest_run, active_run_id, latest_run_id, latest_review_packet, latest_review_packet_id, created_at, updated_at, completed_at, archived_at]
       properties:
         id: { type: string, pattern: "^iss_" }
         identifier: { type: string }
@@ -391,20 +391,71 @@ components:
         acceptance_criteria: { type: array, items: { type: string } }
         state: { $ref: '#/components/schemas/IssueState' }
         priority: { type: integer, minimum: 1, maximum: 5 }
+        url: { type: [string, 'null'] }
         labels: { type: array, items: { type: string } }
-        blocked_by: { type: array, items: { type: string } }
-        blocks: { type: array, items: { type: string } }
+        blocked_by: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
+        blocks: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
         dispatch_paused: { type: boolean }
         dispatch_pause_reason: { type: [string, 'null'] }
         dispatch_paused_at: { type: [string, 'null'], format: date-time }
         branch_name: { type: [string, 'null'] }
         workspace_path: { type: [string, 'null'] }
+        base_ref: { type: [string, 'null'] }
+        base_ref_config: { type: [string, 'null'] }
+        base_sha: { type: [string, 'null'] }
+        workspace:
+          anyOf:
+            - { $ref: '#/components/schemas/WorkspaceSummary' }
+            - { type: 'null' }
+        git:
+          anyOf:
+            - { $ref: '#/components/schemas/GitSummary' }
+            - { type: 'null' }
+        latest_run:
+          anyOf:
+            - { $ref: '#/components/schemas/RunAttempt' }
+            - { type: 'null' }
+        active_run_id: { type: [string, 'null'] }
         latest_run_id: { type: [string, 'null'] }
+        latest_review_packet:
+          anyOf:
+            - { $ref: '#/components/schemas/ReviewPacketSummary' }
+            - { type: 'null' }
         latest_review_packet_id: { type: [string, 'null'] }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         completed_at: { type: [string, 'null'], format: date-time }
         archived_at: { type: [string, 'null'], format: date-time }
+    IssueRefSummary:
+      type: object
+      required: [id, identifier, title, state]
+      additionalProperties: false
+      properties:
+        id: { type: string, pattern: "^iss_" }
+        identifier: { type: string }
+        title: { type: string }
+        state: { $ref: '#/components/schemas/IssueState' }
+    WorkspaceSummary:
+      type: object
+      required: [id, path, branch_name, base_ref, base_ref_config, base_sha, status]
+      additionalProperties: false
+      properties:
+        id: { type: string, pattern: "^ws_" }
+        path: { type: string }
+        branch_name: { type: string }
+        base_ref: { type: string }
+        base_ref_config: { type: string }
+        base_sha: { type: string }
+        status: { type: string, enum: [prepared, conflict, missing] }
+    GitSummary:
+      type: object
+      required: [branch_name, base_ref, base_ref_config, base_sha]
+      additionalProperties: false
+      properties:
+        branch_name: { type: [string, 'null'] }
+        base_ref: { type: [string, 'null'] }
+        base_ref_config: { type: [string, 'null'] }
+        base_sha: { type: [string, 'null'] }
     IssueEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Issue' } } } ]
     IssueListEnvelope:

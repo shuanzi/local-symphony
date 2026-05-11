@@ -27,9 +27,10 @@ version metadata
 ```text
 1. Detect installed Codex version.
 2. Resolve fixture directory.
-3. If fixture missing, fail before starting run with unsupported_codex_version.
-4. If fixture exists, run adapter compatibility checks.
-5. Only then launch codex app-server.
+3. If fixture is missing, record a failed run attempt with `unsupported_codex_version`, restore the issue to its `source_issue_state`, and pause dispatch.
+4. This failure must occur before launching the real `codex app-server` process.
+5. If fixture exists, run adapter compatibility checks.
+6. Only then launch `codex app-server`.
 ```
 
 ## CI

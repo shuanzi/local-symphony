@@ -19,7 +19,8 @@
 
 ```bash
 go test ./...
-npm test --prefix web
+pnpm --dir web typecheck
+pnpm --dir web test
 scripts/validate-contracts.sh
 scripts/acceptance-local.sh
 ```

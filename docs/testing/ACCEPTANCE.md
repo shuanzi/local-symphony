@@ -11,6 +11,8 @@ scripts/validate-contracts.sh
 ```text
 OpenAPI parseable
 JSON schemas parseable
+schemas/normalized_issue.schema.json matches OpenAPI Issue required fields
+schemas/run_event.schema.json requires seq for SSE replay IDs
 SQLite app/project DDL can initialize empty databases
 examples/WORKFLOW.default.md validates
 examples/handoff.json and examples/followup.json validate against schemas/tools/*.input.schema.json and wrapped Tool Gateway call schemas

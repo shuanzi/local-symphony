@@ -21,7 +21,9 @@
 
 ```bash
 go test ./internal/httpapi ./internal/cli ./internal/security
-npm test --prefix web
+pnpm --dir web typecheck
+pnpm --dir web test
+scripts/validate-contracts.sh
 ```
 
 ## 禁止事项

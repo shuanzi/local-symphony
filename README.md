@@ -40,11 +40,13 @@ api/openapi.yaml                # REST/SSE API 可机器校验合同
 db/schema/v1_app.sql            # app-level SQLite DDL
 db/schema/v1_project.sql        # project-level SQLite DDL
 schemas/*.schema.json           # WORKFLOW、RunEvent、Tool Gateway、Review Packet、Diagnostics、FailureCode JSON Schema
+schemas/normalized_issue.schema.json # NormalizedIssue DTO 合同，供 API、prompt、tool 和 review metadata 复用
 schemas/tools/*.input.schema.json # Tool Gateway 各工具输入 schema
 examples/WORKFLOW.default.md    # 默认 WORKFLOW.md 模板
 examples/handoff.json           # agent handoff 输入示例
 examples/followup.json          # agent followup 输入示例
 docs/agent_work_orders/*.md     # M0-M8 可执行开发任务包
+docs/agent_work_orders/EXECUTION_PROTOCOL.md # implementation agent 通用执行纪律
 docs/testing/ACCEPTANCE.md      # 端到端验收场景和命令
 docs/testing/FAILURE_CODE_MATRIX.md
 docs/codex/ADAPTER_MAPPING.md   # Codex app-server → Symphony 映射
@@ -65,6 +67,7 @@ docs/codex/FIXTURE_POLICY.md    # Codex fixture-gated 策略
 
 ```text
 api/openapi.yaml
+schemas/normalized_issue.schema.json
 schemas/*.schema.json
 schemas/tools/*.input.schema.json
 db/schema/*.sql
@@ -202,7 +205,7 @@ v1 不自动 push、create PR、merge、publish
 v1 不允许 agent 自动 commit
 Human Review 是 v1 唯一 handoff target
 real Codex tests 是 opt-in；默认 CI 使用 fake runner
-Codex adapter 必须 fixture-gated；无 fixture 的 Codex protocol version dispatch 前失败
+Codex adapter 必须 fixture-gated；无 fixture 的 Codex protocol version 在启动真实 Codex process 前失败，并记录 `unsupported_codex_version`
 ```
 
 ---
@@ -244,8 +247,9 @@ raw prompt or raw Codex log export through v1 API
 5. db/schema/v1_app.sql + db/schema/v1_project.sql
 6. schemas/*.schema.json
 7. docs/agent_work_orders/README.md
-8. docs/testing/ACCEPTANCE.md
-9. docs/codex/*.md
+8. docs/agent_work_orders/EXECUTION_PROTOCOL.md
+9. docs/testing/ACCEPTANCE.md
+10. docs/codex/*.md
 ```
 
 推荐执行顺序：

@@ -194,6 +194,23 @@ def validate_openapi() -> None:
     openapi_api_errors = set(data["components"]["schemas"]["ApiErrorCode"]["enum"])
     if expected_api_errors != openapi_api_errors:
         fail(f"ApiErrorCode mismatch: {sorted(expected_api_errors ^ openapi_api_errors)}")
+
+    normalized_issue_schema = load_json("schemas/normalized_issue.schema.json")
+    normalized_issue_required = set(normalized_issue_schema["required"])
+    openapi_issue = data["components"]["schemas"]["Issue"]
+    openapi_issue_required = set(openapi_issue.get("required", []))
+    if normalized_issue_required != openapi_issue_required:
+        fail(
+            "OpenAPI Issue required fields must match schemas/normalized_issue.schema.json: "
+            f"{sorted(normalized_issue_required ^ openapi_issue_required)}"
+        )
+    missing_issue_props = normalized_issue_required - set(openapi_issue.get("properties", {}))
+    if missing_issue_props:
+        fail(f"OpenAPI Issue schema missing NormalizedIssue properties: {sorted(missing_issue_props)}")
+
+    run_event_schema = load_json("schemas/run_event.schema.json")
+    if "seq" not in run_event_schema.get("required", []):
+        fail("schemas/run_event.schema.json must require seq for SSE replay IDs")
     print("ok openapi api/openapi.yaml")
 
 

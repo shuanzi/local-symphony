@@ -1,0 +1,424 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-symphony.dev/schemas/normalized_issue.schema.json",
+  "title": "NormalizedIssue",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "identifier",
+    "sequence_no",
+    "title",
+    "description",
+    "acceptance_criteria",
+    "priority",
+    "state",
+    "url",
+    "labels",
+    "blocked_by",
+    "blocks",
+    "dispatch_paused",
+    "dispatch_pause_reason",
+    "dispatch_paused_at",
+    "branch_name",
+    "workspace_path",
+    "base_ref",
+    "base_ref_config",
+    "base_sha",
+    "workspace",
+    "git",
+    "latest_run",
+    "active_run_id",
+    "latest_run_id",
+    "latest_review_packet",
+    "latest_review_packet_id",
+    "created_at",
+    "updated_at",
+    "completed_at",
+    "archived_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^iss_"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sequence_no": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5
+    },
+    "state": {
+      "$ref": "#/$defs/issueState"
+    },
+    "url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blocked_by": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/issueRef"
+      }
+    },
+    "blocks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/issueRef"
+      }
+    },
+    "dispatch_paused": {
+      "type": "boolean"
+    },
+    "dispatch_pause_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "dispatch_paused_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "branch_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base_ref_config": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base_sha": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/workspaceSummary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "git": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/gitSummary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "latest_run": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/runSummary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "active_run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^run_"
+    },
+    "latest_run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^run_"
+    },
+    "latest_review_packet": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/reviewPacketSummary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "latest_review_packet_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^rp_"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "archived_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "issueState": {
+      "enum": [
+        "Inbox",
+        "Ready",
+        "Working",
+        "Rework",
+        "Blocked",
+        "Human Review",
+        "Done",
+        "Cancelled",
+        "Duplicate"
+      ]
+    },
+    "issueRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "identifier",
+        "title",
+        "state"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^iss_"
+        },
+        "identifier": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/issueState"
+        }
+      }
+    },
+    "workspaceSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "path",
+        "branch_name",
+        "base_ref",
+        "base_ref_config",
+        "base_sha",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^ws_"
+        },
+        "path": {
+          "type": "string"
+        },
+        "branch_name": {
+          "type": "string"
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "base_ref_config": {
+          "type": "string"
+        },
+        "base_sha": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "prepared",
+            "conflict",
+            "missing"
+          ]
+        }
+      }
+    },
+    "gitSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch_name",
+        "base_ref",
+        "base_ref_config",
+        "base_sha"
+      ],
+      "properties": {
+        "branch_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_ref_config": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "runSummary": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "id",
+        "status",
+        "attempt_no",
+        "created_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^run_"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "preparing_workspace",
+            "rendering_prompt",
+            "starting_agent",
+            "running",
+            "completed",
+            "completed_without_handoff",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "attempt_no": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "failure_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "reviewPacketSummary": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "id",
+        "run_id",
+        "packet_no",
+        "status",
+        "created_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^rp_"
+        },
+        "run_id": {
+          "type": "string",
+          "pattern": "^run_"
+        },
+        "packet_no": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "enum": [
+            "generated",
+            "partial",
+            "failed"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}
