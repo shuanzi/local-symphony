@@ -415,13 +415,13 @@ components:
           anyOf:
             - { $ref: '#/components/schemas/RunSummary' }
             - { type: 'null' }
-        active_run_id: { type: [string, 'null'] }
-        latest_run_id: { type: [string, 'null'] }
+        active_run_id: { type: [string, 'null'], pattern: "^run_" }
+        latest_run_id: { type: [string, 'null'], pattern: "^run_" }
         latest_review_packet:
           anyOf:
             - { $ref: '#/components/schemas/IssueReviewPacketSummary' }
             - { type: 'null' }
-        latest_review_packet_id: { type: [string, 'null'] }
+        latest_review_packet_id: { type: [string, 'null'], pattern: "^rp_" }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         completed_at: { type: [string, 'null'], format: date-time }

@@ -234,6 +234,15 @@ def validate_openapi() -> None:
     if missing_issue_props:
         fail(f"OpenAPI Issue schema missing NormalizedIssue properties: {sorted(missing_issue_props)}")
 
+    for prop in ("active_run_id", "latest_run_id", "latest_review_packet_id"):
+        normalized_pattern = normalized_issue_schema["properties"][prop].get("pattern")
+        openapi_pattern = openapi_issue["properties"][prop].get("pattern")
+        if normalized_pattern != openapi_pattern:
+            fail(
+                f"OpenAPI Issue.{prop} pattern must match schemas/normalized_issue.schema.json: "
+                f"expected {normalized_pattern!r}, got {openapi_pattern!r}"
+            )
+
     expected_refs = {
         "blocked_by": "IssueRefSummary",
         "blocks": "IssueRefSummary",
