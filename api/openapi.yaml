@@ -133,17 +133,19 @@ paths:
   /issues/{issue_ref}/dispatch-pause:
     post:
       operationId: pauseIssueDispatch
+      description: Pauses dispatch for a non-terminal issue, recording the non-empty operator reason in pause fields, event log, and issue comments.
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
-      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1 } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
+      requestBody: { description: Non-empty operator reason for audit comment/event., required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1 } } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "409": { $ref: '#/components/responses/Error' } }
   /issues/{issue_ref}/dispatch-resume:
     post:
       operationId: resumeIssueDispatch
+      description: Resumes dispatch for a non-terminal issue by clearing only dispatch pause fields; it never changes issue content, blockers, state, or creates a run.
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
-      requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { reason: { type: string } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
+      requestBody: { description: Non-empty operator reason for audit comment/event., required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1 } } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "409": { $ref: '#/components/responses/Error' } }
   /issues/{issue_ref}/blockers:
     post:
       operationId: addIssueBlocker
@@ -222,6 +224,7 @@ paths:
   /reviews/{issue_ref}/mark-done:
     post:
       operationId: markDone
+      description: Requires latest generated review packet to belong to latest completed handoff run, with issue in Human Review and no active run.
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { reason: { type: string } } } } } }
@@ -341,12 +344,39 @@ components:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Health' } } } ]
     AppState:
       type: object
-      required: [project_id, repo_root, daemon_pid]
+      required: [project_id, repo_root, daemon_pid, daemon, project, workflow, running_runs, pending_approvals, human_review, paused_issues, codex, recent_failures]
       properties:
         project_id: { type: string }
         repo_root: { type: string }
         daemon_pid: { type: integer }
         active_runs: { type: integer }
+        daemon:
+          type: object
+          additionalProperties: true
+        project:
+          type: object
+          additionalProperties: true
+        workflow:
+          type: object
+          additionalProperties: true
+        running_runs:
+          type: array
+          items: { type: object, additionalProperties: true }
+        pending_approvals:
+          type: array
+          items: { type: object, additionalProperties: true }
+        human_review:
+          type: array
+          items: { type: object, additionalProperties: true }
+        paused_issues:
+          type: array
+          items: { type: object, additionalProperties: true }
+        codex:
+          type: object
+          additionalProperties: true
+        recent_failures:
+          type: array
+          items: { type: object, additionalProperties: true }
     AppStateEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/AppState' } } } ]
     AuthSession:
@@ -501,6 +531,23 @@ components:
             failure_code: { type: [string, 'null'] }
     IssueTransitionEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/IssueTransitionResult' } } } ]
+    IssueDispatchControlResult:
+      type: object
+      required: [issue, side_effects]
+      properties:
+        issue: { $ref: '#/components/schemas/Issue' }
+        side_effects:
+          type: object
+          additionalProperties: true
+          properties:
+            created_comment_ids:
+              type: array
+              items: { type: string, pattern: "^cmt_" }
+            created_event_ids:
+              type: array
+              items: { type: string, pattern: "^evt_" }
+    IssueDispatchControlEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/IssueDispatchControlResult' } } } ]
     IssueComment:
       type: object
       required: [id, issue_id, body, author_type, created_at]
@@ -622,9 +669,19 @@ components:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ApprovalRequest' } } } ]
     ApprovalListEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/ApprovalRequest' } } } } ]
+    ReviewPacketArtifact:
+      type: object
+      required: [kind, path, artifact_id, redacted, content_url]
+      additionalProperties: false
+      properties:
+        kind: { type: string, enum: [review_md, review_json, patch, changed_files, untracked_files, diffstat, test_output, agent_final_message, commands, tool_calls, approvals, codex_events, prompt_context, prompt_rendered, prompt_meta, prompt_tool_manifest, other] }
+        path: { type: string }
+        artifact_id: { type: string, pattern: "^art_" }
+        redacted: { type: boolean }
+        content_url: { type: [string, 'null'], format: uri-reference }
     ReviewPacketSummary:
       type: object
-      required: [id, issue_id, run_id, packet_no, status, root_path, created_at]
+      required: [id, issue_id, run_id, packet_no, status, root_path, artifacts, created_at]
       properties:
         id: { type: string, pattern: "^rp_" }
         issue_id: { type: string }
@@ -638,6 +695,9 @@ components:
         changed_files_path: { type: [string, 'null'] }
         untracked_files_path: { type: [string, 'null'] }
         diffstat_path: { type: [string, 'null'] }
+        artifacts:
+          type: array
+          items: { $ref: '#/components/schemas/ReviewPacketArtifact' }
         failure_code: { type: [string, 'null'] }
         failure_message: { type: [string, 'null'] }
         created_at: { type: string, format: date-time }

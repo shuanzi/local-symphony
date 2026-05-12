@@ -120,10 +120,12 @@ automatic PR creation, git push, merge, publish, or agent commit
 automatic workspace delete/reset/clean/rebase
 dynamic tools or MCP
 remote dashboard or multi-tenant RBAC
+Tauri desktop shell
 production DB migration/rollback framework
 automatic SQLite backup/restore
 crash recovery beyond startup stale active-run interruption
 full audit log
+supply-chain deep risk scoring
 raw prompt or raw Codex log export through v1 API
 ```
 
@@ -873,7 +875,7 @@ created_at
 updated_at
 ```
 
-`source_issue_state` is mandatory for dispatched runs and is used to restore the issue to Ready/Rework on failure, cancellation, missing handoff, or review packet failure.
+`source_issue_state` is mandatory for dispatched runs and is used to restore the issue to Ready/Rework on failure, cancellation, missing handoff, or review packet failure, unless the issue is already Blocked/Cancelled/Duplicate due to operator transition or agent `issue.block`.
 
 #### run_events
 
@@ -1051,7 +1053,7 @@ insert issue.transitioned event
 Dispatch claim transaction:
 
 ```text
-validate active state
+validate issue.state IN Ready/Rework
 validate not paused
 validate no active blockers
 validate no active run
@@ -1089,6 +1091,10 @@ Missing handoff after allowed continuation:
 
 ```text
 run.status = completed_without_handoff
+if run_attempt.source_issue_state in Ready/Rework and issue is not Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
+  issue.state = run_attempt.source_issue_state
+if issue is Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
+  keep current issue state
 issue.dispatch_paused = true
 dispatch_pause_reason = missing_handoff
 system comment
@@ -1188,7 +1194,7 @@ WHERE i.state IN ('Ready', 'Rework')
 ORDER BY i.priority ASC, i.created_at ASC, i.identifier ASC;
 ```
 
-Note: `Working` is active-dispatch-eligible for reconciliation, but not a normal scheduler candidate.
+Note: `Working` is a reconciliation active state, but not a normal scheduler dispatch candidate.
 
 ### 7.10 File and DB atomicity
 
@@ -1238,12 +1244,24 @@ Duplicate
 | `Rework` | `Working` | orchestrator | Dispatch claim transaction succeeds. |
 | `Working` | `Human Review` | run finalizer | Handoff exists and review packet status is `generated`. |
 | `Human Review` | `Rework` | operator | Reviewer supplies reason/feedback comment. |
-| `Human Review` | `Done` | operator | Latest review packet status `generated`; no active run. |
+| `Human Review` | `Done` | operator | Latest review packet status `generated`; latest review_packet.run_id belongs to latest completed handoff run; no active run. |
 | any non-terminal | `Blocked` | operator or agent tool | Active run reconciliation cancels active run. Agent tool also pauses dispatch. |
 | any non-terminal | `Cancelled` | operator | Active run reconciliation cancels active run. |
 | any non-terminal | `Duplicate` | operator | Active run reconciliation cancels active run. |
 | `Blocked` | `Ready` | operator | Block resolved; blockers inactive or removed. |
-| `Done`/`Cancelled`/`Duplicate` | non-terminal | operator | Explicit reopen only; does not reuse old active runs. |
+| `Done`/`Cancelled`/`Duplicate` | `Inbox`/`Ready` | operator | Explicit reopen only; direct reopen to `Working`, `Human Review`, `Rework`, or `Blocked` is forbidden; requires no active run and does not reuse old runs. Reopen sets `completed_at=null`, clears `dispatch_paused`/reason/paused_at, and preserves workspace, history, review packets, and duplicate relations. |
+
+Reopen rules:
+
+```text
+target_state ∈ Inbox|Ready
+no active run
+old run_attempts are never reused
+reopen to Inbox does not dispatch automatically
+reopen to Ready makes the issue eligible for a new run on the next scheduler tick, subject to normal eligibility
+latest review packet is retained as history only; completion after reopen requires a latest review packet from a new post-reopen handoff run
+duplicate relations are retained; operator must remove or deactivate them separately when the issue is no longer a duplicate
+```
 
 ### 8.3 Orchestrator actor
 
@@ -1446,7 +1464,7 @@ run_attempt.status = cancelled
 run_attempt.failure_code = operator_cancelled
 run_attempt.failure_message = reason
 run_attempt.ended_at = now
-issue.state = run_attempt.source_issue_state when source_issue_state is Ready/Rework, unless operator separately transitioned the issue to Blocked/Cancelled/Duplicate
+issue.state = run_attempt.source_issue_state when source_issue_state is Ready/Rework, unless the issue is already Blocked/Cancelled/Duplicate due to operator transition or agent issue.block
 issues.dispatch_paused = true
 issues.dispatch_pause_reason = operator_cancelled
 issues.dispatch_paused_at = now
@@ -1467,8 +1485,10 @@ run_attempt.status = failed
 run_attempt.failure_code = <code>
 run_attempt.failure_message = <message>
 run_attempt.ended_at = now
-if run_attempt.source_issue_state in Ready/Rework:
+if run_attempt.source_issue_state in Ready/Rework and issue is not Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
   issue.state = run_attempt.source_issue_state
+if issue is Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
+  keep current issue state
 issues.dispatch_paused = true
 issues.dispatch_pause_reason = <code>
 issues.dispatch_paused_at = now
@@ -1477,6 +1497,8 @@ system comment with failure summary
 ```
 
 This state restoration is mandatory. Without it, `dispatch-resume` would leave the issue in `Working`, while the normal scheduler only claims `Ready/Rework`.
+
+When an approval outcome writes `approval_requests.status = auto_denied`, the run failure code (`run_attempt.failure_code`) and `issues.dispatch_pause_reason` MUST use the matching canonical `FailureCode`: `command_denied`, `network_denied`, or `protected_path_denied`.
 
 Canonical `FailureCode`:
 
@@ -1519,7 +1541,10 @@ if continuation unused: send one handoff continuation
 still no handoff:
   run.status = completed_without_handoff
   run.failure_code = missing_handoff
-  issue.state = run_attempt.source_issue_state
+  if run_attempt.source_issue_state in Ready/Rework and issue is not Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
+    issue.state = run_attempt.source_issue_state
+  if issue is Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
+    keep current issue state
   issue.dispatch_paused = true
   dispatch_pause_reason = missing_handoff
   system comment
@@ -1571,7 +1596,10 @@ If review packet fails:
 
 ```text
 run.status = failed
-issue remains not Human Review
+if run_attempt.source_issue_state in Ready/Rework and issue is not Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
+  issue.state = run_attempt.source_issue_state
+if issue is Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
+  keep current issue state
 issue.dispatch_paused = true
 failure_code = review_packet_failed
 ```
@@ -1598,6 +1626,10 @@ On startup, before dispatch, scan active `run_attempts.status` rows. For rows ow
 status = failed
 failure_code = daemon_restarted_run_interrupted
 ended_at = now
+if run_attempt.source_issue_state in Ready/Rework and issue is not Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
+  issue.state = run_attempt.source_issue_state
+if issue is Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
+  keep current issue state
 issues.dispatch_paused = true
 issues.dispatch_pause_reason = daemon_restarted_run_interrupted
 issues.dispatch_paused_at = now
@@ -1781,7 +1813,7 @@ All paths MUST be workspace-relative in review artifacts.
 Absolute paths and path traversal MUST be rejected.
 Symlink targets escaping workspace MUST fail review generation.
 Protected paths MUST fail review generation with review_packet_failed/protected_path_denied according to source.
-Files over artifact_max_bytes MUST be listed with patch_included=false unless binary diff is explicitly allowed by policy.
+Untracked files over artifact_max_bytes, binary files, or files excluded from patch by policy MUST be listed with patch_included=false and a non-empty reason unless binary diff is explicitly allowed by policy.
 ```
 
 `untracked-files.json` MUST still be written. For each untracked file it MUST include:
@@ -2063,7 +2095,20 @@ Exit codes:
 symphony init [--name <name>] [--issue-prefix LOC] [--workflow-template default]
 symphony serve [--project <path>] [--host 127.0.0.1] [--port 0] [--open] [--no-open]
 symphony open [--project <path>]
+symphony status [--json]
 ```
+
+Status command:
+
+```text
+primary API: GET /api/v1/state
+daemon unavailable: CLI MAY fall back to GET /api/v1/health only to report daemon availability; if health is unavailable too, exit 3
+human output: concise status for daemon, project, workflow, running runs, pending approvals, Human Review, paused issues, Codex availability, and recent failure summary
+--json output: envelope-unwrapped stable object with daemon, project, workflow, running_runs, pending_approvals, human_review, paused_issues, codex, and recent_failures fields
+```
+
+`symphony status --json` MUST return the state object directly, not an API envelope. It MUST NOT invent data from diagnostics; unavailable fields from `/api/v1/state` are `null`, empty lists, or `unknown` according to the field type.
+`GET /api/v1/state` `AppState` uses these same field names; legacy `active_runs` remains a compatibility alias for `running_runs` count.
 
 Issue commands:
 
@@ -2098,6 +2143,8 @@ Approval commands:
 ```bash
 symphony approval list
 symphony approval decide appr_... --approve-once
+symphony approval decide appr_... --approve-for-run
+symphony approval decide appr_... --approve-for-session
 symphony approval decide appr_... --deny --reason "..."
 symphony approval decide appr_... --cancel-run --reason "..."
 ```
@@ -2486,6 +2533,36 @@ blockers use blocker command endpoints
 transition leaving Ready/Working/Rework with active run enqueues reconciliation cancel and returns side_effects metadata
 ```
 
+Dispatch pause/resume contract:
+
+```text
+POST /api/v1/issues/{issue_ref}/dispatch-pause
+request body: { "reason": non-empty string }
+allowed states: any non-terminal issue state
+terminal states Done/Cancelled/Duplicate, and archived issues, are rejected with invalid_state_transition; reopen/transition first if dispatch control is needed
+transaction:
+  set issues.dispatch_paused = true
+  set issues.dispatch_pause_reason = request.reason
+  set issues.dispatch_paused_at = now
+  append system event and issue comment with the operator reason
+response: IssueDispatchControlEnvelope; data shape { issue: NormalizedIssue, side_effects } when comments/events are created
+
+POST /api/v1/issues/{issue_ref}/dispatch-resume
+request body: { "reason": non-empty string }
+allowed states: any non-terminal issue state
+terminal states Done/Cancelled/Duplicate, and archived issues, are rejected with invalid_state_transition; reopen/transition first if dispatch control is needed
+transaction:
+  clear issues.dispatch_paused
+  clear issues.dispatch_pause_reason
+  clear issues.dispatch_paused_at
+  append system event and issue comment with the operator reason
+must not change issue.state
+must not edit title/description/acceptance criteria/labels/priority/workspace/git fields
+must not add/remove blockers or auto-transition Blocked to Ready/Rework
+must not create, claim, enqueue, or start a run
+response: IssueDispatchControlEnvelope; data shape { issue: NormalizedIssue, side_effects } when comments/events are created
+```
+
 Transition side effects example:
 
 ```json
@@ -2539,11 +2616,27 @@ POST /api/v1/reviews/{issue_ref}/send-to-rework
 POST /api/v1/reviews/{issue_ref}/mark-done
 ```
 
+`GET /api/v1/reviews/{issue_ref}` returns the latest REST `ReviewPacketSummary`.
+The summary MUST include an `artifacts[]` list for review packet files the dashboard may display:
+
+```text
+kind
+path
+artifact_id
+redacted
+content_url
+```
+
+`kind` identifies the packet file role, for example `review_md`, `review_json`, `patch`, `changed_files`, `untracked_files`, `diffstat`, `test_output`, `tool_calls`, `approvals`, and prompt metadata. `artifact_id` references the Artifact API metadata row. `content_url` is the relative content endpoint for allowed content, usually `/api/v1/artifacts/{artifact_id}/content`; it is `null` when content is unavailable or must not be served. Path fields on the review packet are diagnostics/metadata only. Dashboard MUST NOT read review packet files from the filesystem.
+
+The Review Packet page obtains artifact ids from this API, then fetches file contents through the Artifact API as needed. `review.json` is the preferred structured source for summary, tests, risks, verification, changed files, tool calls, and approvals. `review.md`, `changes.patch`, and other packet files are fetched by `artifact_id` for rendered review and detail panes.
+
 Mark Done guards:
 
 ```text
 issue.state = Human Review
 latest review_packet.status = generated
+review_packet.run_id belongs to latest completed handoff run
 no active run
 ```
 
@@ -2554,7 +2647,9 @@ GET /api/v1/artifacts/{artifact_id}
 GET /api/v1/artifacts/{artifact_id}/content
 ```
 
-Content access MUST enforce containment under `.symphony/artifacts` or `.symphony/exports`. v1 MUST reject raw prompt and raw Codex log content access.
+Review Packet callers use `artifact_id` values returned by the Review API. `GET /api/v1/artifacts/{artifact_id}` returns metadata; `GET /api/v1/artifacts/{artifact_id}/content` returns bytes only when allowed.
+
+Content access MUST enforce containment under `.symphony/artifacts` or `.symphony/exports`. v1 MUST reject raw prompt and raw Codex log content access. Redacted or disallowed artifacts may still appear in metadata and review packet artifact lists, but content access MUST return the existing error response rather than bypassing containment or redaction policy.
 
 ### 12.10 Workflow and diagnostics API
 
@@ -2836,7 +2931,19 @@ network.default = deny
 allowlist = []
 ```
 
-Requests are denied or converted to Approval Inbox items unless allowlisted. v1 does not implement packet firewall, egress accounting, or dependency-origin attribution.
+Network policy is evaluated before `approvals.mode` fallback behavior. `approvals.mode = balanced` does not convert `network.default = deny` into review.
+
+Decision table:
+
+| Match | `network.default` | Outcome | Approval row / Inbox |
+|---|---|---|---|
+| Request matches `allowlist` | any | allow | no pending Approval Inbox item |
+| Request does not match `allowlist` | `deny` | auto-deny and terminate current run with `network_denied` | `auto_denied`; not operator-actionable |
+| Request does not match `allowlist` | `review` | create pending operator decision | pending Approval Inbox item |
+
+Therefore the default config (`approvals.mode = balanced`, `network.default = deny`, empty `allowlist`) MUST auto-deny unknown network requests. Network requests enter Approval Inbox only when the network policy explicitly returns review, for example `network.default = review` or a future more-specific review rule.
+
+v1 does not implement packet firewall, egress accounting, or dependency-origin attribution.
 
 ### 13.6 Protected paths
 
@@ -3094,7 +3201,7 @@ Artifact kinds:
 
 ### 14.6 Untracked file guarantee
 
-A review packet with untracked files is not `generated` unless untracked file contents are represented in `changes.patch`.
+A review packet with untracked files is `generated` only if every untracked file is listed in `changed-files.txt` and `untracked-files.json`. Untracked file contents SHOULD be represented in `changes.patch`; when omitted because of size, binary content, or policy limits, `patch_included` MUST be `false` and `reason` MUST explain the omission in review metadata.
 
 `untracked-files.json` shape:
 
@@ -3104,7 +3211,8 @@ A review packet with untracked files is not `generated` unless untracked file co
     "path": "src/new-file.ts",
     "size_bytes": 1234,
     "sha256": "...",
-    "patch_included": true
+    "patch_included": true,
+    "reason": null
   }
 ]
 ```
@@ -3118,6 +3226,7 @@ Finalizer transitions issue to `Human Review` only when:
 ```text
 handoff exists for run
 handoff.target_state = Human Review
+after_run attempted if workspace exists
 critical review packet files are written
 review_packets.status = generated
 run terminal outcome is otherwise successful
@@ -3269,6 +3378,19 @@ Cancelled
 Duplicate
 ```
 
+Board actions:
+
+```text
+create issue
+transition issue
+dispatch eligible issue
+open Issue Detail
+open Run Detail
+open Review Packet
+```
+
+Board actions MUST call REST command APIs. The dashboard MUST NOT directly read or write backend resources such as SQLite, Git, filesystem, Codex, or Tool Gateway.
+
 Issue Detail shows issue facts, comments, blockers, workspace, run history, review packets, and dispatch paused state. It MUST expose dispatch resume when paused.
 
 Run Detail shows normalized timeline:
@@ -3286,7 +3408,7 @@ failure
 
 Approval Inbox shows command/file/network approvals, risk level, policy match, and approve/deny/cancel controls.
 
-Review Packet page shows summary, tests, risks, verification, changed files, diff, tool calls, approvals, Send to Rework, and Mark Done.
+Review Packet page shows summary, tests, risks, verification, changed files, diff, tool calls, approvals, Send to Rework, and Mark Done. It MUST load the latest packet through `GET /api/v1/reviews/{issue_ref}`, use returned `artifact_id`/`content_url` entries to fetch contents through the Artifact API, and MUST NOT read packet files directly from the filesystem.
 
 Workflow page shows current validation, last valid config, warnings/errors, reload, and render preview.
 
@@ -3607,7 +3729,7 @@ handlers conform to API contract
 CLI matches API side effects
 dashboard can review/approve/cancel/pause/resume/diagnose
 git push denied or unapprovable
-network default denied/reviewed
+network default denied; review-mode network request appears in Approval Inbox
 protected path access denied
 ```
 
