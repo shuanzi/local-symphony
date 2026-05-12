@@ -9,7 +9,7 @@
 
 ## 1. 产品摘要
 
-Local Symphony App v1 是一个 **local-first agent engineering workflow control plane**。它在本地 Git 仓库中运行，把本地工程任务转化为可以由 Codex 执行、由 operator 观察、审批、复核、返工和归档的完整工程流程。
+Local Symphony App v1 是一个 **local-first agent engineering workflow control plane**。它在本地 Git 仓库中运行，把本地工程任务转化为可以由 Codex 执行、由 operator 观察、审批、复核、返工和留存记录的完整工程流程。
 
 v1 的产品目标不是最大自动化，而是建立一条可靠、可观察、可审查、可恢复的本地 agent 工作流：
 
@@ -30,9 +30,9 @@ Codex 在 issue workspace 内工作
   ↓
 Codex 调用 symphony tool handoff submit
   ↓
-执行 after_run hook
+worker terminal finally path 尝试 after_run hook（workspace 已准备时）
   ↓
-生成 review packet
+handoff 存在、after_run 已尝试且无更高优先级失败/取消时生成 review packet
   ↓
 issue → Human Review
   ↓
@@ -87,7 +87,7 @@ active run reconciliation
 | Tracker | 只支持 local tracker，不实现 Linear adapter。 |
 | Source of truth | Project SQLite DB 是本地 issue/run/review source of truth。 |
 | Workspace | 每个 issue 一个 git worktree，workspace 保留，不自动清理。 |
-| Review | handoff 之后必须生成 review packet，成功后才进入 Human Review。 |
+| Review | workspace 已准备时所有 terminal outcome 都尝试 `after_run`；只有 handoff 存在、`after_run` 已尝试且 review packet 成功生成后才进入 Human Review。 |
 | Done | 只能由 operator 触发，agent 不能 Done。 |
 | Retry | v1 没有自动 retry queue/timers；失败后 pause，人工 resume。 |
 | Publish | v1 不 push、不创建 PR、不 merge、不自动 commit。 |
@@ -152,7 +152,7 @@ v1 supported platform scope：产品支持 macOS arm64/x64 和 Linux x64。Windo
 
 ### 7.2 agent 完成后进入 Human Review
 
-作为 operator，我希望 Codex 完成任务后不能直接把 issue 标成 Done，而是提交 handoff。系统必须在 handoff 后执行 `after_run` hook，并生成 review packet。只有 review packet 生成成功，issue 才能进入 `Human Review`。
+作为 operator，我希望 Codex 完成任务后不能直接把 issue 标成 Done，而是提交 handoff。只要 workspace 已准备，系统必须在所有 terminal worker outcome 的 finally path 中尝试 `after_run` hook。只有 handoff 存在、`after_run` 已尝试、且没有更高优先级失败或取消时，系统才生成 review packet；只有 review packet 生成成功，issue 才能进入 `Human Review`。
 
 ### 7.3 人工决定 Rework 或 Done
 
@@ -166,7 +166,7 @@ v1 supported platform scope：产品支持 macOS arm64/x64 和 Linux x64。Windo
 
 作为 operator，我可以在 dashboard 或 CLI 中看到 pending approvals、run timeline、failure_code、dispatch_paused 原因、workflow validation、Codex availability、Git/DB 路径和 redacted diagnostics。
 
-当失败、operator cancel、approval `cancel_run`、agent `issue.block` 或 missing handoff twice 发生时，系统必须暂停该 issue 的 dispatch，避免下一次 tick 自动重复运行。
+当失败、operator cancel、approval `cancel_run`、agent `issue.block`，或 missing handoff 已耗尽配置允许的 handoff continuation 仍未提交 handoff 时，系统必须暂停该 issue 的 dispatch，避免下一次 tick 自动重复运行。默认 `max_handoff_continuations=1` 时，首次 missing handoff 触发 dedicated handoff continuation；若配置为 `0`，首次 missing handoff 直接进入终止并 pause 路径。
 
 ## 8. 产品模块范围
 
@@ -190,13 +190,13 @@ Issue 产品层最小字段边界：
 ```text
 创建 Inbox issue 最小只要求 title。
 description 与 acceptance criteria 在 DTO 中始终存在；Inbox 阶段可为空。
-进入 Ready 或 dispatch 前，必须补齐并满足必要 issue 字段有效。
+进入 Ready 或 dispatch 前，必须补齐并满足必要 issue 字段有效：title trim 后非空；description trim 后非空；acceptance criteria 至少一条 trim 后非空；priority 为 1..5。
 title: 必填，简短任务标题。
-description: 任务背景、目标和约束。
-acceptance criteria: 面向验收的可测试 checklist。
+description: 任务背景、目标和约束；进入 Ready 或 dispatch 前必须非空。
+acceptance criteria: 面向验收的可测试 checklist；进入 Ready 或 dispatch 前至少一条非空。
 priority: 必填，范围 1..5，1 最高；未指定时默认 3。
 labels: 可选，用于分类、筛选和 dispatch 策略匹配。
-state: 必填，遵循 8.10 状态集合与流转规则。
+state: 必填，遵循 PRD 第 9 章状态集合与流转规则；技术枚举以 TECH_SPEC 8.1/12.12 为准。
 comments: 可选，记录 operator、agent、reviewer 的讨论和决策。
 blocked_by / blocks: 只展示直接 blocker relation；不在产品层展开传递依赖。
 dispatch pause: 展示 dispatch_paused、reason、paused_at，用于解释为何不会自动调度。
@@ -231,12 +231,13 @@ startup stale-run guard
 v1 每个 issue 使用独立 git worktree 和 branch：
 
 ```text
-workspace root: ~/.symphony/workspaces/<project_id>/<issue_identifier>/
+workspace.root: ~/.symphony/workspaces/<project_id>/
+issue workspace path: <workspace.root>/<issue_identifier>/
 branch: symphony/<issue_identifier>-<title_slug>-<short_hash>
 base_ref: auto by default
 ```
 
-workspace 在 Done、Cancelled、Duplicate、Blocked、failed、interrupted 和 rework 情况下都保留。v1 不自动 reset、clean、delete、rebase、push 或 create PR。
+workspace 在所有 issue state、所有 run terminal outcome、startup stale run `failed/daemon_restarted_run_interrupted`、以及 Rework 场景下均保留。v1 不自动 reset、clean、delete、rebase、push 或 create PR。
 
 ### 8.4 Codex Runner
 
@@ -261,8 +262,10 @@ v1 默认 prompt 必须告诉 agent：
 不 push branch
 不创建 PR
 不标记 issue Done
-完成后写 handoff.json
-运行 symphony tool handoff submit --json ./handoff.json
+除非 operator 在本次 run 外明确要求，否则不要 commit
+完成后通过 stdin 提交 handoff JSON
+运行 symphony tool handoff submit --json -
+不要在 workspace 根目录留下 handoff.json 临时文件
 handoff 只提交数据，Human Review 由 finalizer 成功后转换
 ```
 
@@ -287,8 +290,8 @@ v1 handoff 是 two-stage：
 
 ```text
 1. agent 调用 handoff.submit，系统记录 handoff 数据。
-2. worker 执行 after_run hook。
-3. finalizer 生成 review packet。
+2. worker 进入 terminal outcome；如果 workspace 已准备，finally path 必须尝试 after_run hook。
+3. 只有 handoff 存在、after_run 已尝试且无更高优先级失败/取消时，finalizer 生成 review packet。
 4. finalizer 成功后 issue 才进入 Human Review。
 ```
 
@@ -341,6 +344,8 @@ v1 Dashboard 是本地控制面，只通过 REST/SSE API 访问系统，不直�
 | Workflow | 展示 validation、last valid config、warnings/errors、reload、render preview。 |
 | Diagnostics | 展示 daemon、Codex、Git、DB、workflow、redacted export。 |
 
+Approval Inbox 的 decision 枚举为 `approve_once`、`approve_for_run`、`approve_for_session`、`deny`、`cancel_run`。只有 pending approval 可以被决定；`cancel_run` 会取消当前 run，并触发 `operator_cancelled` side effects。
+
 ### 8.10 REST/SSE API 与 CLI
 
 REST API 服务 dashboard、operator CLI 和未来 desktop shell。SSE 用于 live timeline 和 event replay。
@@ -365,25 +370,35 @@ symphony tool ...
 
 正常 CLI 是 operator 工具，走 REST API。`symphony tool ...` 是 agent 工具入口，走 Tool Gateway 本地传输，不走 REST `/api/v1`；transport 可为 Unix socket、named pipe 或 loopback HTTP，具体以 TECH_SPEC 为准，并且必须 JSON-only 输出。
 
+REST 与 CLI 的 approval decide 必须使用相同 decision 语义：`approve_once`、`approve_for_run`、`approve_for_session`、`deny`、`cancel_run`；非 pending approval 不允许被 decide。
+
 ### 8.11 Security / Operations
 
 v1 是本地工具，不是远程多租户系统。默认安全模式是 balanced-secure：
 
 ```text
 API 绑定 loopback
-browser session cookie + CSRF
-CLI bearer token
+browser session cookie + CSRF hard enforcement
+CLI bearer token hard enforcement
 open token one-time exchange
-run-scoped tool token
-command allow/review/deny
-network default deny: unknown network requests auto-deny; Approval Inbox is used only when network policy explicitly reviews
-protected paths
-redaction
-artifact containment
-redacted diagnostics export only
+run-scoped tool token + Tool Gateway scope hard enforcement
+command/file/network approvals are Codex-mediated
+network default deny: unknown network requests auto-deny via Codex-mediated policy bridge; Approval Inbox is used only when network policy explicitly reviews
+protected paths: Codex-mediated for Codex file access; artifact.attach protected-path input is daemon-side hard deny
+artifact/export containment hard enforcement
+redaction and redacted diagnostics export hard enforcement
+diagnostic-only events are observation/reporting, not prevention
 ```
 
-产品文案必须诚实说明：network deny 和 protected path enforcement 依赖 Codex approval/sandbox surfacing，不是 OS-level firewall 或完整文件系统沙箱。
+command、network、protected-path auto-deny 必须写入 approval row，并将状态标为 `auto_denied`；同时必须终止当前 run，设置对应 `failure_code`：`command_denied`、`network_denied` 或 `protected_path_denied`，并按失败路径 pause dispatch。默认 unknown network request 使用 auto-deny，不进入 Approval Inbox；只有 network policy 明确返回 `review` 时，才创建 pending operator decision 并出现在 Approval Inbox。
+
+产品文案必须区分三层安全边界：
+
+- Hard daemon/API enforcement：API auth/CSRF、CLI bearer、open token、Tool Gateway token/scope/cwd/schema/registry、`artifact.attach` protected-path 拒绝、artifact/export containment、diagnostics export/redaction。
+- Codex-mediated enforcement：command/file/network approvals，以及 Codex 暴露的 network deny、protected-path read/write deny。
+- Diagnostic-only：命令已执行后观察到的事件、日志、failure/reporting，不应表述为预防性隔离。
+
+诚实边界：v1 不是 OS-level firewall，也不是完整文件系统沙箱。Codex 活动中的 network deny 和 protected-path file access deny 依赖 Codex approval/sandbox surfacing；daemon/API 入口仍必须对 auth/CSRF、Tool Gateway scope、artifact attach protected-path、artifact/export containment 与 redacted diagnostics export 做 hard enforcement。
 
 ## 8A. v1 可执行合同交付物
 
@@ -436,9 +451,9 @@ Duplicate
 
 | From | To | Actor | Guard / Side effect |
 |---|---|---|---|
-| Inbox | Ready | operator | 必要 issue 字段有效。 |
-| Ready | Working | orchestrator | dispatch claim 成功，并在 run_attempt 记录 `source_issue_state=Ready`。 |
-| Rework | Working | orchestrator | rework dispatch claim 成功，并在 run_attempt 记录 `source_issue_state=Rework`。 |
+| Inbox | Ready | operator | 必要 issue 字段有效：title trim 后非空；description trim 后非空；acceptance criteria 至少一条 trim 后非空；priority 为 1..5。 |
+| Ready | Working | orchestrator | dispatch claim 成功，且必要 issue 字段有效；在 run_attempt 记录 `source_issue_state=Ready`。 |
+| Rework | Working | orchestrator | rework dispatch claim 成功，且必要 issue 字段有效；在 run_attempt 记录 `source_issue_state=Rework`。 |
 | Working | Human Review | finalizer | handoff 存在且 review packet generated。 |
 | Working | Ready/Rework | finalizer/orchestrator | run failure、missing handoff、review packet failure、operator cancel、startup stale run 等失败路径；回到 `run_attempt.source_issue_state` 并设置 `dispatch_paused=true`。 |
 | Human Review | Rework | operator | reviewer 提供 reason/feedback；workspace/branch 保留。 |
@@ -446,8 +461,8 @@ Duplicate
 | any non-terminal | Blocked | operator 或 agent tool | 若有 active run，reconciliation cancel；agent block 会 pause dispatch。 |
 | any non-terminal | Cancelled | operator | 若有 active run，reconciliation cancel。 |
 | any non-terminal | Duplicate | operator | 若有 active run，reconciliation cancel；如指定 canonical issue，记录 duplicate relation。 |
-| Blocked | Ready | operator | 阻塞解除，且 active blocker relations 不存在。 |
-| Done/Cancelled/Duplicate | Inbox/Ready | operator | 只允许显式 reopen；禁止直接 reopen 到 `Working`、`Human Review`、`Rework` 或 `Blocked`；要求无 active run，且不复用旧 run。reopen 时 `completed_at=null`，清除 `dispatch_paused`/reason/paused_at；workspace、history、review packets、duplicate relation 保留。 |
+| Blocked | Ready | operator | 阻塞解除，active blocker relations 不存在，且必要 issue 字段有效。 |
+| Done/Cancelled/Duplicate | Inbox/Ready | operator | 只允许显式 reopen；reopen 到 `Ready` 要求必要 issue 字段有效，reopen 到 `Inbox` 仍只要求 title；禁止直接 reopen 到 `Working`、`Human Review`、`Rework` 或 `Blocked`；要求无 active run，且不复用旧 run。reopen 时 `completed_at=null`，清除 `dispatch_paused`/reason/paused_at；workspace、history、review packets、duplicate relation 保留。 |
 
 Reopen 到 `Inbox` 表示任务需要重新整理，不会自动 dispatch。Reopen 到 `Ready` 表示下一次 scheduler tick 可按正常 eligibility 新建 run_attempt。旧 latest review packet 仅作为历史保留；新一轮完成必须来自 reopen 后新 run 生成的 latest review packet。若 reopened Duplicate 不再是重复任务，operator 必须单独移除或失效 duplicate relation。
 
@@ -480,12 +495,13 @@ Ready
 Rework
 ```
 
-`Working` 仅用于 active run reconciliation 和 operator 显式 recovery，不是普通 tick 自动 redispatch candidate。
+`Working` 仅用于 active run reconciliation，不是普通 tick 自动 redispatch candidate。无 active run 的 `Working` 不会被 scheduler 自动 redispatch，依赖 startup stale-run guard 或显式状态转换规则处理。
 
 Issue 可 dispatch 的必要条件：
 
 ```text
 state ∈ Ready/Rework
+必要 issue 字段按 8.1 有效（title、description、acceptance criteria、priority）
 not dispatch_paused
 no active blocker relations
 no active run
@@ -515,6 +531,20 @@ network auto-deny → network_denied
 protected path auto-deny → protected_path_denied
 ```
 
+Operator 手动 `dispatch-pause`：
+
+```text
+允许：any non-terminal issue state
+拒绝：Done/Cancelled/Duplicate；返回 invalid_state_transition，需先 reopen 或 transition
+要求：reason 为非空字符串
+Side effects:
+  issue.dispatch_paused = true
+  issue.dispatch_pause_reason = request.reason
+  issue.dispatch_paused_at = now
+  append system event
+  append issue comment with operator reason
+```
+
 失败或取消路径的 issue state 规则：
 
 ```text
@@ -527,7 +557,27 @@ protected path auto-deny → protected_path_denied
   issue.dispatch_paused = true
 ```
 
-Resume 只清除 pause，不改变 issue 内容，不移除 blockers，不自动切换 Blocked，不自动创建新 run。Resume 后，如果 issue 已处于 Ready/Rework 且满足 eligibility，下一次 tick 可以正常 claim。若 operator 需要立即运行，应使用：
+Operator 手动 `dispatch-resume`：
+
+```text
+允许：any non-terminal issue state
+拒绝：Done/Cancelled/Duplicate；返回 invalid_state_transition，需先 reopen 或 transition
+要求：reason 为非空字符串
+Side effects:
+  clear issue.dispatch_paused
+  clear issue.dispatch_pause_reason
+  clear issue.dispatch_paused_at
+  append system event
+  append issue comment with operator reason
+禁止：
+  不改变 issue.state
+  不改变 title/description/acceptance criteria/labels/priority/workspace/git fields
+  不移除 blockers
+  不自动切换 Blocked 到 Ready/Rework
+  不创建、claim、enqueue 或 start run
+```
+
+Resume 后，如果 issue 已处于 Ready/Rework 且满足 eligibility，下一次 tick 可以正常 claim。若 operator 需要立即运行，应使用：
 
 ```bash
 symphony issue dispatch-resume LOC-1 --reason "..."
@@ -549,7 +599,18 @@ review_packets.status = generated
 run terminal outcome otherwise successful
 ```
 
-### 11.2 Send to Rework
+### 11.2 Run outcome precedence / 结果优先级
+
+当一次 run 同时触发多个结束条件时，产品结果按以下优先级判定；高优先级结果不能被低优先级结果覆盖：
+
+本小节中 active-run-valid states 指 `Ready`/`Working`/`Rework`；其中 `Working` 是 active run 的正常状态，不属于普通 dispatch eligibility。
+
+1. finalizer commit 前，operator cancel 或 approval `cancel_run` 优先，run 进入 cancelled，并按第 10 章失败或取消路径 pause dispatch。
+2. finalizer commit 前，issue 若已离开 active-run-valid states（`Ready`/`Working`/`Rework`），优先于成功 finalizer；系统不得再把该 run 作为成功 handoff 推入 `Human Review`。
+3. 其余结果按顺序判定：startup stale active run interruption；Codex runner / prompt / workspace failure；allowed continuation 后仍 missing handoff；handoff 存在但 review packet failure；handoff 存在且 review packet generated。
+4. finalizer commit 已完成并写入 `issue.state=Human Review`、run completed 后，后续 cancel 必须被拒绝为非 active run。
+
+### 11.3 Send to Rework
 
 Send to Rework 必须满足：
 
@@ -564,17 +625,20 @@ Side effects：
 
 ```text
 issue.state = Rework
-clear dispatch_paused
+issue.dispatch_paused = false
+clear issue.dispatch_pause_reason
+clear issue.dispatch_paused_at
+insert issue_state_history Human Review → Rework
 insert feedback comment
-emit review.sent_to_rework event
+emit review.sent_to_rework
 keep same workspace, branch, base_sha
 ```
 
-### 11.3 Rework review packet
+### 11.4 Rework review packet
 
 Rework 生成新 review packet，旧 packet 不覆盖。diff 是从 workspace `base_sha` 到当前 workspace tree 的累计 diff，不是相对上一个 review packet 的增量 diff。
 
-### 11.4 Mark Done
+### 11.5 Mark Done
 
 Mark Done 必须满足：
 
@@ -607,12 +671,16 @@ v1 产品验收必须覆盖：
 - Handoff target 固定 `Human Review`；其他 target workflow validation fail。
 - `handoff.submit` 只记录数据，不直接状态流转。
 - Review packet 生成失败时 issue 不进入 Human Review。
-- Missing handoff twice 后 run `completed_without_handoff`，issue dispatch paused。
+- 默认 `max_handoff_continuations=1` 时，首次 missing handoff 触发同一 session/thread 内的 dedicated handoff continuation；continuation 提交 handoff 后进入正常 review finalizer 路径。
+- 默认配置下 dedicated handoff continuation 后仍 missing handoff 时，run `completed_without_handoff/missing_handoff`，issue dispatch paused；若配置 `max_handoff_continuations=0`，首次 missing handoff 直接进入同一终止并 pause 路径。
 - Operator cancel / approval `cancel_run` 后 run `cancelled/operator_cancelled`，不自动 redispatch。
+- Approval Inbox / CLI 只允许对 pending approval 使用受支持 decision 枚举。
 - Agent `issue.block` 后 issue `Blocked`，run `cancelled/agent_blocked`，dispatch paused。
+- Active run 所属 issue 被转出 Ready/Working/Rework 时，run 被取消并标记合适 `failure_code`，workspace 保留，且不会自动 redispatch。
+- Daemon startup 发现 stale active run 时，run 标记 `failed/daemon_restarted_run_interrupted`，issue 恢复到来源状态或保留当前状态，dispatch paused。
 - 普通 untracked 文本文件必须包含在 review packet patch；大文件、二进制或策略限制例外必须进入 `changed-files.txt` 和 `untracked-files.json`，并带 `patch_included=false` 与非空 reason。
 - Rework 复用 workspace，生成新的 immutable cumulative review packet。
-- Protected paths、artifact containment、redaction、loopback/session/CSRF/tool token、command allow/review/deny、network denied fake request、raw prompt/raw Codex log API refusal 等安全控制必须通过 security regression tests。
+- Protected paths、artifact containment、redaction、loopback/session/CSRF/tool token、command allow/review/deny、network denied fake request、raw prompt/raw Codex log API refusal 等安全控制必须通过 security regression tests；command/network/protected-path auto-deny 必须写入 approval row `auto_denied`、终止当前 run、设置 `command_denied`/`network_denied`/`protected_path_denied` 并 pause dispatch；默认 unknown network auto-deny 不进入 Approval Inbox，只有 policy 返回 `review` 时才进入 Approval Inbox。
 - v1 release 必须满足 `TECH_SPEC.md` 第 20 章 Definition of Done：API/DB/CLI/dashboard conform、Codex adapter fixture-gated、real Codex tests opt-in、raw prompt/raw Codex logs 不暴露、single dist/symphony binary builds，且 known limitations documented。
 
 ## 14. 后续版本路线
