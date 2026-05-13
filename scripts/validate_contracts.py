@@ -181,6 +181,7 @@ def validate_openapi() -> None:
         "/artifacts/{artifact_id}/content",
         "/workflow",
         "/workflow/validate",
+        "/workflow/render-preview",
         "/workflow/reload",
         "/diagnostics",
         "/diagnostics/export",
@@ -191,6 +192,65 @@ def validate_openapi() -> None:
         fail(f"missing OpenAPI routes: {sorted(missing_routes)}")
     if "/approvals/{approval_id}/decision" in paths:
         fail("OpenAPI must use /approvals/{approval_id}/decide, not /decision")
+
+    render_preview_post = paths.get("/workflow/render-preview", {}).get("post")
+    if not isinstance(render_preview_post, dict):
+        fail("OpenAPI /workflow/render-preview must define POST")
+    render_preview_request_ref = (
+        render_preview_post.get("requestBody", {})
+        .get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
+        .get("$ref")
+    )
+    if render_preview_request_ref != "#/components/schemas/WorkflowRenderPreviewRequest":
+        fail("POST /workflow/render-preview request body must use WorkflowRenderPreviewRequest")
+    render_preview_response_ref = (
+        render_preview_post.get("responses", {})
+        .get("200", {})
+        .get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
+        .get("$ref")
+    )
+    if render_preview_response_ref != "#/components/schemas/WorkflowRenderPreviewEnvelope":
+        fail("POST /workflow/render-preview 200 response must use WorkflowRenderPreviewEnvelope")
+
+    workflow_render_request = data["components"]["schemas"]["WorkflowRenderPreviewRequest"]
+    render_source = workflow_render_request["properties"]["source"]
+    if render_source.get("enum") != ["effective", "candidate"] or render_source.get("default") != "effective":
+        fail("WorkflowRenderPreviewRequest.source must default to effective with effective/candidate enum")
+    candidate_condition_found = False
+    for condition in workflow_render_request.get("allOf", []):
+        condition_if = condition.get("if", {})
+        condition_then = condition.get("then", {})
+        required_source = "source" in condition_if.get("required", [])
+        source_is_candidate = condition_if.get("properties", {}).get("source", {}).get("const") == "candidate"
+        candidate_required = {
+            tuple(branch.get("required", []))
+            for branch in condition_then.get("anyOf", [])
+            if isinstance(branch, dict)
+        }
+        requires_candidate_input = {
+            ("candidate_workflow_md",),
+            ("candidate_config",),
+        }.issubset(candidate_required)
+        if required_source and source_is_candidate and requires_candidate_input:
+            candidate_condition_found = True
+            break
+    if not candidate_condition_found:
+        fail(
+            "WorkflowRenderPreviewRequest must require candidate_workflow_md or candidate_config "
+            "when source is candidate"
+        )
+
+    workflow_render_preview_required = set(data["components"]["schemas"]["WorkflowRenderPreview"].get("required", []))
+    expected_render_preview_required = {"source", "rendered_prompt_preview", "validation", "redactions_applied"}
+    if not expected_render_preview_required.issubset(workflow_render_preview_required):
+        fail(
+            "WorkflowRenderPreview.required missing fields: "
+            f"{sorted(expected_render_preview_required - workflow_render_preview_required)}"
+        )
 
     # All non-error JSON 2xx responses must be enveloped.
     for route, ops in paths.items():

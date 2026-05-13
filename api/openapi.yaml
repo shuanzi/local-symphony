@@ -756,6 +756,15 @@ components:
     WorkflowRenderPreviewRequest:
       type: object
       additionalProperties: false
+      allOf:
+        - if:
+            required: [source]
+            properties:
+              source: { const: candidate }
+          then:
+            anyOf:
+              - required: [candidate_workflow_md]
+              - required: [candidate_config]
       properties:
         source: { type: string, enum: [effective, candidate], default: effective }
         candidate_workflow_md: { type: string }
