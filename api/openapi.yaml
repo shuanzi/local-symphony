@@ -60,8 +60,16 @@ paths:
   /auth/open-token:
     post:
       operationId: createOpenToken
+      description: >
+        Used by CLI/open flow to mint a one-time browser open token. Requires a
+        bearer local operator credential; cookie-authenticated browser sessions
+        are not applicable for this endpoint, so X-Symphony-CSRF is not required.
+      security:
+        - bearerAuth: []
       responses:
         "200": { description: Open token, content: { application/json: { schema: { $ref: '#/components/schemas/OpenTokenEnvelope' } } } }
+        "401": { $ref: '#/components/responses/Error' }
+        "403": { $ref: '#/components/responses/Error' }
   /auth/cli-token/rotate:
     post:
       operationId: rotateCliToken
@@ -227,8 +235,11 @@ paths:
       description: Requires latest generated review packet to belong to latest completed handoff run, with issue in Human Review and no active run.
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
-      requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { reason: { type: string } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1, pattern: "\\S" } } } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }
+        "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is not in Human Review; review_packet_required when latest generated review packet is missing, non-generated, or mismatched; issue_already_running when an active run exists." }
   /artifacts/{artifact_id}:
     get:
       operationId: getArtifactMetadata
