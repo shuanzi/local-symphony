@@ -249,6 +249,19 @@ paths:
       parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowStatusEnvelope' } } } } }
+  /workflow/render-preview:
+    post:
+      operationId: renderWorkflowPreview
+      description: Dry-run rendering endpoint. It never replaces the effective config, persists rendered prompt content, dispatches runs, writes review artifacts, or returns raw secret/log/artifact content; successful responses contain only redacted preview data.
+      parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
+      x-csrf-required-for-cookie-auth: true
+      requestBody:
+        required: false
+        content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowRenderPreviewRequest' } } }
+      responses:
+        "200": { description: Redacted render preview, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowRenderPreviewEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error' }
+        "409": { $ref: '#/components/responses/Error' }
   /workflow/reload:
     post:
       operationId: reloadWorkflow
@@ -603,7 +616,7 @@ components:
         workspace_id: { type: [string, 'null'] }
         workflow_snapshot_id: { type: [string, 'null'] }
         status: { $ref: '#/components/schemas/RunStatus' }
-        dispatch_reason: { type: string, enum: [manual, scheduler, manual_recovery] }
+        dispatch_reason: { type: string, enum: [manual, scheduler] }
         source_issue_state: { type: string, enum: [Ready, Rework] }
         runner_kind: { type: string, enum: [fake, codex] }
         failure_code: { anyOf: [ { $ref: '#/components/schemas/FailureCode' }, { type: 'null' } ] }
@@ -740,6 +753,35 @@ components:
         effective_config: { type: object, additionalProperties: true }
     WorkflowStatusEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/WorkflowStatus' } } } ]
+    WorkflowRenderPreviewRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        source: { type: string, enum: [effective, candidate], default: effective }
+        candidate_workflow_md: { type: string }
+        candidate_config: { type: object, additionalProperties: true }
+        render_context: { type: object, additionalProperties: true }
+    WorkflowValidationSummary:
+      type: object
+      required: [valid, warnings, errors]
+      additionalProperties: false
+      properties:
+        valid: { type: boolean }
+        warnings: { type: array, items: { type: string } }
+        errors: { type: array, items: { type: string } }
+    WorkflowRenderPreview:
+      type: object
+      required: [source, rendered_prompt_preview, validation, redactions_applied]
+      additionalProperties: false
+      properties:
+        source: { type: string, enum: [effective, candidate] }
+        rendered_prompt_preview:
+          type: [string, 'null']
+          description: Redacted rendered prompt preview only; raw secrets, raw environment values, raw prompt artifacts, and raw logs are never returned.
+        validation: { $ref: '#/components/schemas/WorkflowValidationSummary' }
+        redactions_applied: { type: array, items: { type: string } }
+    WorkflowRenderPreviewEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/WorkflowRenderPreview' } } } ]
     Diagnostics:
       type: object
       required: [project_id, generated_at, redacted, checks]
