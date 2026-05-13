@@ -82,6 +82,8 @@ docs/testing/*.md
 docs/codex/*.md
 ```
 
+`docs/agent_work_orders/*.md` 包含 `M0_*.md` 至 `M8_*.md` milestone 任务单，也包含该目录下的 `README.md` 与 `EXECUTION_PROTOCOL.md`；implementation agent MUST 同时消费这些目录级合同说明。
+
 这些文件必须与本文保持一致。若发现冲突，implementation agent MUST 先提交文档/合同修正，再继续实现，不得在代码中自行发明第三套 API、DB 或 JSON shape。
 
 ## 3. 实现边界
@@ -482,6 +484,8 @@ prompt:
   save_prompt_snapshot: redacted
 ```
 
+`workspace.root` is the effective project-scoped root; `<global-workspace-root>/<project_id>` resolves to that root, and each issue workspace is `<workspace.root>/<issue_identifier>`.
+
 `dispatch_candidate_states` MUST be used for normal scheduler eligibility. `reconciliation_active_states` MUST be used only to decide whether an already-active run is still valid. `Working` MUST NOT be included in normal dispatch candidates.
 
 ### 6.3 Hard validation constraints
@@ -601,6 +605,27 @@ prompt/rendered_prompt.redacted.md
 prompt/prompt_meta.json
 prompt/tool_manifest.md
 ```
+
+### 6.7 Default WORKFLOW prompt contract
+
+`examples/WORKFLOW.default.md` is the normative default WORKFLOW example. Its prompt body MUST satisfy this contract, in addition to passing strict config validation and strict prompt rendering.
+
+The default prompt MUST explicitly tell the agent:
+
+```text
+work only inside the current workspace
+do not push branches
+do not create pull requests
+do not mark issues Done
+do not commit unless the operator explicitly requested it outside the current run
+after completion, submit handoff JSON through stdin
+run symphony tool handoff submit --json -
+do not leave a handoff.json temporary file in the workspace root
+handoff submits data only
+Human Review transition is performed by the finalizer after successful handoff processing
+```
+
+The default prompt MUST NOT instruct agents to write handoff JSON to a workspace-root file as the primary path. File-based examples, if any, MUST be clearly secondary diagnostics and MUST preserve the no-root-`handoff.json` rule.
 
 ## 7. Data model and persistence
 
@@ -1053,17 +1078,22 @@ insert issue.transitioned event
 Dispatch claim transaction:
 
 ```text
+shared DispatchIssue preflight for scheduler dispatch and manual dispatch/API/CLI
 validate issue.state IN Ready/Rework
 validate required issue fields per PRD 8.1
 validate not paused
 validate no active blockers
 validate no active run
+validate workflow valid or last valid config available according to reload semantics
+validate available concurrency slot
 allocate attempt_no
 create run_attempt pending
 transition issue to Working if needed
 insert scheduler.dispatch_claimed event
 commit before workspace/token/process/prompt creation
 ```
+
+If any DispatchIssue preflight check fails, the transaction MUST roll back without creating `run_attempt`, changing `issue.state`, allocating workspace/token/process resources, or rendering prompts.
 
 Handoff tool transaction:
 
@@ -1250,7 +1280,7 @@ Duplicate
 | `Rework` | `Working` | orchestrator | Dispatch claim transaction succeeds and required issue fields are valid. |
 | `Working` | `Human Review` | run finalizer | Handoff exists and review packet status is `generated`. |
 | `Human Review` | `Rework` | operator | Reviewer supplies reason/feedback comment. |
-| `Human Review` | `Done` | operator | Latest review packet status `generated`; latest review_packet.run_id belongs to latest completed handoff run; no active run. |
+| `Human Review` | `Done` | operator | Latest review packet status `generated`; latest review_packet.run_id belongs to latest completed handoff run; no active run; operator supplies non-empty reason/comment; sets `completed_at=now` and records history/comment/events. |
 | any non-terminal | `Blocked` | operator or agent tool | Active run reconciliation cancels active run. Agent tool also pauses dispatch. |
 | any non-terminal | `Cancelled` | operator | Active run reconciliation cancels active run. |
 | any non-terminal | `Duplicate` | operator | Active run reconciliation cancels active run. |
@@ -1294,7 +1324,7 @@ WorkflowReloaded
 Shutdown
 ```
 
-Only the orchestrator actor creates run attempts and decides dispatch. Worker goroutines report outcomes to the actor; they do not directly mutate scheduler terminal state.
+`DispatchIssue` is the single dispatch entrypoint for both scheduler-selected candidates and manual dispatch requests from API/CLI. Only the orchestrator actor creates run attempts and decides dispatch. Worker goroutines report outcomes to the actor; they do not directly mutate scheduler terminal state.
 
 ### 8.4 Run statuses
 
@@ -1371,10 +1401,12 @@ Each tick:
 4. Compute available concurrency slots.
 5. Query eligible issues.
 6. Sort by priority ASC, created_at ASC, identifier ASC.
-7. Claim issues until slots exhausted.
+7. Claim issues through `DispatchIssue` until slots exhausted.
 8. Launch run workers.
 9. Emit scheduler events.
 ```
+
+The slot count from step 4 is an upper bound for scheduler selection only. Each `DispatchIssue` claim MUST re-run the full dispatch preflight, including workflow validity and currently available concurrency slot.
 
 ### 8.7 Dispatch eligibility
 
@@ -1387,6 +1419,8 @@ Rework
 
 `Working` is not a normal scheduler candidate. It is valid only while a run is active and during reconciliation. A `Working` issue with no active run MUST NOT be redispatched automatically.
 
+`DispatchIssue` preflight MUST be shared by normal scheduler dispatch and manual dispatch API/CLI. The scheduler supplies sorted candidates; manual dispatch supplies a single `{issue_ref}`. Both paths use the same claim transaction and error mapping.
+
 Dispatch claim transaction MUST:
 
 ```text
@@ -1395,10 +1429,26 @@ Dispatch claim transaction MUST:
 3. verify not dispatch_paused
 4. verify no active blocker relation
 5. verify no active run
-6. create run_attempt with source_issue_state = current issue.state
-7. set issue.state = Working
-8. emit run.claimed and issue.state_changed events
+6. verify workflow valid or last valid config available according to reload semantics
+7. verify available concurrency slot
+8. create run_attempt with source_issue_state = current issue.state
+9. set issue.state = Working
+10. emit run.claimed and issue.state_changed events
 ```
+
+On any preflight failure, the implementation MUST NOT create a `run_attempt`, MUST NOT change `issue.state`, and MUST NOT launch workspace/token/process/prompt side effects.
+
+Preflight failure mapping:
+
+| Failed condition | `ApiErrorCode` | CLI exit |
+|---|---|---:|
+| issue.state not `Ready/Rework` | `invalid_state_transition` | 7 |
+| required issue fields invalid | `invalid_request` | 2 |
+| `dispatch_paused` | `issue_dispatch_paused` | 7 |
+| active blocker relation exists | `issue_blocked` | 7 |
+| active run exists | `issue_already_running` | 7 |
+| no valid workflow or last valid config | `workflow_invalid` | 9 |
+| no available concurrency slot | `concurrency_limit_reached` | 7 |
 
 No automatic retry queue/timers exist in v1. Manual redispatch is represented by an operator command after pause is cleared, not by a background retry scheduler.
 
@@ -1430,6 +1480,7 @@ issue transition command
 operator run cancel
 agent issue.block tool
 startup stale-run guard
+startup inconsistent Working issue guard
 ```
 
 If an issue with an active run leaves `Ready`/`Working`/`Rework`:
@@ -1455,6 +1506,8 @@ Specific codes:
 | Operator moves issue inactive/terminal | `cancelled` | `issue_state_changed` |
 | Reconciliation finds active run for terminal issue | `cancelled` | `canceled_by_reconciliation` |
 | Startup finds active DB rows without process ownership | `failed` | `daemon_restarted_run_interrupted` |
+
+Startup may also find `issues.state=Working` with no active `run_attempt`. This is an inconsistent issue state, not a dispatch candidate. The daemon MUST NOT create a new run for it during reconciliation.
 
 ### 8.9 Cancellation behavior
 
@@ -1632,7 +1685,9 @@ Once finalizer transaction commits `issue.state=Human Review` and `run.status=co
 
 ### 8.15 Startup stale-run guard
 
-On startup, before dispatch, scan active `run_attempts.status` rows. For rows owned by previous daemon/process:
+On startup, before dispatch, run both stale-run scans below in one guarded startup phase. The phase MUST complete before scheduler dispatch can claim new work.
+
+First, scan active `run_attempts.status` rows. For rows owned by previous daemon/process:
 
 ```text
 status = failed
@@ -1640,6 +1695,7 @@ failure_code = daemon_restarted_run_interrupted
 ended_at = now
 if run_attempt.source_issue_state in Ready/Rework and issue is not Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
   issue.state = run_attempt.source_issue_state
+  insert issue_state_history from previous issue.state to run_attempt.source_issue_state
 if issue is Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
   keep current issue state
 issues.dispatch_paused = true
@@ -1647,6 +1703,32 @@ issues.dispatch_pause_reason = daemon_restarted_run_interrupted
 issues.dispatch_paused_at = now
 emit system.interrupted or equivalent run event
 ```
+
+Second, scan `issues.state=Working` where no active `run_attempt` exists for the issue:
+
+```text
+do not create, claim, enqueue, or start a run
+find the latest run_attempt for the issue with source_issue_state in Ready/Rework, ordered by attempt_no DESC / created_at DESC
+if a recoverable source run exists:
+  issue.state = latest_run_attempt.source_issue_state
+  insert issue_state_history Working -> latest_run_attempt.source_issue_state
+  issues.dispatch_paused = true
+  issues.dispatch_pause_reason = daemon_restarted_run_interrupted
+  issues.dispatch_paused_at = now
+  emit system.interrupted or equivalent diagnostic event
+  emit issue.state_changed Working -> source_issue_state
+if no recoverable source run exists:
+  keep issue.state = Working
+  issues.dispatch_paused = true
+  issues.dispatch_pause_reason = daemon_restarted_run_interrupted
+  issues.dispatch_paused_at = now
+  emit system.inconsistent_issue or equivalent diagnostic event
+  expose diagnostics remediation: operator must explicitly transition or reopen the issue
+```
+
+Startup recovery `issue_state_history` rows MUST reflect the actual state restoration from/to values. Their reason/source MAY use `daemon_restarted_run_interrupted` or equivalent startup reconciliation semantics.
+
+This second scan MUST NOT mutate any terminal `run_attempt` status/failure fields, because no active run row exists to interrupt. It only repairs or pauses the inconsistent issue record and emits diagnostics. `dispatch-resume` still MUST NOT change `issue.state`, so a non-recoverable `Working` issue remains blocked from dispatch until an operator performs an explicit valid state transition/reopen.
 
 v1 does not implement crash recovery.
 
@@ -1657,7 +1739,8 @@ v1 does not implement crash recovery.
 Default:
 
 ```text
-~/.symphony/workspaces/<project_id>/<issue_identifier>/
+workspace.root (effective project-scoped root): ~/.symphony/workspaces/<project_id>/
+issue workspace path: <workspace.root>/<issue_identifier>/
 ```
 
 Rules:
@@ -1992,6 +2075,8 @@ Decision mapping:
 | `deny` | decline request |
 | `cancel_run` | interrupt/cancel run and apply `operator_cancelled` side effects |
 
+Operator `deny` MUST resolve only the current approval action with `approval_requests.status = denied`. It MUST NOT interrupt the run, mark `operator_cancelled`, or pause dispatch by itself. After the decline is written back, the adapter continues from the Codex outcome. If Codex/adapter returns a terminal failure because the declined action cannot proceed, the orchestrator applies normal failure behavior with the matching canonical `FailureCode`, such as `command_denied`, `network_denied`, or `protected_path_denied` for terminal policy denial. Only `cancel_run` applies immediate run cancellation side effects.
+
 ### 10.7 Timeout mapping
 
 | Condition | Failure code |
@@ -2099,6 +2184,8 @@ Exit codes:
 | 8 | timeout |
 | 9 | workflow/config error |
 
+API errors with `error.code = approval_not_pending` MUST map to CLI exit code 7.
+
 `symphony tool` always outputs JSON only. Diagnostics go to stderr.
 
 ### 11.2 Operator CLI
@@ -2150,6 +2237,8 @@ symphony run cancel run_... --reason "..."
 
 `run LOC-1` is an alias for issue dispatch.
 
+`symphony issue dispatch LOC-1` and `symphony run LOC-1` call `POST /api/v1/issues/{issue_ref}/dispatch`. On success they print the envelope-unwrapped dispatch data as JSON. On preflight failure they preserve the API error code in JSON diagnostics and use the CLI exit code mapping defined in TECH_SPEC 8.7.
+
 Approval commands:
 
 ```bash
@@ -2169,6 +2258,8 @@ symphony review send-to-rework LOC-1 --reason "..."
 symphony review mark-done LOC-1 --reason "..."
 symphony review path LOC-1
 ```
+
+`send-to-rework` and `mark-done` require `--reason` to be present and non-empty after trimming. CLI validation failures exit with code 2 before sending the request; API validation failures return `invalid_request`.
 
 Workflow and diagnostics:
 
@@ -2336,10 +2427,12 @@ Rules:
 path resolves under workspace
 absolute paths rejected
 path traversal rejected
-protected paths rejected
+protected paths rejected by daemon hard deny
 size <= tools.artifact_max_bytes
 artifact row path is project-local relative under .symphony/artifacts
 ```
+
+Protected-path rejection for `artifact.attach` MUST record the tool call as failed and return a tool error to the agent. It MUST NOT create an `approval_requests` row and MUST NOT directly terminate the run; the agent may continue, or the run may later terminate through normal agent failure handling if the task cannot be completed.
 
 `followup.create` input:
 
@@ -2485,6 +2578,8 @@ http://127.0.0.1:<port>/?open_token=<token>
 
 Browser uses HttpOnly SameSite=Lax cookie plus `X-Symphony-CSRF` for command APIs. CLI uses bearer token. Open token is one-time, short TTL, hash-only at rest, and reuse returns `401 unauthorized`.
 
+Unauthenticated access is limited to bootstrap endpoints. `GET /api/v1/health` MAY be unauthenticated. `POST /api/v1/auth/exchange` is unauthenticated at the session layer but MUST require a valid one-time open token. `POST /api/v1/auth/open-token` and `POST /api/v1/auth/cli-token/rotate` require an authenticated local operator credential. All project state, command APIs, SSE streams, artifacts, diagnostics, and Tool Gateway operations require the actor-specific authorization defined in 13.1.
+
 If `~/.symphony/cli-session.json` is missing but a daemon is running, user MUST run an explicit local login/rotate command from the same OS account. Implementation MUST NOT print existing raw tokens from DB because only hashes are stored.
 
 ### 12.4 Health/state/events
@@ -2545,6 +2640,17 @@ state changes use /transition
 dispatch uses /dispatch
 blockers use blocker command endpoints
 transition leaving Ready/Working/Rework with active run enqueues reconciliation cancel and returns side_effects metadata
+```
+
+Manual dispatch contract:
+
+```text
+POST /api/v1/issues/{issue_ref}/dispatch
+request body: empty object or omitted
+transaction: submit `DispatchIssue` for the resolved issue_ref and execute the shared preflight/claim transaction from 8.7
+success: claim was created and worker launch may continue asynchronously; this is not run completion
+response: standard success envelope; data shape { issue: NormalizedIssue, run_attempt, side_effects }
+failure: return the 8.7 preflight `ApiErrorCode`; do not create run_attempt, do not change issue.state, do not launch workspace/token/process/prompt side effects
 ```
 
 Dispatch pause/resume contract:
@@ -2620,7 +2726,9 @@ deny
 cancel_run
 ```
 
-Only pending approvals can be decided. Approval responses must expose `requested_at`, `timeout_ms`, `expires_at`, `resolved_at`.
+Only pending approvals can be decided. `deny` declines the current approval action and records `approval_requests.status = denied`; it does not cancel the run or apply `operator_cancelled` side effects. `cancel_run` cancels the run and applies `operator_cancelled` side effects. Approval responses must expose `requested_at`, `timeout_ms`, `expires_at`, `resolved_at`.
+
+If the addressed approval is not currently `pending`, `POST /api/v1/approvals/{approval_id}/decide` MUST return `409 Conflict` with `error.code = approval_not_pending`. The request MUST be transactionally read-only: it MUST NOT update `approval_requests.status`, `decision_json`, `resolved_at`, or any run/issue state; MUST NOT write a new decision; MUST NOT write back to Codex; MUST NOT cancel or pause a run; and MUST NOT emit approval decision or cancellation side effects. The CLI MUST preserve `approval_not_pending` in JSON diagnostics and exit with code 7.
 
 ### 12.8 Review API
 
@@ -2641,9 +2749,19 @@ redacted
 content_url
 ```
 
-`kind` identifies the packet file role, for example `review_md`, `review_json`, `patch`, `changed_files`, `untracked_files`, `diffstat`, `test_output`, `tool_calls`, `approvals`, and prompt metadata. `artifact_id` references the Artifact API metadata row. `content_url` is the relative content endpoint for allowed content, usually `/api/v1/artifacts/{artifact_id}/content`; it is `null` when content is unavailable or must not be served. Path fields on the review packet are diagnostics/metadata only. Dashboard MUST NOT read review packet files from the filesystem.
+`kind` identifies the packet file role, for example `review_md`, `review_json`, `patch`, `changed_files`, `untracked_files`, `diffstat`, `test_output`, `tool_calls`, `approvals`, and prompt metadata. `artifact_id` references the Artifact API metadata row. `content_url` is the relative content endpoint for allowed content, usually `/api/v1/artifacts/{artifact_id}/content`; it is `null` when content is unavailable or must not be served. Raw prompt content, raw prompt context values, raw secrets, and raw Codex logs MUST be represented only as metadata/refusal entries with `content_url=null`. Path fields on the review packet are diagnostics/metadata only. Dashboard MUST NOT read review packet files from the filesystem.
 
-The Review Packet page obtains artifact ids from this API, then fetches file contents through the Artifact API as needed. `review.json` is the preferred structured source for summary, tests, risks, verification, changed files, tool calls, and approvals. `review.md`, `changes.patch`, and other packet files are fetched by `artifact_id` for rendered review and detail panes.
+The Review Packet page obtains artifact ids from this API, then fetches file contents through the Artifact API as needed. `review.json` is the preferred structured source for summary, tests, risks, verification, changed files, tool calls, and approvals. `review.md`, `changes.patch`, and other packet files are fetched by `artifact_id` for rendered review and detail panes. Review API MUST NOT expose raw prompt/log bytes inline or provide a `content_url` that bypasses Artifact API redaction and refusal rules.
+
+Review action request bodies:
+
+```text
+POST /api/v1/reviews/{issue_ref}/send-to-rework
+request body: { "reason": non-empty string }
+
+POST /api/v1/reviews/{issue_ref}/mark-done
+request body: { "reason": non-empty string }
+```
 
 Mark Done guards:
 
@@ -2652,6 +2770,30 @@ issue.state = Human Review
 latest review_packet.status = generated
 review_packet.run_id belongs to latest completed handoff run
 no active run
+request.reason is non-empty after trimming
+```
+
+Mark Done transaction:
+
+```text
+validate guards in one transaction
+set issues.state = Done
+set issues.completed_at = now
+insert issue_state_history Human Review → Done
+insert operator comment with request.reason
+append review.marked_done event
+append issue.completed event
+preserve workspace row, branch, base_sha, run_attempts, handoffs, and review_packets
+do not commit, push, merge, create PR, delete workspace, or mutate review packet files
+```
+
+Mark Done error semantics:
+
+```text
+missing/blank reason -> invalid_request, no mutation
+issue not in Human Review -> invalid_state_transition, no mutation
+missing/non-generated/mismatched latest review packet -> review_packet_required, no mutation
+active run exists -> issue_already_running, no mutation
 ```
 
 ### 12.9 Artifact API
@@ -2663,7 +2805,7 @@ GET /api/v1/artifacts/{artifact_id}/content
 
 Review Packet callers use `artifact_id` values returned by the Review API. `GET /api/v1/artifacts/{artifact_id}` returns metadata; `GET /api/v1/artifacts/{artifact_id}/content` returns bytes only when allowed.
 
-Content access MUST enforce containment under `.symphony/artifacts` or `.symphony/exports`. v1 MUST reject raw prompt and raw Codex log content access. Redacted or disallowed artifacts may still appear in metadata and review packet artifact lists, but content access MUST return the existing error response rather than bypassing containment or redaction policy.
+Content access MUST enforce containment under `.symphony/artifacts` or `.symphony/exports`. v1 MUST reject raw prompt, raw prompt context values, raw secrets, and raw Codex log content access. Redacted or disallowed artifacts may still appear in metadata and review packet artifact lists, but their Review API `content_url` MUST be `null` when content must not be served, and direct content access MUST return the existing refusal/error response rather than bypassing containment or redaction policy.
 
 ### 12.10 Workflow and diagnostics API
 
@@ -2764,6 +2906,7 @@ invalid_state_transition
 issue_blocked
 issue_dispatch_paused
 issue_already_running
+concurrency_limit_reached
 workspace_conflict
 workspace_prepare_failed
 after_create_failed
@@ -2806,6 +2949,20 @@ detection/diagnostic only: events observed after a command already executed
 ```
 
 Do not describe Codex-mediated network deny, protected-path file access deny, or command deny as OS-level isolation in v1. Daemon/API hard checks are application-level enforcement, not a full filesystem sandbox or packet firewall.
+
+Protected-path denial has two distinct v1 semantics: Codex-mediated protected-path read/write deny follows the approval auto-deny failure path; Tool Gateway `artifact.attach` protected-path rejection is daemon hard enforcement for that tool call only.
+
+### 13.1.1 v1 authorization matrix
+
+v1 has no multi-tenant RBAC. Authorization is fixed by local actor class and credential type:
+
+| Actor / entrypoint | Accepted credential | Authority | Explicitly not allowed |
+|---|---|---|---|
+| local operator browser | loopback `symphony_session` cookie plus `X-Symphony-CSRF` for command APIs | Full operator command authority over the local project through REST/SSE. | No direct SQLite, Git, filesystem, Codex, or Tool Gateway access from the dashboard. |
+| operator CLI | CLI bearer token from `~/.symphony/cli-session.json` | Same full operator command authority as authenticated browser for normal `symphony ...` REST commands. | No unauthenticated command execution; no Tool Gateway authority unless invoking `symphony tool ...` with a run-scoped tool token. |
+| future desktop shell | authenticated local operator session or equivalent local token | Not implemented in v1; if later added as a local UI wrapper, it has the same operator command authority and backend checks as browser/CLI. | No bypass around REST auth/CSRF, policy checks, or backend containment rules. |
+| agent Tool Gateway | run-scoped tool token with `project_id`, `issue_id`, `run_id`, `workspace_path`, `allowed_tools`, and expiry | Only the fixed Tool Gateway registry entries allowed for the current run scope. | No REST `/api/v1` operator command APIs, no arbitrary tools outside registry, no Done transition, no cross-run/issue/workspace access. |
+| unauthenticated | none, invalid, expired, or wrong token | Bootstrap only: unauthenticated health and one-time open-token exchange when the presented open token is valid. | No project state, commands, SSE streams, artifacts, diagnostics, dashboard session APIs requiring a session, CLI rotation/open-token APIs, or Tool Gateway calls. |
 
 ### 13.2 Session and CLI tokens
 
@@ -2858,6 +3015,8 @@ workspace_path
 allowed_tools
 expires_at
 ```
+
+Tool tokens do not create browser sessions, CLI bearer authority, or operator command authority. They authorize only the fixed Tool Gateway registry entries allowed by the token scope for the current run.
 
 Revoke on:
 
@@ -2951,15 +3110,15 @@ docker run --privileged
 
 v1 uses pattern/prefix classification plus path/protected-path extraction, not deep supply-chain analysis.
 
-Policy outcomes mapping:
+Policy outcomes mapping for Codex-mediated policy bridge outcomes:
 
 | Policy outcome | Approval row | Terminal failure code |
 |---|---|---|
-| command auto-denied/denied | `auto_denied` or `denied` | `command_denied` |
-| network denied | `auto_denied` or `denied` | `network_denied` |
-| protected path denied | `auto_denied` or `denied` | `protected_path_denied` |
+| command auto-denied, or terminal command denial after operator decline | `auto_denied`, or `denied` plus terminal runner failure | `command_denied` |
+| network auto-denied, or terminal network denial after operator decline | `auto_denied`, or `denied` plus terminal runner failure | `network_denied` |
+| protected path read/write auto-denied, or terminal protected-path denial after operator decline | `auto_denied`, or `denied` plus terminal runner failure | `protected_path_denied` |
 
-Security auto-deny MUST terminate the current run in v1. Operator denial MAY either deny the single action or cancel the run if the UI/CLI decision explicitly uses `cancel_run`; if this distinction is not implemented, all deny decisions MUST terminate the run and set the matching failure code.
+Codex-mediated security auto-deny MUST terminate the current run in v1. Operator `deny` MUST decline only the current approval action and write `approval_requests.status = denied`; it MUST NOT cancel the process group, mark `operator_cancelled`, revoke run tokens, or pause dispatch by itself. After the decline, the adapter MUST continue reading Codex until Codex continues or returns a terminal outcome. If the declined action causes terminal policy failure, the run MUST use the matching canonical failure code above and pause through the normal failure path. Operators must use `cancel_run` when they intend to stop the whole run immediately. This mapping does not apply to daemon hard-denied Tool Gateway calls such as `artifact.attach` protected-path rejection.
 
 ### 13.5 Network policy
 
@@ -3008,9 +3167,9 @@ Default protected patterns:
 Rules:
 
 ```text
-write protected path → deny
-artifact attach protected path → deny
-read protected path → deny or approval according to policy mode; default deny for known secret patterns
+Codex-mediated write protected path → auto-deny approval row, terminate run, failure_code=protected_path_denied, pause dispatch
+Codex-mediated read protected path → deny or approval according to policy mode; default deny for known secret patterns; deny uses the same protected_path_denied terminal path
+Tool Gateway artifact.attach protected path → daemon hard deny tool call, failed tool_call + tool error, no approval row, no direct run termination
 ```
 
 ### 13.7 Redaction
@@ -3026,7 +3185,7 @@ diagnostic exports
 UI log surfaces
 ```
 
-Preserve safe metadata such as hash, length category, field name, and safe summary. Redaction is best effort and not compliance-grade.
+Preserve safe metadata such as hash, length category, field name, and safe summary. Prompt snapshot artifacts, including `prompt/context.json` and `prompt/rendered_prompt.redacted.md`, MUST contain only redacted content or safe metadata; they MUST NOT contain raw secrets, raw rendered prompt content, raw prompt context values, or raw Codex logs. Redaction is best effort and not compliance-grade.
 
 ### 13.8 Artifact and export containment
 
@@ -3061,7 +3220,8 @@ open token one-time use
 tool token wrong run/issue/cwd/tool/expired/revoked
 command allow/review/deny classifications
 network denied fake request
-protected path read/write/attach denied
+protected path read/write denied creates approval auto_denied, terminates run, sets protected_path_denied, pauses dispatch
+artifact.attach protected path denied creates failed tool_call and tool error, without approval row or direct run termination
 artifact path traversal and symlink escape
 redaction golden fixtures
 raw prompt/raw Codex log API refusal
@@ -3125,7 +3285,9 @@ changed-files.txt
 untracked-files.json
 ```
 
-Non-critical files may be absent without preventing generation if failure is recorded appropriately.
+Only these critical files determine whether `review_packets.status` may be `generated`. A `generated` row MUST NOT point to missing critical files. Non-critical files MAY be absent without preventing `generated`, but each omission MUST be recorded in review metadata or diagnostics with `path`, `reason`, and `generation_phase`. Silent omission is forbidden.
+
+Prompt snapshot files are redacted review artifacts, not raw prompt archives. `prompt/context.json`, `prompt/rendered_prompt.redacted.md`, `prompt/prompt_meta.json`, and `prompt/tool_manifest.md` MUST follow 13.7 and 12.9: safe metadata/redacted content only; raw prompt, raw context values, raw secrets, and raw Codex logs are disallowed content.
 
 ### 14.3 Generation sequence
 
@@ -3139,17 +3301,22 @@ Non-critical files may be absent without preventing generation if failure is rec
 7. generate changed-files.txt with git diff --cached --name-only
 8. generate diffstat.txt with git diff --cached --numstat
 9. generate untracked-files.json, even when empty
-10. read handoff
-11. export tool calls
-12. export approvals
-13. export redacted run events
-14. copy prompt snapshot metadata files only, not raw prompt unless redacted policy allows
-15. write review.json
-16. write review.md
-17. insert artifacts rows
-18. insert immutable review_packets row
-19. emit review.packet_generated
+10. export test-output.txt from after_run hook/test output summary or diagnostics capture
+11. export agent-final-message.md from runner/adapter final message capture
+12. export commands.jsonl from command/tool execution log and approval/command policy events
+13. read handoff
+14. export tool calls
+15. export approvals
+16. export redacted run events
+17. copy/generate prompt snapshot files as redacted content or safe metadata only; never copy raw prompt, raw prompt context values, raw secrets, or raw Codex logs
+18. write review.json
+19. write review.md
+20. insert artifacts rows
+21. insert immutable review_packets row
+22. emit review.packet_generated
 ```
+
+If any non-critical file from 14.2 cannot be produced during its corresponding generation step/phase, including steps 8, 10, 11, 12, and 14-17, the generator MUST keep the packet eligible for `status=generated` only after recording that omission in review metadata or diagnostics with the file path, reason, and failed generation step/phase. If any critical file is missing, the generator MUST NOT insert a `generated` review packet.
 
 Artifact kinds:
 
@@ -3167,6 +3334,8 @@ Artifact kinds:
 ### 14.4 review.json shape
 
 `review.json` is a file-level review packet document and MUST validate against `schemas/review_packet.schema.json`. It is not the same shape as the REST `ReviewPacketSummary`.
+
+It is the structured source of truth for the Review Packet and MUST cover issue, run, git, files, handoff, changed_files, untracked_files, approvals, tool_calls, prompt_snapshot, and failure metadata.
 
 ```json
 {
@@ -3222,6 +3391,8 @@ Artifact kinds:
 ```
 
 ### 14.5 review.md sections
+
+`review.md` MUST contain these fixed sections:
 
 ```markdown
 # LOC-1 Review Packet
@@ -3283,9 +3454,23 @@ issue.state = Human Review
 latest review_packet.status = generated
 review_packet.run_id belongs to latest completed handoff run
 no active run
+operator supplies non-empty reason/comment
 ```
 
 Partial/failed review packets can be viewed but cannot Mark Done.
+
+Successful `review mark-done` is a single transaction:
+
+```text
+issue.state = Done
+issue.completed_at = now
+insert issue_state_history Human Review → Done
+insert operator comment with reason
+emit review.marked_done
+emit issue.completed
+keep same workspace, branch, base_sha, handoffs, and review packets
+do not commit, push, merge, create PR, delete workspace, or rewrite review packet artifacts
+```
 
 ### 14.9 Rework
 
@@ -3349,6 +3534,8 @@ Review packets are immutable. Rework creates a new packet. All review packets ar
 ```
 
 Dashboard is a control surface only. It MUST NOT directly access SQLite, Git, filesystem, Codex, or Tool Gateway.
+
+Authenticated dashboard users are local operators with the authorization defined in 13.1.1. Dashboard UI affordances MUST NOT imply per-user roles, tenant scopes, or permissions that v1 does not enforce.
 
 ### 15.2 API client
 
@@ -3431,7 +3618,7 @@ open Review Packet
 
 Board actions MUST call REST command APIs. The dashboard MUST NOT directly read or write backend resources such as SQLite, Git, filesystem, Codex, or Tool Gateway.
 
-Issue Detail shows issue facts, comments, blockers, workspace, run history, review packets, and dispatch paused state. It MUST expose dispatch resume when paused.
+Issue Detail shows issue facts, comments, blockers, workspace, run history, review packets, and dispatch paused state. In states allowed by the Issue API dispatch control guards, it MUST expose dispatch pause when not paused and dispatch resume when paused. These actions MUST call `POST /api/v1/issues/{issue_ref}/dispatch-pause` and `POST /api/v1/issues/{issue_ref}/dispatch-resume`, and MUST honor terminal-state, archived-issue, and state guards instead of mutating state locally.
 
 Run Detail shows normalized timeline:
 
@@ -3446,9 +3633,9 @@ review generated
 failure
 ```
 
-Approval Inbox shows command/file/network approvals, risk level, policy match, and approve/deny/cancel controls.
+Approval Inbox shows command/file/network approvals, risk level, policy match, and approve/deny/cancel controls. The UI MUST support all Approval API decisions from 12.7: `approve_once`, `approve_for_run`, `approve_for_session`, `deny`, and `cancel_run`. UI control mapping MUST be explicit: approve once -> `approve_once`; approve for run -> `approve_for_run`; approve for session -> `approve_for_session`; deny current action -> `deny`; cancel run -> `cancel_run`. If approve actions are grouped in a menu or segmented control, all three approval scopes MUST remain separately selectable; a single generic approve control MUST NOT silently collapse them. The UI MUST distinguish `deny` as declining the current approval action from `cancel_run` as cancelling the whole run.
 
-Review Packet page shows summary, tests, risks, verification, changed files, diff, tool calls, approvals, Send to Rework, and Mark Done. It MUST load the latest packet through `GET /api/v1/reviews/{issue_ref}`, use returned `artifact_id`/`content_url` entries to fetch contents through the Artifact API, and MUST NOT read packet files directly from the filesystem.
+Review Packet page shows summary, acceptance criteria, handoff, changed files, diff, tests, risks, verification, approvals, tool calls, git, How to Continue, Send to Rework, and Mark Done. It MUST treat `review.json` as the structured source of truth, load the latest packet through `GET /api/v1/reviews/{issue_ref}`, use returned `artifact_id`/`content_url` entries to fetch contents through the Artifact API, and MUST NOT read packet files directly from the filesystem.
 
 Workflow page shows current validation, last valid config, warnings/errors, reload, and render preview. Render preview MUST call `POST /api/v1/workflow/render-preview` and display only the redacted preview and validation warnings/errors returned by that API.
 
@@ -3493,6 +3680,7 @@ Codex availability/version/support status
 Git repo/worktree status
 redaction enabled state
 warnings
+inconsistent issues, including Working issues with no active run and required operator remediation
 ```
 
 Diagnostics export is redacted-only. `include_raw_logs=true` MUST return `raw_log_access_not_supported`.
@@ -3554,6 +3742,25 @@ go test ./internal/e2e -run TestApprovalCancelRunNoRedispatch
 go test ./internal/e2e -run TestActiveRunReconciliationCancel
 go test ./internal/e2e -run TestAgentIssueBlockCancelsRun
 go test ./internal/e2e -run TestStartupStaleRunInterrupted
+go test ./internal/security/...
+go test ./internal/e2e -run TestSecurityRegression
+```
+
+The default security regression commands MUST use local fakes/fixtures only. They MUST NOT require real Codex, external network access, or `SYMPHONY_TEST_CODEX=1`.
+
+The default security regression suite MUST cover at least the PRD 13 security acceptance scenarios:
+
+```text
+protected path read/write denial
+Tool Gateway artifact.attach protected-path denial
+artifact containment, traversal, and symlink escape
+redaction fixtures and raw prompt/raw Codex log/raw secret API refusal
+loopback origin, session token, CSRF token, CLI token, and tool token rejection cases
+command allow/review/deny policy classifications
+network denied fake request and unknown-network auto-deny
+Codex-mediated command/network/protected-path auto-deny writes approval auto_denied, terminates run, sets canonical failure_code, and pauses dispatch
+network policy review path enters Approval Inbox
+artifact.attach protected-path denial records failed tool_call + tool error without approval row or direct run termination
 ```
 
 Real Codex:
@@ -3571,6 +3778,7 @@ core state transitions
 workflow parser
 effective config defaults
 strict prompt rendering
+default WORKFLOW prompt contract golden rendering
 path normalization
 branch naming
 workspace key sanitization
@@ -3615,6 +3823,7 @@ missing handoff after allowed continuation → dispatch_paused
 max_handoff_continuations=0 missing handoff → dispatch_paused
 invalid tool token
 approval pending → approve → continue
+approval pending → deny current action without operator_cancelled side effects
 command denied
 network denied
 protected path denied
@@ -3626,6 +3835,8 @@ review packet failure → no Human Review
 untracked file created by agent → patch includes file content
 active run issue transition → reconciliation cancel
 Working issue with no active run and dispatch_paused=true is not scheduler-redispatched
+startup recoverable Working issue with no active run → source Ready/Rework + dispatch_paused/daemon_restarted_run_interrupted
+startup non-recoverable Working issue with no active run → remains Working + dispatch_paused/daemon_restarted_run_interrupted + diagnostics remediation
 agent issue.block → Blocked + cancelled/agent_blocked
 stale running run on startup → failed/daemon_restarted_run_interrupted + dispatch_paused
 Rework after Human Review → same workspace and cumulative packet
@@ -3642,9 +3853,11 @@ frontend generated types compile
 {issue_ref} accepts iss_... and LOC-...
 run cancel side effects schema-covered
 approval cancel_run side effects schema-covered
+approval deny records denied without cancel_run side effects
 SSE id equals run_events.seq
 Last-Event-ID / after_seq replay works
 artifact content enforces containment and rejects raw prompt/raw Codex log
+Review API returns `content_url=null` for raw prompt/raw Codex log/raw secret artifacts and does not inline disallowed bytes
 workflow render preview is schema-covered, dry-run only, and redacts secrets in success and validation-error responses
 ```
 
@@ -3661,8 +3874,11 @@ OpenAPI document includes POST /api/v1/workflow/render-preview with request and 
 OpenAPI Issue schema required fields match schemas/normalized_issue.schema.json
 RunEvent schema requires seq for SSE replay IDs
 example WORKFLOW.default.md passes strict config validation
+example WORKFLOW.default.md rendered golden includes every Default WORKFLOW prompt contract requirement from 6.7
+contract validation fails if the default prompt omits any required no-push/no-PR/no-Done/no-commit/stdin-handoff/no-root-handoff-json/finalizer-Human-Review constraint
 example handoff/followup payloads pass their standalone Tool Gateway input schemas and wrapped Tool Gateway call schemas
-agent work orders reference only v1 in-scope capabilities
+docs/agent_work_orders/*.md reference only v1 in-scope capabilities
+default CI/test command manifest includes the 18.2 security regression commands and keeps real Codex behind SYMPHONY_TEST_CODEX=1
 ```
 
 ## 19. Implementation phases M0–M8
@@ -3834,7 +4050,7 @@ workspaces retained in all terminal/failure cases
 rework uses same workspace and cumulative diff
 API/DB/CLI/dashboard conform to this spec
 Codex adapter is fixture-gated
-fake-agent E2E and security regression pass
+fake-agent E2E and 18.2 default security regression commands pass
 real Codex tests are opt-in
 loopback/session/CSRF/tool-token protections work
 raw prompt/raw Codex logs not exposed by v1 API

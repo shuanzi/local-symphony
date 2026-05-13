@@ -10,14 +10,14 @@ polling:
   interval_ms: 30000
 
 workspace:
-  root: "~/.symphony/workspaces"
+  root: "~/.symphony/workspaces/default"
   cleanup:
     enabled: false
 
 hooks:
   after_create: null
   before_run: null
-  after_run: "go test ./..."
+  after_run: null
   before_remove: null
   timeout_ms: 300000
   max_output_bytes: 65536
@@ -111,4 +111,4 @@ Required handoff fields:
 }
 ```
 
-The handoff only submits completion data. The system will run after_run and generate a review packet before moving the issue to Human Review. The daemon resolves the final workspace as `<workspace.root>/<project_id>/<issue_identifier>`; path config fields do not support Liquid interpolation.
+The handoff only submits completion data. The system will run after_run and generate a review packet before moving the issue to Human Review. The daemon resolves the final workspace as `<workspace.root>/<issue_identifier>`; path config fields do not support Liquid interpolation.
