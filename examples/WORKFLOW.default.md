@@ -79,10 +79,20 @@ Rules:
 - Do not push branches, create PRs, merge, publish, or mark the issue Done.
 - Do not commit unless the operator explicitly requests it outside this run.
 - Use only the provided `symphony tool ...` commands for issue state, artifacts, followups, block, and handoff.
-- When finished, write `handoff.json` and run:
+- 完成后通过 stdin 提交 handoff JSON，不要在 workspace 根目录留下 `handoff.json` 临时文件：
 
 ```bash
-symphony tool handoff submit --json ./handoff.json
+symphony tool handoff submit --json - <<'JSON'
+{
+  "summary": "What was completed.",
+  "changed_files": [],
+  "tests": [],
+  "risks": [],
+  "verification": [],
+  "followups": [],
+  "target_state": "Human Review"
+}
+JSON
 ```
 
 This command maps to Tool Gateway registry tool `handoff.submit`.
