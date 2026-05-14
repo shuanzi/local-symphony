@@ -1,0 +1,367 @@
+{
+  "openapi": {
+    "required_routes": [
+      "/health",
+      "/state",
+      "/events",
+      "/events/stream",
+      "/auth/exchange",
+      "/auth/session",
+      "/auth/logout",
+      "/auth/open-token",
+      "/auth/cli-token/rotate",
+      "/issues",
+      "/issues/{issue_ref}",
+      "/issues/{issue_ref}/transition",
+      "/issues/{issue_ref}/comments",
+      "/issues/{issue_ref}/blockers",
+      "/issues/{issue_ref}/blockers/{blocker_issue_ref}",
+      "/issues/{issue_ref}/dispatch",
+      "/issues/{issue_ref}/dispatch-pause",
+      "/issues/{issue_ref}/dispatch-resume",
+      "/issues/{issue_ref}/events/stream",
+      "/runs",
+      "/runs/{run_id}",
+      "/runs/{run_id}/events",
+      "/runs/{run_id}/events/stream",
+      "/runs/{run_id}/cancel",
+      "/approvals",
+      "/approvals/{approval_id}/decide",
+      "/reviews/{issue_ref}",
+      "/reviews/{issue_ref}/send-to-rework",
+      "/reviews/{issue_ref}/mark-done",
+      "/artifacts/{artifact_id}",
+      "/artifacts/{artifact_id}/content",
+      "/workflow",
+      "/workflow/validate",
+      "/workflow/render-preview",
+      "/workflow/reload",
+      "/diagnostics",
+      "/diagnostics/export"
+    ],
+    "forbidden_route_fragments": [
+      "/git/",
+      "/db/",
+      "/audit",
+      "/workspaces/",
+      "/workspace-delete",
+      "/secrets",
+      "/projects/",
+      "/admin",
+      "/rbac",
+      "/desktop-shell"
+    ],
+    "forbidden_route_patterns": [
+      "(^|/)push$",
+      "(^|/)publish$",
+      "(^|/)pr$",
+      "(^|/)create-pr$",
+      "(^|/)backup$",
+      "(^|/)restore$",
+      "(^|/)migrate$",
+      "(^|/)delete$",
+      "(^|/)reset$",
+      "(^|/)clean$",
+      "(^|/)rebase$",
+      "^/api/v1/state/",
+      "^/api/v1/issues/[^/]+/delete$",
+      "^/api/v1/projects/[^/]+/settings$"
+    ],
+    "forbidden_operations": [
+      {
+        "method": "POST",
+        "path": "/git/{issue_ref}/push",
+        "reason": "git push"
+      },
+      {
+        "method": "POST",
+        "path": "/git/{issue_ref}/publish",
+        "reason": "git publish"
+      },
+      {
+        "method": "POST",
+        "path": "/git/{issue_ref}/pr",
+        "reason": "git pr"
+      },
+      {
+        "method": "POST",
+        "path": "/git/{issue_ref}/create-pr",
+        "reason": "git create-pr"
+      },
+      {
+        "method": "POST",
+        "path": "/db/backup",
+        "reason": "database backup"
+      },
+      {
+        "method": "POST",
+        "path": "/db/restore",
+        "reason": "database restore"
+      },
+      {
+        "method": "POST",
+        "path": "/db/migrate",
+        "reason": "database migrate"
+      },
+      {
+        "method": "GET",
+        "path": "/audit",
+        "reason": "audit"
+      },
+      {
+        "method": "POST",
+        "path": "/workspaces/{issue_ref}/delete",
+        "reason": "workspace delete"
+      },
+      {
+        "method": "POST",
+        "path": "/workspaces/{issue_ref}/reset",
+        "reason": "workspace reset"
+      },
+      {
+        "method": "POST",
+        "path": "/workspaces/{issue_ref}/clean",
+        "reason": "workspace clean"
+      },
+      {
+        "method": "POST",
+        "path": "/workspaces/{issue_ref}/rebase",
+        "reason": "workspace rebase"
+      },
+      {
+        "method": "POST",
+        "path": "/workspace-delete",
+        "reason": "workspace delete"
+      },
+      {
+        "method": "POST",
+        "path": "/secrets",
+        "reason": "secrets mutation"
+      },
+      {
+        "method": "PATCH",
+        "path": "/secrets/*",
+        "reason": "secrets mutation"
+      },
+      {
+        "method": "PATCH",
+        "path": "/projects/{project_id}/settings",
+        "reason": "project settings mutation"
+      },
+      {
+        "method": "DELETE",
+        "path": "/issues/{issue_ref}",
+        "reason": "issue delete"
+      },
+      {
+        "method": "PATCH",
+        "path": "/state/*",
+        "reason": "arbitrary state mutation"
+      },
+      {
+        "method": "PATCH",
+        "path_pattern": "^/state(?:/.*)?$",
+        "reason": "arbitrary state mutation"
+      },
+      {
+        "method": "POST",
+        "path_pattern": "^/projects/[^/]+/settings$",
+        "reason": "project settings mutation"
+      },
+      {
+        "method": "PATCH",
+        "path_pattern": "^/projects/[^/]+/settings$",
+        "reason": "project settings mutation"
+      },
+      {
+        "method": "PUT",
+        "path_pattern": "^/projects/[^/]+/settings$",
+        "reason": "project settings mutation"
+      },
+      {
+        "method": "DELETE",
+        "path_pattern": "^/projects/[^/]+/settings$",
+        "reason": "project settings mutation"
+      },
+      {
+        "method": "POST",
+        "path_pattern": "^/workspaces/[^/]+/(delete|reset|clean|rebase)$",
+        "reason": "workspace delete/reset/clean/rebase"
+      },
+      {
+        "method": "DELETE",
+        "path_pattern": "^/workspaces(?:/.*)?$",
+        "reason": "workspace delete"
+      },
+      {
+        "method": "POST",
+        "path_pattern": "^/workspace-(delete|reset|clean|rebase)$",
+        "reason": "workspace delete/reset/clean/rebase"
+      }
+    ]
+  },
+  "cli": {
+    "required_commands": [
+      "symphony init",
+      "symphony serve",
+      "symphony open",
+      "symphony status",
+      "symphony issue create",
+      "symphony issue list",
+      "symphony issue show",
+      "symphony issue update",
+      "symphony issue transition",
+      "symphony issue comment",
+      "symphony issue blocker add",
+      "symphony issue blocker remove",
+      "symphony issue dispatch",
+      "symphony issue dispatch-pause",
+      "symphony issue dispatch-resume",
+      "symphony run",
+      "symphony run list",
+      "symphony run show",
+      "symphony run events",
+      "symphony run cancel",
+      "symphony approval list",
+      "symphony approval decide",
+      "symphony review",
+      "symphony review send-to-rework",
+      "symphony review mark-done",
+      "symphony review path",
+      "symphony workflow validate",
+      "symphony workflow reload",
+      "symphony workflow show",
+      "symphony diagnostics",
+      "symphony diagnostics export"
+    ],
+    "required_help_tokens": [
+      "dispatch-pause",
+      "dispatch-resume",
+      "approve-once",
+      "approve-for-run",
+      "approve-for-session",
+      "cancel-run",
+      "send-to-rework",
+      "mark-done"
+    ],
+    "forbidden_commands": [
+      "symphony publish",
+      "symphony pr",
+      "symphony create-pr",
+      "symphony backup",
+      "symphony restore",
+      "symphony migrate",
+      "symphony audit",
+      "symphony workspace-delete",
+      "symphony secret",
+      "symphony secrets",
+      "symphony project settings"
+    ]
+  },
+  "handler_route_inventory": {
+    "required_routes": [
+      "GET /api/v1/health",
+      "GET /api/v1/state",
+      "POST /api/v1/issues/{issue_ref}/dispatch",
+      "POST /api/v1/issues/{issue_ref}/dispatch-pause",
+      "POST /api/v1/issues/{issue_ref}/dispatch-resume",
+      "POST /api/v1/approvals/{approval_id}/decide",
+      "POST /api/v1/reviews/{issue_ref}/send-to-rework",
+      "POST /api/v1/reviews/{issue_ref}/mark-done",
+      "POST /api/v1/workflow/render-preview",
+      "GET /api/v1/diagnostics"
+    ]
+  },
+  "dashboard_action_inventory": {
+    "required_actions": [
+      "create issue",
+      "transition issue",
+      "dispatch eligible issue",
+      "dispatch pause issue",
+      "dispatch resume issue",
+      "approve once",
+      "approve for run",
+      "approve for session",
+      "deny approval",
+      "cancel run",
+      "send to rework",
+      "mark done",
+      "workflow validate",
+      "workflow reload",
+      "diagnostics export"
+    ],
+    "forbidden_actions": [
+      "git push",
+      "publish",
+      "create pr",
+      "backup database",
+      "restore database",
+      "migrate database",
+      "workspace delete",
+      "secret read",
+      "project settings mutation",
+      "issue delete",
+      "arbitrary state mutation"
+    ]
+  },
+  "tool_gateway": {
+    "registry_tools": [
+      "issue.get",
+      "issue.comment",
+      "issue.block",
+      "artifact.attach",
+      "followup.create",
+      "handoff.submit"
+    ]
+  },
+  "docs": {
+    "required_directories": [
+      "docs/testing",
+      "docs/codex"
+    ],
+    "required_files": [
+      "docs/testing/ACCEPTANCE.md",
+      "docs/codex/ADAPTER_MAPPING.md",
+      "docs/codex/FIXTURE_POLICY.md",
+      "docs/agent_work_orders/README.md",
+      "docs/agent_work_orders/EXECUTION_PROTOCOL.md",
+      "docs/agent_work_orders/M0_contracts_and_scaffold.md",
+      "docs/agent_work_orders/M1_local_tracker.md",
+      "docs/agent_work_orders/M2_workflow_workspace_git.md",
+      "docs/agent_work_orders/M3_orchestrator_fake_runner.md",
+      "docs/agent_work_orders/M4_tool_gateway_handoff.md",
+      "docs/agent_work_orders/M5_review_packet.md",
+      "docs/agent_work_orders/M6_api_cli_dashboard_security.md",
+      "docs/agent_work_orders/M7_codex_adapter.md",
+      "docs/agent_work_orders/M8_release.md"
+    ],
+    "agent_work_order_forbidden_command_like_patterns": [
+      "symphony\\s+.*\\b(publish|create-pr|backup|restore|migrate|audit|workspace-delete|secret|secrets)\\b",
+      "/api/v1/.*\\b(publish|create-pr|backup|restore|migrate|audit|workspace-delete|secrets)\\b",
+      "\\b(POST|PATCH|DELETE|GET)\\s+/api/v1/(git|db|workspaces|secrets|audit|projects)/"
+    ]
+  },
+  "security_regression": {
+    "default_commands": [
+      "go test ./internal/security/...",
+      "go test ./internal/e2e -run TestSecurityRegression"
+    ],
+    "real_codex_command": "SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex/...",
+    "topics": [
+      "loopback required bind validation",
+      "browser session invalid expired revoked",
+      "CSRF missing on command API",
+      "CLI bearer invalid expired",
+      "open token one-time use",
+      "tool token wrong run issue cwd tool expired revoked",
+      "command allow review deny classifications",
+      "network denied fake request and unknown-network auto-deny",
+      "network policy review path enters Approval Inbox",
+      "protected path read write denial auto_denied terminates run pauses dispatch",
+      "artifact.attach protected path denied failed tool_call without approval row",
+      "artifact path traversal and symlink escape",
+      "redaction golden fixtures",
+      "raw prompt raw Codex log raw secret API refusal"
+    ]
+  }
+}

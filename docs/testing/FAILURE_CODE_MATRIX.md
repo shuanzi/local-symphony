@@ -23,6 +23,6 @@
 | review_packet_failed | packet generation failed | failed | source_issue_state | true | No Human Review transition. |
 | operator_cancelled | operator/approval cancel_run | cancelled | source_issue_state unless separately transitioned | true | Token revoked. |
 | agent_blocked | issue.block tool | cancelled | Blocked | true | No blocker relation created. |
-| issue_state_changed | operator moved issue while active | cancelled | operator target state | true | Reconciliation. |
-| canceled_by_reconciliation | active run invalid/stale | cancelled | current valid issue state | true | Startup/tick. |
-| daemon_restarted_run_interrupted | stale active DB row | failed | source_issue_state | true | Startup stale-run guard. |
+| issue_state_changed | ordinary/non-terminal operator transition while active | cancelled | non-terminal operator target state | true | Reconciliation. |
+| canceled_by_reconciliation | terminal active run reconciliation | cancelled | terminal current issue state | true | Startup/tick. |
+| daemon_restarted_run_interrupted | startup stale active DB row after daemon restart | failed | source_issue_state | true | Startup stale-run guard. |
