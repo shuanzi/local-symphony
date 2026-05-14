@@ -1219,6 +1219,7 @@ WHERE i.state IN ('Ready', 'Rework')
     JOIN issues blocker ON blocker.id = r.source_issue_id
     WHERE r.target_issue_id = i.id
       AND r.relation_type = 'blocks'
+      AND r.active = 1
       AND blocker.state NOT IN ('Done', 'Cancelled', 'Duplicate')
   )
   AND NOT EXISTS (
@@ -1279,12 +1280,12 @@ Duplicate
 | `Ready` | `Working` | orchestrator | Dispatch claim transaction succeeds and required issue fields are valid. |
 | `Rework` | `Working` | orchestrator | Dispatch claim transaction succeeds and required issue fields are valid. |
 | `Working` | `Human Review` | run finalizer | Handoff exists and review packet status is `generated`. |
-| `Human Review` | `Rework` | operator | Reviewer supplies reason/feedback comment. |
-| `Human Review` | `Done` | operator | Latest review packet status `generated`; latest review_packet.run_id belongs to latest completed handoff run; no active run; operator supplies non-empty reason/comment; sets `completed_at=now` and records history/comment/events. |
+| `Human Review` | `Rework` | operator | Reviewer supplies non-empty reason; UI may present it as feedback. |
+| `Human Review` | `Done` | operator | Latest review packet status `generated`; latest review_packet.run_id belongs to latest completed handoff run; no active run; operator supplies non-empty reason; UI may present it as comment; sets `completed_at=now` and records history/comment/events. |
 | any non-terminal | `Blocked` | operator or agent tool | Active run reconciliation cancels active run. Agent tool also pauses dispatch. |
 | any non-terminal | `Cancelled` | operator | Active run reconciliation cancels active run. |
 | any non-terminal | `Duplicate` | operator | Active run reconciliation cancels active run. |
-| `Blocked` | `Ready` | operator | Block resolved; blockers inactive or removed; required issue fields valid. |
+| `Blocked` | `Ready` | operator | Block resolved; no active blocker relations remain; required issue fields valid. v1 intentionally resolves all `Blocked` issues to `Ready`; prior review/rework context is retained as history, but unblocking does not automatically return to `Rework`. |
 | `Done`/`Cancelled`/`Duplicate` | `Inbox`/`Ready` | operator | Explicit reopen only; reopening to `Ready` requires valid required issue fields, while reopening to `Inbox` still requires only title; direct reopen to `Working`, `Human Review`, `Rework`, or `Blocked` is forbidden; requires no active run and does not reuse old runs. Reopen sets `completed_at=null`, clears `dispatch_paused`/reason/paused_at, and preserves workspace, history, review packets, and duplicate relations. |
 
 Required issue fields valid follows the PRD 8.1 product rule: title and description are non-empty after trimming, acceptance_criteria has at least one non-empty trimmed item, and priority is an integer in 1..5. Creating an Inbox issue still requires only title.
@@ -2471,7 +2472,7 @@ agent cannot create blocks or duplicates relations
 }
 ```
 
-`target_state` is optional; if present it MUST equal `Human Review`. Successful response indicates receipt only:
+`target_state` is optional; if omitted, the accepted, persisted, and canonical target_state defaults to `Human Review`; if present it MUST equal `Human Review`. Successful response indicates receipt only:
 
 ```json
 {
@@ -2661,6 +2662,7 @@ request body: { "reason": non-empty string }
 allowed states: any non-terminal issue state
 terminal states Done/Cancelled/Duplicate, and archived issues, are rejected with invalid_state_transition; reopen/transition first if dispatch control is needed
 transaction:
+  if issues.dispatch_paused = true: return success no-op, keep existing dispatch_pause_reason/dispatch_paused_at, and do not append a duplicate system event or issue comment
   set issues.dispatch_paused = true
   set issues.dispatch_pause_reason = request.reason
   set issues.dispatch_paused_at = now
@@ -2672,6 +2674,7 @@ request body: { "reason": non-empty string }
 allowed states: any non-terminal issue state
 terminal states Done/Cancelled/Duplicate, and archived issues, are rejected with invalid_state_transition; reopen/transition first if dispatch control is needed
 transaction:
+  if issues.dispatch_paused = false: return success no-op and do not append a system event or issue comment
   clear issues.dispatch_paused
   clear issues.dispatch_pause_reason
   clear issues.dispatch_paused_at
@@ -2751,7 +2754,7 @@ content_url
 
 `kind` identifies the packet file role, for example `review_md`, `review_json`, `patch`, `changed_files`, `untracked_files`, `diffstat`, `test_output`, `tool_calls`, `approvals`, and prompt metadata. `artifact_id` references the Artifact API metadata row. `content_url` is the relative content endpoint for allowed content, usually `/api/v1/artifacts/{artifact_id}/content`; it is `null` when content is unavailable or must not be served. Raw prompt content, raw prompt context values, raw secrets, and raw Codex logs MUST be represented only as metadata/refusal entries with `content_url=null`. Path fields on the review packet are diagnostics/metadata only. Dashboard MUST NOT read review packet files from the filesystem.
 
-The Review Packet page obtains artifact ids from this API, then fetches file contents through the Artifact API as needed. `review.json` is the preferred structured source for summary, tests, risks, verification, changed files, tool calls, and approvals. `review.md`, `changes.patch`, and other packet files are fetched by `artifact_id` for rendered review and detail panes. Review API MUST NOT expose raw prompt/log bytes inline or provide a `content_url` that bypasses Artifact API redaction and refusal rules.
+The Review Packet page obtains artifact ids from this API, then fetches file contents through the Artifact API as needed. File-level `review.json` is the Review Packet schema source of truth for summary, tests, risks, verification, changed files, tool calls, and approvals, but it is not the REST `ReviewPacketSummary` schema. `review.md`, `changes.patch`, and other packet files are fetched by `artifact_id` for rendered review and detail panes. Review API MUST NOT expose raw prompt/log bytes inline or provide a `content_url` that bypasses Artifact API redaction and refusal rules.
 
 Review action request bodies:
 
@@ -2763,6 +2766,8 @@ POST /api/v1/reviews/{issue_ref}/mark-done
 request body: { "reason": non-empty string }
 ```
 
+For Send to Rework, UI labels MAY call `request.reason` feedback. For Mark Done, UI labels MAY call `request.reason` comment. API and CLI request fields are always `reason`, and `request.reason` MUST be non-empty after trimming. Transactions may persist it as an operator comment/event payload, but that persisted comment is not a request field.
+
 Mark Done guards:
 
 ```text
@@ -2772,6 +2777,8 @@ review_packet.run_id belongs to latest completed handoff run
 no active run
 request.reason is non-empty after trimming
 ```
+
+In review action guards, a mismatched latest review packet means the latest generated packet does not belong to the issue's latest completed handoff run.
 
 Mark Done transaction:
 
@@ -3436,7 +3443,7 @@ Finalizer transitions issue to `Human Review` only when:
 
 ```text
 handoff exists for run
-handoff.target_state = Human Review
+handoff.target_state = Human Review, using the canonical default when omitted
 after_run attempted if workspace exists
 critical review packet files are written
 review_packets.status = generated
@@ -3454,8 +3461,10 @@ issue.state = Human Review
 latest review_packet.status = generated
 review_packet.run_id belongs to latest completed handoff run
 no active run
-operator supplies non-empty reason/comment
+operator supplies non-empty reason
 ```
+
+`reason` MUST be non-empty after trimming. UI may present Mark Done `reason` as comment. The transaction may persist it as an operator comment/event payload, but API and CLI input remains `reason`. A mismatched latest review packet means the latest generated packet does not belong to the issue's latest completed handoff run.
 
 Partial/failed review packets can be viewed but cannot Mark Done.
 
@@ -3489,9 +3498,14 @@ Guards:
 ```text
 issue.state = Human Review
 latest review_packet.status = generated
+review_packet.run_id belongs to latest completed handoff run
 no active run
-operator supplies non-empty reason or feedback comment
+operator supplies non-empty reason
 ```
+
+UI labels MAY call Send to Rework `reason` feedback, but API and CLI fields are `reason`, and the value MUST be non-empty after trimming.
+
+Send-to-rework error semantics match Mark Done for shared guards: invalid state returns `invalid_state_transition`; missing/blank reason returns `invalid_request`; missing, non-generated, or mismatched latest review packet returns `review_packet_required`; active run returns `issue_already_running`. All failures are no mutation.
 
 Side effects:
 
@@ -3500,7 +3514,7 @@ issue.state = Rework
 issues.dispatch_paused = false
 clear dispatch pause reason/timestamp
 insert issue_state_history Human Review → Rework
-insert operator/system comment with feedback
+insert operator comment with reason
 emit review.sent_to_rework
 ```
 
@@ -3513,7 +3527,7 @@ same workspace row reused
 same branch reused
 same base_sha retained
 before_run hook runs
-prompt includes latest review feedback and previous review packet summary
+prompt includes latest review reason and previous review packet summary
 ```
 
 Review packets are immutable. Rework creates a new packet. All review packets are cumulative from workspace `base_sha` to current workspace tree, not incremental from previous packet.
