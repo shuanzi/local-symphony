@@ -380,7 +380,7 @@ polling:
   interval_ms: 30000
 
 workspace:
-  root: <global-workspace-root>/<project_id>
+  root: <global-workspace-root>
   cleanup:
     enabled: false
     note: "v1 never deletes, resets, cleans, rebases, or removes workspaces automatically"
@@ -484,7 +484,7 @@ prompt:
   save_prompt_snapshot: redacted
 ```
 
-`workspace.root` is the effective project-scoped root; `<global-workspace-root>/<project_id>` resolves to that root, and each issue workspace is `<workspace.root>/<issue_identifier>`.
+`workspace.root` is the global workspace root. The daemon/workspace resolver derives the project-scoped root as `<workspace.root>/<project_id>`, and each issue workspace is `<workspace.root>/<project_id>/<issue_identifier>`.
 
 `dispatch_candidate_states` MUST be used for normal scheduler eligibility. `reconciliation_active_states` MUST be used only to decide whether an already-active run is still valid. `Working` MUST NOT be included in normal dispatch candidates.
 
@@ -1739,8 +1739,8 @@ v1 does not implement crash recovery.
 Default:
 
 ```text
-workspace.root (effective project-scoped root): ~/.symphony/workspaces/<project_id>/
-issue workspace path: <workspace.root>/<issue_identifier>/
+workspace.root (global workspace root): ~/.symphony/workspaces/
+issue workspace path: <workspace.root>/<project_id>/<issue_identifier>/
 ```
 
 Rules:

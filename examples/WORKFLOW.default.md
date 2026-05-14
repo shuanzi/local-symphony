@@ -10,7 +10,7 @@ polling:
   interval_ms: 30000
 
 workspace:
-  root: "~/.symphony/workspaces/default"
+  root: "~/.symphony/workspaces"
   cleanup:
     enabled: false
 
@@ -111,4 +111,4 @@ Required handoff fields:
 }
 ```
 
-The handoff only submits completion data. The system will run after_run and generate a review packet before moving the issue to Human Review. The daemon resolves the final workspace as `<workspace.root>/<issue_identifier>`; path config fields do not support Liquid interpolation.
+The handoff only submits completion data. The system will run after_run and generate a review packet before moving the issue to Human Review. The daemon resolves the final workspace as `<workspace.root>/<project_id>/<issue_identifier>`; path config fields do not support Liquid interpolation.

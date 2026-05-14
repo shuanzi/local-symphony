@@ -234,8 +234,8 @@ startup inconsistent Working issue guard
 v1 每个 issue 使用独立 git worktree 和 branch：
 
 ```text
-workspace.root (effective project-scoped root): ~/.symphony/workspaces/<project_id>/
-issue workspace path: <workspace.root>/<issue_identifier>/
+workspace.root (global workspace root): ~/.symphony/workspaces/
+issue workspace path: <workspace.root>/<project_id>/<issue_identifier>/
 branch: symphony/<issue_identifier>-<title_slug>-<short_hash>
 base_ref: auto by default
 ```
