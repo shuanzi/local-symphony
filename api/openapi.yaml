@@ -231,8 +231,11 @@ paths:
       operationId: sendToRework
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
-      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1 } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1, pattern: "\\S" } } } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }
+        "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is not in Human Review; review_packet_required when latest generated review packet is missing, non-generated, or mismatched; issue_already_running when an active run exists." }
   /reviews/{issue_ref}/mark-done:
     post:
       operationId: markDone
