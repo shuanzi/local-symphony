@@ -8,52 +8,533 @@
     "project_id",
     "generated_at",
     "redacted",
+    "repo_root",
+    "database",
+    "workflow",
+    "daemon",
+    "codex",
+    "git",
+    "redaction",
+    "warnings",
+    "inconsistent_issues",
+    "remediation",
+    "failure_summary",
+    "pause_summary",
     "checks"
   ],
   "properties": {
     "project_id": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "generated_at": {
       "type": "string",
       "format": "date-time"
     },
     "redacted": {
-      "type": "boolean"
+      "const": true
+    },
+    "repo_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "database": {
+      "$ref": "#/$defs/database"
+    },
+    "workflow": {
+      "$ref": "#/$defs/workflow"
+    },
+    "daemon": {
+      "$ref": "#/$defs/daemon"
+    },
+    "codex": {
+      "$ref": "#/$defs/codex"
+    },
+    "git": {
+      "$ref": "#/$defs/git"
+    },
+    "redaction": {
+      "$ref": "#/$defs/redaction"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "inconsistent_issues": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/inconsistentIssue"
+      }
+    },
+    "remediation": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/remediation"
+      }
+    },
+    "failure_summary": {
+      "$ref": "#/$defs/failureSummary"
+    },
+    "pause_summary": {
+      "$ref": "#/$defs/pauseSummary"
     },
     "checks": {
       "type": "array",
       "items": {
-        "type": "object",
-        "required": [
-          "name",
-          "status"
-        ],
-        "additionalProperties": true,
-        "properties": {
-          "name": {
+        "$ref": "#/$defs/check"
+      }
+    }
+  },
+  "$defs": {
+    "nullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app_db_path",
+        "project_db_path",
+        "app_schema_version",
+        "project_schema_version",
+        "app_version_status",
+        "project_version_status"
+      ],
+      "properties": {
+        "app_db_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_db_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "app_schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project_schema_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "app_version_status": {
+          "$ref": "#/$defs/databaseVersionStatus"
+        },
+        "project_version_status": {
+          "$ref": "#/$defs/databaseVersionStatus"
+        }
+      }
+    },
+    "databaseVersionStatus": {
+      "enum": [
+        "supported",
+        "unsupported",
+        "unknown",
+        "missing"
+      ]
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "config_path",
+        "validation",
+        "last_valid_config"
+      ],
+      "properties": {
+        "config_path": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "validation": {
+          "$ref": "#/$defs/workflowValidation"
+        },
+        "last_valid_config": {
+          "$ref": "#/$defs/lastValidConfig"
+        }
+      }
+    },
+    "workflowValidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "valid",
+        "warnings",
+        "errors"
+      ],
+      "properties": {
+        "valid": {
+          "type": "boolean"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
             "type": "string"
-          },
-          "status": {
-            "enum": [
-              "ok",
-              "warning",
-              "error"
-            ]
-          },
-          "message": {
+          }
+        },
+        "errors": {
+          "type": "array",
+          "items": {
             "type": "string"
           }
         }
       }
     },
-    "runtime": {
+    "lastValidConfig": {
       "type": "object",
-      "additionalProperties": true
+      "additionalProperties": false,
+      "required": [
+        "available",
+        "path",
+        "validated_at",
+        "content_hash"
+      ],
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "path": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "validated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "content_hash": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
     },
-    "security": {
+    "daemon": {
       "type": "object",
-      "additionalProperties": true
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "uptime_ms",
+        "runtime_descriptor"
+      ],
+      "properties": {
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "uptime_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "runtime_descriptor": {
+          "$ref": "#/$defs/runtimeDescriptor"
+        }
+      }
+    },
+    "runtimeDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_url",
+        "tool_gateway_endpoint",
+        "daemon_pid"
+      ],
+      "properties": {
+        "api_url": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "tool_gateway_endpoint": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "daemon_pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      }
+    },
+    "codex": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "available",
+        "version",
+        "support"
+      ],
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "version": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "support": {
+          "$ref": "#/$defs/codexSupport"
+        }
+      }
+    },
+    "codexSupport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cli",
+        "model",
+        "sandbox"
+      ],
+      "properties": {
+        "cli": {
+          "$ref": "#/$defs/supportStatus"
+        },
+        "model": {
+          "$ref": "#/$defs/supportStatus"
+        },
+        "sandbox": {
+          "$ref": "#/$defs/supportStatus"
+        }
+      }
+    },
+    "supportStatus": {
+      "enum": [
+        "supported",
+        "unsupported",
+        "unknown"
+      ]
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "worktree"
+      ],
+      "properties": {
+        "repository": {
+          "$ref": "#/$defs/gitRepository"
+        },
+        "worktree": {
+          "$ref": "#/$defs/gitWorktree"
+        }
+      }
+    },
+    "gitRepository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "is_repo",
+        "root",
+        "branch",
+        "head_sha",
+        "status"
+      ],
+      "properties": {
+        "is_repo": {
+          "type": "boolean"
+        },
+        "root": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "branch": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "head_sha": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "status": {
+          "$ref": "#/$defs/gitStatus"
+        }
+      }
+    },
+    "gitWorktree": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "branch",
+        "base_ref",
+        "status"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "branch": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "base_ref": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "status": {
+          "$ref": "#/$defs/gitStatus"
+        }
+      }
+    },
+    "gitStatus": {
+      "enum": [
+        "clean",
+        "dirty",
+        "unavailable",
+        "unknown"
+      ]
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "export_redacted_only",
+        "rules_version"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "export_redacted_only": {
+          "const": true
+        },
+        "rules_version": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "inconsistentIssue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issue_ref",
+        "problem",
+        "remediation"
+      ],
+      "properties": {
+        "issue_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "problem": {
+          "type": "string",
+          "minLength": 1
+        },
+        "remediation": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "remediation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "description"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "applies_to": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "failureSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "failed_runs_count",
+        "recent_failures"
+      ],
+      "properties": {
+        "failed_runs_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "recent_failures": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/failureBucket"
+          }
+        }
+      }
+    },
+    "failureBucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "failure_code",
+        "count"
+      ],
+      "properties": {
+        "failure_code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "pauseSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "paused_dispatch_count",
+        "paused_issue_refs"
+      ],
+      "properties": {
+        "paused_dispatch_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "paused_issue_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "status"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "warning",
+            "error"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "remediation": {
+          "type": "string"
+        }
+      }
     }
   }
 }
