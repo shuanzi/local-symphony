@@ -2237,7 +2237,7 @@ symphony run cancel run_... --reason "..."
 
 `run LOC-1` is an alias for issue dispatch.
 
-`symphony issue dispatch LOC-1` and `symphony run LOC-1` call `POST /api/v1/issues/{issue_ref}/dispatch`. On success they print the envelope-unwrapped dispatch data as JSON. On preflight failure they preserve the API error code in JSON diagnostics and use the CLI exit code mapping defined in TECH_SPEC 8.7.
+`symphony issue dispatch LOC-1` and `symphony run LOC-1` call `POST /api/v1/issues/{issue_ref}/dispatch`. On success they print the envelope-unwrapped dispatch data as JSON. On preflight failure they preserve the API error code in JSON diagnostics and use the preflight semantics in TECH_SPEC 8.7 and CLI exit code mapping defined in TECH_SPEC 11.1.
 
 Approval commands:
 

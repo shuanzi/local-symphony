@@ -222,6 +222,7 @@ failure classification
 dispatch pause/resume
 handoff finalizer coordination
 startup stale-run guard
+startup inconsistent Working issue guard
 ```
 
 `manual dispatch` 只表示 operator 指定某个 issue 立即尝试调度；它不得绕过 scheduler 的 dispatch eligibility。scheduler dispatch 与 manual dispatch/API/CLI 必须共用第 10 章定义的 `DispatchIssue` preflight。
@@ -254,6 +255,7 @@ Codex Runner 使用 `codex app-server`。v1 要求 Codex adapter 是 version-fix
 - YAML front matter 是配置。
 - Markdown body 是 agent prompt。
 - Config 字段不支持 `{{ ... }}` 插值。
+- Config fields 不支持 Liquid 或 partial interpolation；只允许 full-string `$VAR_NAME` 环境变量展开；wrong type、unsupported enum 等非法配置必须使 workflow invalid 并阻断 dispatch。
 - 只有 prompt body 支持 Liquid-style variables。
 - Prompt body 不允许为空。
 
@@ -312,6 +314,8 @@ followups
 
 其中 `followups` 必须提供，但可以为空数组。
 
+字段类型、空字符串/空数组约束、unknown-field rejection 以 `schemas/tools/handoff_submit.input.schema.json` / Tool Gateway input schema 为准。
+
 `handoff.submit` payload 可选字段：
 
 ```text
@@ -350,7 +354,7 @@ prompt/prompt_meta.json
 prompt/tool_manifest.md
 ```
 
-`review_packets.status=generated` 由 critical files 决定：`review.md`、`review.json`、`changes.patch`、`changed-files.txt`、`untracked-files.json` 必须全部存在且可登记为 artifacts。非 critical 文件缺失不得阻断 `generated`，但必须在 review metadata 或 diagnostics 中记录缺失文件名、缺失原因和生成阶段；不得静默遗漏。
+`review_packets.status=generated` 由 critical files 决定：`review.md`、`review.json`、`changes.patch`、`changed-files.txt`、`untracked-files.json` 必须全部存在且可登记为 artifacts。critical files 缺失的 packet 不得视为 `generated`；`partial` / `failed` packet 可用于诊断查看，但不能满足 Human Review / Mark Done guard。非 critical 文件缺失不得阻断 `generated`，但必须在 review metadata 或 diagnostics 中记录缺失文件名、缺失原因和生成阶段；不得静默遗漏。
 
 `review.json` 必须是 Review Packet 的结构化 source of truth，覆盖 issue、run、git、files、handoff、changed_files、untracked_files、approvals、tool_calls、prompt_snapshot 和 failure metadata。
 
@@ -474,8 +478,8 @@ Tool Gateway `artifact.attach` 命中 protected path 是另一类拒绝：daemon
 | JSON Schema | `schemas/*.schema.json`、`schemas/tools/*.input.schema.json` | 校验 WORKFLOW config、NormalizedIssue、RunEvent、Tool Gateway、各工具输入、Review Packet、Diagnostics、FailureCode。 |
 | 默认模板 | `examples/WORKFLOW.default.md` | `symphony init` 默认生成的 repo-owned workflow。 |
 | 开发任务包 | `docs/agent_work_orders/*.md` | 包含 `M0_*.md` 至 `M8_*.md` milestone 任务单，以及该目录下的 `README.md`、`EXECUTION_PROTOCOL.md` 合同说明；共同避免 agent 自行发散。 |
-| 验收材料 | `docs/testing/*` | 给 test/review agent 执行端到端验证。 |
-| Codex 映射 | `docs/codex/*` | 固定 Codex app-server protocol fixture gate 和事件映射。 |
+| 验收材料 | `docs/testing/*.md` | 给 test/review agent 执行端到端验证。 |
+| Codex 映射 | `docs/codex/*.md` | 固定 Codex app-server protocol fixture gate 和事件映射。 |
 
 这些文件不取代 PRD/TECH_SPEC，但 implementation agent MUST 以它们作为实现、生成类型、写测试和验收的输入。
 
@@ -542,7 +546,8 @@ Blocked 与 blocker relation 的关系：
 
 ```text
 Blocked state 表示当前 issue 被显式阻塞，解除需要 operator transition。
-issue_relations.blocks 表示依赖型 blocker，会影响 dispatch eligibility。
+issue_relations.blocks 表示直接依赖型 blocker（direct blocker relation），会影响 dispatch eligibility，不在产品层展开传递依赖。
+direct blocker relation 的 source issue 未处于 terminal blocker states 时，该 relation 为 active blocker relation；terminal blocker states 为 `Done/Cancelled/Duplicate`（即 `Done`、`Cancelled`、`Duplicate`）。
 添加 active blocker relation 不自动改变 issue.state，但会使 Ready/Rework issue 不可 dispatch。
 移除最后一个 blocker relation 不自动从 Blocked 转 Ready；operator 仍需显式 transition。
 agent issue.block 只设置当前 issue state=Blocked 与 dispatch_paused=true，不创建 blocker relation。
