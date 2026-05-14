@@ -814,7 +814,7 @@ Relation directions are fixed:
 | `duplicates` | duplicate issue | canonical issue | not via Tool Gateway |
 | `followup_of` | follow-up issue | original/current issue | only through `followup.create` |
 
-An issue is blocked while any direct blocker is not terminal. Terminal blocker states:
+An issue is blocked while any active direct blocker relation has `relation.active = true` and its source blocker issue is not terminal. Terminal blocker states:
 
 ```text
 Done
@@ -2731,6 +2731,8 @@ cancel_run
 
 Only pending approvals can be decided. `deny` declines the current approval action and records `approval_requests.status = denied`; it does not cancel the run or apply `operator_cancelled` side effects. `cancel_run` cancels the run and applies `operator_cancelled` side effects. Approval responses must expose `requested_at`, `timeout_ms`, `expires_at`, `resolved_at`.
 
+`GET /api/v1/approvals` and approval decision responses MUST expose `risk_level`, `policy_match`, and `action_summary` for every approval row. If the storage layer keeps approval payloads as opaque `request_json`, the API handler MUST derive these fields from `request_json` and policy evaluation before returning the response. `action_summary` is the stable Dashboard display string and MUST NOT require the UI to parse opaque request JSON.
+
 If the addressed approval is not currently `pending`, `POST /api/v1/approvals/{approval_id}/decide` MUST return `409 Conflict` with `error.code = approval_not_pending`. The request MUST be transactionally read-only: it MUST NOT update `approval_requests.status`, `decision_json`, `resolved_at`, or any run/issue state; MUST NOT write a new decision; MUST NOT write back to Codex; MUST NOT cancel or pause a run; and MUST NOT emit approval decision or cancellation side effects. The CLI MUST preserve `approval_not_pending` in JSON diagnostics and exit with code 7.
 
 ### 12.8 Review API
@@ -2859,13 +2861,26 @@ Do not expose:
 
 ```http
 POST /api/v1/git/:issue_ref/push
+POST /api/v1/git/:issue_ref/publish
+POST /api/v1/git/:issue_ref/pr
 POST /api/v1/git/:issue_ref/create-pr
 POST /api/v1/db/backup
+POST /api/v1/db/restore
 POST /api/v1/db/migrate
 GET  /api/v1/audit
 POST /api/v1/workspaces/:issue_ref/delete
+POST /api/v1/workspaces/:issue_ref/reset
+POST /api/v1/workspaces/:issue_ref/clean
+POST /api/v1/workspaces/:issue_ref/rebase
+POST /api/v1/workspace-delete
 POST /api/v1/secrets
+PATCH /api/v1/secrets/*
+PATCH /api/v1/projects/:project_id/settings
+DELETE /api/v1/issues/:issue_ref
+PATCH /api/v1/state/*
 ```
+
+The Excluded APIs list is the executable guard for the PRD forbidden surface. It MUST also reject aliases or hidden/future routes for publish/PR/create-pr, backup/restore, migrate, audit, workspace delete/reset/clean/rebase, secret or project settings mutation, issue delete, arbitrary state mutation, remote dashboard control, RBAC/admin management, or desktop shell backend bypass.
 
 ### 12.12 Core API enums
 
@@ -3647,7 +3662,7 @@ review generated
 failure
 ```
 
-Approval Inbox shows command/file/network approvals, risk level, policy match, and approve/deny/cancel controls. The UI MUST support all Approval API decisions from 12.7: `approve_once`, `approve_for_run`, `approve_for_session`, `deny`, and `cancel_run`. UI control mapping MUST be explicit: approve once -> `approve_once`; approve for run -> `approve_for_run`; approve for session -> `approve_for_session`; deny current action -> `deny`; cancel run -> `cancel_run`. If approve actions are grouped in a menu or segmented control, all three approval scopes MUST remain separately selectable; a single generic approve control MUST NOT silently collapse them. The UI MUST distinguish `deny` as declining the current approval action from `cancel_run` as cancelling the whole run.
+Approval Inbox shows command/file/network approvals, action summary, risk level, policy match, and approve/deny/cancel controls. The UI MUST render `action_summary` from the Approval API and MUST NOT parse opaque approval request JSON for stable display text. The UI MUST support all Approval API decisions from 12.7: `approve_once`, `approve_for_run`, `approve_for_session`, `deny`, and `cancel_run`. UI control mapping MUST be explicit: approve once -> `approve_once`; approve for run -> `approve_for_run`; approve for session -> `approve_for_session`; deny current action -> `deny`; cancel run -> `cancel_run`. If approve actions are grouped in a menu or segmented control, all three approval scopes MUST remain separately selectable; a single generic approve control MUST NOT silently collapse them. The UI MUST distinguish `deny` as declining the current approval action from `cancel_run` as cancelling the whole run.
 
 Review Packet page shows summary, acceptance criteria, handoff, changed files, diff, tests, risks, verification, approvals, tool calls, git, How to Continue, Send to Rework, and Mark Done. It MUST treat `review.json` as the structured source of truth, load the latest packet through `GET /api/v1/reviews/{issue_ref}`, use returned `artifact_id`/`content_url` entries to fetch contents through the Artifact API, and MUST NOT read packet files directly from the filesystem.
 
@@ -3847,6 +3862,7 @@ workflow invalid → dispatch blocked
 workspace conflict
 review packet failure → no Human Review
 untracked file created by agent → patch includes file content
+Rework dispatch prompt snapshot/rendered prompt includes latest review reason + previous review packet summary with redaction rules
 active run issue transition → reconciliation cancel
 Working issue with no active run and dispatch_paused=true is not scheduler-redispatched
 startup recoverable Working issue with no active run → source Ready/Rework + dispatch_paused/daemon_restarted_run_interrupted
@@ -3868,6 +3884,7 @@ frontend generated types compile
 run cancel side effects schema-covered
 approval cancel_run side effects schema-covered
 approval deny records denied without cancel_run side effects
+approval responses require risk_level, policy_match, and action_summary
 SSE id equals run_events.seq
 Last-Event-ID / after_seq replay works
 artifact content enforces containment and rejects raw prompt/raw Codex log
@@ -3885,6 +3902,10 @@ SQLite DDL executes on empty app/project databases
 OpenAPI document parses and contains every non-excluded v1 route listed in TECH_SPEC.md
 OpenAPI document MUST NOT include routes in 12.11 Excluded APIs
 OpenAPI document includes POST /api/v1/workflow/render-preview with request and response schemas
+CLI help snapshot MUST NOT expose commands for 12.11 Excluded APIs or hidden/future aliases
+handler route inventory MUST match OpenAPI non-excluded routes and MUST NOT include 12.11 Excluded APIs
+dashboard action inventory MUST map only to documented command APIs and MUST NOT expose hidden/future actions
+Tool Gateway registry inventory MUST include only documented v1 tools and MUST NOT bypass REST policy/auth boundaries
 OpenAPI Issue schema required fields match schemas/normalized_issue.schema.json
 RunEvent schema requires seq for SSE replay IDs
 example WORKFLOW.default.md passes strict config validation

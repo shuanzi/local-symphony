@@ -132,7 +132,7 @@ multi-tenant RBAC
 automatic PR creation
 git push / merge / publish automation
 agent automatic commit
-automatic SQLite backup
+automatic SQLite backup/restore
 database migration / rollback framework
 automatic retry queue or timers
 crash recovery beyond startup stale-run interruption
@@ -919,7 +919,9 @@ v1 产品验收必须覆盖：
 - 普通 untracked 文本文件必须包含在 review packet patch；大文件、二进制或策略限制例外必须进入 `changed-files.txt` 和 `untracked-files.json`，并带 `patch_included=false` 与非空 reason。
 - Review Packet prompt snapshot 文件只包含 redacted content / safe metadata；Review API 对 raw prompt/raw Codex log/raw secret 类内容返回 metadata 或 `content_url=null`，Artifact API 内容读取必须 refusal/error。
 - Rework 复用 workspace，生成新的 immutable cumulative review packet。
-- Mark Done 对 blank/trim 后空 `reason`、存在 active run、missing/non-generated/mismatched latest review packet 必须拒绝且 no mutation。
+- Send to Rework 对 blank/trim 后空 `reason`、非 `Human Review`、存在 active run、missing/non-generated/mismatched latest review packet 必须拒绝且 no mutation。
+- 下一次 Rework dispatch 的 prompt snapshot/rendered prompt 必须包含 latest review reason 与 previous review packet summary，并遵守脱敏规则。
+- Mark Done 对 blank/trim 后空 `reason`、非 `Human Review`、存在 active run、missing/non-generated/mismatched latest review packet 必须拒绝且 no mutation；非 `Human Review` 返回 `invalid_state_transition`。
 - Review API 不得 inline raw prompt/raw Codex log/raw secret 内容；Artifact API 对这类 raw content 读取必须 refusal/error。
 - Protected paths、artifact containment、redaction、loopback/session/CSRF/tool token、command allow/review/deny、network denied fake request、raw prompt/raw Codex log API refusal 等安全控制必须通过 security regression tests；Codex-mediated command/network/protected-path read/write auto-deny 必须写入 approval row `auto_denied`、终止当前 run、设置 `command_denied`/`network_denied`/`protected_path_denied` 并 pause dispatch；默认 unknown network auto-deny 不进入 Approval Inbox，只有 policy 返回 `review` 时才进入 Approval Inbox；Tool Gateway `artifact.attach` protected-path 拒绝必须验证为 failed tool_call + tool error，且不写 approval row、不直接终止 run。
 - REST/SSE、dashboard 与 CLI 必须符合 OpenAPI、TECH_SPEC 11-12/15.4：business API envelope 一致、SSE `id=run_events.seq` replay 可用、CLI help/flags/subcommands/exit codes 与实现匹配，Review Packet 只能经 Review API + Artifact API 读取内容，Approval Inbox 必须展示 risk level/policy match 并保留三个 approve scope。
