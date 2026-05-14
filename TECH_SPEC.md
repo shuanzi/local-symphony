@@ -3,7 +3,7 @@
 **状态**：v1 技术方案合并版  
 **更新日期**：2026-05-11  
 **来源**：`local-symphony.zip` 原始文档包经 agent-executable hardening 后更新  
-**文档权威性**：本文档是 Local Symphony App v1 的解释性技术规格文档。`api/openapi.yaml`、`db/schema/*.sql`、`schemas/*.schema.json`、`docs/agent_work_orders/*.md` 与 `docs/testing/*.md` 是本文的可执行合同与验收材料。产品目标、用户场景和非技术范围以 `PRD.md` 为准。
+**文档权威性**：`PRD.md` 是 Local Symphony App v1 产品事实与产品范围的 source of truth。本文档是字段、表结构、API/schema、状态机、校验规则等技术合同细节的 source of truth；`api/openapi.yaml`、`db/schema/*.sql`、`schemas/*.schema.json`、`docs/agent_work_orders/*.md` 与 `docs/testing/*.md` 是本文的可执行合同与验收材料。本文档与 executable contracts 不得新增或扩大 `PRD.md` 未定义的 v1 产品能力。
 
 ---
 
@@ -54,10 +54,11 @@ SHOULD    应该实现，除非有明确理由
 MAY       可选实现
 ```
 
-当 `PRD.md` 与本文冲突时：
+当 `PRD.md`、本文与 executable contract artifacts 冲突时：
 
-- 产品意图以 PRD 为准。
-- API、DB、状态机、CLI、安全、测试、发布等实现合同以本文为准。
+- 产品事实与产品范围以 `PRD.md` 为准。
+- 字段、表结构、API/schema、状态机、校验规则、CLI、安全、测试、发布等技术合同细节以本文及 executable contract artifacts 为准。
+- 本文与 executable contract artifacts 不得新增或扩大 `PRD.md` 未定义的 v1 产品能力。
 
 实现可以在代码仓库中生成或维护 OpenAPI、SQL schema、CLI help、test manifests 等文件，但这些文件必须与本文合同一致。
 
@@ -336,8 +337,9 @@ if front matter is absent, whole file is prompt body
 front matter root MUST be a map/object
 prompt body is trimmed
 empty prompt body blocks dispatch
-unknown keys warn
-wrong type / missing required field / unsupported enum errors block dispatch
+unknown top-level config keys warn and do not block dispatch
+nested unknown keys under extension-friendly sections warn or ignore according to section rules
+wrong type / missing required field / unsupported enum / env unset-or-empty errors block dispatch
 ```
 
 Supported top-level config keys:
@@ -365,6 +367,10 @@ Config fields do **not** support Liquid interpolation. Only full-string `$VAR_NA
 workspace:
   root: "$SYMPHONY_WORKSPACE_ROOT"
 ```
+
+`$VAR_NAME` is expanded only when the environment variable is set and the value is non-empty. If the variable is unset or expands to an empty string, workflow validation fails and dispatch is blocked. Partial strings such as `/tmp/$VAR_NAME` are not env-expanded config values.
+
+`schemas/workflow_config.schema.json` is the machine contract for known fields and hard constraints. Its top-level `additionalProperties` MUST be `true` so the parser can accept unknown top-level keys, emit warnings, and continue validation of known fields instead of failing schema validation before warnings are produced. Known sections MAY remain locally strict with `additionalProperties: false` where this spec defines them as strict.
 
 ### 6.2 EffectiveConfig defaults
 
@@ -530,6 +536,8 @@ path fields MUST NOT be URI
 path fields MUST NOT contain Liquid interpolation
 ```
 
+Path rules are evaluated after successful full-string `$VAR_NAME` expansion. Unset or empty env-expanded path values are workflow validation errors and do not silently normalize to empty paths.
+
 ### 6.5 Reload semantics
 
 Reload sources:
@@ -548,6 +556,7 @@ running run attempts keep captured workflow_snapshot_id and EffectiveConfig
 new dispatch attempts use latest valid workflow snapshot
 invalid reload creates invalid workflow_snapshot row for diagnostics
 invalid reload does not replace effective config
+warning-only reloads are valid reloads and may replace the effective config
 if no valid config exists, dispatch is blocked while UI/diagnostics remain available
 dry-run validation never replaces effective config
 ```
@@ -1282,9 +1291,9 @@ Duplicate
 | `Working` | `Human Review` | run finalizer | Handoff exists and review packet status is `generated`. |
 | `Human Review` | `Rework` | operator | Reviewer supplies non-empty reason; UI may present it as feedback. |
 | `Human Review` | `Done` | operator | Latest review packet status `generated`; latest review_packet.run_id belongs to latest completed handoff run; no active run; operator supplies non-empty reason; UI may present it as comment; sets `completed_at=now` and records history/comment/events. |
-| any non-terminal | `Blocked` | operator or agent tool | Active run reconciliation cancels active run. Agent tool also pauses dispatch. |
-| any non-terminal | `Cancelled` | operator | Active run reconciliation cancels active run. |
-| any non-terminal | `Duplicate` | operator | Active run reconciliation cancels active run. |
+| any non-terminal | `Blocked` | operator or agent tool | Active run reconciliation cancels active run and pauses dispatch. Agent tool uses `agent_blocked`; operator transition uses reconciliation failure-code rules. |
+| any non-terminal | `Cancelled` | operator | Active run reconciliation cancels active run and pauses dispatch. |
+| any non-terminal | `Duplicate` | operator | Active run reconciliation cancels active run and pauses dispatch. |
 | `Blocked` | `Ready` | operator | Block resolved; no active blocker relations remain; required issue fields valid. v1 intentionally resolves all `Blocked` issues to `Ready`; prior review/rework context is retained as history, but unblocking does not automatically return to `Rework`. |
 | `Done`/`Cancelled`/`Duplicate` | `Inbox`/`Ready` | operator | Explicit reopen only; reopening to `Ready` requires valid required issue fields, while reopening to `Inbox` still requires only title; direct reopen to `Working`, `Human Review`, `Rework`, or `Blocked` is forbidden; requires no active run and does not reuse old runs. Reopen sets `completed_at=null`, clears `dispatch_paused`/reason/paused_at, and preserves workspace, history, review packets, and duplicate relations. |
 
@@ -1491,11 +1500,16 @@ If an issue with an active run leaves `Ready`/`Working`/`Rework`:
 2. terminate Codex process group if it exists
 3. set run_attempt.status = cancelled
 4. set failure_code = issue_state_changed unless a more specific code applies
-5. set ended_at
-6. revoke run-scoped tool tokens
-7. emit run.cancelled and scheduler.reconciled events
-8. retain workspace without reset/clean/delete
+5. set issues.dispatch_paused = true
+6. set issues.dispatch_pause_reason = run_attempt.failure_code
+7. set issues.dispatch_paused_at = now
+8. set ended_at
+9. revoke run-scoped tool tokens
+10. emit run.cancelled, scheduler.reconciled, and scheduler.paused events
+11. retain workspace without reset/clean/delete
 ```
+
+Operator transitions that trigger active run reconciliation MUST pause dispatch after canceling the run. The pause reason MUST be the same canonical value as `run_attempt.failure_code`: ordinary non-terminal operator transitions use `issue_state_changed`, terminal reconciliation uses `canceled_by_reconciliation`, and agent `issue.block` uses `agent_blocked`.
 
 Specific codes:
 
@@ -1504,7 +1518,7 @@ Specific codes:
 | Operator cancel | `cancelled` | `operator_cancelled` |
 | Approval `cancel_run` | `cancelled` | `operator_cancelled` |
 | Agent `issue.block` | `cancelled` | `agent_blocked` |
-| Operator moves issue inactive/terminal | `cancelled` | `issue_state_changed` |
+| Operator moves issue to a non-terminal inactive state | `cancelled` | `issue_state_changed` |
 | Reconciliation finds active run for terminal issue | `cancelled` | `canceled_by_reconciliation` |
 | Startup finds active DB rows without process ownership | `failed` | `daemon_restarted_run_interrupted` |
 
@@ -1675,12 +1689,18 @@ In this section, active-run-valid states are `Ready`/`Working`/`Rework`.
 | Priority | Outcome | Final status/code |
 |---:|---|---|
 | 1 | Operator cancel or approval `cancel_run` before finalizer commit | `cancelled/operator_cancelled` |
-| 2 | Issue leaves active-run-valid states before finalizer commit | `cancelled/issue_state_changed` or `agent_blocked` |
+| 2 | Ordinary operator transition leaves active-run-valid states before finalizer commit | `cancelled/issue_state_changed` |
+| 2 | Agent `issue.block` leaves active-run-valid states before finalizer commit | `cancelled/agent_blocked` |
+| 2 | Reconciliation finds active run for terminal issue before finalizer commit | `cancelled/canceled_by_reconciliation` |
 | 3 | Startup stale active run guard | `failed/daemon_restarted_run_interrupted` |
 | 4 | Codex/runner/protocol/workspace/prompt failure | `failed/<canonical code>` |
 | 5 | Missing handoff after allowed continuation is exhausted | `completed_without_handoff/missing_handoff` |
 | 6 | Handoff exists but review packet fails | `failed/review_packet_failed` |
 | 7 | Handoff exists and review packet generated | `completed/null` |
+
+Priority 2 reconciliation outcomes are evaluated only after priority 1, so operator run cancel and approval `cancel_run` MUST keep `operator_cancelled` side effects and MUST NOT be rewritten to reconciliation codes.
+
+Manual `dispatch-pause` / `dispatch-resume` requests are not part of active run outcome precedence; they are rejected with `issue_already_running` while an active run exists.
 
 Once finalizer transaction commits `issue.state=Human Review` and `run.status=completed`, later operator cancellation must be rejected as not active.
 
@@ -2260,7 +2280,7 @@ symphony review mark-done LOC-1 --reason "..."
 symphony review path LOC-1
 ```
 
-`send-to-rework` and `mark-done` require `--reason` to be present and non-empty after trimming. CLI validation failures exit with code 2 before sending the request; API validation failures return `invalid_request`.
+`dispatch-pause`, `dispatch-resume`, `send-to-rework`, and `mark-done` require `--reason` to be present and non-empty after trimming. CLI validation failures exit with code 2 before sending the request; API validation failures return `invalid_request`.
 
 Workflow and diagnostics:
 
@@ -2658,9 +2678,11 @@ Dispatch pause/resume contract:
 
 ```text
 POST /api/v1/issues/{issue_ref}/dispatch-pause
-request body: { "reason": non-empty string }
-allowed states: any non-terminal issue state
+request body: { "reason": string, non-empty after trimming }
+allowed states: no active run, and any non-terminal issue state
+missing/blank reason is rejected with invalid_request and no mutation
 terminal states Done/Cancelled/Duplicate, and archived issues, are rejected with invalid_state_transition; reopen/transition first if dispatch control is needed
+active run exists is rejected with issue_already_running and no mutation
 transaction:
   if issues.dispatch_paused = true: return success no-op, keep existing dispatch_pause_reason/dispatch_paused_at, and do not append a duplicate system event or issue comment
   set issues.dispatch_paused = true
@@ -2670,9 +2692,11 @@ transaction:
 response: IssueDispatchControlEnvelope; data shape { issue: NormalizedIssue, side_effects } when comments/events are created
 
 POST /api/v1/issues/{issue_ref}/dispatch-resume
-request body: { "reason": non-empty string }
-allowed states: any non-terminal issue state
+request body: { "reason": string, non-empty after trimming }
+allowed states: no active run, and any non-terminal issue state
+missing/blank reason is rejected with invalid_request and no mutation
 terminal states Done/Cancelled/Duplicate, and archived issues, are rejected with invalid_state_transition; reopen/transition first if dispatch control is needed
+active run exists is rejected with issue_already_running and no mutation
 transaction:
   if issues.dispatch_paused = false: return success no-op and do not append a system event or issue comment
   clear issues.dispatch_paused
@@ -2965,7 +2989,7 @@ Policy/API errors that terminate runs MUST map to canonical `FailureCode` where 
 Implementations MUST distinguish:
 
 ```text
-hard daemon enforcement: API auth, CSRF, Tool Gateway token/scope/cwd/schema/registry, artifact.attach protected-path rejection, artifact/export containment, diagnostics export/redaction
+hard daemon enforcement: API auth, CSRF, Tool Gateway token/scope/cwd/schema/registry, artifact.attach protected-path rejection, raw secret/content refusal, artifact/export containment, redacted-only diagnostics export
 Codex-mediated enforcement: shell command approvals, file change approvals, network approvals, Codex-surfaced protected-path read/write approvals or denies
 detection/diagnostic only: events observed after a command already executed
 ```
@@ -3395,7 +3419,9 @@ It is the structured source of truth for the Review Packet and MUST cover issue,
     "summary": "...",
     "tests": [],
     "risks": [],
-    "verification": []
+    "verification": [],
+    "followups": [],
+    "target_state": "Human Review"
   },
   "changed_files": [],
   "untracked_files": [],
@@ -3411,6 +3437,8 @@ It is the structured source of truth for the Review Packet and MUST cover issue,
   "created_at": "2026-05-11T00:00:00Z"
 }
 ```
+
+The file-level `review.json` handoff object MUST include the accepted/canonical `followups` array and `target_state: "Human Review"`. `changed_files` is represented by the top-level `changed_files` field and is not duplicated as a required handoff field in the Review Packet schema.
 
 ### 14.5 review.md sections
 
@@ -3647,7 +3675,7 @@ open Review Packet
 
 Board actions MUST call REST command APIs. The dashboard MUST NOT directly read or write backend resources such as SQLite, Git, filesystem, Codex, or Tool Gateway.
 
-Issue Detail shows issue facts, comments, blockers, workspace, run history, review packets, and dispatch paused state. In states allowed by the Issue API dispatch control guards, it MUST expose dispatch pause when not paused and dispatch resume when paused. These actions MUST call `POST /api/v1/issues/{issue_ref}/dispatch-pause` and `POST /api/v1/issues/{issue_ref}/dispatch-resume`, and MUST honor terminal-state, archived-issue, and state guards instead of mutating state locally.
+Issue Detail shows issue facts, comments, blockers, workspace, run history, review packets, and dispatch paused state. In states allowed by the Issue API dispatch control guards, it MUST expose dispatch pause when not paused and dispatch resume when paused. These actions MUST call `POST /api/v1/issues/{issue_ref}/dispatch-pause` and `POST /api/v1/issues/{issue_ref}/dispatch-resume`, and MUST honor active-run, terminal-state, archived-issue, and state guards instead of mutating state locally.
 
 Run Detail shows normalized timeline:
 
@@ -3719,7 +3747,7 @@ Diagnostics export is redacted-only. `include_raw_logs=true` MUST return `raw_lo
 | Topic | Local v1 implementation rule | Required test |
 |---|---|---|
 | Tracker | `tracker.kind: local`; no Linear API surface. | Issue CRUD and dispatch without Linear config. |
-| Reconciliation | Active run leaving `Ready/Working/Rework` is cancelled and workspace retained. | Transition active Working issue to inactive state. |
+| Reconciliation | Active run leaving `Ready/Working/Rework` is cancelled, dispatch is paused with the reconciliation `failure_code`, and workspace is retained. | Transition active Working issue to inactive state; then `Blocked -> Ready` remains idle until operator `dispatch-resume`. |
 | Operator cancel | `cancelled/operator_cancelled`, tool tokens revoked, dispatch paused. | Next tick does not redispatch until resume. |
 | Retry | No automatic retry timers/queue. | Failure pauses and stays idle after waiting. |
 | Continuation | Default is one main turn plus one handoff continuation; config may set zero continuations. | Default: first missing handoff continues, missing after continuation pauses. With `max_handoff_continuations=0`, first missing handoff pauses. |
@@ -3864,6 +3892,7 @@ review packet failure → no Human Review
 untracked file created by agent → patch includes file content
 Rework dispatch prompt snapshot/rendered prompt includes latest review reason + previous review packet summary with redaction rules
 active run issue transition → reconciliation cancel
+Working -> Blocked -> Ready after reconciliation cancel stays dispatch_paused and is not scheduler-redispatched until operator dispatch-resume
 Working issue with no active run and dispatch_paused=true is not scheduler-redispatched
 startup recoverable Working issue with no active run → source Ready/Rework + dispatch_paused/daemon_restarted_run_interrupted
 startup non-recoverable Working issue with no active run → remains Working + dispatch_paused/daemon_restarted_run_interrupted + diagnostics remediation

@@ -3,7 +3,7 @@
   "$id": "https://local-symphony.dev/schemas/workflow_config.schema.json",
   "title": "Local Symphony Workflow Config",
   "type": "object",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "required": [
     "tracker",
     "workspace",

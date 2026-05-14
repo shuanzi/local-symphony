@@ -143,19 +143,19 @@ paths:
   /issues/{issue_ref}/dispatch-pause:
     post:
       operationId: pauseIssueDispatch
-      description: Pauses dispatch for a non-terminal issue, recording the non-empty operator reason in pause fields, event log, and issue comments.
+      description: Pauses dispatch for a non-terminal issue with no active run, recording the operator reason, which must be non-empty after trimming, in pause fields, event log, and issue comments.
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
-      requestBody: { description: Non-empty operator reason for audit comment/event., required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1 } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "409": { $ref: '#/components/responses/Error' } }
+      requestBody: { description: Operator reason for audit comment/event; must be non-empty after trimming., required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1, pattern: "\\S" } } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }, "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is terminal/archived; issue_already_running when an active run exists." } }
   /issues/{issue_ref}/dispatch-resume:
     post:
       operationId: resumeIssueDispatch
-      description: Resumes dispatch for a non-terminal issue by clearing only dispatch pause fields; it never changes issue content, blockers, state, or creates a run.
+      description: Resumes dispatch for a non-terminal issue with no active run by clearing only dispatch pause fields; it never changes issue content, blockers, state, or creates a run.
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
-      requestBody: { description: Non-empty operator reason for audit comment/event., required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1 } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "409": { $ref: '#/components/responses/Error' } }
+      requestBody: { description: Operator reason for audit comment/event; must be non-empty after trimming., required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1, pattern: "\\S" } } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }, "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is terminal/archived; issue_already_running when an active run exists." } }
   /issues/{issue_ref}/blockers:
     post:
       operationId: addIssueBlocker

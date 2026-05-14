@@ -15,7 +15,29 @@ schemas/normalized_issue.schema.json matches OpenAPI Issue required fields
 schemas/run_event.schema.json requires seq for SSE replay IDs
 SQLite app/project DDL can initialize empty databases
 examples/WORKFLOW.default.md validates
+workflow config schema accepts unknown top-level keys so validation can emit warning-only diagnostics instead of schema errors
 examples/handoff.json and examples/followup.json validate against schemas/tools/*.input.schema.json and wrapped Tool Gateway call schemas
+docs/testing/CONTRACT_VALIDATION_MANIFEST.json parseable and complete for v1 manifest/snapshot contracts
+required docs/testing, docs/codex, and docs/agent_work_orders M0-M8 files exist
+OpenAPI contains every required non-excluded v1 route and no excluded API route fragments/patterns
+OpenAPI forbidden method/path operations are validated for git publish/push/PR/create-pr, db backup/restore/migrate, audit, workspace delete/reset/clean/rebase, secrets, project settings, issue delete, and arbitrary state mutation
+manifest OpenAPI route inventory stays aligned with validate_contracts.py required routes
+handler route inventory maps to documented OpenAPI routes
+CLI required/help tokens are declared and forbidden v1 commands are declared
+dashboard action inventory declares required actions and forbidden hidden/future actions
+Tool Gateway registry enum matches the fixed documented v1 tool list
+docs/agent_work_orders/*.md do not contain forbidden v1 command-like capability tokens
+security regression command/topic manifest includes default fake-only commands and gates real Codex behind SYMPHONY_TEST_CODEX=1
+```
+
+## A0a WORKFLOW validation
+
+Expected：
+
+```text
+unknown top-level config key produces a warning only and does not block dispatch
+wrong type, missing required field, unsupported enum, and unset-or-empty full-string $VAR_NAME produce workflow validation errors
+unset-or-empty full-string $VAR_NAME blocks dispatch and invalid reload does not replace the effective config
 ```
 
 ## A1 Init and local tracker
@@ -70,6 +92,53 @@ run.status = failed
 issue.state restored to source_issue_state Ready/Rework
 issue.dispatch_paused = true
 symphony issue dispatch LOC-1 returns state conflict while paused
+symphony issue dispatch-resume LOC-1 clears pause
+next dispatch succeeds when other eligibility guards pass
+```
+
+## A4a Manual dispatch control rejects active run
+
+Start a run, then call manual dispatch pause and resume against the same Working issue.
+
+Expected：
+
+```text
+symphony issue dispatch-pause LOC-1 returns issue_already_running
+symphony issue dispatch-resume LOC-1 returns issue_already_running
+issue.dispatch_paused is unchanged by both requests
+issue.dispatch_pause_reason is unchanged by both requests
+issue.dispatch_paused_at is unchanged by both requests
+active run remains active unless separately cancelled
+```
+
+## A4a.1 Manual dispatch control rejects blank reason
+
+Call manual dispatch pause and resume with missing, blank, and trim-to-empty `--reason` / request `reason` values.
+
+Expected：
+
+```text
+symphony issue dispatch-pause LOC-1 returns invalid_request
+symphony issue dispatch-resume LOC-1 returns invalid_request
+issue.dispatch_paused is unchanged by both requests
+issue.dispatch_pause_reason is unchanged by both requests
+issue.dispatch_paused_at is unchanged by both requests
+no system event or issue comment is appended
+```
+
+## A4b Reconciliation pause survives unblock
+
+Start a run, use an operator transition to move its Working issue to Blocked, then resolve Blocked to Ready.
+
+Expected：
+
+```text
+run.status = cancelled
+run.failure_code = issue_state_changed
+issue.state = Ready
+issue.dispatch_paused = true
+issue.dispatch_pause_reason = run.failure_code
+next scheduler tick does not dispatch the issue
 symphony issue dispatch-resume LOC-1 clears pause
 next dispatch succeeds when other eligibility guards pass
 ```

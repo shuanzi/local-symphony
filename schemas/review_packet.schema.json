@@ -158,7 +158,9 @@
         "summary",
         "tests",
         "risks",
-        "verification"
+        "verification",
+        "followups",
+        "target_state"
       ],
       "additionalProperties": true,
       "properties": {
@@ -182,6 +184,15 @@
           "items": {
             "type": "string"
           }
+        },
+        "followups": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "target_state": {
+          "const": "Human Review"
         }
       }
     },
