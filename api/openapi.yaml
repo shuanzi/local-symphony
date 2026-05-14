@@ -15,6 +15,7 @@ paths:
   /health:
     get:
       operationId: getHealth
+      security: []
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/HealthEnvelope' } } } }
   /state:
@@ -60,8 +61,16 @@ paths:
   /auth/open-token:
     post:
       operationId: createOpenToken
+      description: >
+        Used by CLI/open flow to mint a one-time browser open token. Requires a
+        bearer local operator credential; cookie-authenticated browser sessions
+        are not applicable for this endpoint, so X-Symphony-CSRF is not required.
+      security:
+        - bearerAuth: []
       responses:
         "200": { description: Open token, content: { application/json: { schema: { $ref: '#/components/schemas/OpenTokenEnvelope' } } } }
+        "401": { $ref: '#/components/responses/Error' }
+        "403": { $ref: '#/components/responses/Error' }
   /auth/cli-token/rotate:
     post:
       operationId: rotateCliToken
@@ -208,7 +217,9 @@ paths:
       parameters: [ { $ref: '#/components/parameters/ApprovalId' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalEnvelope' } } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalEnvelope' } } } }
+        "409": { $ref: '#/components/responses/Error', description: "approval_not_pending when approval is not pending; transactionally read-only with no side effects." }
   /reviews/{issue_ref}:
     get:
       operationId: getLatestReview
@@ -227,8 +238,11 @@ paths:
       description: Requires latest generated review packet to belong to latest completed handoff run, with issue in Human Review and no active run.
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
-      requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { reason: { type: string } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1, pattern: "\\S" } } } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }
+        "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is not in Human Review; review_packet_required when latest generated review packet is missing, non-generated, or mismatched; issue_already_running when an active run exists." }
   /artifacts/{artifact_id}:
     get:
       operationId: getArtifactMetadata
@@ -279,7 +293,9 @@ paths:
       parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { include_raw_logs: { type: boolean, default: false } } } } } }
-      responses: { "200": { description: Export created, content: { application/json: { schema: { $ref: '#/components/schemas/DiagnosticsExportEnvelope' } } } } }
+      responses:
+        "200": { description: Export created, content: { application/json: { schema: { $ref: '#/components/schemas/DiagnosticsExportEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: "raw_log_access_not_supported when include_raw_logs=true" }
 components:
   securitySchemes:
     bearerAuth: { type: http, scheme: bearer }
@@ -345,7 +361,7 @@ components:
             request_id: { type: string }
     ApiErrorCode:
       type: string
-      enum: [unauthorized, forbidden, csrf_required, invalid_request, not_found, unsupported_db_version, workflow_invalid, workflow_validation_failed, prompt_render_failed, invalid_state_transition, issue_blocked, issue_dispatch_paused, issue_already_running, workspace_conflict, workspace_prepare_failed, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_not_pending, approval_timeout, review_packet_required, review_packet_failed, tool_token_invalid, tool_gateway_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted, command_denied, network_denied, protected_path_denied, raw_log_access_not_supported, internal_error]
+      enum: [unauthorized, forbidden, csrf_required, invalid_request, not_found, unsupported_db_version, workflow_invalid, workflow_validation_failed, prompt_render_failed, invalid_state_transition, issue_blocked, issue_dispatch_paused, issue_already_running, concurrency_limit_reached, workspace_conflict, workspace_prepare_failed, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_not_pending, approval_timeout, review_packet_required, review_packet_failed, tool_token_invalid, tool_gateway_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted, command_denied, network_denied, protected_path_denied, raw_log_access_not_supported, internal_error]
     FailureCode:
       type: string
       enum: [workflow_invalid, workflow_validation_failed, prompt_render_failed, workspace_prepare_failed, workspace_conflict, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_timeout, command_denied, network_denied, protected_path_denied, tool_gateway_failed, missing_handoff, review_packet_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted]

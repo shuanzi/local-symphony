@@ -61,6 +61,7 @@
         "issue_blocked",
         "issue_dispatch_paused",
         "issue_already_running",
+        "concurrency_limit_reached",
         "workspace_conflict",
         "workspace_prepare_failed",
         "after_create_failed",

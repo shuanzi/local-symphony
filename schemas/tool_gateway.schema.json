@@ -71,7 +71,7 @@
     "handoffSubmitInput": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["summary", "changed_files", "tests", "risks", "verification"],
+      "required": ["summary", "changed_files", "tests", "risks", "verification", "followups"],
       "properties": {
         "summary": { "type": "string", "minLength": 1 },
         "changed_files": { "type": "array", "items": { "type": "string", "minLength": 1 } },

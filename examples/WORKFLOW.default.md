@@ -17,7 +17,7 @@ workspace:
 hooks:
   after_create: null
   before_run: null
-  after_run: "go test ./..."
+  after_run: null
   before_remove: null
   timeout_ms: 300000
   max_output_bytes: 65536
