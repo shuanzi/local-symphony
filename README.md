@@ -222,7 +222,7 @@ multi-tenant RBAC
 automatic PR creation
 git push / merge / publish automation
 agent automatic commit
-automatic SQLite backup
+automatic SQLite backup/restore
 database migration / rollback framework
 automatic retry queue or timers
 crash recovery beyond startup stale-run interruption

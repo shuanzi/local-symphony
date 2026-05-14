@@ -34,6 +34,7 @@ paths:
   /events/stream:
     get:
       operationId: streamEvents
+      parameters: [ { $ref: '#/components/parameters/LastEventID' } ]
       responses:
         "200": { description: SSE stream, content: { text/event-stream: { schema: { type: string } } } }
   /auth/exchange:
@@ -174,7 +175,7 @@ paths:
   /issues/{issue_ref}/events/stream:
     get:
       operationId: streamIssueEvents
-      parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
+      parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/LastEventID' } ]
       responses: { "200": { description: SSE stream, content: { text/event-stream: { schema: { type: string } } } } }
   /runs:
     get:
@@ -198,7 +199,7 @@ paths:
   /runs/{run_id}/events/stream:
     get:
       operationId: streamRunEvents
-      parameters: [ { $ref: '#/components/parameters/RunId' } ]
+      parameters: [ { $ref: '#/components/parameters/RunId' }, { $ref: '#/components/parameters/LastEventID' } ]
       responses: { "200": { description: SSE stream, content: { text/event-stream: { schema: { type: string } } } } }
   /runs/{run_id}/cancel:
     post:
@@ -230,8 +231,11 @@ paths:
       operationId: sendToRework
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
-      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1 } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1, pattern: "\\S" } } } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }
+        "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is not in Human Review; review_packet_required when latest generated review packet is missing, non-generated, or mismatched; issue_already_running when an active run exists." }
   /reviews/{issue_ref}/mark-done:
     post:
       operationId: markDone
@@ -327,6 +331,12 @@ components:
       required: false
       description: Required for cookie-authenticated command APIs. Bearer-token CLI calls do not use this header.
       schema: { type: string }
+    LastEventID:
+      name: Last-Event-ID
+      in: header
+      required: false
+      description: SSE replay cursor; value is the last received event id.
+      schema: { type: string }
   responses:
     Error:
       description: Error response
@@ -352,7 +362,7 @@ components:
       properties:
         error:
           type: object
-          required: [code, message, request_id]
+          required: [code, message, details, request_id]
           additionalProperties: false
           properties:
             code: { $ref: '#/components/schemas/ApiErrorCode' }
@@ -672,13 +682,16 @@ components:
       enum: [pending, approved_once, approved_for_run, approved_for_session, denied, auto_denied, cancelled, timeout]
     ApprovalRequest:
       type: object
-      required: [id, run_id, issue_id, kind, status, requested_at, created_at]
+      required: [id, run_id, issue_id, kind, status, risk_level, policy_match, action_summary, requested_at, created_at]
       properties:
         id: { type: string, pattern: "^appr_" }
         run_id: { type: string }
         issue_id: { type: string }
         kind: { type: string, enum: [command, file_change, network] }
         status: { $ref: '#/components/schemas/ApprovalStatus' }
+        risk_level: { type: string, enum: [low, medium, high, critical] }
+        policy_match: { type: [string, 'null'] }
+        action_summary: { type: string }
         request: { type: object, additionalProperties: true }
         decision: { type: [object, 'null'], additionalProperties: true }
         reason: { type: [string, 'null'] }
