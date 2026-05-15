@@ -2,7 +2,7 @@
 
 ## 目标
 
-系统审查 `PRD.md` 的产品合理性、功能定义清晰度，以及它与 `TECH_SPEC.md` 的一致性。审查必须产出可定位、可修复、可复查的问题清单，并在修复后完成闭环复审。
+系统审查 `PRD.md` 的产品合理性、功能定义清晰度，以及它与 `TECH_SPEC.md` 的一致性。审查必须产出可定位、可修复、可复查的问题清单；可直接修复项完成后进行复审，需要产品决策或下一轮合同审查的事项保持显式 Deferred/Open。
 
 ## 输入
 
@@ -26,8 +26,26 @@
 - [x] 5. 审查 PRD 与 Tech SPEC 的双向一致性。
 - [x] 6. 按端到端用户场景走查边界路径。
 - [x] 7. 合并、去重并分级所有问题。
-- [x] 8. 修复已确认问题，优先处理 Blocker 和 Major。
-- [x] 9. 复审修复结果，确认没有引入新的 PRD-SPEC 漂移。
+- [x] 8. 修复首轮已确认且无需产品决策的问题，优先处理 Blocker 和可直接闭环的 Major。
+- [x] 9. 复审已修复项，确认未引入新的 PRD-SPEC 漂移，并记录 Deferred/Open 剩余项。
+
+## 复审迭代记录
+
+- [x] 第一轮复审：发现 duplicate relation 移除、same-state Duplicate、follow-up 可见性、transition reason、Dashboard shared states 和审查文档状态问题。
+- [x] 第一轮修复：补齐 PRD/TECH 主合同和 review docs 追踪。
+- [x] 第二轮复审：将剩余 Major 收敛到 duplicate relation 在 Dashboard/DTO 不可发现，以及 `PRD-REV-019` 状态误标。
+- [x] 第二轮修复：补齐 duplicate_of/duplicates 产品字段、NormalizedIssue、Issue Detail remove action、验收覆盖和矩阵追踪；`PRD-REV-019` 保持 Open。
+- [x] 第三轮复审：发现 duplicate relation 单值 DTO 与多 active canonical 的潜在冲突。
+- [x] 第三轮修复：明确同一 source issue 最多一个 active duplicate canonical，改 canonical 前必须先 remove 旧 relation，并补充验收与矩阵追踪。
+- [x] 第四轮复审：发现 remove 不改 state 导致“remove 后指定新 canonical”的 same-state Duplicate 路径不可执行。
+- [x] 第四轮修复：补充 no active duplicate relation 时的 same-state Duplicate 建 relation 例外、存储唯一性约束和正向验收。
+- [x] 第五轮聚焦复审：确认本轮无新增 Major，剩余项仅为明确 Deferred/Open；同时修正 same-state Duplicate 省略 `duplicate_of` 的 Minor 歧义和 `PRD-REV-029` 矩阵追踪。
+
+## 剩余决策与下一轮范围
+
+- `PRD-REV-001` 仍为 Major + Deferred，需要产品 owner 决策确认 v1 是完整 release target 还是需要拆分 MVP/hardening scope；本轮不声明该业务决策已闭环。
+- `PRD-REV-019` 仍为 Open，OpenAPI、SQL schema、JSON Schema、docs/testing、docs/codex、docs/agent_work_orders 等 executable contracts 需要下一轮由 implementation owner 逐项审查。
+- 本轮复审新增的问题以 `PRD_REVIEW_ISSUES.md` 的 Open/In Progress 状态为准；只有能从当前文件验证的事项才可标为 Fixed。
 
 ## 分工方式
 
@@ -167,7 +185,7 @@ ID:
 复审必须确认：
 
 - 没有未解决的 Blocker。
-- Major 已修复，或有明确决策。
+- Major 已修复，或有明确决策；若标为 Deferred，必须记录待产品决策和后续 owner，不计入本轮业务决策闭环。
 - PRD 每个功能都有可验证验收标准。
 - PRD 与 Tech SPEC 可以双向映射。
 - 修复没有引入新的命名、状态、接口或边界行为漂移。
@@ -177,4 +195,4 @@ ID:
 - `PRD_TECH_REVIEW_MATRIX.md` 已覆盖所有 PRD 功能和 Tech SPEC 产品可见能力。
 - `PRD_REVIEW_ISSUES.md` 中所有问题都有状态。
 - `PRD.md` 与 `TECH_SPEC.md` 的修改范围最小且可追踪。
-- 复审通过，且最终 `git diff --check` 无空白错误。
+- 首轮复审结果已记录，Deferred/Open 项有明确后续范围，且最终 `git diff --check` 无空白错误。

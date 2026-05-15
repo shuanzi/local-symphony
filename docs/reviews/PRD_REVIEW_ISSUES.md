@@ -7,8 +7,8 @@
 | 严重级别 | 数量 | Fixed | Open | Deferred |
 | --- | ---: | ---: | ---: | ---: |
 | Blocker | 0 | 0 | 0 | 0 |
-| Major | 17 | 16 | 0 | 1 |
-| Minor | 3 | 2 | 1 | 0 |
+| Major | 25 | 24 | 0 | 1 |
+| Minor | 4 | 3 | 1 | 0 |
 
 ## 问题清单
 
@@ -289,5 +289,131 @@
 建议修改: 在 integration tests、fake-agent E2E 和 M0/M1/M4/M6 acceptance 中补充对应测试项。
 是否需要产品决策: 否
 影响到的 TECH_SPEC 部分: §18.4, §18.5, §19
+状态: Fixed
+```
+
+### PRD-REV-021
+
+```text
+来源位置: PRD.md §9; TECH_SPEC.md §8.2/§12.5/§15.4
+问题类型: 定义不清 / 缺少用户可见入口
+严重级别: Major
+当前描述: Duplicate relation 可以把 issue 标记为 Duplicate，但缺少解除 Duplicate relation 或恢复误标的入口。
+问题说明: operator 误标后没有明确的产品路径恢复关系与状态，Dashboard/CLI/API 的行为不可验收。
+建议修改: 明确 Duplicate relation 的解除入口、允许状态、审计事件、Dashboard/CLI 可见动作和失败语义。
+是否需要产品决策: 否
+影响到的 TECH_SPEC 部分: §8.2, §12.5, §15.4
+状态: Fixed
+```
+
+### PRD-REV-022
+
+```text
+来源位置: PRD.md §9; TECH_SPEC.md §8.2/§12.5
+问题类型: 定义不清 / 幂等冲突
+严重级别: Major
+当前描述: Duplicate relation 的重复提交、目标变化和 same-state transition 之间的幂等/冲突规则仍不够明确。
+问题说明: 实现可能把同一 Duplicate 目标视为成功、冲突或重复事件；不同 Duplicate 目标的错误码和 mutation 边界也不清晰。
+建议修改: 补充 Duplicate 幂等规则、不同 target 的 conflict 语义、事件写入规则和 no mutation 保证。
+是否需要产品决策: 否
+影响到的 TECH_SPEC 部分: §8.2, §12.5
+状态: Fixed
+```
+
+### PRD-REV-023
+
+```text
+来源位置: PRD.md §8.6/§8.7; TECH_SPEC.md §7.6/§11.5/§15.4
+问题类型: PRD-SPEC 漂移 / 用户可见性
+严重级别: Major
+当前描述: `followup.create` 创建 followup relation，但关系在 issue detail、Board 或 CLI/API 展示中的可见性不足。
+问题说明: followup issue 被创建后，operator 可能无法从父 issue 或子 issue 追踪上下文，审查和后续调度不可诊断。
+建议修改: 明确 followup relation 的双向展示、API 字段、CLI 输出和 Dashboard issue detail 可见位置。
+是否需要产品决策: 否
+影响到的 TECH_SPEC 部分: §7.6, §11.5, §15.4
+状态: Fixed
+```
+
+### PRD-REV-024
+
+```text
+来源位置: PRD.md §9/§10; TECH_SPEC.md §8.2/§12.5
+问题类型: 定义不清 / 副作用缺口
+严重级别: Major
+当前描述: transition reason 的校验规则已有补充，但不同 reason 对 comment、history、pause、timestamps 等副作用的要求仍不完整。
+问题说明: 同一状态流转可能在 API、CLI、Dashboard 中写出不同审计结果，operator 无法复查为什么发生 transition。
+建议修改: 为 transition reason 补齐副作用矩阵，包括必填/可选 reason、history event、comment 写入、pause 字段和 no mutation 场景。
+是否需要产品决策: 否
+影响到的 TECH_SPEC 部分: §8.2, §12.5
+状态: Fixed
+```
+
+### PRD-REV-025
+
+```text
+来源位置: TECH_SPEC.md §15.4/§18.4/§18.5/§20
+问题类型: 缺少验收覆盖
+严重级别: Major
+当前描述: Dashboard shared states 已补充 loading/empty/auth/error/refusal/daemon unavailable 等产品状态，但对应测试覆盖不足。
+问题说明: UI 状态合同如果没有集成或 E2E 验收，后续实现容易只覆盖主路径页面。
+建议修改: 在 Dashboard/API 集成测试和 fake-agent E2E 中补充 Dashboard shared states 的验收项。
+是否需要产品决策: 否
+影响到的 TECH_SPEC 部分: §15.4, §18.4, §18.5, §20
+状态: Fixed
+```
+
+### PRD-REV-026
+
+```text
+来源位置: docs/reviews/PRD_TECH_REVIEW_PLAN.md
+问题类型: 复审产物闭环 / 状态声明过满
+严重级别: Major
+当前描述: 计划 checklist 曾把“修复已确认问题”和“复审完成”全部勾选，但 `PRD-REV-001` 仍为 Major + Deferred 且需要产品决策。
+问题说明: 审查产物容易被误读为所有 Major 均已业务决策闭环，实际仍存在 Deferred/Open 项。
+建议修改: 调整计划文档，区分首轮审查与可直接修复项完成、Deferred/Open 剩余项、下一轮产品决策范围。
+是否需要产品决策: 否
+影响到的 TECH_SPEC 部分: 无
+状态: Fixed
+```
+
+### PRD-REV-027
+
+```text
+来源位置: docs/reviews/PRD_TECH_REVIEW_MATRIX.md
+问题类型: 可追踪性缺口
+严重级别: Minor
+当前描述: 矩阵漏挂 `PRD-REV-003` 到目标用户/权限/本地单机相关映射行，且漏挂 `PRD-REV-020` 到测试/验收相关映射行。
+问题说明: Fixed issue 虽然在问题清单中存在，但无法从相关矩阵位置追踪回审查发现。
+建议修改: 更新矩阵引用，保证 Fixed issue 至少在相关 PRD->Tech 和 Tech->PRD 映射位置可追踪。
+是否需要产品决策: 否
+影响到的 TECH_SPEC 部分: 无
+状态: Fixed
+```
+
+### PRD-REV-028
+
+```text
+来源位置: PRD.md §9; TECH_SPEC.md §7.6/§8.2/§12.5/§18.5
+问题类型: 定义不清 / 单值 DTO 约束缺口
+严重级别: Major
+当前描述: `duplicate_of` 是单一 active canonical relation，但 reopen 保留 duplicate relation 后，再次转 Duplicate 到另一个 canonical 的行为未定义。
+问题说明: 实现可能为同一 source issue 产生多个 active duplicate canonical relation，导致 `NormalizedIssue.duplicate_of`、Dashboard remove action 和 API 幂等语义不确定。
+建议修改: 明确同一 source issue 最多一个 active duplicate canonical；若要改变 canonical，必须先通过 duplicate relation remove 入口失效旧 relation，再重新 transition。
+是否需要产品决策: 否
+影响到的 TECH_SPEC 部分: §7.6, §8.2, §12.5, §18.5
+状态: Fixed
+```
+
+### PRD-REV-029
+
+```text
+来源位置: PRD.md §9; TECH_SPEC.md §7.6/§12.5/§18.5
+问题类型: 定义不清 / 恢复路径不可执行
+严重级别: Major
+当前描述: 已要求更换 duplicate canonical 前先 remove 旧 relation，但 remove 不改变 issue.state；remove 后再转 Duplicate 到新 canonical 会被 same-state transition 默认冲突规则挡住。
+问题说明: “先 remove 旧 relation 再设置新 canonical”的正确路径在合同上不可执行，导致误标恢复仍可能卡住。
+建议修改: 明确 issue 已是 Duplicate 且当前无 active duplicate relation 时，带合法 `duplicate_of` 的 same-state Duplicate transition 可创建新 relation；同时补充正向验收。
+是否需要产品决策: 否
+影响到的 TECH_SPEC 部分: §7.6, §12.5, §18.5
 状态: Fixed
 ```

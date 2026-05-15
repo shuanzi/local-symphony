@@ -848,6 +848,10 @@ Relation directions are fixed:
 | `duplicates` | duplicate issue | canonical issue | not via Tool Gateway |
 | `followup_of` | follow-up issue | original/current issue | only through `followup.create` |
 
+For `duplicates`, one source issue MUST have at most one active canonical relation. Changing the canonical target requires deactivating the existing relation first.
+
+Relation rows include `active`, `created_at`, and nullable `resolved_at`. The storage layer MUST enforce the active duplicate uniqueness invariant for `(source_issue_id, relation_type='duplicates')`, for example with a partial unique index over active rows.
+
 An issue is blocked while any active direct blocker relation has `relation.active = true` and its source blocker issue is not terminal. Terminal blocker states:
 
 ```text
@@ -1106,8 +1110,11 @@ validate transition
 if transition leaves active states and an active run exists, enqueue reconciliation cancel
 update issue state
 insert issue_state_history
-insert issue.transitioned event
+if operator transition target is Blocked, Cancelled, or Duplicate: insert issue comment with operator reason
+insert issue.transitioned event with from_state, to_state, operator reason when present, duplicate_of when present, and side_effects
 ```
+
+Agent `issue.block` keeps the existing `agent_blocked` semantics and does not create the operator transition comment/event payload described above.
 
 Dispatch claim transaction:
 
@@ -1199,6 +1206,10 @@ url
 labels
 blocked_by
 blocks
+duplicate_of
+duplicates
+followup_of
+followups
 dispatch_paused
 dispatch_pause_reason
 dispatch_paused_at
@@ -1227,6 +1238,10 @@ latest_run null until run exists
 latest_review_packet null until review packet exists
 branch_name/workspace_path/base_ref/base_ref_config/base_sha are top-level compatibility aliases
 git mirrors workspace git fields for prompt ergonomics
+duplicate_of is null or the single active canonical issue reference for the current issue
+duplicates lists direct active duplicate issue references that point to this issue, sorted by created_at then identifier
+followup_of is null or the original issue reference for a follow-up issue
+followups lists direct follow-up issue references created from this issue, sorted by created_at then identifier
 base_ref is resolved Git ref
 base_ref_config preserves configured value such as auto
 created_at/updated_at are RFC3339 UTC
@@ -1335,7 +1350,7 @@ old run_attempts are never reused
 reopen to Inbox does not dispatch automatically
 reopen to Ready makes the issue eligible for a new run on the next scheduler tick, subject to normal eligibility
 latest review packet is retained as history only; completion after reopen requires a latest review packet from a new post-reopen handoff run
-duplicate relations are retained; operator must remove or deactivate them separately when the issue is no longer a duplicate
+duplicate relations are retained; operator must remove or deactivate them separately through the duplicate relation remove endpoint/CLI when the issue is no longer a duplicate
 ```
 
 ### 8.3 Orchestrator actor
@@ -2294,6 +2309,7 @@ symphony issue transition LOC-1 <state> [--reason "..."] [--duplicate-of LOC-2]
 symphony issue comment LOC-1 --body "..."
 symphony issue blocker add LOC-2 --blocked-by LOC-1
 symphony issue blocker remove LOC-2 --blocked-by LOC-1
+symphony issue duplicate remove LOC-1 --duplicate-of LOC-2
 symphony issue dispatch LOC-1
 symphony issue dispatch-pause LOC-1 --reason "..."
 symphony issue dispatch-resume LOC-1 --reason "..."
@@ -2533,6 +2549,7 @@ creates new issue in Inbox
 created_by_type = agent
 created_by_run_id = current run
 creates relation: new_issue followup_of current_issue
+created issue appears in current issue followups; created issue exposes followup_of = current_issue
 agent cannot set follow-up to Ready/Working/Human Review/Done/Cancelled/Duplicate/Blocked
 agent cannot create blocks or duplicates relations
 ```
@@ -2714,6 +2731,7 @@ POST   /api/v1/issues/{issue_ref}/transition
 POST   /api/v1/issues/{issue_ref}/comments
 POST   /api/v1/issues/{issue_ref}/blockers
 DELETE /api/v1/issues/{issue_ref}/blockers/{blocker_issue_ref}
+DELETE /api/v1/issues/{issue_ref}/duplicates/{canonical_issue_ref}
 POST   /api/v1/issues/{issue_ref}/dispatch
 POST   /api/v1/issues/{issue_ref}/dispatch-pause
 POST   /api/v1/issues/{issue_ref}/dispatch-resume
@@ -2726,6 +2744,7 @@ Resource refs:
 ```text
 {issue_ref} accepts internal id iss_... or human identifier LOC-1
 {blocker_issue_ref} follows same rule
+{canonical_issue_ref} follows same rule
 server resolves refs before auth/state/transaction checks
 ambiguous/missing/malformed refs return not_found or invalid_request with no partial mutation
 responses always include both id and identifier
@@ -2777,16 +2796,28 @@ request body:
   state: target issue state, required
   reason: string, required and trim non-empty when target is Blocked, Cancelled, or Duplicate
   duplicate_of: optional issue ref, only valid when target is Duplicate
-same-state transition: invalid_state_transition with no mutation
+same-state transition: invalid_state_transition with no mutation by default
+same-state exception: if state=Duplicate, duplicate_of resolves to the same active duplicate relation, and request validation including reason succeeds, return success no-op without duplicate comment/event/relation writes
+same-state exception: if state=Duplicate, there is no active duplicate relation, duplicate_of resolves to a valid canonical issue, and request validation including reason succeeds, create the duplicate relation, append the operator reason comment, insert issue.transitioned event with from_state=Duplicate and to_state=Duplicate, and leave issue.state unchanged
+same-state Duplicate with a different active canonical relation is invalid_state_transition; missing/blank reason or malformed duplicate_of is invalid_request
 Human Review -> Rework/Done MUST use the Review API, not generic transition
 Duplicate duplicate_of must resolve within the same project and must not equal the current issue
+if the issue is not already Duplicate and Duplicate duplicate_of is omitted, an existing active duplicate relation is preserved; if none exists, no relation is created
+if the issue is already Duplicate and duplicate_of is omitted, same-state default invalid_state_transition applies with no mutation
 duplicate relation creation is idempotent for the same active pair
+if a different active duplicate relation already exists for the source issue, return invalid_state_transition with no mutation; caller must remove the existing relation before changing canonical target
 
 POST /api/v1/issues/{issue_ref}/blockers
 request body: { "blocked_by": issue_ref }
 DELETE /api/v1/issues/{issue_ref}/blockers/{blocker_issue_ref}
 blocker refs must resolve within the same project and must not equal the current issue
 removing an existing blocker relation soft-deactivates it; removing an already inactive relation is success no-op
+
+DELETE /api/v1/issues/{issue_ref}/duplicates/{canonical_issue_ref}
+duplicate refs must resolve within the same project and must not equal the current issue
+removing an existing duplicate relation soft-deactivates it by setting active=false and resolved_at=now; removing an already inactive relation is success no-op
+this endpoint does not change issue.state; a reopened Duplicate that should become Inbox/Ready still uses /transition
+success response MUST include the updated NormalizedIssue so Dashboard can refresh duplicate_of/duplicates from the API response
 ```
 
 All invalid mutation request bodies return `invalid_request`; invalid state/guard failures return the state-specific ApiErrorCode. Failed mutations MUST be transactionally no-op.
@@ -2799,6 +2830,7 @@ state changes use /transition
 dispatch uses /dispatch
 blockers use blocker command endpoints
 transition leaving Ready/Working/Rework with active run enqueues reconciliation cancel and returns side_effects metadata
+operator transition to Blocked/Cancelled/Duplicate appends an issue comment with reason and includes the reason in issue.transitioned event payload
 ```
 
 Manual dispatch contract:
@@ -3852,7 +3884,7 @@ open Review Packet
 
 Board actions MUST call REST command APIs. The dashboard MUST NOT directly read or write backend resources such as SQLite, Git, filesystem, Codex, or Tool Gateway.
 
-Issue Detail shows issue facts, comments, blockers, workspace, run history, review packets, and dispatch paused state. In states allowed by the Issue API dispatch control guards, it MUST expose dispatch pause when not paused and dispatch resume when paused. These actions MUST call `POST /api/v1/issues/{issue_ref}/dispatch-pause` and `POST /api/v1/issues/{issue_ref}/dispatch-resume`, and MUST honor active-run, terminal-state, and state guards instead of mutating state locally.
+Issue Detail shows issue facts, comments, blockers, duplicate_of/duplicates, followup_of/followups, workspace, run history, review packets, and dispatch paused state. If duplicate_of is non-null, it MUST expose a remove duplicate relation action that calls `DELETE /api/v1/issues/{issue_ref}/duplicates/{duplicate_of}` and refreshes from the API response; this action MUST NOT change issue.state locally. In states allowed by the Issue API dispatch control guards, it MUST expose dispatch pause when not paused and dispatch resume when paused. These actions MUST call `POST /api/v1/issues/{issue_ref}/dispatch-pause` and `POST /api/v1/issues/{issue_ref}/dispatch-resume`, and MUST honor active-run, terminal-state, and state guards instead of mutating state locally.
 
 Run Detail shows normalized timeline:
 
@@ -4088,6 +4120,11 @@ workspace conflict
 review packet failure → no Human Review
 untracked file created by agent → patch includes file content
 Rework dispatch prompt snapshot/rendered prompt includes latest review reason + previous review packet summary with redaction rules
+duplicate same-state transition with same active duplicate_of is success no-op; different canonical is invalid_state_transition
+reopened issue with retained duplicate_of cannot transition to Duplicate with a different canonical until the old relation is removed
+duplicate canonical correction path: DELETE old duplicate relation, then same-state Duplicate transition with new duplicate_of succeeds and creates the new relation
+duplicate relation fields duplicate_of/duplicates are visible from Issue API and Issue Detail, and Issue Detail remove action soft-deactivates relation without changing issue.state
+followup.create creates Inbox issue and followup_of/followups are visible from Issue API
 active run issue transition → reconciliation cancel
 Working -> Blocked -> Ready after reconciliation cancel stays dispatch_paused and is not scheduler-redispatched until operator dispatch-resume
 Working issue with no active run and dispatch_paused=true is not scheduler-redispatched
@@ -4117,6 +4154,7 @@ artifact content enforces containment and rejects raw prompt/raw Codex log
 Review API returns `content_url=null` for raw prompt/raw Codex log/raw secret artifacts and does not inline disallowed bytes
 workflow render preview is schema-covered, dry-run only, and redacts secrets in success and validation-error responses
 workflow validate is schema-covered, validates current filesystem WORKFLOW.md only, returns dry-run side effects, and rejects candidate fields
+frontend shared-state tests cover loading, empty, auth error, daemon unavailable, artifact refusal, and command error states
 ```
 
 ### 18.7 Contract artifact validation
@@ -4253,6 +4291,7 @@ Acceptance:
 handlers conform to API contract
 CLI matches API side effects
 dashboard can review/approve/cancel/pause/resume/diagnose
+dashboard shared states cover loading, empty, auth error, daemon unavailable, artifact refusal, and command error
 Approval timeout appears as `approval_timeout`, pauses dispatch, and cannot be decided afterwards
 git push denied or unapprovable
 network default denied; review-mode network request appears in Approval Inbox

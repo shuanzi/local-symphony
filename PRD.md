@@ -207,6 +207,8 @@ labels: 可选，用于分类、筛选、展示和检索。
 state: 必填，遵循 PRD 第 9 章状态集合与流转规则；技术枚举以 TECH_SPEC 8.1/12.12 为准。
 comments: 可选，记录 operator、agent、reviewer 的讨论和决策。
 blocked_by / blocks: 只展示直接 blocker relation；不在产品层展开传递依赖。
+duplicate_of / duplicates: 展示当前 issue 的 active duplicate canonical relation，以及指向当前 issue 的直接 duplicate issue；用于支持误标后从 Issue Detail/API/CLI 发现并解除 relation。
+followup_of / followups: 展示当前 issue 来源于哪个 follow-up relation，以及当前 issue 已创建的直接 follow-up issue。
 dispatch pause: 展示 dispatch_paused、reason、paused_at，用于解释为何不会自动调度。
 workspace / run / review refs: 展示关联 workspace、active/latest run、latest review packet 的引用。
 ```
@@ -312,7 +314,7 @@ handoff.submit
 
 agent 不能通过工具删除 issue、设置 Done、任意状态流转、读取或修改既有非当前 issue、读取 secrets、删除 workspace、push、create PR 或访问 project settings。唯一例外是通过受限 `followup.create` 在当前 issue scope 下创建 follow-up Inbox issue。
 
-`followup.create` 会真实创建一个新的 Inbox issue，并记录 `followup_of` relation；它不得把新 issue 设为 Ready/Done，也不得创建 blocker 或 duplicate relation。`handoff.submit.followups` 则只是 review packet 中展示的建议事项，不自动创建 issue，也不与 `followup.create` 自动去重。若 agent 已经通过 `followup.create` 创建了 follow-up issue，handoff 中仍可提到它，但系统只按实际 issue relation 展示真实 follow-up。
+`followup.create` 会真实创建一个新的 Inbox issue，并记录 `followup_of` relation；Issue Detail 和 Issue DTO 必须展示 created follow-up 与其来源 issue。它不得把新 issue 设为 Ready/Done，也不得创建 blocker 或 duplicate relation。`handoff.submit.followups` 则只是 review packet 中展示的建议事项，不自动创建 issue，也不与 `followup.create` 自动去重。若 agent 已经通过 `followup.create` 创建了 follow-up issue，handoff 中仍可提到它，但系统只按实际 issue relation 展示真实 follow-up。
 
 ### 8.7 Handoff
 
@@ -422,7 +424,7 @@ v1 Dashboard 是本地控制面，只通过 REST/SSE API 访问系统，不直�
 |---|---|
 | Overview | workflow status、running runs、pending approvals、failed runs、Human Review count、paused issues、Codex availability、recent events。 |
 | Board | 展示 issue 状态列，支持 create、transition、dispatch、打开 review/run。 |
-| Issue Detail | 展示 issue facts、comments、blockers、workspace、run history、review packets、dispatch pause/resume。 |
+| Issue Detail | 展示 issue facts、comments、blockers、duplicate relations、follow-up relations、workspace、run history、review packets、dispatch pause/resume；对 active duplicate relation 提供 remove action。 |
 | Run Detail | 展示 normalized timeline、failure、approval、tool、handoff、review generated；timeline 至少覆盖 workspace prepared、prompt rendered、Codex started、approval requested、tool called、handoff submitted、review generated、failure。 |
 | Approval Inbox | 展示 command/file/network approvals、risk level、policy match，并支持 decide。 |
 | Review Packet | 通过 Review API 展示 review packet，再通过 Artifact API 读取允许内容，并支持 Send to Rework / Mark Done。 |
@@ -474,6 +476,7 @@ POST /api/v1/issues/{issue_ref}/transition
 POST /api/v1/issues/{issue_ref}/comments
 POST /api/v1/issues/{issue_ref}/blockers
 DELETE /api/v1/issues/{issue_ref}/blockers/{blocker_issue_ref}
+DELETE /api/v1/issues/{issue_ref}/duplicates/{canonical_issue_ref}
 POST /api/v1/issues/{issue_ref}/dispatch
 POST /api/v1/issues/{issue_ref}/dispatch-pause
 POST /api/v1/issues/{issue_ref}/dispatch-resume
@@ -511,7 +514,7 @@ symphony diagnostics ...
 symphony tool ...
 ```
 
-CLI 全局 flags 至少包括 `--project <path>`、`--api-url <url>`、`--json`、`--quiet`、`--no-color`、`--timeout <duration>`；`symphony help`、各 command group help 与实际可执行 subcommand/flags 必须匹配，不得展示未实现或 v1 禁止能力。operator CLI subcommand 必须覆盖 TECH_SPEC 11.2 的 issue create/list/show/update/transition/comment/blocker/dispatch/dispatch-pause/dispatch-resume、run list/show/events/cancel、approval list/decide、review/send-to-rework/mark-done/path、workflow validate/reload/show、diagnostics/export；`symphony review path` 只能输出 metadata/path diagnostics，不能读取或打印 packet/raw 内容；`symphony tool ...` 只覆盖 TECH_SPEC 11.4 固定 Tool Gateway registry 映射。`symphony issue dispatch-pause` 与 `symphony issue dispatch-resume` 必须要求 trim 后非空的 `--reason`；active run exists 时必须返回 `issue_already_running` 且不得变更 paused 状态。
+CLI 全局 flags 至少包括 `--project <path>`、`--api-url <url>`、`--json`、`--quiet`、`--no-color`、`--timeout <duration>`；`symphony help`、各 command group help 与实际可执行 subcommand/flags 必须匹配，不得展示未实现或 v1 禁止能力。operator CLI subcommand 必须覆盖 TECH_SPEC 11.2 的 issue create/list/show/update/transition/comment/blocker/duplicate/dispatch/dispatch-pause/dispatch-resume、run list/show/events/cancel、approval list/decide、review/send-to-rework/mark-done/path、workflow validate/reload/show、diagnostics/export；`symphony review path` 只能输出 metadata/path diagnostics，不能读取或打印 packet/raw 内容；`symphony tool ...` 只覆盖 TECH_SPEC 11.4 固定 Tool Gateway registry 映射。`symphony issue dispatch-pause` 与 `symphony issue dispatch-resume` 必须要求 trim 后非空的 `--reason`；active run exists 时必须返回 `issue_already_running` 且不得变更 paused 状态。
 
 CLI exit codes 必须采用 TECH_SPEC 11.1 的 0-9 映射；尤其 daemon/gateway unavailable 为 3，auth failure 为 4，permission/policy denial 为 5，not found 为 6，state conflict 为 7，timeout 为 8，workflow/config error 为 9；API `error.code=approval_not_pending` 必须映射为 7。
 
@@ -634,21 +637,26 @@ Duplicate
 | Human Review | Done | operator | operator 提供非空 reason；latest review packet generated；latest review_packet.run_id belongs to latest completed handoff run；且无 active run；UI 可将 reason 呈现为 comment，持久化可记录 operator comment。 |
 | any non-terminal | Blocked | operator 或 agent tool | 若有 active run，必须 reconciliation cancel 并 pause dispatch；agent `issue.block` 使用 `agent_blocked`，ordinary/non-terminal operator transition 使用 reconciliation canonical code `issue_state_changed`。 |
 | any non-terminal | Cancelled | operator | 若有 active run，必须 reconciliation cancel 并 pause dispatch；terminal reconciliation 使用 `canceled_by_reconciliation`。 |
-| any non-terminal | Duplicate | operator | 若有 active run，必须 reconciliation cancel 并 pause dispatch；terminal reconciliation 使用 `canceled_by_reconciliation`；如指定 canonical issue，记录 duplicate relation。 |
+| any non-terminal | Duplicate | operator | 若有 active run，必须 reconciliation cancel 并 pause dispatch；terminal reconciliation 使用 `canceled_by_reconciliation`；如指定 canonical issue，按 Duplicate relation 规则记录或拒绝。 |
 | Blocked | Ready | operator | 阻塞解除，active blocker relations 不存在，且必要 issue 字段有效；v1 统一解除到 Ready。 |
 | Done/Cancelled/Duplicate | Inbox/Ready | operator | 只允许显式 reopen；reopen 到 `Ready` 要求必要 issue 字段有效，reopen 到 `Inbox` 仍只要求 title；禁止直接 reopen 到 `Working`、`Human Review`、`Rework` 或 `Blocked`；要求无 active run，且不复用旧 run。reopen 时 `completed_at=null`，清除 `dispatch_paused`/reason/paused_at；workspace、history、review packets、duplicate relation 保留。 |
 
-Reopen 到 `Inbox` 表示任务需要重新整理，不会自动 dispatch。Reopen 到 `Ready` 表示下一次 scheduler tick 可按正常 eligibility 新建 run_attempt。旧 latest review packet 仅作为历史保留；新一轮完成必须来自 reopen 后新 run 生成的 latest review packet。若 reopened Duplicate 不再是重复任务，operator 必须单独移除或失效 duplicate relation。
+Reopen 到 `Inbox` 表示任务需要重新整理，不会自动 dispatch。Reopen 到 `Ready` 表示下一次 scheduler tick 可按正常 eligibility 新建 run_attempt。旧 latest review packet 仅作为历史保留；新一轮完成必须来自 reopen 后新 run 生成的 latest review packet。若 reopened Duplicate 不再是重复任务，operator 必须通过 duplicate relation remove 入口单独移除或失效 duplicate relation。
 
-通用 `transition` 请求必须提供目标 state；转入 `Blocked`、`Cancelled`、`Duplicate` 时，operator reason 必须 trim 后非空并记录为 comment/event。`Human Review -> Rework/Done` 必须走 Review API，不得通过通用 transition 绕过 review packet guard。重复转入当前 state 必须返回 state conflict 且 no mutation。issue 级 `Cancelled` 表示取消整个任务；run 级 cancel 只取消当前 active run，必须在 Dashboard/CLI 文案中区分。
+通用 `transition` 请求必须提供目标 state；转入 `Blocked`、`Cancelled`、`Duplicate` 时，operator reason 必须 trim 后非空并记录为 comment/event。`Human Review -> Rework/Done` 必须走 Review API，不得通过通用 transition 绕过 review packet guard。重复转入当前 state 默认必须返回 state conflict 且 no mutation；`state=Duplicate` 仅有两个例外：`duplicate_of` 与现有 active duplicate relation 相同，成功 no-op 且不重复写 relation/comment/event；当前没有 active duplicate relation 且提供合法 `duplicate_of` 时，成功创建 relation、记录 reason comment/event，但 issue state 不变。已有不同 active relation、缺少必要字段或其他 same-state transition 仍按 conflict/invalid 处理。issue 级 `Cancelled` 表示取消整个任务；run 级 cancel 只取消当前 active run，必须在 Dashboard/CLI 文案中区分。
 
 Duplicate relation 规则：
 
 ```text
 转为 Duplicate 时 canonical issue 可选；若提供，不能指向当前 issue，必须能解析到同一 project 内 issue。
-同一 duplicate relation 重复提交必须幂等，不创建重复 active relation。
+同一 source issue 同一时间最多只能有一个 active duplicate canonical relation。
+从非 Duplicate 状态转为 Duplicate 且未指定 canonical 时，若已有 active duplicate relation 则沿用该 relation；若没有则只改变 state，不创建 relation；已处于 Duplicate 时省略 `duplicate_of` 仍按 same-state conflict/no mutation 处理。
+转为 Duplicate 且指定 canonical 时，若无 active duplicate relation 则创建 relation；若已有相同 active relation 则幂等；若已有不同 active relation，必须返回 state conflict/no mutation，operator 需先通过 remove 入口失效旧 relation。
+若 issue 已经处于 Duplicate 且旧 relation 已被 remove 到无 active relation，operator 可再次调用 transition 到 Duplicate 并指定新 canonical 来创建新 relation；该路径用于更正 canonical target。
 canonical issue 处于 Done/Cancelled/Duplicate 仍可作为历史指向；v1 不做跨 issue 自动状态同步。
-reopen Duplicate 不自动移除 duplicate relation；operator 必须单独解除或失效 relation。
+duplicate relation remove 入口只做 soft deactivate：设置 relation.active=false 和 resolved_at；对已 inactive 的同一 relation 返回 success no-op。
+reopen Duplicate 不自动移除 duplicate relation；operator 必须通过 remove 入口单独解除或失效 relation。
+Issue Detail 必须能从当前 issue 发现 active duplicate canonical target，并提供 remove duplicate relation action；该动作只解除 relation，不自动改变 issue state。
 ```
 
 Terminal states：
