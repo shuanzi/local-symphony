@@ -1,8 +1,8 @@
 # Local Symphony App v1 Tech SPEC
 
-**状态**：v1 技术方案合并版  
-**更新日期**：2026-05-11  
-**来源**：`local-symphony.zip` 原始文档包经 agent-executable hardening 后更新  
+**状态**：v1 技术方案合并版
+**更新日期**：2026-05-11
+**来源**：`local-symphony.zip` 原始文档包经 agent-executable hardening 后更新
 **文档权威性**：`PRD.md` 是 Local Symphony App v1 产品事实与产品范围的 source of truth。本文档是字段、表结构、API/schema、状态机、校验规则等技术合同细节的 source of truth；`api/openapi.yaml`、`db/schema/*.sql`、`schemas/*.schema.json`、`docs/agent_work_orders/*.md` 与 `docs/testing/*.md` 是本文的可执行合同与验收材料。本文档与 executable contracts 不得新增或扩大 `PRD.md` 未定义的 v1 产品能力。
 
 ---
@@ -221,7 +221,27 @@ macOS arm64/x64
 Linux x64
 ```
 
-Windows support is best-effort only in v1. If implementation chooses to support Windows, it MUST define and test named pipe transport, process group termination, CRLF patch behavior, and path normalization.
+Minimum runtime contract:
+
+```text
+Go: stable version declared in go.mod and CI matrix
+Node.js: active LTS version declared in package/tooling metadata when dashboard assets are built
+pnpm/npm: package manager and version declared in packageManager or equivalent repo metadata
+SQLite: bundled driver/runtime must support the SQL in db/schema/v1_*.sql on supported platforms
+Git: installed git CLI available on PATH; minimum supported version documented in release notes
+Codex: real adapter is fixture-gated; unsupported installed Codex versions fail before process launch
+```
+
+Release build/test matrix:
+
+| Platform | Build | Default tests | Release blocking |
+|---|---|---|---|
+| macOS arm64 | `symphony` binary | unit, integration, contract, fake-runner E2E | yes |
+| macOS x64 | `symphony` binary | unit, integration, contract, fake-runner E2E | yes |
+| Linux x64 | `symphony` binary | unit, integration, contract, fake-runner E2E | yes |
+| Windows | optional experimental build only | optional smoke tests only | no |
+
+Real Codex tests remain opt-in with `SYMPHONY_TEST_CODEX=1` and MUST NOT be part of default release blocking CI. Windows support is best-effort only in v1; v1 does not require a Windows binary or Windows blocking CI. If implementation chooses to support Windows, it MUST define and test named pipe transport, process group termination, CRLF patch behavior, and path normalization, and must document unsupported cases in known limitations.
 
 ## 5. Repository and package layout
 
@@ -493,6 +513,8 @@ prompt:
 `workspace.root` is the global workspace root. The daemon/workspace resolver derives the project-scoped root as `<workspace.root>/<project_id>`, and each issue workspace is `<workspace.root>/<project_id>/<issue_identifier>`.
 
 `dispatch_candidate_states` MUST be used for normal scheduler eligibility. `reconciliation_active_states` MUST be used only to decide whether an already-active run is still valid. `Working` MUST NOT be included in normal dispatch candidates.
+
+`git.agent_commit: manual` is a prompt contract flag, not a Symphony commit feature. v1 MUST NOT expose commit APIs/CLI/dashboard actions, MUST NOT create or rewrite commits, and MUST NOT push commits. The default prompt instructs the agent not to commit unless the operator explicitly requested it outside the current run; if such a commit exists, review generation still compares the workspace tree against `base_sha` without mutating the real Git index.
 
 ### 6.3 Hard validation constraints
 
@@ -814,6 +836,8 @@ archived_at
 
 `dispatch_paused` prevents repeated dispatch after failure, missing handoff, cancellation, block, or startup interruption.
 
+`archived_at` is future-reserved in v1. No v1 API, CLI, dashboard affordance, scheduler guard, or Tool Gateway path may archive an issue or reject a request solely because `archived_at` is non-null; compatible v1 records should keep it null.
+
 #### issue_relations
 
 Relation directions are fixed:
@@ -1111,10 +1135,11 @@ Handoff tool transaction:
 validate run-scoped token
 validate running run
 insert or idempotently return handoff
-insert issue comment
 insert tool_call
 insert handoff.submitted event
 ```
+
+`handoff.submit` MUST NOT insert an issue comment implicitly. If the agent needs a user-visible discussion comment, it must call `issue.comment` explicitly.
 
 Review finalizer transaction after files are written:
 
@@ -1290,6 +1315,7 @@ Duplicate
 | `Ready` | `Working` | orchestrator | Dispatch claim transaction succeeds and required issue fields are valid. |
 | `Rework` | `Working` | orchestrator | Dispatch claim transaction succeeds and required issue fields are valid. |
 | `Working` | `Human Review` | run finalizer | Handoff exists and review packet status is `generated`. |
+| `Working` | `Ready`/`Rework` | finalizer/orchestrator/startup guard | Failure, cancellation, missing handoff after allowed continuation, review packet failure, or stale-run recovery restores `run_attempt.source_issue_state` when the issue has not already moved to `Blocked`/`Cancelled`/`Duplicate`; see 8.10, 8.11, 8.13, and 8.15. |
 | `Human Review` | `Rework` | operator | Reviewer supplies non-empty reason; UI may present it as feedback. |
 | `Human Review` | `Done` | operator | Latest review packet status `generated`; latest review_packet.run_id belongs to latest completed handoff run; no active run; operator supplies non-empty reason; UI may present it as comment; sets `completed_at=now` and records history/comment/events. |
 | any non-terminal | `Blocked` | operator or agent tool | Active run reconciliation cancels active run and pauses dispatch. Agent tool uses `agent_blocked`; operator transition uses reconciliation failure-code rules. |
@@ -1680,6 +1706,8 @@ if run_attempt.source_issue_state in Ready/Rework and issue is not Blocked/Cance
 if issue is Blocked/Cancelled/Duplicate due to operator transition or agent issue.block:
   keep current issue state
 issue.dispatch_paused = true
+issue.dispatch_pause_reason = review_packet_failed
+issue.dispatch_paused_at = now
 failure_code = review_packet_failed
 ```
 
@@ -2223,6 +2251,26 @@ symphony open [--project <path>]
 symphony status [--json]
 ```
 
+Init command:
+
+```text
+preflight:
+  repo_root must resolve to a Git repository
+  target project files/directories must be writable
+  existing generated files must either match v1 expected content or be left untouched with a clear conflict error
+side effects:
+  create or validate project DB using db/schema/v1_project.sql
+  create or validate app DB registration as needed
+  create default WORKFLOW.md from examples/WORKFLOW.default.md when missing
+  create required local metadata directories
+idempotency:
+  rerunning init on an already initialized project returns success no-op when existing files are compatible
+failure:
+  non-Git repo, permission denied, unsupported DB version, or conflicting existing WORKFLOW.md returns a structured error and no partial mutation beyond already-compatible files
+success output:
+  print next-step commands for serve/open/create issue
+```
+
 Status command:
 
 ```text
@@ -2238,12 +2286,12 @@ human output: concise status for daemon, project, workflow, running runs, pendin
 Issue commands:
 
 ```bash
-symphony issue create ...
-symphony issue list ...
+symphony issue create --title <title> [--description <text>] [--acceptance <item>]... [--priority 1..5] [--label <label>]...
+symphony issue list [--state <state>] [--label <label>] [--query <text>] [--paused true|false] [--limit <n>] [--cursor <cursor>] [--sort priority|updated|identifier]
 symphony issue show LOC-1
-symphony issue update LOC-1 ...
-symphony issue transition LOC-1 Ready
-symphony issue comment LOC-1 ...
+symphony issue update LOC-1 [--title <title>] [--description <text>] [--acceptance <item>]... [--priority 1..5] [--label <label>]...
+symphony issue transition LOC-1 <state> [--reason "..."] [--duplicate-of LOC-2]
+symphony issue comment LOC-1 --body "..."
 symphony issue blocker add LOC-2 --blocked-by LOC-1
 symphony issue blocker remove LOC-2 --blocked-by LOC-1
 symphony issue dispatch LOC-1
@@ -2264,6 +2312,8 @@ symphony run cancel run_... --reason "..."
 `run LOC-1` is an alias for issue dispatch.
 
 `symphony issue dispatch LOC-1` and `symphony run LOC-1` call `POST /api/v1/issues/{issue_ref}/dispatch`. On success they print the envelope-unwrapped dispatch data as JSON. On preflight failure they preserve the API error code in JSON diagnostics and use the preflight semantics in TECH_SPEC 8.7 and CLI exit code mapping defined in TECH_SPEC 11.1.
+
+Issue list output MUST preserve the API pagination metadata. Empty lists return success with an empty `items` array and pagination metadata, not an error.
 
 Approval commands:
 
@@ -2681,6 +2731,66 @@ ambiguous/missing/malformed refs return not_found or invalid_request with no par
 responses always include both id and identifier
 ```
 
+List contract:
+
+```text
+GET /api/v1/issues
+query:
+  state: optional issue state, repeatable or comma-separated
+  label: optional label, repeatable or comma-separated
+  q: optional text query against identifier/title/description
+  dispatch_paused: optional boolean
+  limit: optional integer, default 50, max 200
+  cursor: optional opaque cursor returned by previous page
+  sort: optional enum priority|updated|identifier, default priority
+sort semantics:
+  priority = priority ASC, updated_at DESC, identifier ASC
+  updated = updated_at DESC, identifier ASC
+  identifier = sequence ASC
+response: standard success envelope; data shape { items: NormalizedIssue[], page: { limit, next_cursor, has_more } }
+empty result: success with items=[] and has_more=false
+invalid query/filter/sort/cursor: invalid_request, no mutation
+```
+
+Mutation request contracts:
+
+```text
+POST /api/v1/issues
+request body:
+  title: string, required, trim non-empty
+  description: string, optional, default ""
+  acceptance_criteria: string[], optional, default []
+  priority: integer 1..5, optional, default 3
+  labels: string[], optional, default []
+effect: create Inbox issue only
+
+PATCH /api/v1/issues/{issue_ref}
+request body may include title, description, acceptance_criteria, priority, labels
+PATCH cannot change state, dispatch pause, workspace, git, run, review, or relation fields
+labels are trim-non-empty strings normalized to lowercase and sorted in responses; duplicate labels for one issue are de-duplicated
+
+POST /api/v1/issues/{issue_ref}/comments
+request body: { "body": string, trim non-empty }
+
+POST /api/v1/issues/{issue_ref}/transition
+request body:
+  state: target issue state, required
+  reason: string, required and trim non-empty when target is Blocked, Cancelled, or Duplicate
+  duplicate_of: optional issue ref, only valid when target is Duplicate
+same-state transition: invalid_state_transition with no mutation
+Human Review -> Rework/Done MUST use the Review API, not generic transition
+Duplicate duplicate_of must resolve within the same project and must not equal the current issue
+duplicate relation creation is idempotent for the same active pair
+
+POST /api/v1/issues/{issue_ref}/blockers
+request body: { "blocked_by": issue_ref }
+DELETE /api/v1/issues/{issue_ref}/blockers/{blocker_issue_ref}
+blocker refs must resolve within the same project and must not equal the current issue
+removing an existing blocker relation soft-deactivates it; removing an already inactive relation is success no-op
+```
+
+All invalid mutation request bodies return `invalid_request`; invalid state/guard failures return the state-specific ApiErrorCode. Failed mutations MUST be transactionally no-op.
+
 Rules:
 
 ```text
@@ -2709,7 +2819,7 @@ POST /api/v1/issues/{issue_ref}/dispatch-pause
 request body: { "reason": string, non-empty after trimming }
 allowed states: no active run, and any non-terminal issue state
 missing/blank reason is rejected with invalid_request and no mutation
-terminal states Done/Cancelled/Duplicate, and archived issues, are rejected with invalid_state_transition; reopen/transition first if dispatch control is needed
+terminal states Done/Cancelled/Duplicate are rejected with invalid_state_transition; reopen/transition first if dispatch control is needed
 active run exists is rejected with issue_already_running and no mutation
 transaction:
   if issues.dispatch_paused = true: return success no-op, keep existing dispatch_pause_reason/dispatch_paused_at, and do not append a duplicate system event or issue comment
@@ -2723,7 +2833,7 @@ POST /api/v1/issues/{issue_ref}/dispatch-resume
 request body: { "reason": string, non-empty after trimming }
 allowed states: no active run, and any non-terminal issue state
 missing/blank reason is rejected with invalid_request and no mutation
-terminal states Done/Cancelled/Duplicate, and archived issues, are rejected with invalid_state_transition; reopen/transition first if dispatch control is needed
+terminal states Done/Cancelled/Duplicate are rejected with invalid_state_transition; reopen/transition first if dispatch control is needed
 active run exists is rejected with issue_already_running and no mutation
 transaction:
   if issues.dispatch_paused = false: return success no-op and do not append a system event or issue comment
@@ -2782,6 +2892,8 @@ cancel_run
 ```
 
 Only pending approvals can be decided. `deny` declines the current approval action and records `approval_requests.status = denied`; it does not cancel the run or apply `operator_cancelled` side effects. `cancel_run` cancels the run and applies `operator_cancelled` side effects. Approval responses must expose `requested_at`, `timeout_ms`, `expires_at`, `resolved_at`.
+
+If a pending approval reaches `expires_at` while the run is waiting, the adapter/orchestrator MUST mark that approval resolved as expired or timed out, fail the run with `failure_code=approval_timeout`, restore the issue to `run_attempt.source_issue_state` when applicable, set `issues.dispatch_paused=true`, set `issues.dispatch_pause_reason=approval_timeout`, and set `issues.dispatch_paused_at=now`. Expired approvals MUST no longer be decidable; later decide attempts return `approval_not_pending` with no mutation.
 
 `GET /api/v1/approvals` and approval decision responses MUST expose `risk_level`, `policy_match`, and `action_summary` for every approval row. If the storage layer keeps approval payloads as opaque `request_json`, the API handler MUST derive these fields from `request_json` and policy evaluation before returning the response. `action_summary` is the stable Dashboard display string and MUST NOT require the UI to parse opaque request JSON.
 
@@ -3740,7 +3852,7 @@ open Review Packet
 
 Board actions MUST call REST command APIs. The dashboard MUST NOT directly read or write backend resources such as SQLite, Git, filesystem, Codex, or Tool Gateway.
 
-Issue Detail shows issue facts, comments, blockers, workspace, run history, review packets, and dispatch paused state. In states allowed by the Issue API dispatch control guards, it MUST expose dispatch pause when not paused and dispatch resume when paused. These actions MUST call `POST /api/v1/issues/{issue_ref}/dispatch-pause` and `POST /api/v1/issues/{issue_ref}/dispatch-resume`, and MUST honor active-run, terminal-state, archived-issue, and state guards instead of mutating state locally.
+Issue Detail shows issue facts, comments, blockers, workspace, run history, review packets, and dispatch paused state. In states allowed by the Issue API dispatch control guards, it MUST expose dispatch pause when not paused and dispatch resume when paused. These actions MUST call `POST /api/v1/issues/{issue_ref}/dispatch-pause` and `POST /api/v1/issues/{issue_ref}/dispatch-resume`, and MUST honor active-run, terminal-state, and state guards instead of mutating state locally.
 
 Run Detail shows normalized timeline:
 
@@ -3762,6 +3874,17 @@ Review Packet page shows summary, acceptance criteria, handoff, changed files, d
 Workflow page shows current validation, last valid config, warnings/errors, reload, and render preview. The validate action MUST call `POST /api/v1/workflow/validate` with an empty body or `{"dry_run": true}` and display the returned current-filesystem validation result without implying that effective config changed. Render preview MUST call `POST /api/v1/workflow/render-preview` and display only the redacted preview and validation warnings/errors returned by that API.
 
 Diagnostics page shows daemon, project paths, Codex, Git, DB, workflow, and redacted export.
+
+All pages MUST implement these shared states:
+
+```text
+loading: visible while initial query, command mutation, artifact fetch, or SSE reconnect is in progress
+empty: visible for empty issue lists, no pending approvals, no review packet, no run history, and no diagnostics export
+auth error: 401/403/CSRF/session expired shows local re-auth/open instructions and does not retry command mutations silently
+daemon unavailable: Overview/status surfaces unavailable daemon state and suggests `symphony serve`
+artifact refusal: raw prompt, raw Codex log, raw secret, or other disallowed content shows metadata/refusal only
+command error: display API error.code and stable message; never infer mutation success before API/SSE confirmation
+```
 
 ## 16. Observability and diagnostics
 
@@ -3796,6 +3919,7 @@ Diagnostics MUST show at least:
 project_id
 repo_root
 DB paths and version status
+unsupported DB version remediation when schema guard fails
 workflow validation and last valid config metadata
 daemon pid/uptime/runtime descriptor
 Codex availability/version/support status
@@ -3806,6 +3930,8 @@ inconsistent issues, including Working issues with no active run and required op
 ```
 
 Diagnostics export is redacted-only. `include_raw_logs=true` MUST return `raw_log_access_not_supported`.
+
+When DB schema version is unsupported, diagnostics and CLI errors MUST be read-only and include the detected version, expected v1 version, affected DB path, and operator guidance to use a compatible binary, restore a manual backup, or initialize a new project DB. v1 MUST NOT attempt automatic migration, rollback, or backup/restore.
 
 ## 17. Upstream-vs-Local resolution table
 
@@ -3920,15 +4046,18 @@ Required coverage:
 
 ```text
 SQLite schema init
+init non-Git repo / permission denied / conflicting WORKFLOW.md fails without partial incompatible state
 unsupported DB version refusal
 foreign key enforcement
 issue create transaction
 issue sequence concurrent allocation
+issue list filtering, sorting, pagination, empty result, and invalid query behavior
 attempt_no monotonic allocation
 blocker eligibility query
 worktree create/reuse
 hook lifecycle
 Tool Gateway token validation
+handoff.submit persists handoff/tool_call/event but does not create an implicit issue comment
 artifact attach containment
 review packet generation after after_run
 untracked new-file content in changes.patch
@@ -3948,6 +4077,7 @@ invalid tool token
 handoff payload hash conflict → Tool Gateway `handoff_conflict`, CLI exit 7, no Human Review
 approval pending → approve → continue
 approval pending → deny current action without operator_cancelled side effects
+approval pending → expires_at reached → approval_timeout failure + dispatch_paused
 command denied
 network denied
 protected path denied
@@ -4007,7 +4137,7 @@ OpenAPI Issue schema required fields match schemas/normalized_issue.schema.json
 RunEvent schema requires seq for SSE replay IDs
 example WORKFLOW.default.md passes strict config validation
 example WORKFLOW.default.md rendered golden includes every Default WORKFLOW prompt contract requirement from 6.7
-contract validation fails if the default prompt omits any required no-push/no-PR/no-Done/no-commit/stdin-handoff/no-root-handoff-json/finalizer-Human-Review constraint
+contract validation fails if the default prompt omits any required no-push/no-PR/no-Done/no-automatic-commit/stdin-handoff/no-root-handoff-json/finalizer-Human-Review constraint
 example handoff/followup payloads pass their standalone Tool Gateway input schemas and wrapped Tool Gateway call schemas
 docs/agent_work_orders/*.md reference only v1 in-scope capabilities
 default CI/test command manifest includes the 18.2 security regression commands and keeps real Codex behind SYMPHONY_TEST_CODEX=1
@@ -4035,6 +4165,7 @@ Acceptance:
 
 ```text
 symphony init works
+init in non-Git repo, permission denied, or conflicting WORKFLOW.md fails safely without partial incompatible state
 symphony serve starts localhost API
 GET /api/v1/health works
 dashboard opens
@@ -4051,6 +4182,7 @@ Acceptance:
 
 ```text
 Create LOC-1
+Issue list supports empty result, pagination, state/label/query/paused filters, stable sorting, and invalid query rejection
 Move Inbox → Ready
 Add blocker
 Blocked issue not dispatchable
@@ -4093,6 +4225,7 @@ Acceptance:
 ```text
 tool token validates run/issue/cwd/tool scope
 handoff idempotent by payload_hash
+handoff.submit does not create an implicit issue comment
 issue.block cancels current run with agent_blocked
 followup.create creates Inbox issue and followup_of relation
 ```
@@ -4120,6 +4253,7 @@ Acceptance:
 handlers conform to API contract
 CLI matches API side effects
 dashboard can review/approve/cancel/pause/resume/diagnose
+Approval timeout appears as `approval_timeout`, pauses dispatch, and cannot be decided afterwards
 git push denied or unapprovable
 network default denied; review-mode network request appears in Approval Inbox
 protected path access denied
