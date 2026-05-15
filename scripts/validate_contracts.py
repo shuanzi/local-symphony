@@ -60,6 +60,14 @@ REQUIRED_OPENAPI_ROUTES = frozenset(
     }
 )
 
+REQUIRED_CLI_COMMANDS = frozenset(
+    {
+        "symphony issue duplicate remove",
+        "symphony issue dispatch-pause",
+        "symphony issue dispatch-resume",
+    }
+)
+
 REQUIRED_DIAGNOSTICS_FIELDS = frozenset(
     {
         "project_id",
@@ -437,6 +445,10 @@ def validate_contract_manifest(manifest: dict[str, Any]) -> None:
         fail(f"{CONTRACT_MANIFEST_REL} missing security regression topics: {sorted(missing_security_topics)}")
 
     cli_section_text = "\n".join(manifest_strings(manifest.get("cli", {})))
+    cli_required_commands = set(require_list(manifest, ("cli", "required_commands")))
+    missing_required_cli_commands = REQUIRED_CLI_COMMANDS - cli_required_commands
+    if missing_required_cli_commands:
+        fail(f"{CONTRACT_MANIFEST_REL} missing required CLI commands: {sorted(missing_required_cli_commands)}")
     for token in require_list(manifest, ("cli", "required_help_tokens")):
         if str(token) not in cli_section_text:
             fail(f"{CONTRACT_MANIFEST_REL} CLI help token is not covered by the CLI manifest: {token}")

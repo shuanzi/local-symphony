@@ -82,6 +82,8 @@ class ManifestContractTests(unittest.TestCase):
         self.assertIn("/issues/{issue_ref}/dispatch-resume", manifest["openapi"]["required_routes"])
         self.assertIn("symphony issue dispatch-pause", manifest["cli"]["required_commands"])
         self.assertIn("symphony issue dispatch-resume", manifest["cli"]["required_commands"])
+        self.assertIn("symphony issue duplicate remove", manifest["cli"]["required_commands"])
+        self.assertIn("--duplicate-of", manifest["cli"]["required_help_tokens"])
         self.assertIn("issue.get", manifest["tool_gateway"]["registry_tools"])
         self.assertGreaterEqual(len(manifest["handler_route_inventory"]["required_routes"]), 1)
         self.assertGreaterEqual(len(manifest["dashboard_action_inventory"]["required_actions"]), 1)
@@ -525,6 +527,18 @@ class ManifestContractTests(unittest.TestCase):
                             validator.validate_agent_work_order_scope(manifest)
                     finally:
                         validator.ROOT = old_root
+
+    def test_manifest_missing_required_duplicate_cli_command_fails(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+        manifest["cli"]["required_commands"] = [
+            command
+            for command in manifest["cli"]["required_commands"]
+            if command != "symphony issue duplicate remove"
+        ]
+
+        with self.assertRaises(SystemExit):
+            validator.validate_contract_manifest(manifest)
 
     def test_manifest_required_route_drift_fails(self) -> None:
         validator = load_validator()
