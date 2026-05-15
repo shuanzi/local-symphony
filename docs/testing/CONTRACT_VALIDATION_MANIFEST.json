@@ -16,6 +16,7 @@
       "/issues/{issue_ref}/comments",
       "/issues/{issue_ref}/blockers",
       "/issues/{issue_ref}/blockers/{blocker_issue_ref}",
+      "/issues/{issue_ref}/duplicates/{canonical_issue_ref}",
       "/issues/{issue_ref}/dispatch",
       "/issues/{issue_ref}/dispatch-pause",
       "/issues/{issue_ref}/dispatch-resume",

@@ -172,6 +172,15 @@ paths:
         - { $ref: '#/components/parameters/SymphonyCSRF' }
       x-csrf-required-for-cookie-auth: true
       responses: { "204": { description: Removed } }
+  /issues/{issue_ref}/duplicates/{canonical_issue_ref}:
+    delete:
+      operationId: removeIssueDuplicateRelation
+      parameters:
+        - { $ref: '#/components/parameters/IssueRef' }
+        - { name: canonical_issue_ref, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/SymphonyCSRF' }
+      x-csrf-required-for-cookie-auth: true
+      responses: { "200": { description: Removed, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
   /issues/{issue_ref}/events/stream:
     get:
       operationId: streamIssueEvents
@@ -461,7 +470,7 @@ components:
       enum: [Inbox, Ready, Working, Rework, Blocked, Human Review, Done, Cancelled, Duplicate]
     Issue:
       type: object
-      required: [id, identifier, sequence_no, title, description, acceptance_criteria, priority, state, url, labels, blocked_by, blocks, dispatch_paused, dispatch_pause_reason, dispatch_paused_at, branch_name, workspace_path, base_ref, base_ref_config, base_sha, workspace, git, latest_run, active_run_id, latest_run_id, latest_review_packet, latest_review_packet_id, created_at, updated_at, completed_at, archived_at]
+      required: [id, identifier, sequence_no, title, description, acceptance_criteria, priority, state, url, labels, blocked_by, blocks, duplicate_of, duplicates, followup_of, followups, dispatch_paused, dispatch_pause_reason, dispatch_paused_at, branch_name, workspace_path, base_ref, base_ref_config, base_sha, workspace, git, latest_run, active_run_id, latest_run_id, latest_review_packet, latest_review_packet_id, created_at, updated_at, completed_at, archived_at]
       properties:
         id: { type: string, pattern: "^iss_" }
         identifier: { type: string }
@@ -475,6 +484,16 @@ components:
         labels: { type: array, items: { type: string } }
         blocked_by: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
         blocks: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
+        duplicate_of:
+          anyOf:
+            - { $ref: '#/components/schemas/IssueRefSummary' }
+            - { type: 'null' }
+        duplicates: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
+        followup_of:
+          anyOf:
+            - { $ref: '#/components/schemas/IssueRefSummary' }
+            - { type: 'null' }
+        followups: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
         dispatch_paused: { type: boolean }
         dispatch_pause_reason: { type: [string, 'null'] }
         dispatch_paused_at: { type: [string, 'null'], format: date-time }

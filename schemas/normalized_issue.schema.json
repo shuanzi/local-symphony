@@ -17,6 +17,10 @@
     "labels",
     "blocked_by",
     "blocks",
+    "duplicate_of",
+    "duplicates",
+    "followup_of",
+    "followups",
     "dispatch_paused",
     "dispatch_pause_reason",
     "dispatch_paused_at",
@@ -90,6 +94,38 @@
       }
     },
     "blocks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/issueRef"
+      }
+    },
+    "duplicate_of": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/issueRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "duplicates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/issueRef"
+      }
+    },
+    "followup_of": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/issueRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "followups": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/issueRef"
