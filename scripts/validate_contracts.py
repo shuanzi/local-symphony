@@ -949,27 +949,29 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
     issue_list_get = paths.get("/issues", {}).get("get", {})
     if not isinstance(issue_list_get, dict):
         fail("OpenAPI /issues must define GET")
-    issue_list_params = {
-        param.get("name"): param for param in issue_list_get.get("parameters", []) if isinstance(param, dict)
-    }
-    required_issue_list_params = {"state", "label", "q", "dispatch_paused", "limit", "cursor", "sort"}
-    missing_issue_list_params = required_issue_list_params - set(issue_list_params)
+    issue_list_query_params = {}
+    for param in issue_list_get.get("parameters", []):
+        if isinstance(param, dict) and param.get("in") == "query":
+            name = param.get("name")
+            if name in issue_list_query_params:
+                fail(f"OpenAPI GET /issues duplicate query parameter: {name}")
+            issue_list_query_params[name] = param
+    required_issue_list_params = ("state", "label", "q", "dispatch_paused", "limit", "cursor", "sort")
+    missing_issue_list_params = set(required_issue_list_params) - set(issue_list_query_params)
     if missing_issue_list_params:
         fail(f"OpenAPI GET /issues missing query parameters: {sorted(missing_issue_list_params)}")
     for name in ("state", "label"):
-        param = issue_list_params[name]
+        param = issue_list_query_params[name]
         schema = param.get("schema", {})
-        if param.get("in") != "query":
-            fail(f"OpenAPI GET /issues {name} parameter must be in query")
         if param.get("style") != "form" or param.get("explode") is not True:
             fail(f"OpenAPI GET /issues {name} parameter must use style=form and explode=true")
         if schema.get("type") != "array":
             fail(f"OpenAPI GET /issues {name} parameter must be an array")
-    if issue_list_params["q"].get("schema", {}).get("type") != "string":
+    if issue_list_query_params["q"].get("schema", {}).get("type") != "string":
         fail("OpenAPI GET /issues q parameter must be a string")
-    if issue_list_params["dispatch_paused"].get("schema", {}).get("type") != "boolean":
+    if issue_list_query_params["dispatch_paused"].get("schema", {}).get("type") != "boolean":
         fail("OpenAPI GET /issues dispatch_paused parameter must be a boolean")
-    limit_schema = issue_list_params["limit"].get("schema", {})
+    limit_schema = issue_list_query_params["limit"].get("schema", {})
     if (
         limit_schema.get("type") != "integer"
         or limit_schema.get("minimum") != 1
@@ -977,9 +979,9 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
         or limit_schema.get("default") != 50
     ):
         fail("OpenAPI GET /issues limit parameter must be integer minimum=1 maximum=200 default=50")
-    if issue_list_params["cursor"].get("schema", {}).get("type") != "string":
+    if issue_list_query_params["cursor"].get("schema", {}).get("type") != "string":
         fail("OpenAPI GET /issues cursor parameter must be a string")
-    sort_schema = issue_list_params["sort"].get("schema", {})
+    sort_schema = issue_list_query_params["sort"].get("schema", {})
     if sort_schema.get("enum") != ["priority", "updated", "identifier"] or sort_schema.get("default") != "priority":
         fail("OpenAPI GET /issues sort parameter must use priority/updated/identifier enum with priority default")
     issue_list_responses = issue_list_get.get("responses", {})

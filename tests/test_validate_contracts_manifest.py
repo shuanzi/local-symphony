@@ -524,6 +524,79 @@ class ManifestContractTests(unittest.TestCase):
                     finally:
                         validator.ROOT = old_root
 
+    def test_openapi_issue_list_query_param_location_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        required_params = ("state", "label", "q", "dispatch_paused", "limit", "cursor", "sort")
+        for param_name in required_params:
+            with self.subTest(param_name=param_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    for param in openapi["paths"]["/issues"]["get"]["parameters"]:
+                        if param.get("name") == param_name:
+                            param["in"] = "header"
+                            break
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_issue_list_query_param_contract_ignores_same_name_non_query_param(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            copy_contract_root(temp_root)
+            openapi_path = temp_root / "api/openapi.yaml"
+            openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+            openapi["paths"]["/issues"]["get"]["parameters"].append(
+                {"name": "q", "in": "header", "schema": {"type": "string"}}
+            )
+            openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+            old_root = validator.ROOT
+            validator.ROOT = temp_root
+            try:
+                validator.validate_openapi(manifest)
+            finally:
+                validator.ROOT = old_root
+
+    def test_openapi_issue_list_duplicate_query_param_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            copy_contract_root(temp_root)
+            openapi_path = temp_root / "api/openapi.yaml"
+            openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+            for param in openapi["paths"]["/issues"]["get"]["parameters"]:
+                if param.get("name") == "q":
+                    param["schema"] = {"type": "integer"}
+                    break
+            openapi["paths"]["/issues"]["get"]["parameters"].append(
+                {"name": "q", "in": "query", "schema": {"type": "string"}}
+            )
+            openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+            old_root = validator.ROOT
+            validator.ROOT = temp_root
+            try:
+                with self.assertRaises(SystemExit):
+                    validator.validate_openapi(manifest)
+            finally:
+                validator.ROOT = old_root
+
     def test_openapi_issue_list_invalid_query_error_contract_fails_when_drifted(self) -> None:
         validator = load_validator()
         manifest = load_manifest()
