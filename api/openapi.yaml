@@ -83,8 +83,13 @@ paths:
     get:
       operationId: listIssues
       parameters:
-        - { name: state, in: query, schema: { $ref: '#/components/schemas/IssueState' } }
+        - { name: state, in: query, description: Repeatable issue state filter; server also accepts comma-separated values., style: form, explode: true, schema: { type: array, items: { $ref: '#/components/schemas/IssueState' } } }
+        - { name: label, in: query, description: Repeatable label filter; server also accepts comma-separated values., style: form, explode: true, schema: { type: array, items: { type: string } } }
         - { name: q, in: query, schema: { type: string } }
+        - { name: dispatch_paused, in: query, schema: { type: boolean } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: sort, in: query, schema: { type: string, enum: [priority, updated, identifier], default: priority } }
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueListEnvelope' } } } }
     post:
@@ -557,8 +562,21 @@ components:
         base_sha: { type: [string, 'null'] }
     IssueEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Issue' } } } ]
+    IssueListPage:
+      type: object
+      required: [items, page]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Issue' } }
+        page: { $ref: '#/components/schemas/IssueListPageMeta' }
+    IssueListPageMeta:
+      type: object
+      required: [limit, next_cursor, has_more]
+      properties:
+        limit: { type: integer }
+        next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean }
     IssueListEnvelope:
-      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Issue' } } } } ]
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/IssueListPage' } } } ]
     IssueCreateRequest:
       type: object
       required: [title]
@@ -585,7 +603,7 @@ components:
       properties:
         state: { $ref: '#/components/schemas/IssueState' }
         reason: { type: string }
-        canonical_issue_ref: { type: string }
+        duplicate_of: { type: string }
     IssueTransitionResult:
       type: object
       required: [issue]

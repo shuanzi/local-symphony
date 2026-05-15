@@ -924,6 +924,43 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
     if "/approvals/{approval_id}/decision" in paths:
         fail("OpenAPI must use /approvals/{approval_id}/decide, not /decision")
 
+    issue_list_get = paths.get("/issues", {}).get("get", {})
+    if not isinstance(issue_list_get, dict):
+        fail("OpenAPI /issues must define GET")
+    issue_list_params = {
+        param.get("name"): param for param in issue_list_get.get("parameters", []) if isinstance(param, dict)
+    }
+    required_issue_list_params = {"state", "label", "q", "dispatch_paused", "limit", "cursor", "sort"}
+    missing_issue_list_params = required_issue_list_params - set(issue_list_params)
+    if missing_issue_list_params:
+        fail(f"OpenAPI GET /issues missing query parameters: {sorted(missing_issue_list_params)}")
+    for name in ("state", "label"):
+        param = issue_list_params[name]
+        schema = param.get("schema", {})
+        if param.get("in") != "query":
+            fail(f"OpenAPI GET /issues {name} parameter must be in query")
+        if param.get("style") != "form" or param.get("explode") is not True:
+            fail(f"OpenAPI GET /issues {name} parameter must use style=form and explode=true")
+        if schema.get("type") != "array":
+            fail(f"OpenAPI GET /issues {name} parameter must be an array")
+    if issue_list_params["q"].get("schema", {}).get("type") != "string":
+        fail("OpenAPI GET /issues q parameter must be a string")
+    if issue_list_params["dispatch_paused"].get("schema", {}).get("type") != "boolean":
+        fail("OpenAPI GET /issues dispatch_paused parameter must be a boolean")
+    limit_schema = issue_list_params["limit"].get("schema", {})
+    if (
+        limit_schema.get("type") != "integer"
+        or limit_schema.get("minimum") != 1
+        or limit_schema.get("maximum") != 200
+        or limit_schema.get("default") != 50
+    ):
+        fail("OpenAPI GET /issues limit parameter must be integer minimum=1 maximum=200 default=50")
+    if issue_list_params["cursor"].get("schema", {}).get("type") != "string":
+        fail("OpenAPI GET /issues cursor parameter must be a string")
+    sort_schema = issue_list_params["sort"].get("schema", {})
+    if sort_schema.get("enum") != ["priority", "updated", "identifier"] or sort_schema.get("default") != "priority":
+        fail("OpenAPI GET /issues sort parameter must use priority/updated/identifier enum with priority default")
+
     openapi_route_candidates = [(route, route_candidates(route)) for route in paths]
     for fragment in require_list(manifest, ("openapi", "forbidden_route_fragments")):
         fragment_text = str(fragment).lower()
@@ -1071,6 +1108,44 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
     openapi_api_errors = set(data["components"]["schemas"]["ApiErrorCode"]["enum"])
     if expected_api_errors != openapi_api_errors:
         fail(f"ApiErrorCode mismatch: {sorted(expected_api_errors ^ openapi_api_errors)}")
+
+    schemas = data["components"]["schemas"]
+    issue_list_data: dict[str, Any] | None = None
+    for part in schemas["IssueListEnvelope"].get("allOf", []):
+        candidate = part.get("properties", {}).get("data") if isinstance(part, dict) else None
+        if isinstance(candidate, dict):
+            issue_list_data = candidate
+            break
+    if not issue_list_data or ref_name(issue_list_data.get("$ref", "")) != "IssueListPage":
+        fail("OpenAPI IssueListEnvelope.data must reference IssueListPage")
+
+    issue_list_page = schemas["IssueListPage"]
+    issue_list_page_required = set(issue_list_page.get("required", []))
+    if not {"items", "page"}.issubset(issue_list_page_required):
+        fail("OpenAPI IssueListPage.required must include items and page")
+    issue_list_page_props = issue_list_page.get("properties", {})
+    items_schema = issue_list_page_props.get("items", {})
+    if items_schema.get("type") != "array" or ref_name(items_schema.get("items", {}).get("$ref", "")) != "Issue":
+        fail("OpenAPI IssueListPage.items must be an array of Issue")
+    if ref_name(issue_list_page_props.get("page", {}).get("$ref", "")) != "IssueListPageMeta":
+        fail("OpenAPI IssueListPage.page must reference IssueListPageMeta")
+
+    issue_list_page_meta = schemas["IssueListPageMeta"]
+    if set(issue_list_page_meta.get("required", [])) != {"limit", "next_cursor", "has_more"}:
+        fail("OpenAPI IssueListPageMeta.required must be limit, next_cursor, has_more")
+    issue_list_page_meta_props = issue_list_page_meta.get("properties", {})
+    if issue_list_page_meta_props.get("limit", {}).get("type") != "integer":
+        fail("OpenAPI IssueListPageMeta.limit must be an integer")
+    if set(issue_list_page_meta_props.get("next_cursor", {}).get("type", [])) != {"string", "null"}:
+        fail("OpenAPI IssueListPageMeta.next_cursor must allow string or null")
+    if issue_list_page_meta_props.get("has_more", {}).get("type") != "boolean":
+        fail("OpenAPI IssueListPageMeta.has_more must be a boolean")
+
+    transition_props = schemas["IssueTransitionRequest"].get("properties", {})
+    if "duplicate_of" not in transition_props:
+        fail("OpenAPI IssueTransitionRequest must define duplicate_of")
+    if "canonical_issue_ref" in transition_props:
+        fail("OpenAPI IssueTransitionRequest must not define canonical_issue_ref")
 
     normalized_issue_schema = load_json("schemas/normalized_issue.schema.json")
     normalized_failure_codes = set(normalized_issue_schema["$defs"]["failureCode"]["enum"])

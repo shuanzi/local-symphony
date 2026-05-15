@@ -399,6 +399,82 @@ class ManifestContractTests(unittest.TestCase):
                     finally:
                         validator.ROOT = old_root
 
+    def test_openapi_issue_list_query_param_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        required_params = ("state", "label", "q", "dispatch_paused", "limit", "cursor", "sort")
+        for param_name in required_params:
+            with self.subTest(param_name=param_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    params = openapi["paths"]["/issues"]["get"]["parameters"]
+                    openapi["paths"]["/issues"]["get"]["parameters"] = [
+                        param for param in params if param.get("name") != param_name
+                    ]
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_issue_list_envelope_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            copy_contract_root(temp_root)
+            openapi_path = temp_root / "api/openapi.yaml"
+            openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+            openapi["components"]["schemas"]["IssueListEnvelope"]["allOf"][1]["properties"]["data"] = {
+                "type": "array",
+                "items": {"$ref": "#/components/schemas/Issue"},
+            }
+            openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+            old_root = validator.ROOT
+            validator.ROOT = temp_root
+            try:
+                with self.assertRaises(SystemExit):
+                    validator.validate_openapi(manifest)
+            finally:
+                validator.ROOT = old_root
+
+    def test_openapi_issue_transition_duplicate_of_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            ("missing duplicate_of", lambda props: props.pop("duplicate_of", None)),
+            ("legacy canonical_issue_ref", lambda props: props.__setitem__("canonical_issue_ref", {"type": "string"})),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    props = openapi["components"]["schemas"]["IssueTransitionRequest"]["properties"]
+                    mutate(props)
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
     def test_workflow_config_schema_top_level_unknown_keys_must_be_allowed(self) -> None:
         validator = load_validator()
         schema = validator.load_json("schemas/workflow_config.schema.json")
