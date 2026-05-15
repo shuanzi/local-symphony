@@ -972,6 +972,13 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
     sort_schema = issue_list_params["sort"].get("schema", {})
     if sort_schema.get("enum") != ["priority", "updated", "identifier"] or sort_schema.get("default") != "priority":
         fail("OpenAPI GET /issues sort parameter must use priority/updated/identifier enum with priority default")
+    issue_list_responses = issue_list_get.get("responses", {})
+    issue_list_bad_request = issue_list_responses.get("400")
+    if (
+        not isinstance(issue_list_bad_request, dict)
+        or ref_name(issue_list_bad_request.get("$ref", "")) != "Error"
+    ):
+        fail("OpenAPI GET /issues must document 400 Error for invalid query/filter/sort/cursor")
 
     openapi_route_candidates = [(route, route_candidates(route)) for route in paths]
     for fragment in require_list(manifest, ("openapi", "forbidden_route_fragments")):
@@ -1153,11 +1160,41 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
     if issue_list_page_meta_props.get("has_more", {}).get("type") != "boolean":
         fail("OpenAPI IssueListPageMeta.has_more must be a boolean")
 
-    transition_props = schemas["IssueTransitionRequest"].get("properties", {})
+    transition_request = schemas["IssueTransitionRequest"]
+    transition_props = transition_request.get("properties", {})
     if "duplicate_of" not in transition_props:
         fail("OpenAPI IssueTransitionRequest must define duplicate_of")
     if "canonical_issue_ref" in transition_props:
         fail("OpenAPI IssueTransitionRequest must not define canonical_issue_ref")
+    reason_schema = transition_props.get("reason", {})
+    if (
+        not isinstance(reason_schema, dict)
+        or reason_schema.get("type") != "string"
+        or reason_schema.get("minLength") != 1
+        or reason_schema.get("pattern") != r"\S"
+    ):
+        fail("OpenAPI IssueTransitionRequest.reason must require a non-blank string")
+    transition_conditionals = transition_request.get("allOf", [])
+    if not isinstance(transition_conditionals, list):
+        fail("OpenAPI IssueTransitionRequest.allOf must define transition guard conditionals")
+    requires_reason_for_terminal_states = any(
+        isinstance(condition, dict)
+        and set(condition.get("if", {}).get("properties", {}).get("state", {}).get("enum", []))
+        == {"Blocked", "Cancelled", "Duplicate"}
+        and "reason" in condition.get("then", {}).get("required", [])
+        for condition in transition_conditionals
+    )
+    forbids_duplicate_of_for_non_duplicate_states = any(
+        isinstance(condition, dict)
+        and condition.get("if", {}).get("properties", {}).get("state", {}).get("not", {}).get("const")
+        == "Duplicate"
+        and "duplicate_of" in condition.get("then", {}).get("not", {}).get("required", [])
+        for condition in transition_conditionals
+    )
+    if not requires_reason_for_terminal_states:
+        fail("OpenAPI IssueTransitionRequest must require reason for Blocked/Cancelled/Duplicate transitions")
+    if not forbids_duplicate_of_for_non_duplicate_states:
+        fail("OpenAPI IssueTransitionRequest must forbid duplicate_of unless state is Duplicate")
 
     normalized_issue_schema = load_json("schemas/normalized_issue.schema.json")
     normalized_failure_codes = set(normalized_issue_schema["$defs"]["failureCode"]["enum"])

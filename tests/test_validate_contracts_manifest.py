@@ -427,6 +427,26 @@ class ManifestContractTests(unittest.TestCase):
                     finally:
                         validator.ROOT = old_root
 
+    def test_openapi_issue_list_invalid_query_error_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            copy_contract_root(temp_root)
+            openapi_path = temp_root / "api/openapi.yaml"
+            openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+            openapi["paths"]["/issues"]["get"]["responses"].pop("400", None)
+            openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+            old_root = validator.ROOT
+            validator.ROOT = temp_root
+            try:
+                with self.assertRaises(SystemExit):
+                    validator.validate_openapi(manifest)
+            finally:
+                validator.ROOT = old_root
+
     def test_openapi_issue_list_envelope_contract_fails_when_drifted(self) -> None:
         validator = load_validator()
         manifest = load_manifest()
@@ -467,6 +487,36 @@ class ManifestContractTests(unittest.TestCase):
                     openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
                     props = openapi["components"]["schemas"]["IssueTransitionRequest"]["properties"]
                     mutate(props)
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_issue_transition_guard_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            ("reason may be blank", lambda schema: schema["properties"]["reason"].pop("pattern", None)),
+            ("reason may be empty", lambda schema: schema["properties"]["reason"].pop("minLength", None)),
+            ("missing reason guard", lambda schema: schema["allOf"].pop(0)),
+            ("missing duplicate_of guard", lambda schema: schema["allOf"].pop(1)),
+            ("missing allOf guards", lambda schema: schema.pop("allOf", None)),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    schema = openapi["components"]["schemas"]["IssueTransitionRequest"]
+                    mutate(schema)
                     openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
 
                     old_root = validator.ROOT

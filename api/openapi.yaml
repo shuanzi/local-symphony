@@ -92,6 +92,7 @@ paths:
         - { name: sort, in: query, schema: { type: string, enum: [priority, updated, identifier], default: priority } }
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueListEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid query/filter/sort/cursor }
     post:
       operationId: createIssue
       parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
@@ -602,8 +603,23 @@ components:
       additionalProperties: false
       properties:
         state: { $ref: '#/components/schemas/IssueState' }
-        reason: { type: string }
+        reason: { type: string, minLength: 1, pattern: "\\S" }
         duplicate_of: { type: string }
+      allOf:
+        - if:
+            required: [state]
+            properties:
+              state: { enum: [Blocked, Cancelled, Duplicate] }
+          then:
+            required: [reason]
+        - if:
+            required: [state]
+            properties:
+              state:
+                not: { const: Duplicate }
+          then:
+            not:
+              required: [duplicate_of]
     IssueTransitionResult:
       type: object
       required: [issue]
