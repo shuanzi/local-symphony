@@ -2835,7 +2835,7 @@ state changes use /transition
 dispatch uses /dispatch
 blockers use blocker command endpoints
 transition leaving Ready/Working/Rework with active run enqueues reconciliation cancel and returns side_effects metadata
-operator transition to Blocked/Cancelled/Duplicate appends an issue comment with reason and includes the reason in issue.transitioned event payload
+except for the same-state Duplicate success no-op exception defined above, operator transition to Blocked/Cancelled/Duplicate appends an issue comment with reason and includes the reason in issue.transitioned event payload
 ```
 
 Manual dispatch contract:
