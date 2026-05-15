@@ -59,6 +59,84 @@ REQUIRED_OPENAPI_ROUTES = frozenset(
     }
 )
 
+REQUIRED_DIAGNOSTICS_FIELDS = frozenset(
+    {
+        "project_id",
+        "generated_at",
+        "redacted",
+        "repo_root",
+        "database",
+        "workflow",
+        "daemon",
+        "codex",
+        "git",
+        "redaction",
+        "warnings",
+        "inconsistent_issues",
+        "remediation",
+        "failure_summary",
+        "pause_summary",
+        "checks",
+    }
+)
+
+DIAGNOSTICS_DATABASE_FIELDS = frozenset(
+    {
+        "app_db_path",
+        "project_db_path",
+        "app_schema_version",
+        "project_schema_version",
+        "app_version_status",
+        "project_version_status",
+    }
+)
+DIAGNOSTICS_DATABASE_VERSION_STATUS_ENUM = ("supported", "unsupported", "unknown", "missing")
+DIAGNOSTICS_SUPPORT_STATUS_ENUM = ("supported", "unsupported", "unknown")
+DIAGNOSTICS_GIT_STATUS_ENUM = ("clean", "dirty", "unavailable", "unknown")
+DIAGNOSTICS_CHECK_STATUS_ENUM = ("ok", "warning", "error")
+DIAGNOSTICS_DEFINITION_REQUIRED_FIELDS = {
+    "database": DIAGNOSTICS_DATABASE_FIELDS,
+    "workflow": frozenset({"config_path", "validation", "last_valid_config"}),
+    "workflowValidation": frozenset({"valid", "warnings", "errors"}),
+    "lastValidConfig": frozenset({"available", "path", "validated_at", "content_hash"}),
+    "daemon": frozenset({"pid", "uptime_ms", "runtime_descriptor"}),
+    "runtimeDescriptor": frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid"}),
+    "codex": frozenset({"available", "version", "support"}),
+    "codexSupport": frozenset({"cli", "model", "sandbox"}),
+    "git": frozenset({"repository", "worktree"}),
+    "gitRepository": frozenset({"is_repo", "root", "branch", "head_sha", "status"}),
+    "gitWorktree": frozenset({"path", "branch", "base_ref", "status"}),
+    "redaction": frozenset({"enabled", "export_redacted_only", "rules_version"}),
+    "inconsistentIssue": frozenset({"issue_ref", "problem", "remediation"}),
+    "remediation": frozenset({"action", "description"}),
+    "failureSummary": frozenset({"failed_runs_count", "recent_failures"}),
+    "failureBucket": frozenset({"failure_code", "count"}),
+    "pauseSummary": frozenset({"paused_dispatch_count", "paused_issue_refs"}),
+    "check": frozenset({"name", "status"}),
+}
+OPENAPI_DIAGNOSTICS_REQUIRED_FIELDS = {
+    "Diagnostics": REQUIRED_DIAGNOSTICS_FIELDS,
+    "DiagnosticsDatabase": DIAGNOSTICS_DATABASE_FIELDS,
+    "DiagnosticsWorkflow": frozenset({"config_path", "validation", "last_valid_config"}),
+    "DiagnosticsWorkflowValidation": frozenset({"valid", "warnings", "errors"}),
+    "DiagnosticsLastValidConfig": frozenset({"available", "path", "validated_at", "content_hash"}),
+    "DiagnosticsDaemon": frozenset({"pid", "uptime_ms", "runtime_descriptor"}),
+    "DiagnosticsRuntimeDescriptor": frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid"}),
+    "DiagnosticsCodex": frozenset({"available", "version", "support"}),
+    "DiagnosticsCodexSupport": frozenset({"cli", "model", "sandbox"}),
+    "DiagnosticsGit": frozenset({"repository", "worktree"}),
+    "DiagnosticsGitRepository": frozenset({"is_repo", "root", "branch", "head_sha", "status"}),
+    "DiagnosticsGitWorktree": frozenset({"path", "branch", "base_ref", "status"}),
+    "DiagnosticsRedaction": frozenset({"enabled", "export_redacted_only", "rules_version"}),
+    "DiagnosticsInconsistentIssue": frozenset({"issue_ref", "problem", "remediation"}),
+    "DiagnosticsRemediation": frozenset({"action", "description"}),
+    "DiagnosticsFailureSummary": frozenset({"failed_runs_count", "recent_failures"}),
+    "DiagnosticsFailureBucket": frozenset({"failure_code", "count"}),
+    "DiagnosticsPauseSummary": frozenset({"paused_dispatch_count", "paused_issue_refs"}),
+    "DiagnosticsCheck": frozenset({"name", "status"}),
+    "DiagnosticsExport": frozenset({"artifact_id"}),
+}
+
 REQUIRED_FORBIDDEN_CONCEPTS = frozenset(
     {
         "publish",
@@ -205,6 +283,70 @@ def fail(msg: str) -> None:
 
 def load_json(rel: str) -> Any:
     return json.loads((ROOT / rel).read_text(encoding="utf-8"))
+
+
+def require_dict(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail(f"{label} must be an object")
+    return value
+
+
+def assert_required_fields(schema: dict[str, Any], label: str, required_fields: set[str] | frozenset[str]) -> None:
+    required = schema.get("required")
+    if not isinstance(required, list):
+        fail(f"{label}.required must be a list")
+    missing_required = required_fields - set(required)
+    if missing_required:
+        fail(f"{label}.required missing fields: {sorted(missing_required)}")
+
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        missing_properties = required_fields - set(properties)
+        if missing_properties:
+            fail(f"{label}.properties missing required fields: {sorted(missing_properties)}")
+
+
+def assert_required_field_map_covers_schema(
+    definitions: dict[str, Any],
+    label_prefix: str,
+    required_fields_by_name: dict[str, frozenset[str]],
+) -> None:
+    for name, definition in definitions.items():
+        if not isinstance(definition, dict) or definition.get("type") != "object":
+            continue
+        required = definition.get("required")
+        if not required:
+            continue
+        if not isinstance(required, list):
+            fail(f"{label_prefix}{name}.required must be a list")
+        expected = required_fields_by_name.get(name)
+        if expected is None:
+            fail(f"{label_prefix}{name}.required fields are not covered by contract validation: {sorted(required)}")
+        missing_from_map = set(required) - expected
+        if missing_from_map:
+            fail(f"{label_prefix}{name}.required fields missing from contract validation map: {sorted(missing_from_map)}")
+
+
+def assert_const(schema: dict[str, Any], label: str, expected: Any) -> None:
+    if schema.get("const") != expected:
+        fail(f"{label}.const must be {expected!r}")
+
+
+def assert_enum(schema: dict[str, Any], label: str, expected: tuple[str, ...]) -> None:
+    if schema.get("enum") != list(expected):
+        fail(f"{label}.enum must be {list(expected)}")
+
+
+def assert_additional_properties_false(schema: dict[str, Any], label: str) -> None:
+    if schema.get("additionalProperties") is not False:
+        fail(f"{label}.additionalProperties must be false")
+
+
+def assert_failure_code_or_null(schema: dict[str, Any], label: str, expected_ref: str) -> None:
+    refs = {item.get("$ref", "") for item in schema.get("anyOf", []) if isinstance(item, dict)}
+    has_null = any(item.get("type") == "null" for item in schema.get("anyOf", []) if isinstance(item, dict))
+    if expected_ref not in refs or not has_null:
+        fail(f"{label} must be {expected_ref} or null")
 
 
 def load_contract_manifest() -> dict[str, Any]:
@@ -433,6 +575,41 @@ def validate_json() -> None:
 
 def validate_review_packet_schema_contract() -> None:
     schema = load_json("schemas/review_packet.schema.json")
+    top_level_required = schema.get("required")
+    if not isinstance(top_level_required, list):
+        fail("schemas/review_packet.schema.json required must be a list")
+    failure_metadata_required = {"failure_code", "failure_message"}
+    missing_failure_metadata = failure_metadata_required - set(top_level_required)
+    if missing_failure_metadata:
+        fail(
+            "schemas/review_packet.schema.json required missing failure metadata fields: "
+            f"{sorted(missing_failure_metadata)}"
+        )
+
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        fail("schemas/review_packet.schema.json properties must be an object")
+    failure_code = properties.get("failure_code")
+    if not isinstance(failure_code, dict):
+        fail("schemas/review_packet.schema.json properties.failure_code must be an object")
+    failure_code_enum = failure_code.get("enum")
+    if not isinstance(failure_code_enum, list) or None not in failure_code_enum:
+        fail("schemas/review_packet.schema.json failure_code must be canonical failure codes or null")
+    failure_codes_schema = load_json("schemas/failure_codes.schema.json")
+    canonical_failure_code = (
+        failure_codes_schema.get("$defs", {}).get("failureCode", {}) if isinstance(failure_codes_schema, dict) else {}
+    )
+    canonical_failure_code_enum = canonical_failure_code.get("enum")
+    if not isinstance(canonical_failure_code_enum, list):
+        fail("schemas/failure_codes.schema.json $defs.failureCode.enum must be a list")
+    expected_failure_codes = set(canonical_failure_code_enum)
+    actual_failure_codes = {code for code in failure_code_enum if code is not None}
+    if actual_failure_codes != expected_failure_codes:
+        fail(f"Review packet failure_code mismatch: {sorted(actual_failure_codes ^ expected_failure_codes)}")
+    failure_message = properties.get("failure_message")
+    if not isinstance(failure_message, dict) or set(failure_message.get("type", [])) != {"string", "null"}:
+        fail("schemas/review_packet.schema.json failure_message must allow string or null")
+
     handoff = schema.get("properties", {}).get("handoff")
     if not isinstance(handoff, dict):
         fail("schemas/review_packet.schema.json must define handoff object properties")
@@ -472,9 +649,110 @@ def validate_workflow_config_schema_contract() -> None:
     schema = load_json("schemas/workflow_config.schema.json")
     if schema.get("additionalProperties") is not True:
         fail("schemas/workflow_config.schema.json top-level additionalProperties must be true")
-    if not isinstance(schema.get("properties"), dict):
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
         fail("schemas/workflow_config.schema.json must define known top-level properties")
+    git = properties.get("git")
+    if not isinstance(git, dict):
+        fail("schemas/workflow_config.schema.json properties.git must be an object")
+    assert_required_fields(git, "schemas/workflow_config.schema.json properties.git", frozenset({"branch_prefix"}))
+    git_properties = git.get("properties")
+    if not isinstance(git_properties, dict):
+        fail("schemas/workflow_config.schema.json properties.git.properties must be an object")
+    branch_prefix = git_properties.get("branch_prefix")
+    if not isinstance(branch_prefix, dict) or branch_prefix.get("const") != "symphony":
+        fail("schemas/workflow_config.schema.json git.branch_prefix.const must be 'symphony'")
     print("ok workflow config schema contract schemas/workflow_config.schema.json")
+
+
+def validate_diagnostics_schema_contract() -> None:
+    schema = load_json("schemas/diagnostics.schema.json")
+    schema = require_dict(schema, "schemas/diagnostics.schema.json")
+    assert_additional_properties_false(schema, "schemas/diagnostics.schema.json")
+    assert_required_fields(schema, "schemas/diagnostics.schema.json", REQUIRED_DIAGNOSTICS_FIELDS)
+
+    properties = require_dict(schema.get("properties"), "schemas/diagnostics.schema.json.properties")
+    defs = require_dict(schema.get("$defs"), "schemas/diagnostics.schema.json.$defs")
+    for name, definition in defs.items():
+        if isinstance(definition, dict) and definition.get("type") == "object":
+            assert_additional_properties_false(definition, f"schemas/diagnostics.schema.json.$defs.{name}")
+    assert_required_field_map_covers_schema(
+        defs,
+        "schemas/diagnostics.schema.json.$defs.",
+        DIAGNOSTICS_DEFINITION_REQUIRED_FIELDS,
+    )
+    for name, required_fields in DIAGNOSTICS_DEFINITION_REQUIRED_FIELDS.items():
+        assert_required_fields(
+            require_dict(defs.get(name), f"schemas/diagnostics.schema.json.$defs.{name}"),
+            f"schemas/diagnostics.schema.json.$defs.{name}",
+            required_fields,
+        )
+    assert_const(require_dict(properties.get("redacted"), "schemas/diagnostics.schema.json.properties.redacted"), "schemas/diagnostics.schema.json.properties.redacted", True)
+
+    database = require_dict(defs.get("database"), "schemas/diagnostics.schema.json.$defs.database")
+    assert_required_fields(database, "schemas/diagnostics.schema.json.$defs.database", DIAGNOSTICS_DATABASE_FIELDS)
+    assert_enum(
+        require_dict(defs.get("databaseVersionStatus"), "schemas/diagnostics.schema.json.$defs.databaseVersionStatus"),
+        "schemas/diagnostics.schema.json.$defs.databaseVersionStatus",
+        DIAGNOSTICS_DATABASE_VERSION_STATUS_ENUM,
+    )
+
+    workflow = require_dict(defs.get("workflow"), "schemas/diagnostics.schema.json.$defs.workflow")
+    assert_required_fields(workflow, "schemas/diagnostics.schema.json.$defs.workflow", frozenset({"validation", "last_valid_config"}))
+    workflow_validation = require_dict(defs.get("workflowValidation"), "schemas/diagnostics.schema.json.$defs.workflowValidation")
+    assert_required_fields(workflow_validation, "schemas/diagnostics.schema.json.$defs.workflowValidation", frozenset({"valid", "warnings", "errors"}))
+    last_valid_config = require_dict(defs.get("lastValidConfig"), "schemas/diagnostics.schema.json.$defs.lastValidConfig")
+    assert_required_fields(last_valid_config, "schemas/diagnostics.schema.json.$defs.lastValidConfig", frozenset({"available", "path", "validated_at", "content_hash"}))
+
+    daemon = require_dict(defs.get("daemon"), "schemas/diagnostics.schema.json.$defs.daemon")
+    assert_required_fields(daemon, "schemas/diagnostics.schema.json.$defs.daemon", frozenset({"pid", "uptime_ms", "runtime_descriptor"}))
+    runtime_descriptor = require_dict(defs.get("runtimeDescriptor"), "schemas/diagnostics.schema.json.$defs.runtimeDescriptor")
+    assert_required_fields(runtime_descriptor, "schemas/diagnostics.schema.json.$defs.runtimeDescriptor", frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid"}))
+
+    codex = require_dict(defs.get("codex"), "schemas/diagnostics.schema.json.$defs.codex")
+    assert_required_fields(codex, "schemas/diagnostics.schema.json.$defs.codex", frozenset({"available", "version", "support"}))
+    codex_support = require_dict(defs.get("codexSupport"), "schemas/diagnostics.schema.json.$defs.codexSupport")
+    assert_required_fields(codex_support, "schemas/diagnostics.schema.json.$defs.codexSupport", frozenset({"cli", "model", "sandbox"}))
+    assert_enum(
+        require_dict(defs.get("supportStatus"), "schemas/diagnostics.schema.json.$defs.supportStatus"),
+        "schemas/diagnostics.schema.json.$defs.supportStatus",
+        DIAGNOSTICS_SUPPORT_STATUS_ENUM,
+    )
+
+    git = require_dict(defs.get("git"), "schemas/diagnostics.schema.json.$defs.git")
+    assert_required_fields(git, "schemas/diagnostics.schema.json.$defs.git", frozenset({"repository", "worktree"}))
+    git_repository = require_dict(defs.get("gitRepository"), "schemas/diagnostics.schema.json.$defs.gitRepository")
+    assert_required_fields(git_repository, "schemas/diagnostics.schema.json.$defs.gitRepository", frozenset({"status"}))
+    git_worktree = require_dict(defs.get("gitWorktree"), "schemas/diagnostics.schema.json.$defs.gitWorktree")
+    assert_required_fields(git_worktree, "schemas/diagnostics.schema.json.$defs.gitWorktree", frozenset({"status"}))
+    assert_enum(
+        require_dict(defs.get("gitStatus"), "schemas/diagnostics.schema.json.$defs.gitStatus"),
+        "schemas/diagnostics.schema.json.$defs.gitStatus",
+        DIAGNOSTICS_GIT_STATUS_ENUM,
+    )
+
+    redaction = require_dict(defs.get("redaction"), "schemas/diagnostics.schema.json.$defs.redaction")
+    assert_required_fields(redaction, "schemas/diagnostics.schema.json.$defs.redaction", frozenset({"enabled", "export_redacted_only", "rules_version"}))
+    redaction_properties = require_dict(redaction.get("properties"), "schemas/diagnostics.schema.json.$defs.redaction.properties")
+    assert_const(require_dict(redaction_properties.get("enabled"), "schemas/diagnostics.schema.json.$defs.redaction.properties.enabled"), "schemas/diagnostics.schema.json.$defs.redaction.properties.enabled", True)
+    assert_const(require_dict(redaction_properties.get("export_redacted_only"), "schemas/diagnostics.schema.json.$defs.redaction.properties.export_redacted_only"), "schemas/diagnostics.schema.json.$defs.redaction.properties.export_redacted_only", True)
+
+    inconsistent_issue = require_dict(defs.get("inconsistentIssue"), "schemas/diagnostics.schema.json.$defs.inconsistentIssue")
+    assert_required_fields(inconsistent_issue, "schemas/diagnostics.schema.json.$defs.inconsistentIssue", frozenset({"remediation"}))
+    remediation = require_dict(defs.get("remediation"), "schemas/diagnostics.schema.json.$defs.remediation")
+    assert_required_fields(remediation, "schemas/diagnostics.schema.json.$defs.remediation", frozenset({"action", "description"}))
+    failure_summary = require_dict(defs.get("failureSummary"), "schemas/diagnostics.schema.json.$defs.failureSummary")
+    assert_required_fields(failure_summary, "schemas/diagnostics.schema.json.$defs.failureSummary", frozenset({"failed_runs_count", "recent_failures"}))
+    pause_summary = require_dict(defs.get("pauseSummary"), "schemas/diagnostics.schema.json.$defs.pauseSummary")
+    assert_required_fields(pause_summary, "schemas/diagnostics.schema.json.$defs.pauseSummary", frozenset({"paused_dispatch_count", "paused_issue_refs"}))
+    diagnostics_check = require_dict(defs.get("check"), "schemas/diagnostics.schema.json.$defs.check")
+    assert_required_fields(diagnostics_check, "schemas/diagnostics.schema.json.$defs.check", frozenset({"name", "status"}))
+    assert_enum(
+        require_dict(require_dict(diagnostics_check.get("properties"), "schemas/diagnostics.schema.json.$defs.check.properties").get("status"), "schemas/diagnostics.schema.json.$defs.check.properties.status"),
+        "schemas/diagnostics.schema.json.$defs.check.properties.status",
+        DIAGNOSTICS_CHECK_STATUS_ENUM,
+    )
+    print("ok diagnostics schema contract schemas/diagnostics.schema.json")
 
 
 def validate_sql() -> None:
@@ -525,6 +803,95 @@ def validate_sql() -> None:
         except Exception as exc:  # noqa: BLE001
             fail(f"invalid SQLite DDL {rel}: {exc}")
         print(f"ok sql {rel}")
+
+
+def validate_openapi_diagnostics_contract(data: dict[str, Any]) -> None:
+    components = require_dict(data.get("components"), "OpenAPI components")
+    schemas = require_dict(components.get("schemas"), "OpenAPI components.schemas")
+
+    diagnostics = require_dict(schemas.get("Diagnostics"), "OpenAPI Diagnostics")
+    for name, definition in schemas.items():
+        if name.startswith("Diagnostics") and isinstance(definition, dict) and definition.get("type") == "object":
+            assert_additional_properties_false(definition, f"OpenAPI {name}")
+    openapi_diagnostics_schemas = {
+        name: definition
+        for name, definition in schemas.items()
+        if name.startswith("Diagnostics") and isinstance(definition, dict) and definition.get("type") == "object"
+    }
+    assert_required_field_map_covers_schema(
+        openapi_diagnostics_schemas,
+        "OpenAPI ",
+        OPENAPI_DIAGNOSTICS_REQUIRED_FIELDS,
+    )
+    for name, required_fields in OPENAPI_DIAGNOSTICS_REQUIRED_FIELDS.items():
+        assert_required_fields(require_dict(schemas.get(name), f"OpenAPI {name}"), f"OpenAPI {name}", required_fields)
+    assert_required_fields(diagnostics, "OpenAPI Diagnostics", REQUIRED_DIAGNOSTICS_FIELDS)
+    diagnostics_properties = require_dict(diagnostics.get("properties"), "OpenAPI Diagnostics.properties")
+    assert_const(require_dict(diagnostics_properties.get("redacted"), "OpenAPI Diagnostics.properties.redacted"), "OpenAPI Diagnostics.properties.redacted", True)
+
+    database = require_dict(schemas.get("DiagnosticsDatabase"), "OpenAPI DiagnosticsDatabase")
+    assert_required_fields(database, "OpenAPI DiagnosticsDatabase", DIAGNOSTICS_DATABASE_FIELDS)
+    assert_enum(
+        require_dict(schemas.get("DiagnosticsDatabaseVersionStatus"), "OpenAPI DiagnosticsDatabaseVersionStatus"),
+        "OpenAPI DiagnosticsDatabaseVersionStatus",
+        DIAGNOSTICS_DATABASE_VERSION_STATUS_ENUM,
+    )
+
+    workflow = require_dict(schemas.get("DiagnosticsWorkflow"), "OpenAPI DiagnosticsWorkflow")
+    assert_required_fields(workflow, "OpenAPI DiagnosticsWorkflow", frozenset({"validation", "last_valid_config"}))
+    workflow_validation = require_dict(schemas.get("DiagnosticsWorkflowValidation"), "OpenAPI DiagnosticsWorkflowValidation")
+    assert_required_fields(workflow_validation, "OpenAPI DiagnosticsWorkflowValidation", frozenset({"valid", "warnings", "errors"}))
+    last_valid_config = require_dict(schemas.get("DiagnosticsLastValidConfig"), "OpenAPI DiagnosticsLastValidConfig")
+    assert_required_fields(last_valid_config, "OpenAPI DiagnosticsLastValidConfig", frozenset({"available", "path", "validated_at", "content_hash"}))
+
+    daemon = require_dict(schemas.get("DiagnosticsDaemon"), "OpenAPI DiagnosticsDaemon")
+    assert_required_fields(daemon, "OpenAPI DiagnosticsDaemon", frozenset({"pid", "uptime_ms", "runtime_descriptor"}))
+    runtime_descriptor = require_dict(schemas.get("DiagnosticsRuntimeDescriptor"), "OpenAPI DiagnosticsRuntimeDescriptor")
+    assert_required_fields(runtime_descriptor, "OpenAPI DiagnosticsRuntimeDescriptor", frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid"}))
+
+    codex = require_dict(schemas.get("DiagnosticsCodex"), "OpenAPI DiagnosticsCodex")
+    assert_required_fields(codex, "OpenAPI DiagnosticsCodex", frozenset({"available", "version", "support"}))
+    codex_support = require_dict(schemas.get("DiagnosticsCodexSupport"), "OpenAPI DiagnosticsCodexSupport")
+    assert_required_fields(codex_support, "OpenAPI DiagnosticsCodexSupport", frozenset({"cli", "model", "sandbox"}))
+    assert_enum(
+        require_dict(schemas.get("DiagnosticsSupportStatus"), "OpenAPI DiagnosticsSupportStatus"),
+        "OpenAPI DiagnosticsSupportStatus",
+        DIAGNOSTICS_SUPPORT_STATUS_ENUM,
+    )
+
+    git = require_dict(schemas.get("DiagnosticsGit"), "OpenAPI DiagnosticsGit")
+    assert_required_fields(git, "OpenAPI DiagnosticsGit", frozenset({"repository", "worktree"}))
+    git_repository = require_dict(schemas.get("DiagnosticsGitRepository"), "OpenAPI DiagnosticsGitRepository")
+    assert_required_fields(git_repository, "OpenAPI DiagnosticsGitRepository", frozenset({"status"}))
+    git_worktree = require_dict(schemas.get("DiagnosticsGitWorktree"), "OpenAPI DiagnosticsGitWorktree")
+    assert_required_fields(git_worktree, "OpenAPI DiagnosticsGitWorktree", frozenset({"status"}))
+    assert_enum(
+        require_dict(schemas.get("DiagnosticsGitStatus"), "OpenAPI DiagnosticsGitStatus"),
+        "OpenAPI DiagnosticsGitStatus",
+        DIAGNOSTICS_GIT_STATUS_ENUM,
+    )
+
+    redaction = require_dict(schemas.get("DiagnosticsRedaction"), "OpenAPI DiagnosticsRedaction")
+    assert_required_fields(redaction, "OpenAPI DiagnosticsRedaction", frozenset({"enabled", "export_redacted_only", "rules_version"}))
+    redaction_properties = require_dict(redaction.get("properties"), "OpenAPI DiagnosticsRedaction.properties")
+    assert_const(require_dict(redaction_properties.get("enabled"), "OpenAPI DiagnosticsRedaction.properties.enabled"), "OpenAPI DiagnosticsRedaction.properties.enabled", True)
+    assert_const(require_dict(redaction_properties.get("export_redacted_only"), "OpenAPI DiagnosticsRedaction.properties.export_redacted_only"), "OpenAPI DiagnosticsRedaction.properties.export_redacted_only", True)
+
+    inconsistent_issue = require_dict(schemas.get("DiagnosticsInconsistentIssue"), "OpenAPI DiagnosticsInconsistentIssue")
+    assert_required_fields(inconsistent_issue, "OpenAPI DiagnosticsInconsistentIssue", frozenset({"remediation"}))
+    remediation = require_dict(schemas.get("DiagnosticsRemediation"), "OpenAPI DiagnosticsRemediation")
+    assert_required_fields(remediation, "OpenAPI DiagnosticsRemediation", frozenset({"action", "description"}))
+    failure_summary = require_dict(schemas.get("DiagnosticsFailureSummary"), "OpenAPI DiagnosticsFailureSummary")
+    assert_required_fields(failure_summary, "OpenAPI DiagnosticsFailureSummary", frozenset({"failed_runs_count", "recent_failures"}))
+    pause_summary = require_dict(schemas.get("DiagnosticsPauseSummary"), "OpenAPI DiagnosticsPauseSummary")
+    assert_required_fields(pause_summary, "OpenAPI DiagnosticsPauseSummary", frozenset({"paused_dispatch_count", "paused_issue_refs"}))
+    diagnostics_check = require_dict(schemas.get("DiagnosticsCheck"), "OpenAPI DiagnosticsCheck")
+    assert_required_fields(diagnostics_check, "OpenAPI DiagnosticsCheck", frozenset({"name", "status"}))
+    assert_enum(
+        require_dict(require_dict(diagnostics_check.get("properties"), "OpenAPI DiagnosticsCheck.properties").get("status"), "OpenAPI DiagnosticsCheck.properties.status"),
+        "OpenAPI DiagnosticsCheck.properties.status",
+        DIAGNOSTICS_CHECK_STATUS_ENUM,
+    )
 
 
 def validate_openapi(manifest: dict[str, Any]) -> None:
@@ -756,17 +1123,26 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
     for normalized_name, openapi_name in summary_pairs:
         assert_required_and_props_match(normalized_issue_schema, data, normalized_name, openapi_name)
 
-    normalized_failure_code = normalized_issue_schema["$defs"]["runSummary"]["properties"]["failure_code"]
-    normalized_failure_refs = {item.get("$ref", "") for item in normalized_failure_code.get("anyOf", [])}
-    normalized_failure_null = any(item.get("type") == "null" for item in normalized_failure_code.get("anyOf", []))
-    if "#/$defs/failureCode" not in normalized_failure_refs or not normalized_failure_null:
-        fail("NormalizedIssue runSummary.failure_code must be failureCode or null")
-
-    openapi_failure_code = data["components"]["schemas"]["RunSummary"]["properties"]["failure_code"]
-    openapi_failure_refs = {item.get("$ref", "") for item in openapi_failure_code.get("anyOf", [])}
-    openapi_failure_null = any(item.get("type") == "null" for item in openapi_failure_code.get("anyOf", []))
-    if "#/components/schemas/FailureCode" not in openapi_failure_refs or not openapi_failure_null:
-        fail("OpenAPI RunSummary.failure_code must be FailureCode or null")
+    assert_failure_code_or_null(
+        normalized_issue_schema["$defs"]["runSummary"]["properties"]["failure_code"],
+        "NormalizedIssue runSummary.failure_code",
+        "#/$defs/failureCode",
+    )
+    assert_failure_code_or_null(
+        data["components"]["schemas"]["RunSummary"]["properties"]["failure_code"],
+        "OpenAPI RunSummary.failure_code",
+        "#/components/schemas/FailureCode",
+    )
+    review_packet_summary = data["components"]["schemas"]["ReviewPacketSummary"]
+    assert_required_fields(review_packet_summary, "OpenAPI ReviewPacketSummary", frozenset({"failure_code", "failure_message"}))
+    assert_failure_code_or_null(
+        review_packet_summary["properties"]["failure_code"],
+        "OpenAPI ReviewPacketSummary.failure_code",
+        "#/components/schemas/FailureCode",
+    )
+    review_packet_failure_message = review_packet_summary["properties"]["failure_message"]
+    if set(review_packet_failure_message.get("type", [])) != {"string", "null"}:
+        fail("OpenAPI ReviewPacketSummary.failure_message must allow string or null")
 
     normalized_states = normalized_issue_schema["$defs"]["issueState"]["enum"]
     openapi_states = data["components"]["schemas"]["IssueState"]["enum"]
@@ -776,6 +1152,8 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
     run_event_schema = load_json("schemas/run_event.schema.json")
     if "seq" not in run_event_schema.get("required", []):
         fail("schemas/run_event.schema.json must require seq for SSE replay IDs")
+
+    validate_openapi_diagnostics_contract(data)
     print("ok openapi api/openapi.yaml")
 
 
@@ -876,6 +1254,7 @@ def main() -> None:
     validate_json()
     validate_review_packet_schema_contract()
     validate_workflow_config_schema_contract()
+    validate_diagnostics_schema_contract()
     validate_sql()
     validate_openapi(manifest)
     validate_tool_gateway_manifest(manifest)

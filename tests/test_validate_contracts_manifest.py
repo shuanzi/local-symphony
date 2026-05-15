@@ -238,7 +238,9 @@ class ManifestContractTests(unittest.TestCase):
                 handoff_required.remove(required_field)
 
                 original_load_json = validator.load_json
-                validator.load_json = lambda rel, drifted_schema=drifted_schema: drifted_schema
+                validator.load_json = lambda rel, drifted_schema=drifted_schema: (
+                    drifted_schema if rel == "schemas/review_packet.schema.json" else original_load_json(rel)
+                )
                 try:
                     with self.assertRaises(SystemExit):
                         validator.validate_review_packet_schema_contract()
@@ -252,18 +254,170 @@ class ManifestContractTests(unittest.TestCase):
         drifted_schema["properties"]["handoff"]["properties"]["target_state"]["const"] = "Review"
 
         original_load_json = validator.load_json
-        validator.load_json = lambda rel: drifted_schema
+        validator.load_json = lambda rel: (
+            drifted_schema if rel == "schemas/review_packet.schema.json" else original_load_json(rel)
+        )
         try:
             with self.assertRaises(SystemExit):
                 validator.validate_review_packet_schema_contract()
         finally:
             validator.load_json = original_load_json
 
+    def test_diagnostics_schema_contract_fails_when_nested_contract_drifts(self) -> None:
+        validator = load_validator()
+        schema = validator.load_json("schemas/diagnostics.schema.json")
+
+        cases = (
+            ("root additionalProperties", lambda drifted: drifted.__setitem__("additionalProperties", True)),
+            (
+                "database additionalProperties",
+                lambda drifted: drifted["$defs"]["database"].__setitem__("additionalProperties", True),
+            ),
+            ("workflow.config_path", lambda drifted: drifted["$defs"]["workflow"]["required"].remove("config_path")),
+            ("workflow.unmapped_required", lambda drifted: drifted["$defs"]["workflow"]["required"].append("new_required")),
+            ("gitRepository.root", lambda drifted: drifted["$defs"]["gitRepository"]["required"].remove("root")),
+            ("gitWorktree.base_ref", lambda drifted: drifted["$defs"]["gitWorktree"]["required"].remove("base_ref")),
+            ("database.app_db_path", lambda drifted: drifted["$defs"]["database"]["required"].remove("app_db_path")),
+            ("daemon.uptime_ms", lambda drifted: drifted["$defs"]["daemon"]["required"].remove("uptime_ms")),
+            ("redaction.enabled const", lambda drifted: drifted["$defs"]["redaction"]["properties"]["enabled"].pop("const")),
+            ("redaction.rules_version", lambda drifted: drifted["$defs"]["redaction"]["required"].remove("rules_version")),
+            ("inconsistentIssue.issue_ref", lambda drifted: drifted["$defs"]["inconsistentIssue"]["required"].remove("issue_ref")),
+            ("inconsistentIssue.problem", lambda drifted: drifted["$defs"]["inconsistentIssue"]["required"].remove("problem")),
+            ("failureBucket.count", lambda drifted: drifted["$defs"]["failureBucket"]["required"].remove("count")),
+            ("check.name", lambda drifted: drifted["$defs"]["check"]["required"].remove("name")),
+            ("check.status", lambda drifted: drifted["$defs"]["check"]["required"].remove("status")),
+            (
+                "database version status enum",
+                lambda drifted: drifted["$defs"]["databaseVersionStatus"]["enum"].remove("missing"),
+            ),
+        )
+
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                drifted_schema = copy.deepcopy(schema)
+                mutate(drifted_schema)
+
+                original_load_json = validator.load_json
+                validator.load_json = lambda rel, drifted_schema=drifted_schema: (
+                    drifted_schema if rel == "schemas/diagnostics.schema.json" else original_load_json(rel)
+                )
+                try:
+                    with self.assertRaises(SystemExit):
+                        validator.validate_diagnostics_schema_contract()
+                finally:
+                    validator.load_json = original_load_json
+
+    def test_openapi_diagnostics_contract_fails_when_nested_contract_drifts(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            ("Diagnostics additionalProperties", lambda schemas: schemas["Diagnostics"].__setitem__("additionalProperties", True)),
+            (
+                "DiagnosticsDatabase additionalProperties",
+                lambda schemas: schemas["DiagnosticsDatabase"].__setitem__("additionalProperties", True),
+            ),
+            ("workflow.config_path", lambda schemas: schemas["DiagnosticsWorkflow"]["required"].remove("config_path")),
+            ("workflow.unmapped_required", lambda schemas: schemas["DiagnosticsWorkflow"]["required"].append("new_required")),
+            ("gitRepository.root", lambda schemas: schemas["DiagnosticsGitRepository"]["required"].remove("root")),
+            ("gitWorktree.base_ref", lambda schemas: schemas["DiagnosticsGitWorktree"]["required"].remove("base_ref")),
+            ("database.app_db_path", lambda schemas: schemas["DiagnosticsDatabase"]["required"].remove("app_db_path")),
+            ("daemon.uptime_ms", lambda schemas: schemas["DiagnosticsDaemon"]["required"].remove("uptime_ms")),
+            ("redaction.enabled const", lambda schemas: schemas["DiagnosticsRedaction"]["properties"]["enabled"].pop("const")),
+            ("redaction.rules_version", lambda schemas: schemas["DiagnosticsRedaction"]["required"].remove("rules_version")),
+            ("inconsistentIssue.issue_ref", lambda schemas: schemas["DiagnosticsInconsistentIssue"]["required"].remove("issue_ref")),
+            ("inconsistentIssue.problem", lambda schemas: schemas["DiagnosticsInconsistentIssue"]["required"].remove("problem")),
+            ("failureBucket.count", lambda schemas: schemas["DiagnosticsFailureBucket"]["required"].remove("count")),
+            ("diagnosticsExport.artifact_id", lambda schemas: schemas["DiagnosticsExport"]["required"].remove("artifact_id")),
+            ("check.name", lambda schemas: schemas["DiagnosticsCheck"]["required"].remove("name")),
+            ("check.status", lambda schemas: schemas["DiagnosticsCheck"]["required"].remove("status")),
+            (
+                "database version status enum",
+                lambda schemas: schemas["DiagnosticsDatabaseVersionStatus"]["enum"].remove("missing"),
+            ),
+        )
+
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    mutate(openapi["components"]["schemas"])
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_review_packet_summary_failure_metadata_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            (
+                "failure_code required",
+                lambda schemas: schemas["ReviewPacketSummary"]["required"].remove("failure_code"),
+            ),
+            (
+                "failure_message required",
+                lambda schemas: schemas["ReviewPacketSummary"]["required"].remove("failure_message"),
+            ),
+            (
+                "failure_code canonical ref",
+                lambda schemas: schemas["ReviewPacketSummary"]["properties"].__setitem__(
+                    "failure_code",
+                    {"type": ["string", "null"]},
+                ),
+            ),
+            (
+                "failure_message null allowed",
+                lambda schemas: schemas["ReviewPacketSummary"]["properties"]["failure_message"].__setitem__("type", ["string"]),
+            ),
+        )
+
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    mutate(openapi["components"]["schemas"])
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
     def test_workflow_config_schema_top_level_unknown_keys_must_be_allowed(self) -> None:
         validator = load_validator()
         schema = validator.load_json("schemas/workflow_config.schema.json")
         drifted_schema = copy.deepcopy(schema)
         drifted_schema["additionalProperties"] = False
+
+        original_load_json = validator.load_json
+        validator.load_json = lambda rel: drifted_schema
+        try:
+            with self.assertRaises(SystemExit):
+                validator.validate_workflow_config_schema_contract()
+        finally:
+            validator.load_json = original_load_json
+
+    def test_workflow_config_schema_contract_fails_when_branch_prefix_not_required(self) -> None:
+        validator = load_validator()
+        schema = validator.load_json("schemas/workflow_config.schema.json")
+        drifted_schema = copy.deepcopy(schema)
+        drifted_schema["properties"]["git"]["required"].remove("branch_prefix")
 
         original_load_json = validator.load_json
         validator.load_json = lambda rel: drifted_schema

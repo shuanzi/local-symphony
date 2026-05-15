@@ -18,6 +18,8 @@
     "approvals",
     "tool_calls",
     "prompt_snapshot",
+    "failure_code",
+    "failure_message",
     "created_at"
   ],
   "properties": {
@@ -319,9 +321,32 @@
       }
     },
     "failure_code": {
-      "type": [
-        "string",
-        "null"
+      "enum": [
+        "workflow_invalid",
+        "workflow_validation_failed",
+        "prompt_render_failed",
+        "workspace_prepare_failed",
+        "workspace_conflict",
+        "after_create_failed",
+        "before_run_failed",
+        "codex_startup_failed",
+        "unsupported_codex_version",
+        "codex_protocol_error",
+        "turn_timeout",
+        "stall_timeout",
+        "approval_timeout",
+        "command_denied",
+        "network_denied",
+        "protected_path_denied",
+        "tool_gateway_failed",
+        "missing_handoff",
+        "review_packet_failed",
+        "operator_cancelled",
+        "agent_blocked",
+        "issue_state_changed",
+        "canceled_by_reconciliation",
+        "daemon_restarted_run_interrupted",
+        null
       ]
     },
     "failure_message": {

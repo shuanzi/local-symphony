@@ -163,7 +163,7 @@
           "type": "string"
         },
         "branch_prefix": {
-          "type": "string"
+          "const": "symphony"
         },
         "agent_commit": {
           "const": "manual"

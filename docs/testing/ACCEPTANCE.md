@@ -26,6 +26,7 @@ handler route inventory maps to documented OpenAPI routes
 CLI required/help tokens are declared and forbidden v1 commands are declared
 dashboard action inventory declares required actions and forbidden hidden/future actions
 Tool Gateway registry enum matches the fixed documented v1 tool list
+Tool Gateway error enum includes `handoff_conflict` for mismatched handoff payload hashes
 docs/agent_work_orders/*.md do not contain forbidden v1 command-like capability tokens
 security regression command/topic manifest includes default fake-only commands and gates real Codex behind SYMPHONY_TEST_CODEX=1
 ```
@@ -38,6 +39,24 @@ Expected：
 unknown top-level config key produces a warning only and does not block dispatch
 wrong type, missing required field, unsupported enum, and unset-or-empty full-string $VAR_NAME produce workflow validation errors
 unset-or-empty full-string $VAR_NAME blocks dispatch and invalid reload does not replace the effective config
+```
+
+## A0b Workflow validate API
+
+Call `POST /api/v1/workflow/validate` with omitted body, `{}`, and `{"dry_run": true}`.
+
+Expected:
+
+```text
+validates the current filesystem WORKFLOW.md
+returns data.source = current_filesystem
+returns validation.valid / warnings / errors
+returns side_effects fields all false
+does not replace effective config
+does not update last-valid config
+does not render prompts, dispatch runs, or write review artifacts
+candidate_workflow_md, candidate_config, render_context, unknown fields, malformed JSON, and dry_run=false return invalid_request
+invalid WORKFLOW.md content returns 200 with validation.valid=false
 ```
 
 ## A1 Init and local tracker
@@ -58,6 +77,7 @@ symphony serve --project . --no-open
 symphony issue dispatch LOC-1
 symphony run events run_<from-dispatch-response> --follow
 symphony review LOC-1
+symphony review path LOC-1
 ```
 
 Expected：
@@ -69,6 +89,7 @@ handoff stored
 review packet generated
 issue state = Human Review
 main repo working tree not polluted except documented init files
+symphony review path prints metadata/path diagnostics only and does not print packet file contents or raw artifact bytes
 ```
 
 ## A3 Rework path
@@ -80,6 +101,19 @@ symphony review LOC-1
 ```
 
 Expected：same workspace/branch reused; latest review packet has packet_no incremented; cumulative diff includes prior changes.
+
+## A3a Send to Rework rejection matrix
+
+Each rejection must return the listed error code and leave issue state, active run records, review packet metadata, review packet files, comments, and system events unchanged.
+
+| Scenario | Expected error |
+| --- | --- |
+| missing, blank, or trim-to-empty reason | invalid_request |
+| issue is not in Human Review | invalid_state_transition |
+| issue has an active run | issue_already_running |
+| latest review packet is missing | review_packet_required |
+| latest review packet status is not generated | review_packet_required |
+| latest review packet row is generated but does not belong to latest completed handoff run | review_packet_required |
 
 ## A4 Failure pause and resume
 
@@ -160,6 +194,7 @@ agent cannot mark Done
 agent cannot attach artifact outside workspace
 agent cannot handoff target other than Human Review
 expired/revoked tool token fails
+second handoff.submit for the same run with a different canonical payload hash returns handoff_conflict, CLI exit code 7, does not replace the original handoff, and does not advance Human Review
 ```
 
 ## A7 Review packet integrity
@@ -182,6 +217,16 @@ redacted run events
 
 Untracked files, binary-safe diffs, deletions, mode changes, and symlink escape failures must be tested.
 
+Untracked file handling must be tested with concrete cases:
+
+```text
+ordinary text untracked file content is included in changes.patch
+large untracked files, binary untracked files, and policy-restricted untracked files are listed in changed-files.txt
+large untracked files, binary untracked files, and policy-restricted untracked files are listed in untracked-files.json
+untracked-files.json sets patch_included=false for each omitted untracked file
+untracked-files.json includes a non-empty reason for each omitted untracked file
+```
+
 ## A8 Security
 
 Expected：
@@ -193,7 +238,11 @@ CLI bearer works and can rotate
 runtime descriptor contains no secrets
 protected path access denies or requires review according to policy
 network deny does not claim OS-level isolation
-raw prompt/raw Codex log not exposed via API
+raw prompt context values are not exposed via API
+raw secrets are not exposed via API
+diagnostics export contains redacted values only
+symphony review path does not bypass Review API + Artifact API redaction/refusal
+security tests do not claim compliance-grade DLP
 ```
 
 ## A9 Done gate
@@ -203,3 +252,27 @@ symphony review mark-done LOC-1 --reason "Accepted"
 ```
 
 Expected：issue state = Done; no git commit, push, PR, merge, publish, workspace cleanup, reset, or delete occurs.
+
+## A9a Mark Done rejection matrix
+
+Each rejection must return the listed error code and leave issue state, active run records, review packet metadata, review packet files, comments, and system events unchanged.
+
+| Scenario | Expected error |
+| --- | --- |
+| missing, blank, or trim-to-empty reason | invalid_request |
+| issue is not in Human Review | invalid_state_transition |
+| issue has an active run | issue_already_running |
+| latest review packet is missing | review_packet_required |
+| latest review packet status is not generated | review_packet_required |
+| latest review packet row is generated but does not belong to latest completed handoff run | review_packet_required |
+
+## A10 Codex fixture gate
+
+Expected：
+
+```text
+prelaunch gate reads installed Codex version without starting the long-lived real codex app-server process
+generated protocol/schema version comes from committed fixture metadata or static compatibility metadata
+missing compatible metadata or fixture fails before process launch with unsupported_codex_version
+post-launch handshake schema/protocol mismatch fails through codex_protocol_error
+```

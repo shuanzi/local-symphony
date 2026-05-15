@@ -235,18 +235,18 @@ paths:
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
         "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }
-        "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is not in Human Review; review_packet_required when latest generated review packet is missing, non-generated, or mismatched; issue_already_running when an active run exists." }
+        "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is not in Human Review; review_packet_required when latest review packet row is missing, non-generated, or mismatched with the latest completed handoff run; issue_already_running when an active run exists." }
   /reviews/{issue_ref}/mark-done:
     post:
       operationId: markDone
-      description: Requires latest generated review packet to belong to latest completed handoff run, with issue in Human Review and no active run.
+      description: Requires the latest review packet row to be generated and belong to the latest completed handoff run, with issue in Human Review and no active run.
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1, pattern: "\\S" } } } } } }
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
         "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }
-        "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is not in Human Review; review_packet_required when latest generated review packet is missing, non-generated, or mismatched; issue_already_running when an active run exists." }
+        "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is not in Human Review; review_packet_required when latest review packet row is missing, non-generated, or mismatched with the latest completed handoff run; issue_already_running when an active run exists." }
   /artifacts/{artifact_id}:
     get:
       operationId: getArtifactMetadata
@@ -264,9 +264,20 @@ paths:
   /workflow/validate:
     post:
       operationId: validateWorkflow
+      description: "Validates the current filesystem WORKFLOW.md only. This endpoint is always dry-run: it does not replace effective config, update last-valid workflow state, render prompts, dispatch runs, or write review artifacts. Candidate workflow input belongs to /workflow/render-preview and is rejected here as invalid_request."
       parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowStatusEnvelope' } } } } }
+      requestBody:
+        required: false
+        content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowValidateRequest' } } }
+      responses:
+        "200":
+          description: >
+            Validation result for current filesystem WORKFLOW.md. Invalid workflow
+            content is reported with data.validation.valid=false rather than replacing
+            effective config.
+          content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowValidateEnvelope' } } }
+        "400": { $ref: '#/components/responses/Error', description: "invalid_request when JSON is malformed, unknown fields are present, dry_run is false, or candidate workflow/render fields are supplied." }
   /workflow/render-preview:
     post:
       operationId: renderWorkflowPreview
@@ -723,7 +734,7 @@ components:
         content_url: { type: [string, 'null'], format: uri-reference }
     ReviewPacketSummary:
       type: object
-      required: [id, issue_id, run_id, packet_no, status, root_path, artifacts, created_at]
+      required: [id, issue_id, run_id, packet_no, status, root_path, artifacts, failure_code, failure_message, created_at]
       properties:
         id: { type: string, pattern: "^rp_" }
         issue_id: { type: string }
@@ -740,7 +751,7 @@ components:
         artifacts:
           type: array
           items: { $ref: '#/components/schemas/ReviewPacketArtifact' }
-        failure_code: { type: [string, 'null'] }
+        failure_code: { anyOf: [ { $ref: '#/components/schemas/FailureCode' }, { type: 'null' } ] }
         failure_message: { type: [string, 'null'] }
         created_at: { type: string, format: date-time }
     IssueReviewPacketSummary:
@@ -782,6 +793,39 @@ components:
         effective_config: { type: object, additionalProperties: true }
     WorkflowStatusEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/WorkflowStatus' } } } ]
+    WorkflowValidateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        dry_run:
+          const: true
+          default: true
+          description: Always true; validation never replaces effective config. Omit this field for the same behavior.
+    WorkflowValidateSideEffects:
+      type: object
+      required: [effective_config_replaced, last_valid_config_updated, prompt_rendered, run_dispatched, review_artifacts_written]
+      additionalProperties: false
+      properties:
+        effective_config_replaced: { const: false }
+        last_valid_config_updated: { const: false }
+        prompt_rendered: { const: false }
+        run_dispatched: { const: false }
+        review_artifacts_written: { const: false }
+    WorkflowValidateResult:
+      type: object
+      required: [source, workflow_path, validation, side_effects]
+      additionalProperties: false
+      properties:
+        source:
+          const: current_filesystem
+          description: The project/repository WORKFLOW.md currently present on disk at request time.
+        workflow_path:
+          type: string
+          description: Filesystem path or project-relative path of the validated WORKFLOW.md; file content is not returned.
+        validation: { $ref: '#/components/schemas/WorkflowValidationSummary' }
+        side_effects: { $ref: '#/components/schemas/WorkflowValidateSideEffects' }
+    WorkflowValidateEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/WorkflowValidateResult' } } } ]
     WorkflowRenderPreviewRequest:
       type: object
       additionalProperties: false
@@ -822,18 +866,184 @@ components:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/WorkflowRenderPreview' } } } ]
     Diagnostics:
       type: object
-      required: [project_id, generated_at, redacted, checks]
+      additionalProperties: false
+      required: [project_id, generated_at, redacted, repo_root, database, workflow, daemon, codex, git, redaction, warnings, inconsistent_issues, remediation, failure_summary, pause_summary, checks]
       properties:
-        project_id: { type: string }
+        project_id: { type: string, minLength: 1 }
         generated_at: { type: string, format: date-time }
-        redacted: { type: boolean }
-        checks: { type: array, items: { type: object, additionalProperties: true } }
-        runtime: { type: object, additionalProperties: true }
-        security: { type: object, additionalProperties: true }
+        redacted: { const: true }
+        repo_root: { type: string, minLength: 1 }
+        database: { $ref: '#/components/schemas/DiagnosticsDatabase' }
+        workflow: { $ref: '#/components/schemas/DiagnosticsWorkflow' }
+        daemon: { $ref: '#/components/schemas/DiagnosticsDaemon' }
+        codex: { $ref: '#/components/schemas/DiagnosticsCodex' }
+        git: { $ref: '#/components/schemas/DiagnosticsGit' }
+        redaction: { $ref: '#/components/schemas/DiagnosticsRedaction' }
+        warnings: { type: array, items: { type: string } }
+        inconsistent_issues: { type: array, items: { $ref: '#/components/schemas/DiagnosticsInconsistentIssue' } }
+        remediation: { type: array, items: { $ref: '#/components/schemas/DiagnosticsRemediation' } }
+        failure_summary: { $ref: '#/components/schemas/DiagnosticsFailureSummary' }
+        pause_summary: { $ref: '#/components/schemas/DiagnosticsPauseSummary' }
+        checks: { type: array, items: { $ref: '#/components/schemas/DiagnosticsCheck' } }
+    DiagnosticsDatabase:
+      type: object
+      additionalProperties: false
+      required: [app_db_path, project_db_path, app_schema_version, project_schema_version, app_version_status, project_version_status]
+      properties:
+        app_db_path: { type: string, minLength: 1 }
+        project_db_path: { type: string, minLength: 1 }
+        app_schema_version: { type: string, minLength: 1 }
+        project_schema_version: { type: string, minLength: 1 }
+        app_version_status: { $ref: '#/components/schemas/DiagnosticsDatabaseVersionStatus' }
+        project_version_status: { $ref: '#/components/schemas/DiagnosticsDatabaseVersionStatus' }
+    DiagnosticsDatabaseVersionStatus:
+      enum: [supported, unsupported, unknown, missing]
+    DiagnosticsWorkflow:
+      type: object
+      additionalProperties: false
+      required: [config_path, validation, last_valid_config]
+      properties:
+        config_path: { type: [string, 'null'] }
+        validation: { $ref: '#/components/schemas/DiagnosticsWorkflowValidation' }
+        last_valid_config: { $ref: '#/components/schemas/DiagnosticsLastValidConfig' }
+    DiagnosticsWorkflowValidation:
+      type: object
+      additionalProperties: false
+      required: [valid, warnings, errors]
+      properties:
+        valid: { type: boolean }
+        warnings: { type: array, items: { type: string } }
+        errors: { type: array, items: { type: string } }
+    DiagnosticsLastValidConfig:
+      type: object
+      additionalProperties: false
+      required: [available, path, validated_at, content_hash]
+      properties:
+        available: { type: boolean }
+        path: { type: [string, 'null'] }
+        validated_at: { type: [string, 'null'], format: date-time }
+        content_hash: { type: [string, 'null'] }
+    DiagnosticsDaemon:
+      type: object
+      additionalProperties: false
+      required: [pid, uptime_ms, runtime_descriptor]
+      properties:
+        pid: { type: [integer, 'null'], minimum: 1 }
+        uptime_ms: { type: [integer, 'null'], minimum: 0 }
+        runtime_descriptor: { $ref: '#/components/schemas/DiagnosticsRuntimeDescriptor' }
+    DiagnosticsRuntimeDescriptor:
+      type: object
+      additionalProperties: false
+      required: [api_url, tool_gateway_endpoint, daemon_pid]
+      properties:
+        api_url: { type: [string, 'null'] }
+        tool_gateway_endpoint: { type: [string, 'null'] }
+        daemon_pid: { type: [integer, 'null'], minimum: 1 }
+    DiagnosticsCodex:
+      type: object
+      additionalProperties: false
+      required: [available, version, support]
+      properties:
+        available: { type: boolean }
+        version: { type: [string, 'null'] }
+        support: { $ref: '#/components/schemas/DiagnosticsCodexSupport' }
+    DiagnosticsCodexSupport:
+      type: object
+      additionalProperties: false
+      required: [cli, model, sandbox]
+      properties:
+        cli: { $ref: '#/components/schemas/DiagnosticsSupportStatus' }
+        model: { $ref: '#/components/schemas/DiagnosticsSupportStatus' }
+        sandbox: { $ref: '#/components/schemas/DiagnosticsSupportStatus' }
+    DiagnosticsSupportStatus:
+      enum: [supported, unsupported, unknown]
+    DiagnosticsGit:
+      type: object
+      additionalProperties: false
+      required: [repository, worktree]
+      properties:
+        repository: { $ref: '#/components/schemas/DiagnosticsGitRepository' }
+        worktree: { $ref: '#/components/schemas/DiagnosticsGitWorktree' }
+    DiagnosticsGitRepository:
+      type: object
+      additionalProperties: false
+      required: [is_repo, root, branch, head_sha, status]
+      properties:
+        is_repo: { type: boolean }
+        root: { type: [string, 'null'] }
+        branch: { type: [string, 'null'] }
+        head_sha: { type: [string, 'null'] }
+        status: { $ref: '#/components/schemas/DiagnosticsGitStatus' }
+    DiagnosticsGitWorktree:
+      type: object
+      additionalProperties: false
+      required: [path, branch, base_ref, status]
+      properties:
+        path: { type: [string, 'null'] }
+        branch: { type: [string, 'null'] }
+        base_ref: { type: [string, 'null'] }
+        status: { $ref: '#/components/schemas/DiagnosticsGitStatus' }
+    DiagnosticsGitStatus:
+      enum: [clean, dirty, unavailable, unknown]
+    DiagnosticsRedaction:
+      type: object
+      additionalProperties: false
+      required: [enabled, export_redacted_only, rules_version]
+      properties:
+        enabled: { const: true }
+        export_redacted_only: { const: true }
+        rules_version: { type: [string, 'null'] }
+    DiagnosticsInconsistentIssue:
+      type: object
+      additionalProperties: false
+      required: [issue_ref, problem, remediation]
+      properties:
+        issue_ref: { type: string, minLength: 1 }
+        problem: { type: string, minLength: 1 }
+        remediation: { type: string, minLength: 1 }
+    DiagnosticsRemediation:
+      type: object
+      additionalProperties: false
+      required: [action, description]
+      properties:
+        action: { type: string, minLength: 1 }
+        description: { type: string, minLength: 1 }
+        applies_to: { type: [string, 'null'] }
+    DiagnosticsFailureSummary:
+      type: object
+      additionalProperties: false
+      required: [failed_runs_count, recent_failures]
+      properties:
+        failed_runs_count: { type: integer, minimum: 0 }
+        recent_failures: { type: array, items: { $ref: '#/components/schemas/DiagnosticsFailureBucket' } }
+    DiagnosticsFailureBucket:
+      type: object
+      additionalProperties: false
+      required: [failure_code, count]
+      properties:
+        failure_code: { type: string, minLength: 1 }
+        count: { type: integer, minimum: 0 }
+    DiagnosticsPauseSummary:
+      type: object
+      additionalProperties: false
+      required: [paused_dispatch_count, paused_issue_refs]
+      properties:
+        paused_dispatch_count: { type: integer, minimum: 0 }
+        paused_issue_refs: { type: array, items: { type: string } }
+    DiagnosticsCheck:
+      type: object
+      additionalProperties: false
+      required: [name, status]
+      properties:
+        name: { type: string, minLength: 1 }
+        status: { enum: [ok, warning, error] }
+        message: { type: string }
+        remediation: { type: string }
     DiagnosticsEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Diagnostics' } } } ]
     DiagnosticsExport:
       type: object
+      additionalProperties: false
       required: [artifact_id]
       properties:
         artifact_id: { type: string, pattern: "^art_" }

@@ -172,7 +172,7 @@ symphony
 
 `symphony serve` starts the daemon, REST/SSE server, dashboard static asset server, Tool Gateway transport, orchestrator actor, and project runtime lock.
 
-Each run launches one Codex app-server process group, with cwd set to the issue workspace. Operator cancellation, approval `cancel_run`, reconciliation, shutdown, timeout, or context cancellation MUST terminate the process group gracefully first, then kill if needed.
+Each run launches one Codex app-server process group, with cwd set to the issue workspace. Operator run cancellation, approval `cancel_run`, reconciliation, shutdown, timeout, or context cancellation MUST terminate the process group gracefully first, then kill if needed.
 
 ### 4.3 Runtime descriptor
 
@@ -506,6 +506,7 @@ agent.max_turns_per_run MUST equal 1 + agent.max_handoff_continuations when expl
 tools.allow_dynamic_tools MUST be false
 tools.allow_mcp MUST be false
 tools.agent_can_set_terminal_state MUST be false
+git.branch_prefix MUST equal symphony
 git.auto_push MUST be false
 git.auto_rebase MUST be false
 security.allow_remote_api MUST be false in v1
@@ -1378,7 +1379,7 @@ Upstream-to-local outcome mapping:
 | Timed out | `failed` | `turn_timeout` |
 | Stalled | `failed` | `stall_timeout` |
 | Canceled by reconciliation | `cancelled` | `issue_state_changed` or `canceled_by_reconciliation` |
-| Operator cancel | `cancelled` | `operator_cancelled` |
+| Operator run cancel | `cancelled` | `operator_cancelled` |
 | Approval `cancel_run` | `cancelled` | `operator_cancelled` |
 | Agent blocked current issue | `cancelled` | `agent_blocked` |
 
@@ -1515,7 +1516,7 @@ Specific codes:
 
 | Trigger | Local status | failure_code |
 |---|---|---|
-| Operator cancel | `cancelled` | `operator_cancelled` |
+| Operator run cancel | `cancelled` | `operator_cancelled` |
 | Approval `cancel_run` | `cancelled` | `operator_cancelled` |
 | Agent `issue.block` | `cancelled` | `agent_blocked` |
 | Operator moves issue to a non-terminal inactive state | `cancelled` | `issue_state_changed` |
@@ -1526,7 +1527,7 @@ Startup may also find `issues.state=Working` with no active `run_attempt`. This 
 
 ### 8.9 Cancellation behavior
 
-Operator cancellation applies to:
+Operator run cancellation applies to:
 
 ```text
 POST /api/v1/runs/{run_id}/cancel
@@ -1688,7 +1689,7 @@ In this section, active-run-valid states are `Ready`/`Working`/`Rework`.
 
 | Priority | Outcome | Final status/code |
 |---:|---|---|
-| 1 | Operator cancel or approval `cancel_run` before finalizer commit | `cancelled/operator_cancelled` |
+| 1 | Operator run cancel or approval `cancel_run` before finalizer commit | `cancelled/operator_cancelled` |
 | 2 | Ordinary operator transition leaves active-run-valid states before finalizer commit | `cancelled/issue_state_changed` |
 | 2 | Agent `issue.block` leaves active-run-valid states before finalizer commit | `cancelled/agent_blocked` |
 | 2 | Reconciliation finds active run for terminal issue before finalizer commit | `cancelled/canceled_by_reconciliation` |
@@ -1702,7 +1703,7 @@ Priority 2 reconciliation outcomes are evaluated only after priority 1, so opera
 
 Manual `dispatch-pause` / `dispatch-resume` requests are not part of active run outcome precedence; they are rejected with `issue_already_running` while an active run exists.
 
-Once finalizer transaction commits `issue.state=Human Review` and `run.status=completed`, later operator cancellation must be rejected as not active.
+Once finalizer transaction commits `issue.state=Human Review` and `run.status=completed`, later operator run cancellation must be rejected as not active.
 
 ### 8.15 Startup stale-run guard
 
@@ -1744,12 +1745,12 @@ if no recoverable source run exists:
   issues.dispatch_pause_reason = daemon_restarted_run_interrupted
   issues.dispatch_paused_at = now
   emit system.inconsistent_issue or equivalent diagnostic event
-  expose diagnostics remediation: operator must explicitly transition or reopen the issue
+  expose diagnostics remediation: operator must use a legal indirect state path, such as Working -> Blocked -> Ready after resolving blockers, or Working -> Cancelled/Duplicate followed by explicit reopen to Inbox/Ready under reopen rules
 ```
 
 Startup recovery `issue_state_history` rows MUST reflect the actual state restoration from/to values. Their reason/source MAY use `daemon_restarted_run_interrupted` or equivalent startup reconciliation semantics.
 
-This second scan MUST NOT mutate any terminal `run_attempt` status/failure fields, because no active run row exists to interrupt. It only repairs or pauses the inconsistent issue record and emits diagnostics. `dispatch-resume` still MUST NOT change `issue.state`, so a non-recoverable `Working` issue remains blocked from dispatch until an operator performs an explicit valid state transition/reopen.
+This second scan MUST NOT mutate any terminal `run_attempt` status/failure fields, because no active run row exists to interrupt. It only repairs or pauses the inconsistent issue record and emits diagnostics. `dispatch-resume` still MUST NOT change `issue.state`, so a non-recoverable `Working` issue remains blocked from dispatch until an operator performs an explicit valid state transition path. Direct `Working -> Ready`, `Working -> Rework`, `Working -> Human Review`, `Working -> Done`, or direct reopen from `Working` is forbidden.
 
 v1 does not implement crash recovery.
 
@@ -2001,12 +2002,16 @@ docs/codex/FIXTURE_POLICY.md
 Startup behavior:
 
 ```text
-1. detect installed `codex app-server` version and generated protocol/schema version
-2. look up committed fixture for that version
-3. if no fixture exists, fail before launching the real Codex process with unsupported_codex_version
-4. emit codex.version_checked event
-5. only then launch the real adapter
+1. detect installed Codex version without launching the long-lived `codex app-server` process
+2. resolve committed fixture metadata/static compatibility metadata for that installed Codex version
+3. read expected generated protocol/schema version from that committed metadata
+4. look up committed fixture for the installed Codex version and expected generated protocol/schema version
+5. if no compatible fixture/metadata exists, fail before launching the real Codex process with unsupported_codex_version
+6. emit codex.version_checked event
+7. only then launch the real adapter
 ```
+
+The prelaunch fixture gate is based only on the installed Codex version and committed fixture metadata/static compatibility metadata. It MUST NOT depend on starting the real `codex app-server` process to discover the generated protocol/schema version. If the post-launch initialize handshake contradicts the committed compatibility metadata or returns an incompatible schema/protocol shape, the adapter MUST terminate the run through the normal failure path with `codex_protocol_error`.
 
 Default CI MUST use `internal/agent/fake`. Real Codex tests MUST be opt-in through `SYMPHONY_TEST_CODEX=1`.
 
@@ -2035,7 +2040,7 @@ Codex protocol internals MUST remain inside `internal/agent/codex`.
 7. write approval decision back to Codex
 8. detect turn completed/failed/stalled/timed out
 9. if completed without handoff and configured handoff continuation remains available, send one handoff continuation in same thread/session
-10. cancel/interrupt on operator cancel, approval cancel_run, reconciliation, shutdown, timeout, context cancellation
+10. cancel/interrupt on operator run cancel, approval cancel_run, reconciliation, shutdown, timeout, context cancellation
 11. terminate process group if graceful shutdown fails
 ```
 
@@ -2205,7 +2210,7 @@ Exit codes:
 | 8 | timeout |
 | 9 | workflow/config error |
 
-API errors with `error.code = approval_not_pending` MUST map to CLI exit code 7.
+API errors with `error.code = approval_not_pending` MUST map to CLI exit code 7. Tool Gateway errors with `error.code = handoff_conflict` MUST also map to CLI exit code 7.
 
 `symphony tool` always outputs JSON only. Diagnostics go to stderr.
 
@@ -2280,6 +2285,8 @@ symphony review mark-done LOC-1 --reason "..."
 symphony review path LOC-1
 ```
 
+`symphony review path` is a diagnostics command. It MUST call the Review API and print only review packet metadata/path diagnostics such as packet id, packet_no, run_id, artifact kind, artifact_id, stored path, redacted flag, content_url presence/null, and missing/omitted-file diagnostics. It MUST NOT read packet files from the filesystem, MUST NOT print raw packet or artifact bytes, and MUST NOT bypass Review API plus Artifact API redaction/refusal. Disallowed raw prompt, raw prompt context values, raw secrets, and raw Codex logs remain metadata/refusal-only.
+
 `dispatch-pause`, `dispatch-resume`, `send-to-rework`, and `mark-done` require `--reason` to be present and non-empty after trimming. CLI validation failures exit with code 2 before sending the request; API validation failures return `invalid_request`.
 
 Workflow and diagnostics:
@@ -2291,6 +2298,8 @@ symphony workflow show
 symphony diagnostics
 symphony diagnostics export
 ```
+
+`symphony workflow validate` calls `POST /api/v1/workflow/validate` with an empty body or `{"dry_run": true}`. It validates the current filesystem `WORKFLOW.md` only, prints the envelope-unwrapped validation result, and MUST NOT replace the effective config, update last-valid workflow state, render prompts, dispatch runs, or write review artifacts. Candidate workflow validation/rendering belongs to `POST /api/v1/workflow/render-preview`, not this CLI command.
 
 Do not implement publish/PR/backup/migrate/audit/workspace-delete/secret CLI commands in v1.
 
@@ -2525,7 +2534,26 @@ Idempotency:
 |---|---|---|
 | none | any valid hash | insert handoff |
 | exists | same hash | return existing handoff as idempotent success |
-| exists | different hash | reject state conflict |
+| exists | different hash | reject with Tool Gateway error `handoff_conflict` |
+
+Conflict response:
+
+```json
+{
+  "error": {
+    "code": "handoff_conflict",
+    "message": "handoff already exists for this run with a different payload hash",
+    "details": {
+      "run_id": "run_...",
+      "handoff_id": "hand_...",
+      "existing_payload_hash": "lowercase_sha256_hex",
+      "incoming_payload_hash": "lowercase_sha256_hex"
+    }
+  }
+}
+```
+
+On `handoff_conflict`, the daemon MUST record the Tool Gateway call as failed, MUST NOT insert or replace the existing handoff, MUST NOT emit a new `handoff.submitted` event, MUST NOT generate a review packet from the conflicting payload, and MUST NOT transition the issue to `Human Review`. The agent-facing CLI command `symphony tool handoff submit` MUST print the JSON error and exit with code 7. If this conflict occurs while the run is still active, the run terminal failure path MUST use `run.failure_code = tool_gateway_failed` unless a higher-precedence cancellation/failure has already won.
 
 ## 12. REST API and SSE contract
 
@@ -2782,6 +2810,8 @@ content_url
 
 The Review Packet page obtains artifact ids from this API, then fetches file contents through the Artifact API as needed. File-level `review.json` is the Review Packet schema source of truth for summary, tests, risks, verification, changed files, tool calls, and approvals, but it is not the REST `ReviewPacketSummary` schema. `review.md`, `changes.patch`, and other packet files are fetched by `artifact_id` for rendered review and detail panes. Review API MUST NOT expose raw prompt/log bytes inline or provide a `content_url` that bypasses Artifact API redaction and refusal rules.
 
+The CLI `symphony review path` command uses this endpoint for metadata/path diagnostics only. Its output MUST NOT include packet file contents, raw artifact bytes, raw prompt content, raw prompt context values, raw secrets, or raw Codex logs.
+
 Review action request bodies:
 
 ```text
@@ -2804,7 +2834,7 @@ no active run
 request.reason is non-empty after trimming
 ```
 
-In review action guards, a mismatched latest review packet means the latest generated packet does not belong to the issue's latest completed handoff run.
+In review action guards, latest review packet MUST be selected by the issue's latest packet row (highest `packet_no`). That latest packet MUST have `status=generated`, and its `run_id` MUST belong to the latest completed handoff run. A mismatched latest review packet means the latest packet does not match the latest completed handoff run. Guards MUST NOT search for an earlier `generated` packet to bypass a newer `failed` or `partial` packet.
 
 Mark Done transaction:
 
@@ -2852,6 +2882,26 @@ POST /api/v1/diagnostics/export
 ```
 
 `dry_run=true` validates without replacing effective config. Invalid reload preserves last valid config. If no valid config exists, dispatch is blocked.
+
+Workflow validate contract:
+
+```text
+POST /api/v1/workflow/validate
+request body:
+  empty object, omitted body, or { dry_run: true }
+response data:
+  source: current_filesystem
+  workflow_path: path to the validated WORKFLOW.md
+  validation: { valid: boolean, warnings: [], errors: [] }
+  side_effects:
+    effective_config_replaced: false
+    last_valid_config_updated: false
+    prompt_rendered: false
+    run_dispatched: false
+    review_artifacts_written: false
+```
+
+`/workflow/validate` validates the current filesystem `WORKFLOW.md` at request time. It does not validate candidate input and MUST reject `candidate_workflow_md`, `candidate_config`, `render_context`, unknown fields, malformed JSON, or `dry_run=false` with `invalid_request`. Validation failures in the current file are successful HTTP responses with `validation.valid=false` and populated `errors`; they MUST NOT replace the effective config or last-valid config.
 
 Render preview contract:
 
@@ -3068,7 +3118,7 @@ Revoke on:
 
 ```text
 run terminal outcome
-operator cancel
+operator run cancel
 approval cancel_run
 reconciliation cancel
 daemon shutdown
@@ -3331,7 +3381,7 @@ changed-files.txt
 untracked-files.json
 ```
 
-Only these critical files determine whether `review_packets.status` may be `generated`. A `generated` row MUST NOT point to missing critical files. Non-critical files MAY be absent without preventing `generated`, but each omission MUST be recorded in review metadata or diagnostics with `path`, `reason`, and `generation_phase`. Silent omission is forbidden.
+For the file-existence gate, only these critical files block `review_packets.status=generated`. A `generated` row MUST NOT point to missing critical files. Non-critical files MAY be absent without preventing `generated`, but each omission MUST be recorded in review metadata or diagnostics with `path`, `reason`, and `generation_phase`. Silent omission is forbidden. Critical file presence is necessary but not sufficient: the packet MUST also pass the Review Packet schema, artifact registration, security, redaction, generation, and finalizer gates before it may be marked `generated`.
 
 Prompt snapshot files are redacted review artifacts, not raw prompt archives. `prompt/context.json`, `prompt/rendered_prompt.redacted.md`, `prompt/prompt_meta.json`, and `prompt/tool_manifest.md` MUST follow 13.7 and 12.9: safe metadata/redacted content only; raw prompt, raw context values, raw secrets, and raw Codex logs are disallowed content.
 
@@ -3507,7 +3557,7 @@ no active run
 operator supplies non-empty reason
 ```
 
-`reason` MUST be non-empty after trimming. UI may present Mark Done `reason` as comment. The transaction may persist it as an operator comment/event payload, but API and CLI input remains `reason`. A mismatched latest review packet means the latest generated packet does not belong to the issue's latest completed handoff run.
+`reason` MUST be non-empty after trimming. UI may present Mark Done `reason` as comment. The transaction may persist it as an operator comment/event payload, but API and CLI input remains `reason`. The latest review packet MUST be selected by the issue's latest packet row (highest `packet_no`). That latest packet MUST have `status=generated`, and its `run_id` MUST belong to the latest completed handoff run. A mismatched latest review packet means the latest packet does not match the latest completed handoff run. Mark Done MUST NOT search for an earlier `generated` packet to bypass a newer `failed` or `partial` packet.
 
 Partial/failed review packets can be viewed but cannot Mark Done.
 
@@ -3546,7 +3596,7 @@ no active run
 operator supplies non-empty reason
 ```
 
-UI labels MAY call Send to Rework `reason` feedback, but API and CLI fields are `reason`, and the value MUST be non-empty after trimming.
+UI labels MAY call Send to Rework `reason` feedback, but API and CLI fields are `reason`, and the value MUST be non-empty after trimming. The latest review packet MUST be selected by the issue's latest packet row (highest `packet_no`). That latest packet MUST have `status=generated`, and its `run_id` MUST belong to the latest completed handoff run. A mismatched latest review packet means the latest packet does not match the latest completed handoff run. Send to Rework MUST NOT search for an earlier `generated` packet to bypass a newer `failed` or `partial` packet.
 
 Send-to-rework error semantics match Mark Done for shared guards: invalid state returns `invalid_state_transition`; missing/blank reason returns `invalid_request`; missing, non-generated, or mismatched latest review packet returns `review_packet_required`; active run returns `issue_already_running`. All failures are no mutation.
 
@@ -3572,6 +3622,21 @@ same base_sha retained
 before_run hook runs
 prompt includes latest review reason and previous review packet summary
 ```
+
+The `previous review packet summary` included in a Rework prompt MUST be the minimal safe summary below:
+
+```text
+packet_no
+run_id
+handoff.summary
+changed_files
+tests
+risks
+verification
+followups
+```
+
+These fields MUST come only from redacted/safe review metadata and accepted handoff metadata. The prompt MUST NOT include raw packet file contents, raw prompt content, raw prompt context values, raw secrets, or raw Codex logs.
 
 Review packets are immutable. Rework creates a new packet. All review packets are cumulative from workspace `base_sha` to current workspace tree, not incremental from previous packet.
 
@@ -3694,7 +3759,7 @@ Approval Inbox shows command/file/network approvals, action summary, risk level,
 
 Review Packet page shows summary, acceptance criteria, handoff, changed files, diff, tests, risks, verification, approvals, tool calls, git, How to Continue, Send to Rework, and Mark Done. It MUST treat `review.json` as the structured source of truth, load the latest packet through `GET /api/v1/reviews/{issue_ref}`, use returned `artifact_id`/`content_url` entries to fetch contents through the Artifact API, and MUST NOT read packet files directly from the filesystem.
 
-Workflow page shows current validation, last valid config, warnings/errors, reload, and render preview. Render preview MUST call `POST /api/v1/workflow/render-preview` and display only the redacted preview and validation warnings/errors returned by that API.
+Workflow page shows current validation, last valid config, warnings/errors, reload, and render preview. The validate action MUST call `POST /api/v1/workflow/validate` with an empty body or `{"dry_run": true}` and display the returned current-filesystem validation result without implying that effective config changed. Render preview MUST call `POST /api/v1/workflow/render-preview` and display only the redacted preview and validation warnings/errors returned by that API.
 
 Diagnostics page shows daemon, project paths, Codex, Git, DB, workflow, and redacted export.
 
@@ -3748,7 +3813,7 @@ Diagnostics export is redacted-only. `include_raw_logs=true` MUST return `raw_lo
 |---|---|---|
 | Tracker | `tracker.kind: local`; no Linear API surface. | Issue CRUD and dispatch without Linear config. |
 | Reconciliation | Active run leaving `Ready/Working/Rework` is cancelled, dispatch is paused with the reconciliation `failure_code`, and workspace is retained. | Transition active Working issue to inactive state; then `Blocked -> Ready` remains idle until operator `dispatch-resume`. |
-| Operator cancel | `cancelled/operator_cancelled`, tool tokens revoked, dispatch paused. | Next tick does not redispatch until resume. |
+| Operator run cancel | `cancelled/operator_cancelled`, tool tokens revoked, dispatch paused. | Next tick does not redispatch until resume. |
 | Retry | No automatic retry timers/queue. | Failure pauses and stays idle after waiting. |
 | Continuation | Default is one main turn plus one handoff continuation; config may set zero continuations. | Default: first missing handoff continues, missing after continuation pauses. With `max_handoff_continuations=0`, first missing handoff pauses. |
 | Hooks | `after_create`, then `before_run` on first run; `before_run` on every run; `after_run` finally. | Hook order tests. |
@@ -3845,6 +3910,7 @@ redaction
 split ApiErrorCode vs FailureCode mapping
 agent turn-count/handoff constraints
 handoff canonical payload hashing
+handoff payload hash conflict returns Tool Gateway `handoff_conflict`, CLI exit 7, and does not advance Human Review
 run outcome precedence and finalizer/cancel race handling
 ```
 
@@ -3879,6 +3945,7 @@ missing handoff → continuation → handoff
 missing handoff after allowed continuation → dispatch_paused
 max_handoff_continuations=0 missing handoff → dispatch_paused
 invalid tool token
+handoff payload hash conflict → Tool Gateway `handoff_conflict`, CLI exit 7, no Human Review
 approval pending → approve → continue
 approval pending → deny current action without operator_cancelled side effects
 command denied
@@ -3919,6 +3986,7 @@ Last-Event-ID / after_seq replay works
 artifact content enforces containment and rejects raw prompt/raw Codex log
 Review API returns `content_url=null` for raw prompt/raw Codex log/raw secret artifacts and does not inline disallowed bytes
 workflow render preview is schema-covered, dry-run only, and redacts secrets in success and validation-error responses
+workflow validate is schema-covered, validates current filesystem WORKFLOW.md only, returns dry-run side effects, and rejects candidate fields
 ```
 
 ### 18.7 Contract artifact validation
@@ -4012,7 +4080,7 @@ Acceptance:
 ```text
 single actor owns dispatch/outcomes
 failure pauses dispatch
-operator cancel and approval cancel_run do not redispatch
+operator run cancel and approval cancel_run do not redispatch
 startup stale active runs fail with daemon_restarted_run_interrupted
 ```
 
