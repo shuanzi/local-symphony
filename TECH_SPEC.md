@@ -1114,6 +1114,11 @@ if operator transition target is Blocked, Cancelled, or Duplicate: insert issue 
 insert issue.transitioned event with from_state, to_state, operator reason when present, duplicate_of when present, and side_effects
 ```
 
+Same-state `Duplicate` exceptions refine the generic transition writes above:
+
+- when `duplicate_of` resolves to the same active duplicate relation, success no-op performs no issue state/history/comment/event/relation writes
+- when there is no active duplicate relation and `duplicate_of` resolves to a valid canonical issue, create the duplicate relation, append the operator reason comment, insert `issue.transitioned` with `from_state=Duplicate` and `to_state=Duplicate`, and leave `issue.state` unchanged
+
 Agent `issue.block` keeps the existing `agent_blocked` semantics and does not create the operator transition comment/event payload described above.
 
 Dispatch claim transaction:
