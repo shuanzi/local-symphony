@@ -2573,6 +2573,8 @@ agent cannot create blocks or duplicates relations
 }
 ```
 
+`summary` must be non-empty after trimming.
+
 `target_state` is optional; if omitted, the accepted, persisted, and canonical target_state defaults to `Human Review`; if present it MUST equal `Human Review`. Successful response indicates receipt only:
 
 ```json
@@ -2790,6 +2792,7 @@ effect: create Inbox issue only
 
 PATCH /api/v1/issues/{issue_ref}
 request body may include title, description, acceptance_criteria, priority, labels
+title, when present, must be trim non-empty
 PATCH cannot change state, dispatch pause, workspace, git, run, review, or relation fields
 labels are trim-non-empty strings normalized to lowercase and sorted in responses; duplicate labels for one issue are de-duplicated
 

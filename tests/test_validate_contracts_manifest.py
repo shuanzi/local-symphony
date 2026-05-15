@@ -224,6 +224,103 @@ class ManifestContractTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             validator.validate_tool_gateway_manifest(manifest)
 
+    def test_tool_gateway_non_blank_input_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        def mutate_json(temp_root: Path, rel: str, mutate: Any) -> None:
+            path = temp_root / rel
+            data = json.loads(path.read_text(encoding="utf-8"))
+            mutate(data)
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+        cases = (
+            (
+                "embedded issue.comment body may be blank",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tool_gateway.schema.json",
+                    lambda schema: schema["$defs"]["issueCommentInput"]["properties"]["body"].pop("pattern", None),
+                ),
+            ),
+            (
+                "standalone issue.comment body may be empty",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tools/issue_comment.input.schema.json",
+                    lambda schema: schema["properties"]["body"].pop("minLength", None),
+                ),
+            ),
+            (
+                "embedded followup title may be blank",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tool_gateway.schema.json",
+                    lambda schema: schema["$defs"]["followupCreateInput"]["properties"]["title"].pop(
+                        "pattern", None
+                    ),
+                ),
+            ),
+            (
+                "standalone followup title may be empty",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tools/followup_create.input.schema.json",
+                    lambda schema: schema["properties"]["title"].pop("minLength", None),
+                ),
+            ),
+            (
+                "embedded followup label may be blank",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tool_gateway.schema.json",
+                    lambda schema: schema["$defs"]["followupCreateInput"]["properties"]["labels"]["items"].pop(
+                        "pattern", None
+                    ),
+                ),
+            ),
+            (
+                "standalone followup label may be empty",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tools/followup_create.input.schema.json",
+                    lambda schema: schema["properties"]["labels"]["items"].pop("minLength", None),
+                ),
+            ),
+            (
+                "embedded handoff summary may be blank",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tool_gateway.schema.json",
+                    lambda schema: schema["$defs"]["handoffSubmitInput"]["properties"]["summary"].pop(
+                        "pattern", None
+                    ),
+                ),
+            ),
+            (
+                "standalone handoff summary may be empty",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tools/handoff_submit.input.schema.json",
+                    lambda schema: schema["properties"]["summary"].pop("minLength", None),
+                ),
+            ),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    mutate(temp_root)
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_tool_gateway_manifest(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
     def test_review_packet_handoff_requires_followups_and_human_review_target(self) -> None:
         validator = load_validator()
 
@@ -446,6 +543,116 @@ class ManifestContractTests(unittest.TestCase):
                     validator.validate_openapi(manifest)
             finally:
                 validator.ROOT = old_root
+
+    def test_openapi_issue_mutation_bad_request_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        operations = (
+            ("/issues", "post"),
+            ("/issues/{issue_ref}", "patch"),
+            ("/issues/{issue_ref}/transition", "post"),
+            ("/issues/{issue_ref}/comments", "post"),
+            ("/issues/{issue_ref}/blockers", "post"),
+            ("/issues/{issue_ref}/dispatch-pause", "post"),
+            ("/issues/{issue_ref}/dispatch-resume", "post"),
+        )
+        for route, method in operations:
+            with self.subTest(route=route, method=method):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    openapi["paths"][route][method]["responses"].pop("400", None)
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_issue_text_request_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        def comment_body_schema(openapi: dict) -> dict:
+            return openapi["paths"]["/issues/{issue_ref}/comments"]["post"]["requestBody"]["content"][
+                "application/json"
+            ]["schema"]["properties"]["body"]
+
+        cases = (
+            (
+                "create title may be blank",
+                lambda openapi: openapi["components"]["schemas"]["IssueCreateRequest"]["properties"]["title"].pop(
+                    "pattern", None
+                ),
+            ),
+            (
+                "create title may be empty",
+                lambda openapi: openapi["components"]["schemas"]["IssueCreateRequest"]["properties"]["title"].pop(
+                    "minLength", None
+                ),
+            ),
+            (
+                "patch title may be blank",
+                lambda openapi: openapi["components"]["schemas"]["IssuePatchRequest"]["properties"]["title"].pop(
+                    "pattern", None
+                ),
+            ),
+            (
+                "patch title may be empty",
+                lambda openapi: openapi["components"]["schemas"]["IssuePatchRequest"]["properties"]["title"].pop(
+                    "minLength", None
+                ),
+            ),
+            ("comment body may be blank", lambda openapi: comment_body_schema(openapi).pop("pattern", None)),
+            ("comment body may be empty", lambda openapi: comment_body_schema(openapi).pop("minLength", None)),
+            (
+                "create label may be empty",
+                lambda openapi: openapi["components"]["schemas"]["IssueCreateRequest"]["properties"]["labels"][
+                    "items"
+                ].pop("minLength", None),
+            ),
+            (
+                "create label may be blank",
+                lambda openapi: openapi["components"]["schemas"]["IssueCreateRequest"]["properties"]["labels"][
+                    "items"
+                ].pop("pattern", None),
+            ),
+            (
+                "patch label may be blank",
+                lambda openapi: openapi["components"]["schemas"]["IssuePatchRequest"]["properties"]["labels"][
+                    "items"
+                ].pop("pattern", None),
+            ),
+            (
+                "patch label may be empty",
+                lambda openapi: openapi["components"]["schemas"]["IssuePatchRequest"]["properties"]["labels"][
+                    "items"
+                ].pop("minLength", None),
+            ),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    mutate(openapi)
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
 
     def test_openapi_issue_list_envelope_contract_fails_when_drifted(self) -> None:
         validator = load_validator()
