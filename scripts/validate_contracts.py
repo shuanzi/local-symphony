@@ -1073,10 +1073,9 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
             fail(f"handler route inventory entry missing from OpenAPI paths: {handler_route}")
 
     for route in ("/issues/{issue_ref}/dispatch-pause", "/issues/{issue_ref}/dispatch-resume"):
+        operation = paths.get(route, {}).get("post", {})
         reason_schema = (
-            paths.get(route, {})
-            .get("post", {})
-            .get("requestBody", {})
+            operation.get("requestBody", {})
             .get("content", {})
             .get("application/json", {})
             .get("schema", {})
@@ -1084,6 +1083,15 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
             .get("reason", {})
         )
         assert_non_blank_string_schema(reason_schema, f"OpenAPI {route} request reason")
+        conflict_response = operation.get("responses", {}).get("409", {})
+        if not isinstance(conflict_response, dict) or ref_name(conflict_response.get("$ref", "")) != "Error":
+            fail(f"OpenAPI POST {route} must document 409 Error")
+        conflict_description = str(conflict_response.get("description", "")).lower()
+        for error_code in ("invalid_state_transition", "issue_already_running"):
+            if error_code not in conflict_description:
+                fail(f"OpenAPI POST {route} 409 response must document {error_code}")
+        if "archived" in conflict_description:
+            fail(f"OpenAPI POST {route} 409 response must not reject archived issues")
 
     render_preview_post = paths.get("/workflow/render-preview", {}).get("post")
     if not isinstance(render_preview_post, dict):

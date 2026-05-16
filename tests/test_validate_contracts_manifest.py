@@ -1025,6 +1025,44 @@ class ManifestContractTests(unittest.TestCase):
                     finally:
                         validator.ROOT = old_root
 
+    def test_dispatch_pause_resume_rejection_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            (
+                "mentions archived",
+                "invalid_state_transition when issue is terminal/archived; "
+                "issue_already_running when an active run exists.",
+            ),
+            (
+                "missing invalid state transition",
+                "issue_already_running when an active run exists.",
+            ),
+            (
+                "missing active run guard",
+                "invalid_state_transition when issue state is Done, Cancelled, or Duplicate.",
+            ),
+        )
+        for route in ("/issues/{issue_ref}/dispatch-pause", "/issues/{issue_ref}/dispatch-resume"):
+            for name, description in cases:
+                with self.subTest(route=route, name=name):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        temp_root = Path(temp_dir)
+                        copy_contract_root(temp_root)
+                        openapi_path = temp_root / "api/openapi.yaml"
+                        openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                        openapi["paths"][route]["post"]["responses"]["409"]["description"] = description
+                        openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                        old_root = validator.ROOT
+                        validator.ROOT = temp_root
+                        try:
+                            with self.assertRaises(SystemExit):
+                                validator.validate_openapi(manifest)
+                        finally:
+                            validator.ROOT = old_root
+
 
 if __name__ == "__main__":
     unittest.main()
