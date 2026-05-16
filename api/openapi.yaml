@@ -83,10 +83,16 @@ paths:
     get:
       operationId: listIssues
       parameters:
-        - { name: state, in: query, schema: { $ref: '#/components/schemas/IssueState' } }
+        - { name: state, in: query, description: Repeatable issue state filter; server also accepts comma-separated values., style: form, explode: true, schema: { type: array, items: { $ref: '#/components/schemas/IssueState' } } }
+        - { name: label, in: query, description: Repeatable label filter; server also accepts comma-separated values., style: form, explode: true, schema: { type: array, items: { type: string } } }
         - { name: q, in: query, schema: { type: string } }
+        - { name: dispatch_paused, in: query, schema: { type: boolean } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: sort, in: query, schema: { type: string, enum: [priority, updated, identifier], default: priority } }
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueListEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid query/filter/sort/cursor }
     post:
       operationId: createIssue
       parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
@@ -113,6 +119,7 @@ paths:
         content: { application/json: { schema: { $ref: '#/components/schemas/IssuePatchRequest' } } }
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid mutation request body }
   /issues/{issue_ref}/transition:
     post:
       operationId: transitionIssue
@@ -123,15 +130,17 @@ paths:
         content: { application/json: { schema: { $ref: '#/components/schemas/IssueTransitionRequest' } } }
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueTransitionEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid mutation request body }
         "409": { $ref: '#/components/responses/Error' }
   /issues/{issue_ref}/comments:
     post:
       operationId: createIssueComment
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
-      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [body], additionalProperties: false, properties: { body: { type: string, minLength: 1 } } } } } }
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [body], additionalProperties: false, properties: { body: { type: string, minLength: 1, pattern: "\\S" } } } } } }
       responses:
         "201": { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/IssueCommentEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid mutation request body }
   /issues/{issue_ref}/dispatch:
     post:
       operationId: dispatchIssue
@@ -147,7 +156,7 @@ paths:
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { description: Operator reason for audit comment/event; must be non-empty after trimming., required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1, pattern: "\\S" } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }, "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is terminal/archived; issue_already_running when an active run exists." } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }, "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue state is Done, Cancelled, or Duplicate; issue_already_running when an active run exists." } }
   /issues/{issue_ref}/dispatch-resume:
     post:
       operationId: resumeIssueDispatch
@@ -155,14 +164,14 @@ paths:
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { description: Operator reason for audit comment/event; must be non-empty after trimming., required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1, pattern: "\\S" } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }, "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue is terminal/archived; issue_already_running when an active run exists." } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }, "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue state is Done, Cancelled, or Duplicate; issue_already_running when an active run exists." } }
   /issues/{issue_ref}/blockers:
     post:
       operationId: addIssueBlocker
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [blocked_by], additionalProperties: false, properties: { blocked_by: { type: string } } } } } }
-      responses: { "201": { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/IssueRelationEnvelope' } } } } }
+      responses: { "201": { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/IssueRelationEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid mutation request body } }
   /issues/{issue_ref}/blockers/{blocker_issue_ref}:
     delete:
       operationId: removeIssueBlocker
@@ -172,6 +181,18 @@ paths:
         - { $ref: '#/components/parameters/SymphonyCSRF' }
       x-csrf-required-for-cookie-auth: true
       responses: { "204": { description: Removed } }
+  /issues/{issue_ref}/duplicates/{canonical_issue_ref}:
+    delete:
+      operationId: removeIssueDuplicateRelation
+      parameters:
+        - { $ref: '#/components/parameters/IssueRef' }
+        - { name: canonical_issue_ref, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/SymphonyCSRF' }
+      x-csrf-required-for-cookie-auth: true
+      responses:
+        "200": { description: Removed, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: "invalid_request for malformed, self, cross-project, or invalid duplicate refs; no mutation is applied." }
+        "404": { $ref: '#/components/responses/Error', description: "not_found when issue_ref or canonical_issue_ref is unresolved; no mutation is applied." }
   /issues/{issue_ref}/events/stream:
     get:
       operationId: streamIssueEvents
@@ -461,7 +482,7 @@ components:
       enum: [Inbox, Ready, Working, Rework, Blocked, Human Review, Done, Cancelled, Duplicate]
     Issue:
       type: object
-      required: [id, identifier, sequence_no, title, description, acceptance_criteria, priority, state, url, labels, blocked_by, blocks, dispatch_paused, dispatch_pause_reason, dispatch_paused_at, branch_name, workspace_path, base_ref, base_ref_config, base_sha, workspace, git, latest_run, active_run_id, latest_run_id, latest_review_packet, latest_review_packet_id, created_at, updated_at, completed_at, archived_at]
+      required: [id, identifier, sequence_no, title, description, acceptance_criteria, priority, state, url, labels, blocked_by, blocks, duplicate_of, duplicates, followup_of, followups, dispatch_paused, dispatch_pause_reason, dispatch_paused_at, branch_name, workspace_path, base_ref, base_ref_config, base_sha, workspace, git, latest_run, active_run_id, latest_run_id, latest_review_packet, latest_review_packet_id, created_at, updated_at, completed_at, archived_at]
       properties:
         id: { type: string, pattern: "^iss_" }
         identifier: { type: string }
@@ -475,6 +496,16 @@ components:
         labels: { type: array, items: { type: string } }
         blocked_by: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
         blocks: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
+        duplicate_of:
+          anyOf:
+            - { $ref: '#/components/schemas/IssueRefSummary' }
+            - { type: 'null' }
+        duplicates: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
+        followup_of:
+          anyOf:
+            - { $ref: '#/components/schemas/IssueRefSummary' }
+            - { type: 'null' }
+        followups: { type: array, items: { $ref: '#/components/schemas/IssueRefSummary' } }
         dispatch_paused: { type: boolean }
         dispatch_pause_reason: { type: [string, 'null'] }
         dispatch_paused_at: { type: [string, 'null'], format: date-time }
@@ -538,35 +569,63 @@ components:
         base_sha: { type: [string, 'null'] }
     IssueEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Issue' } } } ]
+    IssueListPage:
+      type: object
+      required: [items, page]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Issue' } }
+        page: { $ref: '#/components/schemas/IssueListPageMeta' }
+    IssueListPageMeta:
+      type: object
+      required: [limit, next_cursor, has_more]
+      properties:
+        limit: { type: integer }
+        next_cursor: { type: [string, 'null'] }
+        has_more: { type: boolean }
     IssueListEnvelope:
-      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Issue' } } } } ]
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/IssueListPage' } } } ]
     IssueCreateRequest:
       type: object
       required: [title]
       additionalProperties: false
       properties:
-        title: { type: string, minLength: 1 }
+        title: { type: string, minLength: 1, pattern: "\\S" }
         description: { type: string }
         acceptance_criteria: { type: array, items: { type: string } }
         priority: { type: integer, minimum: 1, maximum: 5, default: 3 }
-        labels: { type: array, items: { type: string } }
+        labels: { type: array, items: { type: string, minLength: 1, pattern: "\\S" } }
     IssuePatchRequest:
       type: object
       additionalProperties: false
       properties:
-        title: { type: string, minLength: 1 }
+        title: { type: string, minLength: 1, pattern: "\\S" }
         description: { type: string }
         acceptance_criteria: { type: array, items: { type: string } }
         priority: { type: integer, minimum: 1, maximum: 5 }
-        labels: { type: array, items: { type: string } }
+        labels: { type: array, items: { type: string, minLength: 1, pattern: "\\S" } }
     IssueTransitionRequest:
       type: object
       required: [state]
       additionalProperties: false
       properties:
         state: { $ref: '#/components/schemas/IssueState' }
-        reason: { type: string }
-        canonical_issue_ref: { type: string }
+        reason: { type: string, minLength: 1, pattern: "\\S" }
+        duplicate_of: { type: string, minLength: 1, pattern: "\\S" }
+      allOf:
+        - if:
+            required: [state]
+            properties:
+              state: { enum: [Blocked, Cancelled, Duplicate] }
+          then:
+            required: [reason]
+        - if:
+            required: [state]
+            properties:
+              state:
+                not: { const: Duplicate }
+          then:
+            not:
+              required: [duplicate_of]
     IssueTransitionResult:
       type: object
       required: [issue]

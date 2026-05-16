@@ -34,6 +34,7 @@ REQUIRED_OPENAPI_ROUTES = frozenset(
         "/issues/{issue_ref}/comments",
         "/issues/{issue_ref}/blockers",
         "/issues/{issue_ref}/blockers/{blocker_issue_ref}",
+        "/issues/{issue_ref}/duplicates/{canonical_issue_ref}",
         "/issues/{issue_ref}/dispatch",
         "/issues/{issue_ref}/dispatch-pause",
         "/issues/{issue_ref}/dispatch-resume",
@@ -56,6 +57,14 @@ REQUIRED_OPENAPI_ROUTES = frozenset(
         "/workflow/reload",
         "/diagnostics",
         "/diagnostics/export",
+    }
+)
+
+REQUIRED_CLI_COMMANDS = frozenset(
+    {
+        "symphony issue duplicate remove",
+        "symphony issue dispatch-pause",
+        "symphony issue dispatch-resume",
     }
 )
 
@@ -337,6 +346,16 @@ def assert_enum(schema: dict[str, Any], label: str, expected: tuple[str, ...]) -
         fail(f"{label}.enum must be {list(expected)}")
 
 
+def assert_non_blank_string_schema(schema: Any, label: str) -> None:
+    if (
+        not isinstance(schema, dict)
+        or schema.get("type") != "string"
+        or schema.get("minLength") != 1
+        or schema.get("pattern") != r"\S"
+    ):
+        fail(f"{label} must require a non-blank string")
+
+
 def assert_additional_properties_false(schema: dict[str, Any], label: str) -> None:
     if schema.get("additionalProperties") is not False:
         fail(f"{label}.additionalProperties must be false")
@@ -436,6 +455,10 @@ def validate_contract_manifest(manifest: dict[str, Any]) -> None:
         fail(f"{CONTRACT_MANIFEST_REL} missing security regression topics: {sorted(missing_security_topics)}")
 
     cli_section_text = "\n".join(manifest_strings(manifest.get("cli", {})))
+    cli_required_commands = set(require_list(manifest, ("cli", "required_commands")))
+    missing_required_cli_commands = REQUIRED_CLI_COMMANDS - cli_required_commands
+    if missing_required_cli_commands:
+        fail(f"{CONTRACT_MANIFEST_REL} missing required CLI commands: {sorted(missing_required_cli_commands)}")
     for token in require_list(manifest, ("cli", "required_help_tokens")):
         if str(token) not in cli_section_text:
             fail(f"{CONTRACT_MANIFEST_REL} CLI help token is not covered by the CLI manifest: {token}")
@@ -923,6 +946,90 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
     if "/approvals/{approval_id}/decision" in paths:
         fail("OpenAPI must use /approvals/{approval_id}/decide, not /decision")
 
+    issue_list_get = paths.get("/issues", {}).get("get", {})
+    if not isinstance(issue_list_get, dict):
+        fail("OpenAPI /issues must define GET")
+    issue_list_query_params = {}
+    for param in issue_list_get.get("parameters", []):
+        if isinstance(param, dict) and param.get("in") == "query":
+            name = param.get("name")
+            if name in issue_list_query_params:
+                fail(f"OpenAPI GET /issues duplicate query parameter: {name}")
+            issue_list_query_params[name] = param
+    required_issue_list_params = ("state", "label", "q", "dispatch_paused", "limit", "cursor", "sort")
+    missing_issue_list_params = set(required_issue_list_params) - set(issue_list_query_params)
+    if missing_issue_list_params:
+        fail(f"OpenAPI GET /issues missing query parameters: {sorted(missing_issue_list_params)}")
+    for name in ("state", "label"):
+        param = issue_list_query_params[name]
+        schema = param.get("schema", {})
+        if param.get("style") != "form" or param.get("explode") is not True:
+            fail(f"OpenAPI GET /issues {name} parameter must use style=form and explode=true")
+        if schema.get("type") != "array":
+            fail(f"OpenAPI GET /issues {name} parameter must be an array")
+        items = schema.get("items", {})
+        if not isinstance(items, dict):
+            fail(f"OpenAPI GET /issues {name} parameter items must be an object")
+        if name == "state" and ref_name(items.get("$ref", "")) != "IssueState":
+            fail("OpenAPI GET /issues state parameter items must reference IssueState")
+        if name == "label" and items.get("type") != "string":
+            fail("OpenAPI GET /issues label parameter items must be strings")
+    if issue_list_query_params["q"].get("schema", {}).get("type") != "string":
+        fail("OpenAPI GET /issues q parameter must be a string")
+    if issue_list_query_params["dispatch_paused"].get("schema", {}).get("type") != "boolean":
+        fail("OpenAPI GET /issues dispatch_paused parameter must be a boolean")
+    limit_schema = issue_list_query_params["limit"].get("schema", {})
+    if (
+        limit_schema.get("type") != "integer"
+        or limit_schema.get("minimum") != 1
+        or limit_schema.get("maximum") != 200
+        or limit_schema.get("default") != 50
+    ):
+        fail("OpenAPI GET /issues limit parameter must be integer minimum=1 maximum=200 default=50")
+    if issue_list_query_params["cursor"].get("schema", {}).get("type") != "string":
+        fail("OpenAPI GET /issues cursor parameter must be a string")
+    sort_schema = issue_list_query_params["sort"].get("schema", {})
+    if sort_schema.get("enum") != ["priority", "updated", "identifier"] or sort_schema.get("default") != "priority":
+        fail("OpenAPI GET /issues sort parameter must use priority/updated/identifier enum with priority default")
+    issue_list_responses = issue_list_get.get("responses", {})
+    issue_list_bad_request = issue_list_responses.get("400")
+    if (
+        not isinstance(issue_list_bad_request, dict)
+        or ref_name(issue_list_bad_request.get("$ref", "")) != "Error"
+    ):
+        fail("OpenAPI GET /issues must document 400 Error for invalid query/filter/sort/cursor")
+    for route, method in (
+        ("/issues", "post"),
+        ("/issues/{issue_ref}", "patch"),
+        ("/issues/{issue_ref}/transition", "post"),
+        ("/issues/{issue_ref}/comments", "post"),
+        ("/issues/{issue_ref}/blockers", "post"),
+        ("/issues/{issue_ref}/dispatch-pause", "post"),
+        ("/issues/{issue_ref}/dispatch-resume", "post"),
+    ):
+        operation = paths.get(route, {}).get(method, {})
+        if not isinstance(operation, dict):
+            fail(f"OpenAPI {method.upper()} {route} must be defined")
+        bad_request = operation.get("responses", {}).get("400")
+        if not isinstance(bad_request, dict) or ref_name(bad_request.get("$ref", "")) != "Error":
+            fail(f"OpenAPI {method.upper()} {route} must document 400 Error for invalid mutation request body")
+
+    duplicate_delete_route = "/issues/{issue_ref}/duplicates/{canonical_issue_ref}"
+    duplicate_delete = paths.get(duplicate_delete_route, {}).get("delete")
+    if not isinstance(duplicate_delete, dict):
+        fail(f"OpenAPI DELETE {duplicate_delete_route} must be defined")
+    duplicate_delete_responses = duplicate_delete.get("responses", {})
+    required_duplicate_delete_errors = {"400": "invalid_request", "404": "not_found"}
+    for status, error_code in required_duplicate_delete_errors.items():
+        response = duplicate_delete_responses.get(status)
+        if not isinstance(response, dict) or ref_name(response.get("$ref", "")) != "Error":
+            fail(f"OpenAPI DELETE {duplicate_delete_route} must document {status} Error")
+        description = str(response.get("description", "")).lower()
+        if error_code not in description:
+            fail(f"OpenAPI DELETE {duplicate_delete_route} {status} response must document {error_code}")
+        if "no mutation" not in description:
+            fail(f"OpenAPI DELETE {duplicate_delete_route} {status} response must document no mutation")
+
     openapi_route_candidates = [(route, route_candidates(route)) for route in paths]
     for fragment in require_list(manifest, ("openapi", "forbidden_route_fragments")):
         fragment_text = str(fragment).lower()
@@ -966,18 +1073,25 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
             fail(f"handler route inventory entry missing from OpenAPI paths: {handler_route}")
 
     for route in ("/issues/{issue_ref}/dispatch-pause", "/issues/{issue_ref}/dispatch-resume"):
+        operation = paths.get(route, {}).get("post", {})
         reason_schema = (
-            paths.get(route, {})
-            .get("post", {})
-            .get("requestBody", {})
+            operation.get("requestBody", {})
             .get("content", {})
             .get("application/json", {})
             .get("schema", {})
             .get("properties", {})
             .get("reason", {})
         )
-        if not isinstance(reason_schema, dict) or reason_schema.get("pattern") != r"\S":
-            fail(f"OpenAPI {route} request reason must use pattern '\\\\S'")
+        assert_non_blank_string_schema(reason_schema, f"OpenAPI {route} request reason")
+        conflict_response = operation.get("responses", {}).get("409", {})
+        if not isinstance(conflict_response, dict) or ref_name(conflict_response.get("$ref", "")) != "Error":
+            fail(f"OpenAPI POST {route} must document 409 Error")
+        conflict_description = str(conflict_response.get("description", "")).lower()
+        for error_code in ("invalid_state_transition", "issue_already_running"):
+            if error_code not in conflict_description:
+                fail(f"OpenAPI POST {route} 409 response must document {error_code}")
+        if "archived" in conflict_description:
+            fail(f"OpenAPI POST {route} 409 response must not reject archived issues")
 
     render_preview_post = paths.get("/workflow/render-preview", {}).get("post")
     if not isinstance(render_preview_post, dict):
@@ -1070,6 +1184,95 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
     openapi_api_errors = set(data["components"]["schemas"]["ApiErrorCode"]["enum"])
     if expected_api_errors != openapi_api_errors:
         fail(f"ApiErrorCode mismatch: {sorted(expected_api_errors ^ openapi_api_errors)}")
+
+    schemas = data["components"]["schemas"]
+    issue_create_props = schemas["IssueCreateRequest"].get("properties", {})
+    assert_non_blank_string_schema(issue_create_props.get("title"), "OpenAPI IssueCreateRequest.title")
+    assert_non_blank_string_schema(
+        issue_create_props.get("labels", {}).get("items", {}),
+        "OpenAPI IssueCreateRequest.labels.items",
+    )
+    issue_patch_props = schemas["IssuePatchRequest"].get("properties", {})
+    assert_non_blank_string_schema(issue_patch_props.get("title"), "OpenAPI IssuePatchRequest.title")
+    assert_non_blank_string_schema(
+        issue_patch_props.get("labels", {}).get("items", {}),
+        "OpenAPI IssuePatchRequest.labels.items",
+    )
+    issue_comment_body = (
+        paths.get("/issues/{issue_ref}/comments", {})
+        .get("post", {})
+        .get("requestBody", {})
+        .get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
+        .get("properties", {})
+        .get("body", {})
+    )
+    assert_non_blank_string_schema(issue_comment_body, "OpenAPI POST /issues/{issue_ref}/comments body")
+
+    issue_list_data: dict[str, Any] | None = None
+    for part in schemas["IssueListEnvelope"].get("allOf", []):
+        candidate = part.get("properties", {}).get("data") if isinstance(part, dict) else None
+        if isinstance(candidate, dict):
+            issue_list_data = candidate
+            break
+    if not issue_list_data or ref_name(issue_list_data.get("$ref", "")) != "IssueListPage":
+        fail("OpenAPI IssueListEnvelope.data must reference IssueListPage")
+
+    issue_list_page = schemas["IssueListPage"]
+    issue_list_page_required = set(issue_list_page.get("required", []))
+    if not {"items", "page"}.issubset(issue_list_page_required):
+        fail("OpenAPI IssueListPage.required must include items and page")
+    issue_list_page_props = issue_list_page.get("properties", {})
+    items_schema = issue_list_page_props.get("items", {})
+    if items_schema.get("type") != "array" or ref_name(items_schema.get("items", {}).get("$ref", "")) != "Issue":
+        fail("OpenAPI IssueListPage.items must be an array of Issue")
+    if ref_name(issue_list_page_props.get("page", {}).get("$ref", "")) != "IssueListPageMeta":
+        fail("OpenAPI IssueListPage.page must reference IssueListPageMeta")
+
+    issue_list_page_meta = schemas["IssueListPageMeta"]
+    if set(issue_list_page_meta.get("required", [])) != {"limit", "next_cursor", "has_more"}:
+        fail("OpenAPI IssueListPageMeta.required must be limit, next_cursor, has_more")
+    issue_list_page_meta_props = issue_list_page_meta.get("properties", {})
+    if issue_list_page_meta_props.get("limit", {}).get("type") != "integer":
+        fail("OpenAPI IssueListPageMeta.limit must be an integer")
+    if set(issue_list_page_meta_props.get("next_cursor", {}).get("type", [])) != {"string", "null"}:
+        fail("OpenAPI IssueListPageMeta.next_cursor must allow string or null")
+    if issue_list_page_meta_props.get("has_more", {}).get("type") != "boolean":
+        fail("OpenAPI IssueListPageMeta.has_more must be a boolean")
+
+    transition_request = schemas["IssueTransitionRequest"]
+    transition_props = transition_request.get("properties", {})
+    if "duplicate_of" not in transition_props:
+        fail("OpenAPI IssueTransitionRequest must define duplicate_of")
+    if "canonical_issue_ref" in transition_props:
+        fail("OpenAPI IssueTransitionRequest must not define canonical_issue_ref")
+    assert_non_blank_string_schema(transition_props.get("reason", {}), "OpenAPI IssueTransitionRequest.reason")
+    assert_non_blank_string_schema(
+        transition_props.get("duplicate_of", {}),
+        "OpenAPI IssueTransitionRequest.duplicate_of",
+    )
+    transition_conditionals = transition_request.get("allOf", [])
+    if not isinstance(transition_conditionals, list):
+        fail("OpenAPI IssueTransitionRequest.allOf must define transition guard conditionals")
+    requires_reason_for_terminal_states = any(
+        isinstance(condition, dict)
+        and set(condition.get("if", {}).get("properties", {}).get("state", {}).get("enum", []))
+        == {"Blocked", "Cancelled", "Duplicate"}
+        and "reason" in condition.get("then", {}).get("required", [])
+        for condition in transition_conditionals
+    )
+    forbids_duplicate_of_for_non_duplicate_states = any(
+        isinstance(condition, dict)
+        and condition.get("if", {}).get("properties", {}).get("state", {}).get("not", {}).get("const")
+        == "Duplicate"
+        and "duplicate_of" in condition.get("then", {}).get("not", {}).get("required", [])
+        for condition in transition_conditionals
+    )
+    if not requires_reason_for_terminal_states:
+        fail("OpenAPI IssueTransitionRequest must require reason for Blocked/Cancelled/Duplicate transitions")
+    if not forbids_duplicate_of_for_non_duplicate_states:
+        fail("OpenAPI IssueTransitionRequest must forbid duplicate_of unless state is Duplicate")
 
     normalized_issue_schema = load_json("schemas/normalized_issue.schema.json")
     normalized_failure_codes = set(normalized_issue_schema["$defs"]["failureCode"]["enum"])
@@ -1217,6 +1420,43 @@ def validate_tool_gateway_manifest(manifest: dict[str, Any]) -> None:
     schema_tools = set(gateway_schema["$defs"]["toolName"]["enum"])
     if schema_tools != manifest_tools:
         fail(f"Tool Gateway registry mismatch with {CONTRACT_MANIFEST_REL}: {sorted(schema_tools ^ manifest_tools)}")
+    gateway_defs = gateway_schema["$defs"]
+    issue_comment_schema = load_json("schemas/tools/issue_comment.input.schema.json")
+    followup_create_schema = load_json("schemas/tools/followup_create.input.schema.json")
+    handoff_submit_schema = load_json("schemas/tools/handoff_submit.input.schema.json")
+
+    assert_non_blank_string_schema(
+        gateway_defs["issueCommentInput"]["properties"].get("body"),
+        "schemas/tool_gateway.schema.json issueCommentInput.body",
+    )
+    assert_non_blank_string_schema(
+        issue_comment_schema["properties"].get("body"),
+        "schemas/tools/issue_comment.input.schema.json body",
+    )
+    assert_non_blank_string_schema(
+        gateway_defs["followupCreateInput"]["properties"].get("title"),
+        "schemas/tool_gateway.schema.json followupCreateInput.title",
+    )
+    assert_non_blank_string_schema(
+        followup_create_schema["properties"].get("title"),
+        "schemas/tools/followup_create.input.schema.json title",
+    )
+    assert_non_blank_string_schema(
+        gateway_defs["followupCreateInput"]["properties"].get("labels", {}).get("items", {}),
+        "schemas/tool_gateway.schema.json followupCreateInput.labels.items",
+    )
+    assert_non_blank_string_schema(
+        followup_create_schema["properties"].get("labels", {}).get("items", {}),
+        "schemas/tools/followup_create.input.schema.json labels.items",
+    )
+    assert_non_blank_string_schema(
+        gateway_defs["handoffSubmitInput"]["properties"].get("summary"),
+        "schemas/tool_gateway.schema.json handoffSubmitInput.summary",
+    )
+    assert_non_blank_string_schema(
+        handoff_submit_schema["properties"].get("summary"),
+        "schemas/tools/handoff_submit.input.schema.json summary",
+    )
     print("ok tool gateway registry schemas/tool_gateway.schema.json")
 
 

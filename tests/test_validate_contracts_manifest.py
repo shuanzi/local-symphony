@@ -82,6 +82,8 @@ class ManifestContractTests(unittest.TestCase):
         self.assertIn("/issues/{issue_ref}/dispatch-resume", manifest["openapi"]["required_routes"])
         self.assertIn("symphony issue dispatch-pause", manifest["cli"]["required_commands"])
         self.assertIn("symphony issue dispatch-resume", manifest["cli"]["required_commands"])
+        self.assertIn("symphony issue duplicate remove", manifest["cli"]["required_commands"])
+        self.assertIn("--duplicate-of", manifest["cli"]["required_help_tokens"])
         self.assertIn("issue.get", manifest["tool_gateway"]["registry_tools"])
         self.assertGreaterEqual(len(manifest["handler_route_inventory"]["required_routes"]), 1)
         self.assertGreaterEqual(len(manifest["dashboard_action_inventory"]["required_actions"]), 1)
@@ -221,6 +223,103 @@ class ManifestContractTests(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             validator.validate_tool_gateway_manifest(manifest)
+
+    def test_tool_gateway_non_blank_input_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        def mutate_json(temp_root: Path, rel: str, mutate: Any) -> None:
+            path = temp_root / rel
+            data = json.loads(path.read_text(encoding="utf-8"))
+            mutate(data)
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+        cases = (
+            (
+                "embedded issue.comment body may be blank",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tool_gateway.schema.json",
+                    lambda schema: schema["$defs"]["issueCommentInput"]["properties"]["body"].pop("pattern", None),
+                ),
+            ),
+            (
+                "standalone issue.comment body may be empty",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tools/issue_comment.input.schema.json",
+                    lambda schema: schema["properties"]["body"].pop("minLength", None),
+                ),
+            ),
+            (
+                "embedded followup title may be blank",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tool_gateway.schema.json",
+                    lambda schema: schema["$defs"]["followupCreateInput"]["properties"]["title"].pop(
+                        "pattern", None
+                    ),
+                ),
+            ),
+            (
+                "standalone followup title may be empty",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tools/followup_create.input.schema.json",
+                    lambda schema: schema["properties"]["title"].pop("minLength", None),
+                ),
+            ),
+            (
+                "embedded followup label may be blank",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tool_gateway.schema.json",
+                    lambda schema: schema["$defs"]["followupCreateInput"]["properties"]["labels"]["items"].pop(
+                        "pattern", None
+                    ),
+                ),
+            ),
+            (
+                "standalone followup label may be empty",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tools/followup_create.input.schema.json",
+                    lambda schema: schema["properties"]["labels"]["items"].pop("minLength", None),
+                ),
+            ),
+            (
+                "embedded handoff summary may be blank",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tool_gateway.schema.json",
+                    lambda schema: schema["$defs"]["handoffSubmitInput"]["properties"]["summary"].pop(
+                        "pattern", None
+                    ),
+                ),
+            ),
+            (
+                "standalone handoff summary may be empty",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tools/handoff_submit.input.schema.json",
+                    lambda schema: schema["properties"]["summary"].pop("minLength", None),
+                ),
+            ),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    mutate(temp_root)
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_tool_gateway_manifest(manifest)
+                    finally:
+                        validator.ROOT = old_root
 
     def test_review_packet_handoff_requires_followups_and_human_review_target(self) -> None:
         validator = load_validator()
@@ -399,6 +498,424 @@ class ManifestContractTests(unittest.TestCase):
                     finally:
                         validator.ROOT = old_root
 
+    def test_openapi_issue_list_query_param_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        required_params = ("state", "label", "q", "dispatch_paused", "limit", "cursor", "sort")
+        for param_name in required_params:
+            with self.subTest(param_name=param_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    params = openapi["paths"]["/issues"]["get"]["parameters"]
+                    openapi["paths"]["/issues"]["get"]["parameters"] = [
+                        param for param in params if param.get("name") != param_name
+                    ]
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_issue_list_array_query_param_items_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            (
+                "state items must reference IssueState",
+                "state",
+                {"type": "string"},
+            ),
+            (
+                "label items must be strings",
+                "label",
+                {"$ref": "#/components/schemas/IssueState"},
+            ),
+        )
+        for name, param_name, drifted_items in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    for param in openapi["paths"]["/issues"]["get"]["parameters"]:
+                        if param.get("name") == param_name:
+                            param["schema"]["items"] = drifted_items
+                            break
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_issue_list_query_param_location_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        required_params = ("state", "label", "q", "dispatch_paused", "limit", "cursor", "sort")
+        for param_name in required_params:
+            with self.subTest(param_name=param_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    for param in openapi["paths"]["/issues"]["get"]["parameters"]:
+                        if param.get("name") == param_name:
+                            param["in"] = "header"
+                            break
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_issue_list_query_param_contract_ignores_same_name_non_query_param(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            copy_contract_root(temp_root)
+            openapi_path = temp_root / "api/openapi.yaml"
+            openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+            openapi["paths"]["/issues"]["get"]["parameters"].append(
+                {"name": "q", "in": "header", "schema": {"type": "string"}}
+            )
+            openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+            old_root = validator.ROOT
+            validator.ROOT = temp_root
+            try:
+                validator.validate_openapi(manifest)
+            finally:
+                validator.ROOT = old_root
+
+    def test_openapi_issue_list_duplicate_query_param_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            copy_contract_root(temp_root)
+            openapi_path = temp_root / "api/openapi.yaml"
+            openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+            for param in openapi["paths"]["/issues"]["get"]["parameters"]:
+                if param.get("name") == "q":
+                    param["schema"] = {"type": "integer"}
+                    break
+            openapi["paths"]["/issues"]["get"]["parameters"].append(
+                {"name": "q", "in": "query", "schema": {"type": "string"}}
+            )
+            openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+            old_root = validator.ROOT
+            validator.ROOT = temp_root
+            try:
+                with self.assertRaises(SystemExit):
+                    validator.validate_openapi(manifest)
+            finally:
+                validator.ROOT = old_root
+
+    def test_openapi_issue_list_invalid_query_error_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            copy_contract_root(temp_root)
+            openapi_path = temp_root / "api/openapi.yaml"
+            openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+            openapi["paths"]["/issues"]["get"]["responses"].pop("400", None)
+            openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+            old_root = validator.ROOT
+            validator.ROOT = temp_root
+            try:
+                with self.assertRaises(SystemExit):
+                    validator.validate_openapi(manifest)
+            finally:
+                validator.ROOT = old_root
+
+    def test_openapi_issue_mutation_bad_request_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        operations = (
+            ("/issues", "post"),
+            ("/issues/{issue_ref}", "patch"),
+            ("/issues/{issue_ref}/transition", "post"),
+            ("/issues/{issue_ref}/comments", "post"),
+            ("/issues/{issue_ref}/blockers", "post"),
+            ("/issues/{issue_ref}/dispatch-pause", "post"),
+            ("/issues/{issue_ref}/dispatch-resume", "post"),
+        )
+        for route, method in operations:
+            with self.subTest(route=route, method=method):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    openapi["paths"][route][method]["responses"].pop("400", None)
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_duplicate_delete_failure_response_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+        route = "/issues/{issue_ref}/duplicates/{canonical_issue_ref}"
+
+        cases = (
+            ("missing delete operation", lambda paths: paths[route].pop("delete", None)),
+            ("missing 400 response", lambda paths: paths[route]["delete"]["responses"].pop("400", None)),
+            ("missing 404 response", lambda paths: paths[route]["delete"]["responses"].pop("404", None)),
+            (
+                "400 does not reference Error",
+                lambda paths: paths[route]["delete"]["responses"].__setitem__(
+                    "400",
+                    {"description": "Bad request"},
+                ),
+            ),
+            (
+                "404 does not reference Error",
+                lambda paths: paths[route]["delete"]["responses"].__setitem__(
+                    "404",
+                    {"description": "Not found"},
+                ),
+            ),
+            (
+                "400 does not document invalid_request",
+                lambda paths: paths[route]["delete"]["responses"]["400"].__setitem__(
+                    "description",
+                    "Bad request",
+                ),
+            ),
+            (
+                "404 does not document not_found",
+                lambda paths: paths[route]["delete"]["responses"]["404"].__setitem__(
+                    "description",
+                    "Missing relation",
+                ),
+            ),
+            (
+                "400 does not document no mutation",
+                lambda paths: paths[route]["delete"]["responses"]["400"].__setitem__(
+                    "description",
+                    "invalid_request for malformed duplicate refs.",
+                ),
+            ),
+            (
+                "404 does not document no mutation",
+                lambda paths: paths[route]["delete"]["responses"]["404"].__setitem__(
+                    "description",
+                    "not_found when duplicate refs are unresolved.",
+                ),
+            ),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    mutate(openapi["paths"])
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_issue_text_request_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        def comment_body_schema(openapi: dict) -> dict:
+            return openapi["paths"]["/issues/{issue_ref}/comments"]["post"]["requestBody"]["content"][
+                "application/json"
+            ]["schema"]["properties"]["body"]
+
+        cases = (
+            (
+                "create title may be blank",
+                lambda openapi: openapi["components"]["schemas"]["IssueCreateRequest"]["properties"]["title"].pop(
+                    "pattern", None
+                ),
+            ),
+            (
+                "create title may be empty",
+                lambda openapi: openapi["components"]["schemas"]["IssueCreateRequest"]["properties"]["title"].pop(
+                    "minLength", None
+                ),
+            ),
+            (
+                "patch title may be blank",
+                lambda openapi: openapi["components"]["schemas"]["IssuePatchRequest"]["properties"]["title"].pop(
+                    "pattern", None
+                ),
+            ),
+            (
+                "patch title may be empty",
+                lambda openapi: openapi["components"]["schemas"]["IssuePatchRequest"]["properties"]["title"].pop(
+                    "minLength", None
+                ),
+            ),
+            ("comment body may be blank", lambda openapi: comment_body_schema(openapi).pop("pattern", None)),
+            ("comment body may be empty", lambda openapi: comment_body_schema(openapi).pop("minLength", None)),
+            (
+                "create label may be empty",
+                lambda openapi: openapi["components"]["schemas"]["IssueCreateRequest"]["properties"]["labels"][
+                    "items"
+                ].pop("minLength", None),
+            ),
+            (
+                "create label may be blank",
+                lambda openapi: openapi["components"]["schemas"]["IssueCreateRequest"]["properties"]["labels"][
+                    "items"
+                ].pop("pattern", None),
+            ),
+            (
+                "patch label may be blank",
+                lambda openapi: openapi["components"]["schemas"]["IssuePatchRequest"]["properties"]["labels"][
+                    "items"
+                ].pop("pattern", None),
+            ),
+            (
+                "patch label may be empty",
+                lambda openapi: openapi["components"]["schemas"]["IssuePatchRequest"]["properties"]["labels"][
+                    "items"
+                ].pop("minLength", None),
+            ),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    mutate(openapi)
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_issue_list_envelope_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            copy_contract_root(temp_root)
+            openapi_path = temp_root / "api/openapi.yaml"
+            openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+            openapi["components"]["schemas"]["IssueListEnvelope"]["allOf"][1]["properties"]["data"] = {
+                "type": "array",
+                "items": {"$ref": "#/components/schemas/Issue"},
+            }
+            openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+            old_root = validator.ROOT
+            validator.ROOT = temp_root
+            try:
+                with self.assertRaises(SystemExit):
+                    validator.validate_openapi(manifest)
+            finally:
+                validator.ROOT = old_root
+
+    def test_openapi_issue_transition_duplicate_of_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            ("missing duplicate_of", lambda props: props.pop("duplicate_of", None)),
+            ("duplicate_of may be blank", lambda props: props["duplicate_of"].pop("pattern", None)),
+            ("duplicate_of may be empty", lambda props: props["duplicate_of"].pop("minLength", None)),
+            ("legacy canonical_issue_ref", lambda props: props.__setitem__("canonical_issue_ref", {"type": "string"})),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    props = openapi["components"]["schemas"]["IssueTransitionRequest"]["properties"]
+                    mutate(props)
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_issue_transition_guard_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            ("reason may be blank", lambda schema: schema["properties"]["reason"].pop("pattern", None)),
+            ("reason may be empty", lambda schema: schema["properties"]["reason"].pop("minLength", None)),
+            ("missing reason guard", lambda schema: schema["allOf"].pop(0)),
+            ("missing duplicate_of guard", lambda schema: schema["allOf"].pop(1)),
+            ("missing allOf guards", lambda schema: schema.pop("allOf", None)),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    schema = openapi["components"]["schemas"]["IssueTransitionRequest"]
+                    mutate(schema)
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
     def test_workflow_config_schema_top_level_unknown_keys_must_be_allowed(self) -> None:
         validator = load_validator()
         schema = validator.load_json("schemas/workflow_config.schema.json")
@@ -450,6 +967,18 @@ class ManifestContractTests(unittest.TestCase):
                     finally:
                         validator.ROOT = old_root
 
+    def test_manifest_missing_required_duplicate_cli_command_fails(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+        manifest["cli"]["required_commands"] = [
+            command
+            for command in manifest["cli"]["required_commands"]
+            if command != "symphony issue duplicate remove"
+        ]
+
+        with self.assertRaises(SystemExit):
+            validator.validate_contract_manifest(manifest)
+
     def test_manifest_required_route_drift_fails(self) -> None:
         validator = load_validator()
         manifest = load_manifest()
@@ -495,6 +1024,44 @@ class ManifestContractTests(unittest.TestCase):
                             validator.validate_openapi(manifest)
                     finally:
                         validator.ROOT = old_root
+
+    def test_dispatch_pause_resume_rejection_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            (
+                "mentions archived",
+                "invalid_state_transition when issue is terminal/archived; "
+                "issue_already_running when an active run exists.",
+            ),
+            (
+                "missing invalid state transition",
+                "issue_already_running when an active run exists.",
+            ),
+            (
+                "missing active run guard",
+                "invalid_state_transition when issue state is Done, Cancelled, or Duplicate.",
+            ),
+        )
+        for route in ("/issues/{issue_ref}/dispatch-pause", "/issues/{issue_ref}/dispatch-resume"):
+            for name, description in cases:
+                with self.subTest(route=route, name=name):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        temp_root = Path(temp_dir)
+                        copy_contract_root(temp_root)
+                        openapi_path = temp_root / "api/openapi.yaml"
+                        openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                        openapi["paths"][route]["post"]["responses"]["409"]["description"] = description
+                        openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                        old_root = validator.ROOT
+                        validator.ROOT = temp_root
+                        try:
+                            with self.assertRaises(SystemExit):
+                                validator.validate_openapi(manifest)
+                        finally:
+                            validator.ROOT = old_root
 
 
 if __name__ == "__main__":

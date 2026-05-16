@@ -16,6 +16,7 @@
       "/issues/{issue_ref}/comments",
       "/issues/{issue_ref}/blockers",
       "/issues/{issue_ref}/blockers/{blocker_issue_ref}",
+      "/issues/{issue_ref}/duplicates/{canonical_issue_ref}",
       "/issues/{issue_ref}/dispatch",
       "/issues/{issue_ref}/dispatch-pause",
       "/issues/{issue_ref}/dispatch-resume",
@@ -214,6 +215,7 @@
       "symphony issue comment",
       "symphony issue blocker add",
       "symphony issue blocker remove",
+      "symphony issue duplicate remove",
       "symphony issue dispatch",
       "symphony issue dispatch-pause",
       "symphony issue dispatch-resume",
@@ -237,6 +239,7 @@
     "required_help_tokens": [
       "dispatch-pause",
       "dispatch-resume",
+      "--duplicate-of",
       "approve-once",
       "approve-for-run",
       "approve-for-session",

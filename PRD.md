@@ -1,8 +1,8 @@
 # Local Symphony App v1 PRD
 
-**状态**：v1 产品方案合并版  
-**更新日期**：2026-05-11  
-**来源**：`local-symphony.zip` 原始文档包经 agent-executable hardening 后更新  
+**状态**：v1 产品方案合并版
+**更新日期**：2026-05-11
+**来源**：`local-symphony.zip` 原始文档包经 agent-executable hardening 后更新
 **文档权威性**：Local Symphony App v1 的产品事实和产品范围以本 PRD 定义为准。`TECH_SPEC.md` 只作为字段、表结构、API/schema、状态机、校验规则等技术合同细节的 source of truth；它和 executable contracts 不得新增或扩大本 PRD 未定义的 v1 产品能力。
 
 ---
@@ -98,12 +98,14 @@ active run reconciliation
 
 ## 4. 目标用户
 
-v1 面向本地开发者和小团队 operator：
+v1 面向本地开发者、单机本地 operator，以及小团队中负责在某个本地 checkout 上运行该控制面的 operator：
 
 - 希望让 Codex 在本地仓库中执行工程任务，但需要可审查交付物的人。
 - 希望不依赖 Linear、GitHub Issues 或其他外部 tracker，就能管理 agent task lifecycle 的人。
 - 希望把 agent 的执行过程、审批、工具调用、失败原因和 review packet 留存在本地的人。
-- 希望在引入更高自动化之前，先建立可控、可调试 MVP 工作流的团队。
+- 希望在引入更高自动化之前，先建立可控、可调试本地工作流的团队。
+
+v1 的“小团队”含义不是多人同时登录同一远程服务，也不是共享权限模型；v1 只交付单机本地 daemon 与本地 operator 入口。团队协作发生在本地仓库、workspace、review packet 和人工沟通层面，不引入用户身份、租户、审批人归属或远程共享 DB 语义。
 
 v1 不是远程 SaaS、多租户平台、完整 CI/CD、通用 workflow engine 或 Git provider automation 产品。
 
@@ -132,6 +134,7 @@ multi-tenant RBAC
 automatic PR creation
 git push / merge / publish automation
 agent automatic commit
+issue archive/delete lifecycle
 automatic SQLite backup/restore
 database migration / rollback framework
 automatic retry queue or timers
@@ -143,13 +146,15 @@ automatic workspace cleanup/delete/reset/rebase
 raw prompt or raw Codex log export through v1 API
 ```
 
-v1 supported platform scope：产品支持 macOS arm64/x64 和 Linux x64。Windows 为 best-effort，不作为 v1 产品验收阻塞；具体 runtime/build/test matrix、版本和验收细节以 `TECH_SPEC.md` 第 4A 节的技术合同为准，不改变上述平台产品范围。
+v1 supported platform scope：产品支持 macOS arm64/x64 和 Linux x64。Windows 为 best-effort，不作为 v1 产品验收阻塞；v1 不要求发布 Windows binary 或让 Windows CI 成为阻断项。若实现提供 Windows 实验性构建，必须在 known limitations 中标明 named pipe、process group termination、CRLF patch 和 path normalization 的覆盖情况。具体 runtime/build/test matrix、版本和验收细节以 `TECH_SPEC.md` 第 4A 节的技术合同为准，不改变上述平台产品范围。
 
 ## 7. 核心用户故事
 
 ### 7.1 创建本地任务并派发给 Codex
 
 作为 operator，我可以在本地项目中执行 `symphony init` 初始化 Local Symphony，然后创建一个本地 issue，填写 title、description、acceptance criteria、priority、可选 `labels`，把它从 `Inbox` 移到 `Ready`，并通过 dashboard 或 CLI dispatch。
+
+`symphony init` 的产品结果必须可解释：它只在 Git repository 内初始化 project DB、runtime metadata 所需目录和默认 `WORKFLOW.md`；重复执行应保持幂等，除非已有文件与 v1 生成内容冲突。非 Git repo、无写权限、DB schema version 不支持或默认 workflow 写入冲突时，必须失败且不产生部分初始化状态，并给出 operator 下一步指引。初始化成功后，CLI 输出应指向 `symphony serve`、`symphony open` 和创建首个 issue 的下一步命令；Dashboard 首次打开时必须显示空 Board 和创建 issue 的入口。
 
 dispatch 成功必须先通过 shared `DispatchIssue` preflight。成功后，系统必须创建或复用该 issue 的 git worktree 和 branch，并启动 Codex app-server。Codex 的 cwd 必须是 issue workspace。若 preflight 因 pause、blocked、workflow invalid、concurrency full 等原因失败，系统不得创建 run、workspace 或 process。
 
@@ -202,6 +207,8 @@ labels: 可选，用于分类、筛选、展示和检索。
 state: 必填，遵循 PRD 第 9 章状态集合与流转规则；技术枚举以 TECH_SPEC 8.1/12.12 为准。
 comments: 可选，记录 operator、agent、reviewer 的讨论和决策。
 blocked_by / blocks: 只展示直接 blocker relation；不在产品层展开传递依赖。
+duplicate_of / duplicates: 展示当前 issue 的 active duplicate canonical relation，以及指向当前 issue 的直接 duplicate issue；用于支持误标后从 Issue Detail/API/CLI 发现并解除 relation。
+followup_of / followups: 展示当前 issue 来源于哪个 follow-up relation，以及当前 issue 已创建的直接 follow-up issue。
 dispatch pause: 展示 dispatch_paused、reason、paused_at，用于解释为何不会自动调度。
 workspace / run / review refs: 展示关联 workspace、active/latest run、latest review packet 的引用。
 ```
@@ -209,6 +216,18 @@ workspace / run / review refs: 展示关联 workspace、active/latest run、late
 详细 API/DTO 字段、required set、序列化形态和兼容 alias 以 TECH_SPEC 的 `NormalizedIssue` 为准；PRD 不重复定义完整技术字段。
 
 Issue human identifier 使用项目 issue prefix 和 sequence，例如 `LOC-1`。内部 ID 使用 opaque prefixed ID，例如 `iss_...`。
+
+Issue 列表与编辑的产品规则：
+
+```text
+create: Inbox issue 最小只接受 trim 后非空 title；未指定 priority 时为 3。
+update: 可编辑 title、description、acceptance criteria、priority、labels；不得通过 update 改 state、workspace、run、review 或 dispatch pause 字段。
+comment: comment body 必须 trim 后非空。
+labels: 作为 trim 后非空、lowercase-normalized 的字符串标签存储；同一 issue 内重复 label 必须去重。
+list: 必须支持按 state、label、text query、dispatch_paused 过滤，并支持稳定分页；默认排序为 priority ASC、updated_at DESC、identifier ASC。
+empty list: API 返回空数组和分页 metadata；Dashboard 显示空态和创建 issue 入口。
+invalid input: 返回结构化错误且 no mutation。
+```
 
 ### 8.2 Orchestrator
 
@@ -249,7 +268,7 @@ workspace 在所有 issue state、所有 run terminal outcome、startup stale ru
 
 Codex Runner 使用 `codex app-server`。v1 要求 Codex adapter 是 version-fixture gated：prelaunch gate 基于 installed Codex version 与 committed fixture metadata/static compatibility metadata；generated protocol/schema version 来自该 metadata，而不是启动真实 `codex app-server` 后才知道。只有有 committed fixture 的 Codex protocol/schema version 才可运行；不支持的版本必须在启动真实 Codex process 前失败，并给出 `unsupported_codex_version`。若启动后的 initialize handshake 与 metadata 不一致或出现 schema mismatch，run 走 `codex_protocol_error` 失败路径。
 
-默认测试使用 fake runner。Real Codex tests 只在显式设置 `SYMPHONY_TEST_CODEX=1` 时运行。
+真实 Codex adapter 是 v1 release scope，但真实 Codex 兼容性必须通过 committed fixture gate 进入；没有匹配 fixture 的本机 Codex 版本只阻断 real Codex dispatch，不影响 fake runner 主路径和默认 CI。默认测试使用 fake runner。Real Codex tests 只在显式设置 `SYMPHONY_TEST_CODEX=1` 时运行。
 
 ### 8.5 WORKFLOW.md 与 Prompt
 
@@ -278,6 +297,8 @@ v1 默认 prompt 必须告诉 agent：
 handoff 只提交数据，Human Review 由 finalizer 成功后转换
 ```
 
+v1 不提供 commit 自动化、commit API 或 commit CLI。默认 prompt 中的“除非 operator 在本次 run 外明确要求，否则不要 commit”只表示 Codex 不得自行提交；如果 operator 通过 Symphony 之外的上下文明确要求 agent commit，Symphony 仍只把 workspace 当前 tree 作为 review packet 输入，且不会创建、修改、push 或验证 commit。
+
 ### 8.6 Tool Gateway
 
 Tool Gateway 是 agent 修改系统状态的唯一入口。v1 固定 registry：
@@ -292,6 +313,8 @@ handoff.submit
 ```
 
 agent 不能通过工具删除 issue、设置 Done、任意状态流转、读取或修改既有非当前 issue、读取 secrets、删除 workspace、push、create PR 或访问 project settings。唯一例外是通过受限 `followup.create` 在当前 issue scope 下创建 follow-up Inbox issue。
+
+`followup.create` 会真实创建一个新的 Inbox issue，并记录 `followup_of` relation；Issue Detail 和 Issue DTO 必须展示 created follow-up 与其来源 issue。它不得把新 issue 设为 Ready/Done，也不得创建 blocker 或 duplicate relation。`handoff.submit.followups` 则只是 review packet 中展示的建议事项，不自动创建 issue，也不与 `followup.create` 自动去重。若 agent 已经通过 `followup.create` 创建了 follow-up issue，handoff 中仍可提到它，但系统只按实际 issue relation 展示真实 follow-up。
 
 ### 8.7 Handoff
 
@@ -319,7 +342,7 @@ verification
 followups
 ```
 
-其中 `followups` 必须提供，但可以为空数组。各数组字段是否允许空数组、元素是否允许空字符串，以 schema 为准。
+其中 `followups` 必须提供，但可以为空数组。`summary` 必须是 trim 后非空字符串。`changed_files`、`tests`、`risks`、`verification`、`followups` 必须是数组；数组可以为空，以表达“无变更文件上报”“未运行测试”“无已知风险”“无补充验证步骤”或“无建议 follow-up”。数组元素若存在，必须是字符串；空字符串的接受或拒绝以 Tool Gateway input schema 为准。Review Packet UI 对空数组必须显示明确空态，不得把空值解释为成功验证。
 
 字段类型、空字符串/空数组约束、unknown-field rejection 以 `schemas/tools/handoff_submit.input.schema.json` / Tool Gateway input schema 为准。
 
@@ -332,6 +355,8 @@ target_state
 `target_state` 可省略；省略时 accepted / persisted / canonical target_state 默认为 `Human Review`。若提供，必须为 `Human Review`。
 
 同一 run 内首个 handoff wins。后续提交与已记录 handoff 的 canonical payload hash 相同时，视为幂等成功并返回同一 handoff；canonical payload hash 不同时，必须返回 state conflict，且不得推进 `Human Review`。
+
+`handoff.submit` 不自动写入 issue comment。handoff 内容通过 handoff 记录、tool call、event 和 Review Packet 展示；若 agent 需要留下普通讨论评论，必须显式调用 `issue.comment`。
 
 ### 8.8 Review Packet
 
@@ -399,7 +424,7 @@ v1 Dashboard 是本地控制面，只通过 REST/SSE API 访问系统，不直�
 |---|---|
 | Overview | workflow status、running runs、pending approvals、failed runs、Human Review count、paused issues、Codex availability、recent events。 |
 | Board | 展示 issue 状态列，支持 create、transition、dispatch、打开 review/run。 |
-| Issue Detail | 展示 issue facts、comments、blockers、workspace、run history、review packets、dispatch pause/resume。 |
+| Issue Detail | 展示 issue facts、comments、blockers、duplicate relations、follow-up relations、workspace、run history、review packets、dispatch pause/resume；对 active duplicate relation 提供 remove action。 |
 | Run Detail | 展示 normalized timeline、failure、approval、tool、handoff、review generated；timeline 至少覆盖 workspace prepared、prompt rendered、Codex started、approval requested、tool called、handoff submitted、review generated、failure。 |
 | Approval Inbox | 展示 command/file/network approvals、risk level、policy match，并支持 decide。 |
 | Review Packet | 通过 Review API 展示 review packet，再通过 Artifact API 读取允许内容，并支持 Send to Rework / Mark Done。 |
@@ -409,6 +434,20 @@ v1 Dashboard 是本地控制面，只通过 REST/SSE API 访问系统，不直�
 Approval Inbox 的 decision 枚举为 `approve_once`、`approve_for_run`、`approve_for_session`、`deny`、`cancel_run`。只有 pending approval 可以被决定；`deny` 只拒绝当前 approval action，不等同于取消 run，也不触发 `operator_cancelled` side effects。Codex 接收 decline 后，run 是否继续或以失败终止由 Codex/adapter 的 terminal outcome 决定；如果 denial 导致 terminal policy failure，必须使用对应 canonical `failure_code`，例如 `command_denied`、`network_denied` 或 `protected_path_denied`，并按失败路径 pause dispatch。只有 `cancel_run` 会立即取消当前 run，并触发 `operator_cancelled` side effects。
 
 Dashboard 的 approve 控件必须把 `approve_once`、`approve_for_run`、`approve_for_session` 三个 scope 保持为三个可选择动作；可以分组展示，但不得折叠成单一 approve。Review Packet 页面必须以 `GET /api/v1/reviews/{issue_ref}` 返回的 REST `ReviewPacketSummary` 为入口；该 summary 只包含 artifact metadata 和 summary fields。完整 `review.json` 是 artifact 内容，必须使用返回的 `artifact_id`/`content_url` 通过 Artifact API 获取；不得直接读取 filesystem 中的 packet 文件。
+
+Dashboard 必须为所有页面定义可验收的 loading、empty、error 和 auth/refusal 状态：
+
+```text
+loading: command/API 正在执行或 SSE 正在重连时显示非阻塞加载状态。
+empty: 无 issue、无 run、无 pending approval、无 review packet、无 diagnostics export 时显示空态和下一步动作。
+auth/error: 401/403/CSRF/session expired 必须引导重新打开或重新登录本地 session；不得静默失败。
+artifact refusal: raw prompt/raw Codex log/raw secret 等内容只显示 metadata/refusal，不提供直接文件读取入口。
+daemon unavailable: Overview/status 显示 daemon 不可用，并提示启动 `symphony serve`。
+```
+
+Approval pending 过期时，run 必须以 `approval_timeout` 失败并按失败路径 pause dispatch；Approval Inbox 必须把已过期 approval 与 pending approval 区分展示。对已 resolved、expired、denied 或 auto_denied 的 approval 再次 decide 必须是 state conflict 且 no mutation。
+
+Workflow 页面与 CLI 的产品路径是：validate 只验证当前 filesystem `WORKFLOW.md`，不替换 effective config；render preview 只显示 redacted preview 和 warnings/errors；reload 成功才更新 effective/last-valid workflow。invalid reload 必须保留 last valid config 并阻断后续 dispatch，除非 reload semantics 明确允许使用 last valid config。
 
 ### 8.10 REST/SSE API 与 CLI
 
@@ -437,6 +476,7 @@ POST /api/v1/issues/{issue_ref}/transition
 POST /api/v1/issues/{issue_ref}/comments
 POST /api/v1/issues/{issue_ref}/blockers
 DELETE /api/v1/issues/{issue_ref}/blockers/{blocker_issue_ref}
+DELETE /api/v1/issues/{issue_ref}/duplicates/{canonical_issue_ref}
 POST /api/v1/issues/{issue_ref}/dispatch
 POST /api/v1/issues/{issue_ref}/dispatch-pause
 POST /api/v1/issues/{issue_ref}/dispatch-resume
@@ -474,13 +514,15 @@ symphony diagnostics ...
 symphony tool ...
 ```
 
-CLI 全局 flags 至少包括 `--project <path>`、`--api-url <url>`、`--json`、`--quiet`、`--no-color`、`--timeout <duration>`；`symphony help`、各 command group help 与实际可执行 subcommand/flags 必须匹配，不得展示未实现或 v1 禁止能力。operator CLI subcommand 必须覆盖 TECH_SPEC 11.2 的 issue create/list/show/update/transition/comment/blocker/dispatch/dispatch-pause/dispatch-resume、run list/show/events/cancel、approval list/decide、review/send-to-rework/mark-done/path、workflow validate/reload/show、diagnostics/export；`symphony review path` 只能输出 metadata/path diagnostics，不能读取或打印 packet/raw 内容；`symphony tool ...` 只覆盖 TECH_SPEC 11.4 固定 Tool Gateway registry 映射。`symphony issue dispatch-pause` 与 `symphony issue dispatch-resume` 必须要求 trim 后非空的 `--reason`；active run exists 时必须返回 `issue_already_running` 且不得变更 paused 状态。
+CLI 全局 flags 至少包括 `--project <path>`、`--api-url <url>`、`--json`、`--quiet`、`--no-color`、`--timeout <duration>`；`symphony help`、各 command group help 与实际可执行 subcommand/flags 必须匹配，不得展示未实现或 v1 禁止能力。operator CLI subcommand 必须覆盖 TECH_SPEC 11.2 的 issue create/list/show/update/transition/comment/blocker/duplicate/dispatch/dispatch-pause/dispatch-resume、run list/show/events/cancel、approval list/decide、review/send-to-rework/mark-done/path、workflow validate/reload/show、diagnostics/export；`symphony review path` 只能输出 metadata/path diagnostics，不能读取或打印 packet/raw 内容；`symphony tool ...` 只覆盖 TECH_SPEC 11.4 固定 Tool Gateway registry 映射。`symphony issue dispatch-pause` 与 `symphony issue dispatch-resume` 必须要求 trim 后非空的 `--reason`；active run exists 时必须返回 `issue_already_running` 且不得变更 paused 状态。
 
 CLI exit codes 必须采用 TECH_SPEC 11.1 的 0-9 映射；尤其 daemon/gateway unavailable 为 3，auth failure 为 4，permission/policy denial 为 5，not found 为 6，state conflict 为 7，timeout 为 8，workflow/config error 为 9；API `error.code=approval_not_pending` 必须映射为 7。
 
 `symphony status` 使用 `/api/v1/state` 输出与 Overview 对齐的 concise project/daemon/workflow/run/approval/review/paused/Codex/failure 状态；daemon 不可用时只能降级到 `/health` 可用性信息或报错。
 
 正常 CLI 是 operator 工具，走 REST API。`symphony tool ...` 是 agent 工具入口，走 Tool Gateway 本地传输，不走 REST `/api/v1`；transport 可为 Unix socket、named pipe 或 loopback HTTP，具体以 TECH_SPEC 为准，并且必须 JSON-only 输出。
+
+当 app/project DB schema version 不受当前 v1 binary 支持时，CLI、Dashboard 和 diagnostics 必须只读失败，展示检测到的版本、期望版本、DB 路径，以及 operator 可执行恢复指引：使用兼容 binary、人工恢复备份，或初始化新的 project DB。v1 不自动 migration、rollback、backup 或 restore。
 
 REST 与 CLI 的 approval decide 必须使用相同 decision 语义：`approve_once`、`approve_for_run`、`approve_for_session`、`deny`、`cancel_run`；非 pending approval 不允许被 decide，必须作为 state conflict 失败且不得写入新的 decision 或产生 side effects。Dashboard、REST 与 CLI 必须把 `deny` 呈现为“拒绝当前 action”，把 `cancel_run` 呈现为“取消整个 run”，二者不得共用 side effects。
 
@@ -595,11 +637,27 @@ Duplicate
 | Human Review | Done | operator | operator 提供非空 reason；latest review packet generated；latest review_packet.run_id belongs to latest completed handoff run；且无 active run；UI 可将 reason 呈现为 comment，持久化可记录 operator comment。 |
 | any non-terminal | Blocked | operator 或 agent tool | 若有 active run，必须 reconciliation cancel 并 pause dispatch；agent `issue.block` 使用 `agent_blocked`，ordinary/non-terminal operator transition 使用 reconciliation canonical code `issue_state_changed`。 |
 | any non-terminal | Cancelled | operator | 若有 active run，必须 reconciliation cancel 并 pause dispatch；terminal reconciliation 使用 `canceled_by_reconciliation`。 |
-| any non-terminal | Duplicate | operator | 若有 active run，必须 reconciliation cancel 并 pause dispatch；terminal reconciliation 使用 `canceled_by_reconciliation`；如指定 canonical issue，记录 duplicate relation。 |
+| any non-terminal | Duplicate | operator | 若有 active run，必须 reconciliation cancel 并 pause dispatch；terminal reconciliation 使用 `canceled_by_reconciliation`；如指定 canonical issue，按 Duplicate relation 规则记录或拒绝。 |
 | Blocked | Ready | operator | 阻塞解除，active blocker relations 不存在，且必要 issue 字段有效；v1 统一解除到 Ready。 |
 | Done/Cancelled/Duplicate | Inbox/Ready | operator | 只允许显式 reopen；reopen 到 `Ready` 要求必要 issue 字段有效，reopen 到 `Inbox` 仍只要求 title；禁止直接 reopen 到 `Working`、`Human Review`、`Rework` 或 `Blocked`；要求无 active run，且不复用旧 run。reopen 时 `completed_at=null`，清除 `dispatch_paused`/reason/paused_at；workspace、history、review packets、duplicate relation 保留。 |
 
-Reopen 到 `Inbox` 表示任务需要重新整理，不会自动 dispatch。Reopen 到 `Ready` 表示下一次 scheduler tick 可按正常 eligibility 新建 run_attempt。旧 latest review packet 仅作为历史保留；新一轮完成必须来自 reopen 后新 run 生成的 latest review packet。若 reopened Duplicate 不再是重复任务，operator 必须单独移除或失效 duplicate relation。
+Reopen 到 `Inbox` 表示任务需要重新整理，不会自动 dispatch。Reopen 到 `Ready` 表示下一次 scheduler tick 可按正常 eligibility 新建 run_attempt。旧 latest review packet 仅作为历史保留；新一轮完成必须来自 reopen 后新 run 生成的 latest review packet。若 reopened Duplicate 不再是重复任务，operator 必须通过 duplicate relation remove 入口单独移除或失效 duplicate relation。
+
+通用 `transition` 请求必须提供目标 state；转入 `Blocked`、`Cancelled`、`Duplicate` 时，operator reason 必须 trim 后非空并记录为 comment/event。`Human Review -> Rework/Done` 必须走 Review API，不得通过通用 transition 绕过 review packet guard。重复转入当前 state 默认必须返回 state conflict 且 no mutation；`state=Duplicate` 仅有两个例外：`duplicate_of` 与现有 active duplicate relation 相同，成功 no-op 且不重复写 relation/comment/event；当前没有 active duplicate relation 且提供合法 `duplicate_of` 时，成功创建 relation、记录 reason comment/event，但 issue state 不变。已有不同 active relation、缺少必要字段或其他 same-state transition 仍按 conflict/invalid 处理。issue 级 `Cancelled` 表示取消整个任务；run 级 cancel 只取消当前 active run，必须在 Dashboard/CLI 文案中区分。
+
+Duplicate relation 规则：
+
+```text
+转为 Duplicate 时 canonical issue 可选；若提供，不能指向当前 issue，必须能解析到同一 project 内 issue。
+同一 source issue 同一时间最多只能有一个 active duplicate canonical relation。
+从非 Duplicate 状态转为 Duplicate 且未指定 canonical 时，若已有 active duplicate relation 则沿用该 relation；若没有则只改变 state，不创建 relation；已处于 Duplicate 时省略 `duplicate_of` 仍按 same-state conflict/no mutation 处理。
+转为 Duplicate 且指定 canonical 时，若无 active duplicate relation 则创建 relation；若已有相同 active relation 则幂等；若已有不同 active relation，必须返回 state conflict/no mutation，operator 需先通过 remove 入口失效旧 relation。
+若 issue 已经处于 Duplicate 且旧 relation 已被 remove 到无 active relation，operator 可再次调用 transition 到 Duplicate 并指定新 canonical 来创建新 relation；该路径用于更正 canonical target。
+canonical issue 处于 Done/Cancelled/Duplicate 仍可作为历史指向；v1 不做跨 issue 自动状态同步。
+duplicate relation remove 入口只做 soft deactivate：设置 relation.active=false 和 resolved_at；对已 inactive 的同一 relation 返回 success no-op。
+reopen Duplicate 不自动移除 duplicate relation；operator 必须通过 remove 入口单独解除或失效 relation。
+Issue Detail 必须能从当前 issue 发现 active duplicate canonical target，并提供 remove duplicate relation action；该动作只解除 relation，不自动改变 issue state。
+```
 
 Terminal states：
 
@@ -736,9 +794,9 @@ canonical `dispatch_pause_reason` 映射：
 Operator 手动 `dispatch-pause`：
 
 ```text
-允许：no active run，且 any non-terminal、non-archived issue state
+允许：no active run，且 any non-terminal issue state
 拒绝：missing/blank reason；返回 invalid_request，no mutation
-拒绝：Done/Cancelled/Duplicate，或 archived_at 非空；返回 invalid_state_transition，需先 reopen 或 transition
+拒绝：Done/Cancelled/Duplicate；返回 invalid_state_transition，需先 reopen 或 transition
 拒绝：active run exists；返回 issue_already_running，no mutation
 要求：reason trim 后非空
 Side effects:
@@ -766,9 +824,9 @@ Side effects:
 Operator 手动 `dispatch-resume`：
 
 ```text
-允许：no active run，且 any non-terminal、non-archived issue state
+允许：no active run，且 any non-terminal issue state
 拒绝：missing/blank reason；返回 invalid_request，no mutation
-拒绝：Done/Cancelled/Duplicate，或 archived_at 非空；返回 invalid_state_transition，需先 reopen 或 transition
+拒绝：Done/Cancelled/Duplicate；返回 invalid_state_transition，需先 reopen 或 transition
 拒绝：active run exists；返回 issue_already_running，no mutation
 要求：reason trim 后非空
 Side effects:
