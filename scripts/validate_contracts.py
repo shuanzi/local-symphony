@@ -1240,6 +1240,10 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
     if "canonical_issue_ref" in transition_props:
         fail("OpenAPI IssueTransitionRequest must not define canonical_issue_ref")
     assert_non_blank_string_schema(transition_props.get("reason", {}), "OpenAPI IssueTransitionRequest.reason")
+    assert_non_blank_string_schema(
+        transition_props.get("duplicate_of", {}),
+        "OpenAPI IssueTransitionRequest.duplicate_of",
+    )
     transition_conditionals = transition_request.get("allOf", [])
     if not isinstance(transition_conditionals, list):
         fail("OpenAPI IssueTransitionRequest.allOf must define transition guard conditionals")

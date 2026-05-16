@@ -863,6 +863,8 @@ class ManifestContractTests(unittest.TestCase):
 
         cases = (
             ("missing duplicate_of", lambda props: props.pop("duplicate_of", None)),
+            ("duplicate_of may be blank", lambda props: props["duplicate_of"].pop("pattern", None)),
+            ("duplicate_of may be empty", lambda props: props["duplicate_of"].pop("minLength", None)),
             ("legacy canonical_issue_ref", lambda props: props.__setitem__("canonical_issue_ref", {"type": "string"})),
         )
         for name, mutate in cases:

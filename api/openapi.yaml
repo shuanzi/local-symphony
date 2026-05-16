@@ -610,7 +610,7 @@ components:
       properties:
         state: { $ref: '#/components/schemas/IssueState' }
         reason: { type: string, minLength: 1, pattern: "\\S" }
-        duplicate_of: { type: string }
+        duplicate_of: { type: string, minLength: 1, pattern: "\\S" }
       allOf:
         - if:
             required: [state]
