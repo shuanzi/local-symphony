@@ -524,6 +524,43 @@ class ManifestContractTests(unittest.TestCase):
                     finally:
                         validator.ROOT = old_root
 
+    def test_openapi_issue_list_array_query_param_items_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            (
+                "state items must reference IssueState",
+                "state",
+                {"type": "string"},
+            ),
+            (
+                "label items must be strings",
+                "label",
+                {"$ref": "#/components/schemas/IssueState"},
+            ),
+        )
+        for name, param_name, drifted_items in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    for param in openapi["paths"]["/issues"]["get"]["parameters"]:
+                        if param.get("name") == param_name:
+                            param["schema"]["items"] = drifted_items
+                            break
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
     def test_openapi_issue_list_query_param_location_contract_fails_when_drifted(self) -> None:
         validator = load_validator()
         manifest = load_manifest()
@@ -638,6 +675,76 @@ class ManifestContractTests(unittest.TestCase):
                     openapi_path = temp_root / "api/openapi.yaml"
                     openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
                     openapi["paths"][route][method]["responses"].pop("400", None)
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_duplicate_delete_failure_response_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+        route = "/issues/{issue_ref}/duplicates/{canonical_issue_ref}"
+
+        cases = (
+            ("missing delete operation", lambda paths: paths[route].pop("delete", None)),
+            ("missing 400 response", lambda paths: paths[route]["delete"]["responses"].pop("400", None)),
+            ("missing 404 response", lambda paths: paths[route]["delete"]["responses"].pop("404", None)),
+            (
+                "400 does not reference Error",
+                lambda paths: paths[route]["delete"]["responses"].__setitem__(
+                    "400",
+                    {"description": "Bad request"},
+                ),
+            ),
+            (
+                "404 does not reference Error",
+                lambda paths: paths[route]["delete"]["responses"].__setitem__(
+                    "404",
+                    {"description": "Not found"},
+                ),
+            ),
+            (
+                "400 does not document invalid_request",
+                lambda paths: paths[route]["delete"]["responses"]["400"].__setitem__(
+                    "description",
+                    "Bad request",
+                ),
+            ),
+            (
+                "404 does not document not_found",
+                lambda paths: paths[route]["delete"]["responses"]["404"].__setitem__(
+                    "description",
+                    "Missing relation",
+                ),
+            ),
+            (
+                "400 does not document no mutation",
+                lambda paths: paths[route]["delete"]["responses"]["400"].__setitem__(
+                    "description",
+                    "invalid_request for malformed duplicate refs.",
+                ),
+            ),
+            (
+                "404 does not document no mutation",
+                lambda paths: paths[route]["delete"]["responses"]["404"].__setitem__(
+                    "description",
+                    "not_found when duplicate refs are unresolved.",
+                ),
+            ),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    mutate(openapi["paths"])
                     openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
 
                     old_root = validator.ROOT

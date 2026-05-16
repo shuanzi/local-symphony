@@ -967,6 +967,13 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
             fail(f"OpenAPI GET /issues {name} parameter must use style=form and explode=true")
         if schema.get("type") != "array":
             fail(f"OpenAPI GET /issues {name} parameter must be an array")
+        items = schema.get("items", {})
+        if not isinstance(items, dict):
+            fail(f"OpenAPI GET /issues {name} parameter items must be an object")
+        if name == "state" and ref_name(items.get("$ref", "")) != "IssueState":
+            fail("OpenAPI GET /issues state parameter items must reference IssueState")
+        if name == "label" and items.get("type") != "string":
+            fail("OpenAPI GET /issues label parameter items must be strings")
     if issue_list_query_params["q"].get("schema", {}).get("type") != "string":
         fail("OpenAPI GET /issues q parameter must be a string")
     if issue_list_query_params["dispatch_paused"].get("schema", {}).get("type") != "boolean":
@@ -1006,6 +1013,22 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
         bad_request = operation.get("responses", {}).get("400")
         if not isinstance(bad_request, dict) or ref_name(bad_request.get("$ref", "")) != "Error":
             fail(f"OpenAPI {method.upper()} {route} must document 400 Error for invalid mutation request body")
+
+    duplicate_delete_route = "/issues/{issue_ref}/duplicates/{canonical_issue_ref}"
+    duplicate_delete = paths.get(duplicate_delete_route, {}).get("delete")
+    if not isinstance(duplicate_delete, dict):
+        fail(f"OpenAPI DELETE {duplicate_delete_route} must be defined")
+    duplicate_delete_responses = duplicate_delete.get("responses", {})
+    required_duplicate_delete_errors = {"400": "invalid_request", "404": "not_found"}
+    for status, error_code in required_duplicate_delete_errors.items():
+        response = duplicate_delete_responses.get(status)
+        if not isinstance(response, dict) or ref_name(response.get("$ref", "")) != "Error":
+            fail(f"OpenAPI DELETE {duplicate_delete_route} must document {status} Error")
+        description = str(response.get("description", "")).lower()
+        if error_code not in description:
+            fail(f"OpenAPI DELETE {duplicate_delete_route} {status} response must document {error_code}")
+        if "no mutation" not in description:
+            fail(f"OpenAPI DELETE {duplicate_delete_route} {status} response must document no mutation")
 
     openapi_route_candidates = [(route, route_candidates(route)) for route in paths]
     for fragment in require_list(manifest, ("openapi", "forbidden_route_fragments")):

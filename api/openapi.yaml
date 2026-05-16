@@ -189,7 +189,10 @@ paths:
         - { name: canonical_issue_ref, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/SymphonyCSRF' }
       x-csrf-required-for-cookie-auth: true
-      responses: { "200": { description: Removed, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
+      responses:
+        "200": { description: Removed, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: "invalid_request for malformed, self, cross-project, or invalid duplicate refs; no mutation is applied." }
+        "404": { $ref: '#/components/responses/Error', description: "not_found when issue_ref or canonical_issue_ref is unresolved; no mutation is applied." }
   /issues/{issue_ref}/events/stream:
     get:
       operationId: streamIssueEvents
