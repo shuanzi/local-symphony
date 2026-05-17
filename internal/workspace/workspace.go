@@ -33,25 +33,32 @@ func (m Manager) Prepare(run *core.RunAttempt, issue *core.Issue) (*core.Workspa
 	}
 	branch := branchName(m.Config.Git.BranchPrefix, issue.Identifier, run.ID)
 	path := filepath.Join(projectRoot, issue.Identifier)
-	baseRef := m.Config.Git.BaseRef
-	if baseRef == "" || baseRef == "auto" {
+	baseRefConfig := m.Config.Git.BaseRef
+	if baseRefConfig == "" {
+		baseRefConfig = "auto"
+	}
+	baseRef := baseRefConfig
+	if baseRefConfig == "auto" {
 		baseRef = gitx.CurrentBranch(m.Store.RepoRoot)
 		if baseRef == "" {
 			baseRef = "HEAD"
 		}
 	}
-	baseSHA := gitx.HeadSHA(m.Store.RepoRoot)
-	if err := gitx.WorktreeAdd(m.Store.RepoRoot, path, branch); err != nil {
+	baseSHA := gitx.RefSHA(m.Store.RepoRoot, baseRef)
+	if gitx.IsRepo(m.Store.RepoRoot) && gitx.HasHEAD(m.Store.RepoRoot) && baseSHA == "0000000000000000000000000000000000000000" {
+		return nil, fmt.Errorf("git base ref %q could not be resolved", baseRef)
+	}
+	if err := gitx.WorktreeAdd(m.Store.RepoRoot, path, branch, baseRef); err != nil {
 		return nil, err
 	}
-	wsID, err := m.Store.CreateOrUpdateWorkspace(issue.ID, path, branch, "auto", baseRef, baseSHA)
+	wsID, err := m.Store.CreateOrUpdateWorkspace(issue.ID, path, branch, baseRefConfig, baseRef, baseSHA)
 	if err != nil {
 		return nil, err
 	}
-	if err := m.Store.SetRunWorkspace(run.ID, wsID, branch, "auto", baseRef, baseSHA); err != nil {
+	if err := m.Store.SetRunWorkspace(run.ID, wsID, branch, baseRefConfig, baseRef, baseSHA); err != nil {
 		return nil, err
 	}
-	return &core.WorkspaceSummary{ID: wsID, Path: path, BranchName: branch, BaseRef: baseRef, BaseRefConfig: "auto", BaseSHA: baseSHA, Status: "prepared"}, nil
+	return &core.WorkspaceSummary{ID: wsID, Path: path, BranchName: branch, BaseRef: baseRef, BaseRefConfig: baseRefConfig, BaseSHA: baseSHA, Status: "prepared"}, nil
 }
 
 func branchName(prefix, ident, runID string) string {

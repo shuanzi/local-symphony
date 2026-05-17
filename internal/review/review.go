@@ -44,7 +44,7 @@ func (g Generator) Generate(runID string) (string, error) {
 	}
 	root := filepath.Join(g.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, runID)
 	if err := os.MkdirAll(filepath.Join(root, "prompt"), 0o755); err != nil {
-		return "", err
+		return "", reviewPacketError("create review packet directory", err)
 	}
 	changed, untracked := collectChanges(issue.Workspace.Path)
 	if len(handoff.ChangedFiles) > 0 {
@@ -68,29 +68,67 @@ func (g Generator) Generate(runID string) (string, error) {
 	untrackedPath := filepath.Join(root, "untracked-files.json")
 	reviewJSONPath := filepath.Join(root, "review.json")
 	reviewMDPath := filepath.Join(root, "review.md")
-	_ = os.WriteFile(changedPath, []byte(strings.Join(changed, "\n")+"\n"), 0o644)
-	_ = os.WriteFile(patchPath, []byte(patch), 0o644)
+	if err := os.WriteFile(changedPath, []byte(strings.Join(changed, "\n")+"\n"), 0o644); err != nil {
+		return "", reviewPacketError("write changed files artifact", err)
+	}
+	if err := os.WriteFile(patchPath, []byte(patch), 0o644); err != nil {
+		return "", reviewPacketError("write patch artifact", err)
+	}
 	diffstat := gitx.DiffNumstat(issue.Workspace.Path)
 	if diffstat == "" {
 		diffstat = "0\t0\tgenerated\n"
 	}
-	_ = os.WriteFile(diffstatPath, []byte(diffstat), 0o644)
-	ub, _ := json.MarshalIndent(untracked, "", "  ")
-	_ = os.WriteFile(untrackedPath, ub, 0o644)
+	if err := os.WriteFile(diffstatPath, []byte(diffstat), 0o644); err != nil {
+		return "", reviewPacketError("write diffstat artifact", err)
+	}
+	ub, err := json.MarshalIndent(untracked, "", "  ")
+	if err != nil {
+		return "", reviewPacketError("marshal untracked files artifact", err)
+	}
+	if err := os.WriteFile(untrackedPath, ub, 0o644); err != nil {
+		return "", reviewPacketError("write untracked files artifact", err)
+	}
 	promptID := ""
+	promptContextHash := ""
+	promptRenderedHash := ""
 	if run.WorkflowSnapshotID != nil {
 		ctx := map[string]any{"issue_identifier": issue.Identifier, "run_id": runID}
-		cb, _ := json.MarshalIndent(ctx, "", "  ")
-		_ = os.WriteFile(filepath.Join(root, "prompt", "context.json"), cb, 0o644)
-		_ = os.WriteFile(filepath.Join(root, "prompt", "rendered_prompt.redacted.md"), []byte("[redacted prompt snapshot metadata only]\n"), 0o644)
-		_ = os.WriteFile(filepath.Join(root, "prompt", "prompt_meta.json"), []byte(`{"redacted":true}`), 0o644)
-		_ = os.WriteFile(filepath.Join(root, "prompt", "tool_manifest.md"), []byte("issue.get\nissue.comment\nissue.block\nartifact.attach\nfollowup.create\nhandoff.submit\n"), 0o644)
+		cb, err := json.MarshalIndent(ctx, "", "  ")
+		if err != nil {
+			return "", reviewPacketError("marshal prompt context", err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "prompt", "context.json"), cb, 0o644); err != nil {
+			return "", reviewPacketError("write prompt context", err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "prompt", "rendered_prompt.redacted.md"), []byte("[redacted prompt snapshot metadata only]\n"), 0o644); err != nil {
+			return "", reviewPacketError("write redacted prompt", err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "prompt", "prompt_meta.json"), []byte(`{"redacted":true}`), 0o644); err != nil {
+			return "", reviewPacketError("write prompt metadata", err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "prompt", "tool_manifest.md"), []byte("issue.get\nissue.comment\nissue.block\nartifact.attach\nfollowup.create\nhandoff.submit\n"), 0o644); err != nil {
+			return "", reviewPacketError("write tool manifest", err)
+		}
 		h := sha256.Sum256(cb)
 		ph := sha256.Sum256([]byte("redacted"))
-		pid, err := g.Store.CreatePromptSnapshot(runID, *run.WorkflowSnapshotID, hex.EncodeToString(h[:]), hex.EncodeToString(ph[:]), root)
-		if err == nil {
-			promptID = pid
+		promptContextHash = hex.EncodeToString(h[:])
+		promptRenderedHash = hex.EncodeToString(ph[:])
+	}
+	if err := g.Store.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return "", reviewPacketError("begin review packet transaction", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = g.Store.Project.Exec(`ROLLBACK`)
 		}
+	}()
+	if run.WorkflowSnapshotID != nil {
+		pid, err := g.Store.CreatePromptSnapshot(runID, *run.WorkflowSnapshotID, promptContextHash, promptRenderedHash, root)
+		if err != nil {
+			return "", reviewPacketError("create prompt snapshot", err)
+		}
+		promptID = pid
 	}
 	rpID := core.NewID("rp_tmp_")
 	packetNo := nextPacketNo(g.Store, issue.ID)
@@ -106,22 +144,46 @@ func (g Generator) Generate(runID string) (string, error) {
 		"prompt_snapshot": map[string]any{"id": promptID, "rendered_prompt_hash": "redacted", "tool_manifest_path": "prompt/tool_manifest.md"},
 		"failure_code":    nil, "failure_message": nil, "created_at": core.Now(),
 	}
-	jb, _ := json.MarshalIndent(packet, "", "  ")
-	_ = os.WriteFile(reviewJSONPath, jb, 0o644)
-	_ = os.WriteFile(reviewMDPath, []byte(renderMarkdown(issue, handoff, changed, run)), 0o644)
+	jb, err := json.MarshalIndent(packet, "", "  ")
+	if err != nil {
+		return "", reviewPacketError("marshal review packet", err)
+	}
+	if err := os.WriteFile(reviewJSONPath, jb, 0o644); err != nil {
+		return "", reviewPacketError("write review json artifact", err)
+	}
+	if err := os.WriteFile(reviewMDPath, []byte(renderMarkdown(issue, handoff, changed, run)), 0o644); err != nil {
+		return "", reviewPacketError("write review markdown artifact", err)
+	}
 	// Insert immutable packet with the final ID, then rewrite review.json with the final id.
 	finalID, err := g.Store.InsertReviewPacket(issue.ID, runID, handoff.ID, root, reviewMDPath, reviewJSONPath, patchPath, changedPath, untrackedPath, diffstatPath, promptID)
 	if err != nil {
-		return "", err
+		return "", reviewPacketError("insert review packet", err)
 	}
 	packet["id"] = finalID
-	jb, _ = json.MarshalIndent(packet, "", "  ")
-	_ = os.WriteFile(reviewJSONPath, jb, 0o644)
-	for _, item := range []struct{ kind, path string }{{"review_packet", reviewMDPath}, {"review_packet", reviewJSONPath}, {"patch", patchPath}, {"changed_files", changedPath}, {"untracked_files", untrackedPath}, {"diffstat", diffstatPath}} {
-		st, _ := os.Stat(item.path)
-		sha := fileSHA(item.path)
-		_ = g.Store.InsertArtifact(store.ArtifactRecord{ID: core.NewID("art_"), IssueID: &issue.ID, RunID: &runID, ReviewPacketID: &finalID, Kind: item.kind, Path: item.path, SizeBytes: sizeOf(st), SHA256: &sha, Redacted: true})
+	jb, err = json.MarshalIndent(packet, "", "  ")
+	if err != nil {
+		return "", reviewPacketError("marshal final review packet", err)
 	}
+	if err := os.WriteFile(reviewJSONPath, jb, 0o644); err != nil {
+		return "", reviewPacketError("write final review json artifact", err)
+	}
+	for _, item := range []struct{ kind, path string }{{"review_packet", reviewMDPath}, {"review_packet", reviewJSONPath}, {"patch", patchPath}, {"changed_files", changedPath}, {"untracked_files", untrackedPath}, {"diffstat", diffstatPath}} {
+		st, err := os.Stat(item.path)
+		if err != nil {
+			return "", reviewPacketError("stat review artifact", err)
+		}
+		sha, err := fileSHA(item.path)
+		if err != nil {
+			return "", reviewPacketError("hash review artifact", err)
+		}
+		if err := g.Store.InsertArtifact(store.ArtifactRecord{ID: core.NewID("art_"), IssueID: &issue.ID, RunID: &runID, ReviewPacketID: &finalID, Kind: item.kind, Path: item.path, SizeBytes: st.Size(), SHA256: &sha, Redacted: true}); err != nil {
+			return "", reviewPacketError("insert review artifact metadata", err)
+		}
+	}
+	if err := g.Store.Project.Exec(`COMMIT`); err != nil {
+		return "", reviewPacketError("commit review packet transaction", err)
+	}
+	committed = true
 	return finalID, nil
 }
 
@@ -284,16 +346,19 @@ func val(p *string) string {
 	}
 	return *p
 }
-func fileSHA(path string) string {
-	b, _ := os.ReadFile(path)
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
-}
-func sizeOf(st os.FileInfo) int64 {
-	if st == nil {
-		return 0
+func reviewPacketError(action string, err error) error {
+	if err == nil {
+		return nil
 	}
-	return st.Size()
+	return core.NewError(core.ErrReviewPacketFailed, action+": "+err.Error(), nil)
+}
+func fileSHA(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:]), nil
 }
 func nextPacketNo(st *store.Store, issueID string) int {
 	row, err := st.Project.QueryOne(`SELECT COALESCE(MAX(packet_no),0)+1 AS n FROM review_packets WHERE issue_id=?`, issueID)

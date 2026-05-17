@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +22,8 @@ import (
 	"local-symphony/internal/store"
 	"local-symphony/internal/toolgateway"
 )
+
+const sessionCookieName = "symphony_session"
 
 type Server struct {
 	Store     *store.Store
@@ -96,9 +99,10 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = "/"
 	}
-	if requiresCSRF(path, r.Method) && r.Header.Get("X-Symphony-CSRF") != s.csrfToken {
-		apiErr(w, core.NewError(core.ErrCSRFRequired, "CSRF token required", nil))
-		return
+	if requiresCSRF(path, r.Method) {
+		if !s.authorizeCommand(w, r) {
+			return
+		}
 	}
 	switch {
 	case r.Method == "GET" && path == "/health":
@@ -110,13 +114,17 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "GET" && path == "/events/stream":
 		s.sse(w, r, "", "")
 	case r.Method == "POST" && path == "/auth/exchange":
-		ok(w, map[string]any{"session": "created", "authenticated": true, "csrf_token": s.csrfToken, "csrf": s.csrfToken})
+		s.authExchange(w, r)
 	case r.Method == "GET" && path == "/auth/session":
+		if !s.validSession(r) {
+			ok(w, map[string]any{"authenticated": false, "project_id": s.Store.ProjectID})
+			return
+		}
 		ok(w, map[string]any{"authenticated": true, "project_id": s.Store.ProjectID, "csrf_token": s.csrfToken, "csrf": s.csrfToken})
 	case r.Method == "POST" && path == "/auth/logout":
-		ok(w, map[string]any{"logged_out": true})
+		s.authLogout(w, r)
 	case r.Method == "POST" && path == "/auth/open-token":
-		ok(w, map[string]any{"open_token": "redacted", "open_url": "/"})
+		s.openToken(w, r)
 	case r.Method == "POST" && path == "/auth/cli-token/rotate":
 		ok(w, map[string]any{"rotated": true})
 	case path == "/issues" && r.Method == "GET":
@@ -407,7 +415,9 @@ func (s *Server) runRoutes(w http.ResponseWriter, r *http.Request, rest string) 
 				var in struct {
 					Reason string `json:"reason"`
 				}
-				_ = json.NewDecoder(r.Body).Decode(&in)
+				if readBody(r, &in, w) {
+					return
+				}
 				if err := s.Store.CancelRun(id, in.Reason); err != nil {
 					apiErr(w, err)
 					return
@@ -640,6 +650,9 @@ func apiErr(w http.ResponseWriter, err error) {
 	if ae.Code == core.ErrForbidden || ae.Code == core.ErrCSRFRequired {
 		status = 403
 	}
+	if ae.Code == core.ErrInternal {
+		status = 500
+	}
 	writeJSON(w, status, core.ErrorEnvelope{Error: map[string]any{"code": ae.Code, "message": ae.Message, "details": ae.Details, "request_id": core.NewID("req_")}})
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -704,4 +717,159 @@ func requiresCSRF(path, method string) bool {
 		return false
 	}
 	return path != "/auth/exchange" && path != "/auth/open-token"
+}
+
+func (s *Server) authorizeCommand(w http.ResponseWriter, r *http.Request) bool {
+	if s.validBearerSession(r) {
+		return true
+	}
+	if !s.validSession(r) {
+		apiErr(w, core.NewError(core.ErrUnauthorized, "browser session invalid", nil))
+		return false
+	}
+	if r.Header.Get("X-Symphony-CSRF") != s.csrfToken {
+		apiErr(w, core.NewError(core.ErrCSRFRequired, "CSRF token required", nil))
+		return false
+	}
+	return true
+}
+
+func (s *Server) authExchange(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		OpenToken string `json:"open_token"`
+	}
+	if readBody(r, &in, w) {
+		return
+	}
+	if strings.TrimSpace(in.OpenToken) == "" {
+		apiErr(w, core.NewError(core.ErrInvalidRequest, "open_token is required", nil))
+		return
+	}
+	sessionToken, expiresAt, err := s.exchangeOpenToken(in.OpenToken)
+	if err != nil {
+		apiErr(w, err)
+		return
+	}
+	s.setSessionCookie(w, r, sessionToken, expiresAt)
+	ok(w, map[string]any{"session": "created", "authenticated": true, "csrf_token": s.csrfToken, "csrf": s.csrfToken, "expires_at": expiresAt})
+}
+
+func (s *Server) exchangeOpenToken(openToken string) (string, string, error) {
+	now := core.Now()
+	hash := security.HashToken(openToken)
+	if err := s.Store.App.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return "", "", err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.Store.App.Exec(`ROLLBACK`)
+		}
+	}()
+	row, err := s.Store.App.QueryOne(`SELECT id,expires_at FROM open_tokens WHERE project_id=? AND token_hash=? AND consumed_at IS NULL`, s.Store.ProjectID, hash)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", "", core.NewError(core.ErrUnauthorized, "open token invalid", nil)
+	}
+	if err != nil {
+		return "", "", err
+	}
+	if row["expires_at"].String() < now {
+		return "", "", core.NewError(core.ErrUnauthorized, "open token expired", nil)
+	}
+	sessionToken := security.NewToken()
+	expiresAt := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano)
+	if err := s.Store.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,csrf_hash,user_label,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("ses_"), s.Store.ProjectID, "browser", security.HashToken(sessionToken), security.HashToken(s.csrfToken), "local-dashboard", now, expiresAt); err != nil {
+		return "", "", err
+	}
+	if err := s.Store.App.Exec(`UPDATE open_tokens SET consumed_at=? WHERE id=?`, now, row["id"].String()); err != nil {
+		return "", "", err
+	}
+	if err := s.Store.App.Exec(`COMMIT`); err != nil {
+		return "", "", err
+	}
+	committed = true
+	return sessionToken, expiresAt, nil
+}
+
+func (s *Server) openToken(w http.ResponseWriter, r *http.Request) {
+	if !s.validBearerSession(r) {
+		apiErr(w, core.NewError(core.ErrUnauthorized, "bearer token invalid", nil))
+		return
+	}
+	token := security.NewToken()
+	expiresAt := time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339Nano)
+	if err := s.Store.App.Exec(`INSERT INTO open_tokens(id,project_id,token_hash,expires_at,created_at) VALUES(?,?,?,?,?)`, core.NewID("open_"), s.Store.ProjectID, security.HashToken(token), expiresAt, core.Now()); err != nil {
+		apiErr(w, err)
+		return
+	}
+	ok(w, map[string]any{"open_token": token, "expires_at": expiresAt})
+}
+
+func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
+	if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
+		_ = s.Store.App.Exec(`UPDATE local_sessions SET revoked_at=? WHERE project_id=? AND token_hash=? AND kind='browser'`, core.Now(), s.Store.ProjectID, security.HashToken(cookie.Value))
+	}
+	s.clearSessionCookie(w)
+	ok(w, map[string]any{"logged_out": true})
+}
+
+func (s *Server) validBearerSession(r *http.Request) bool {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if token == "" || token == r.Header.Get("Authorization") {
+		return false
+	}
+	return s.validStoredSession(security.HashToken(token), "cli", "desktop")
+}
+
+func (s *Server) validSession(r *http.Request) bool {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" {
+		return false
+	}
+	return s.validStoredSession(security.HashToken(cookie.Value), "browser")
+}
+
+func (s *Server) validStoredSession(tokenHash string, kinds ...string) bool {
+	args := []any{s.Store.ProjectID, tokenHash}
+	placeholders := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		placeholders = append(placeholders, "?")
+		args = append(args, kind)
+	}
+	row, err := s.Store.App.QueryOne(`SELECT id,expires_at,revoked_at FROM local_sessions WHERE project_id=? AND token_hash=? AND kind IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return false
+	}
+	if !row["revoked_at"].Null && row["revoked_at"].String() != "" {
+		return false
+	}
+	if !row["expires_at"].Null && row["expires_at"].String() != "" && row["expires_at"].String() < core.Now() {
+		return false
+	}
+	_ = s.Store.App.Exec(`UPDATE local_sessions SET last_seen_at=? WHERE id=?`, core.Now(), row["id"].String())
+	return true
+}
+
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token, expiresAt string) {
+	expires, _ := time.Parse(time.RFC3339Nano, expiresAt)
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		Expires:  expires,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+	})
+}
+
+func (s *Server) clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
 }

@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"local-symphony/internal/core"
+	"local-symphony/internal/security"
 	"local-symphony/internal/store"
 )
 
@@ -36,12 +38,21 @@ func decodeEnvelope(t *testing.T, body *strings.Reader) map[string]any {
 
 func TestSessionReturnsCSRFTokenAndMutationsRequireIt(t *testing.T) {
 	srv := newTestServer(t)
-
-	token := sessionCSRFToken(t, srv)
+	auth := sessionAuth(t, srv)
 
 	body := `{"title":"CSRF issue","description":"desc","acceptance_criteria":["done"],"priority":3,"labels":[]}`
+	noSessionReq := httptest.NewRequest(http.MethodPost, "/api/v1/issues", strings.NewReader(body))
+	noSessionReq.Header.Set("Content-Type", "application/json")
+	noSessionReq.Header.Set("X-Symphony-CSRF", auth.csrf)
+	noSessionRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(noSessionRec, noSessionReq)
+	if noSessionRec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing session status = %d, want 401", noSessionRec.Code)
+	}
+
 	noCSRFReq := httptest.NewRequest(http.MethodPost, "/api/v1/issues", strings.NewReader(body))
 	noCSRFReq.Header.Set("Content-Type", "application/json")
+	addCookies(noCSRFReq, auth.cookies)
 	noCSRFRec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(noCSRFRec, noCSRFReq)
 	if noCSRFRec.Code != http.StatusForbidden {
@@ -55,11 +66,165 @@ func TestSessionReturnsCSRFTokenAndMutationsRequireIt(t *testing.T) {
 
 	withCSRFReq := httptest.NewRequest(http.MethodPost, "/api/v1/issues", strings.NewReader(body))
 	withCSRFReq.Header.Set("Content-Type", "application/json")
-	withCSRFReq.Header.Set("X-Symphony-CSRF", token)
+	applySessionAuth(withCSRFReq, auth)
 	withCSRFRec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(withCSRFRec, withCSRFReq)
 	if withCSRFRec.Code != http.StatusOK {
 		t.Fatalf("valid CSRF status = %d, body = %s", withCSRFRec.Code, withCSRFRec.Body.String())
+	}
+}
+
+func TestSessionWithoutCookieDoesNotExposeCSRFToken(t *testing.T) {
+	srv := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session status = %d", rec.Code)
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	data := payload["data"].(map[string]any)
+	if data["authenticated"] != false {
+		t.Fatalf("session data = %#v, want authenticated false", data)
+	}
+	if token, _ := data["csrf_token"].(string); token != "" {
+		t.Fatalf("unauthenticated session leaked csrf_token %q", token)
+	}
+	if token, _ := data["csrf"].(string); token != "" {
+		t.Fatalf("unauthenticated session leaked csrf %q", token)
+	}
+}
+
+func TestExchangeRequiresValidOpenTokenAndCreatesSessionCookie(t *testing.T) {
+	srv := newTestServer(t)
+
+	badReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/exchange", strings.NewReader(`{"open_token":"not-valid"}`))
+	badReq.Header.Set("Content-Type", "application/json")
+	badRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid exchange status = %d, body = %s", badRec.Code, badRec.Body.String())
+	}
+	if cookies := badRec.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("invalid exchange set cookies: %#v", cookies)
+	}
+
+	openToken := insertOpenToken(t, srv)
+	exchangeReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/exchange", strings.NewReader(`{"open_token":"`+openToken+`"}`))
+	exchangeReq.Header.Set("Content-Type", "application/json")
+	exchangeRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(exchangeRec, exchangeReq)
+	if exchangeRec.Code != http.StatusOK {
+		t.Fatalf("valid exchange status = %d, body = %s", exchangeRec.Code, exchangeRec.Body.String())
+	}
+	cookies := exchangeRec.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatalf("valid exchange did not set a session cookie")
+	}
+	payload := decodeEnvelope(t, strings.NewReader(exchangeRec.Body.String()))
+	data := payload["data"].(map[string]any)
+	if data["authenticated"] != true {
+		t.Fatalf("exchange data = %#v, want authenticated true", data)
+	}
+	if token, _ := data["csrf_token"].(string); token == "" {
+		t.Fatalf("exchange data = %#v, want csrf_token", data)
+	}
+
+	sessionReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+	for _, cookie := range cookies {
+		sessionReq.AddCookie(cookie)
+	}
+	sessionRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(sessionRec, sessionReq)
+	if sessionRec.Code != http.StatusOK {
+		t.Fatalf("session status = %d, body = %s", sessionRec.Code, sessionRec.Body.String())
+	}
+	sessionPayload := decodeEnvelope(t, strings.NewReader(sessionRec.Body.String()))
+	sessionData := sessionPayload["data"].(map[string]any)
+	if sessionData["authenticated"] != true {
+		t.Fatalf("session data = %#v, want authenticated true", sessionData)
+	}
+	if token, _ := sessionData["csrf_token"].(string); token == "" {
+		t.Fatalf("session data = %#v, want csrf_token", sessionData)
+	}
+
+	reuseReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/exchange", strings.NewReader(`{"open_token":"`+openToken+`"}`))
+	reuseReq.Header.Set("Content-Type", "application/json")
+	reuseRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(reuseRec, reuseReq)
+	if reuseRec.Code != http.StatusUnauthorized {
+		t.Fatalf("reused exchange status = %d, body = %s", reuseRec.Code, reuseRec.Body.String())
+	}
+}
+
+func TestOpenTokenRequiresBearerSession(t *testing.T) {
+	srv := newTestServer(t)
+
+	noBearerReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/open-token", nil)
+	noBearerRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(noBearerRec, noBearerReq)
+	if noBearerRec.Code != http.StatusUnauthorized {
+		t.Fatalf("open-token without bearer status = %d, body = %s", noBearerRec.Code, noBearerRec.Body.String())
+	}
+
+	cliToken := insertLocalSession(t, srv, "cli")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/open-token", nil)
+	req.Header.Set("Authorization", "Bearer "+cliToken)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("open-token with bearer status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	data := payload["data"].(map[string]any)
+	openToken, _ := data["open_token"].(string)
+	if openToken == "" {
+		t.Fatalf("open-token data = %#v, want open_token", data)
+	}
+
+	exchangeReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/exchange", strings.NewReader(`{"open_token":"`+openToken+`"}`))
+	exchangeReq.Header.Set("Content-Type", "application/json")
+	exchangeRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(exchangeRec, exchangeReq)
+	if exchangeRec.Code != http.StatusOK {
+		t.Fatalf("exchange minted open token status = %d, body = %s", exchangeRec.Code, exchangeRec.Body.String())
+	}
+}
+
+func TestLogoutRevokesBrowserSession(t *testing.T) {
+	srv := newTestServer(t)
+	auth := sessionAuth(t, srv)
+
+	logoutReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+	applySessionAuth(logoutReq, auth)
+	logoutRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(logoutRec, logoutReq)
+	if logoutRec.Code != http.StatusOK {
+		t.Fatalf("logout status = %d, body = %s", logoutRec.Code, logoutRec.Body.String())
+	}
+
+	sessionReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+	addCookies(sessionReq, auth.cookies)
+	sessionRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(sessionRec, sessionReq)
+	if sessionRec.Code != http.StatusOK {
+		t.Fatalf("session status = %d, body = %s", sessionRec.Code, sessionRec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(sessionRec.Body.String()))
+	data := payload["data"].(map[string]any)
+	if data["authenticated"] != false {
+		t.Fatalf("session data = %#v, want authenticated false after logout", data)
+	}
+
+	body := `{"title":"After logout","description":"desc","acceptance_criteria":["done"],"priority":3,"labels":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/issues", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, auth)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("mutation after logout status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -283,11 +448,85 @@ func TestRunEventStreamUnknownRunReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestCancelRunRejectsMalformedJSONWithoutCancelling(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Cancel malformed", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.Identifier, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", strings.NewReader(`{"reason":`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("malformed cancel status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != "invalid_request" {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	after, err := srv.Store.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if after.Status == core.RunCancelled {
+		t.Fatalf("malformed cancel request cancelled run %#v", after)
+	}
+}
+
+func TestCancelRunAllowsEmptyBody(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Cancel empty", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.Identifier, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", nil)
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty cancel status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	after, err := srv.Store.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if after.Status != core.RunCancelled {
+		t.Fatalf("run status = %s, want cancelled", after.Status)
+	}
+}
+
+func TestInternalErrorMapsToHTTP500(t *testing.T) {
+	rec := httptest.NewRecorder()
+	apiErr(rec, core.NewError(core.ErrInternal, "boom", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("internal error status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestWorkflowPreviewDoesNotReturnRenderedPromptBody(t *testing.T) {
 	srv := newTestServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/workflow/render-preview", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Symphony-CSRF", sessionCSRFToken(t, srv))
+	applySessionAuth(req, sessionAuth(t, srv))
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -303,7 +542,28 @@ func TestWorkflowPreviewDoesNotReturnRenderedPromptBody(t *testing.T) {
 
 func sessionCSRFToken(t *testing.T, srv *Server) string {
 	t.Helper()
+	return sessionAuth(t, srv).csrf
+}
+
+type testSessionAuth struct {
+	csrf    string
+	cookies []*http.Cookie
+}
+
+func sessionAuth(t *testing.T, srv *Server) testSessionAuth {
+	t.Helper()
+	openToken := insertOpenToken(t, srv)
+	exchangeReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/exchange", strings.NewReader(`{"open_token":"`+openToken+`"}`))
+	exchangeReq.Header.Set("Content-Type", "application/json")
+	exchangeRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(exchangeRec, exchangeReq)
+	if exchangeRec.Code != http.StatusOK {
+		t.Fatalf("exchange status = %d, body = %s", exchangeRec.Code, exchangeRec.Body.String())
+	}
+	cookies := exchangeRec.Result().Cookies()
+
 	sessionReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+	addCookies(sessionReq, cookies)
 	sessionRec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(sessionRec, sessionReq)
 	if sessionRec.Code != http.StatusOK {
@@ -314,6 +574,36 @@ func sessionCSRFToken(t *testing.T, srv *Server) string {
 	token, _ := data["csrf_token"].(string)
 	if data["authenticated"] != true || token == "" {
 		t.Fatalf("session data = %#v, want authenticated true and csrf_token", data)
+	}
+	return testSessionAuth{csrf: token, cookies: cookies}
+}
+
+func applySessionAuth(req *http.Request, auth testSessionAuth) {
+	req.Header.Set("X-Symphony-CSRF", auth.csrf)
+	addCookies(req, auth.cookies)
+}
+
+func addCookies(req *http.Request, cookies []*http.Cookie) {
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+}
+
+func insertOpenToken(t *testing.T, srv *Server) string {
+	t.Helper()
+	token := security.NewToken()
+	expiresAt := time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano)
+	if err := srv.Store.App.Exec(`INSERT INTO open_tokens(id,project_id,token_hash,expires_at,created_at) VALUES(?,?,?,?,?)`, core.NewID("open_"), srv.Store.ProjectID, security.HashToken(token), expiresAt, core.Now()); err != nil {
+		t.Fatalf("insert open token: %v", err)
+	}
+	return token
+}
+
+func insertLocalSession(t *testing.T, srv *Server, kind string) string {
+	t.Helper()
+	token := security.NewToken()
+	if err := srv.Store.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("ses_"), srv.Store.ProjectID, kind, security.HashToken(token), "test-session", core.Now()); err != nil {
+		t.Fatalf("insert local session: %v", err)
 	}
 	return token
 }

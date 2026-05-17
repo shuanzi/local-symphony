@@ -452,10 +452,12 @@ components:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/AppState' } } } ]
     AuthSession:
       type: object
-      required: [authenticated, csrf_token]
+      required: [authenticated]
       properties:
         authenticated: { type: boolean }
+        project_id: { type: string }
         csrf_token: { type: string }
+        csrf: { type: string, deprecated: true }
         expires_at: { type: [string, 'null'], format: date-time }
     AuthSessionEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/AuthSession' } } } ]

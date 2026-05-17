@@ -116,15 +116,24 @@ func (g Gateway) dispatch(issue *core.Issue, runID string, req Request) (Respons
 		if st.Size() > max {
 			return Response{}, core.NewError(core.ErrInvalidRequest, "artifact exceeds max size", nil)
 		}
-		b, _ := os.ReadFile(target)
+		b, err := os.ReadFile(target)
+		if err != nil {
+			return Response{}, core.NewError(core.ErrToolGatewayFailed, "read artifact: "+err.Error(), nil)
+		}
 		sha := security.SHA256Bytes(b)
 		artDir := filepath.Join(g.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, runID, "agent")
-		_ = os.MkdirAll(artDir, 0o755)
+		if err := os.MkdirAll(artDir, 0o755); err != nil {
+			return Response{}, core.NewError(core.ErrToolGatewayFailed, "create artifact directory: "+err.Error(), nil)
+		}
 		dst := filepath.Join(artDir, filepath.Base(rel))
-		_ = os.WriteFile(dst, b, 0o644)
+		if err := os.WriteFile(dst, b, 0o644); err != nil {
+			return Response{}, core.NewError(core.ErrToolGatewayFailed, "write artifact: "+err.Error(), nil)
+		}
 		aid := core.NewID("art_")
 		desc := fmt.Sprint(req.Input["description"])
-		_ = g.Store.InsertArtifact(store.ArtifactRecord{ID: aid, IssueID: &issue.ID, RunID: &runID, Kind: kind, Path: dst, SizeBytes: st.Size(), SHA256: &sha, Redacted: true, Description: core.NullableString(desc)})
+		if err := g.Store.InsertArtifact(store.ArtifactRecord{ID: aid, IssueID: &issue.ID, RunID: &runID, Kind: kind, Path: dst, SizeBytes: st.Size(), SHA256: &sha, Redacted: true, Description: core.NullableString(desc)}); err != nil {
+			return Response{}, core.NewError(core.ErrToolGatewayFailed, "insert artifact metadata: "+err.Error(), nil)
+		}
 		return Response{Success: true, Tool: req.Tool, Data: map[string]any{"artifact_id": aid}}, nil
 	case "followup.create":
 		title := strings.TrimSpace(fmt.Sprint(req.Input["title"]))

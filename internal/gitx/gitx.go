@@ -3,6 +3,7 @@ package gitx
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,7 +34,13 @@ func IsRepo(dir string) bool {
 }
 func HasHEAD(dir string) bool { return Run(dir, "rev-parse", "--verify", "HEAD").Err == nil }
 func HeadSHA(dir string) string {
-	r := Run(dir, "rev-parse", "HEAD")
+	return RefSHA(dir, "HEAD")
+}
+func RefSHA(dir, ref string) string {
+	if strings.TrimSpace(ref) == "" {
+		ref = "HEAD"
+	}
+	r := Run(dir, "rev-parse", ref)
 	if r.Err != nil {
 		return "0000000000000000000000000000000000000000"
 	}
@@ -47,24 +54,30 @@ func CurrentBranch(dir string) string {
 	return strings.TrimSpace(r.Stdout)
 }
 
-func WorktreeAdd(repoRoot, path, branch string) error {
+func WorktreeAdd(repoRoot, path, branch, startPoint string) error {
 	if !IsRepo(repoRoot) || !HasHEAD(repoRoot) {
 		return copyWorkspace(repoRoot, path)
 	}
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	if strings.TrimSpace(startPoint) == "" {
+		startPoint = "HEAD"
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	if _, err := os.Stat(path); err == nil {
-		return nil
+		return fmt.Errorf("workspace path already exists: %s", path)
+	} else if !os.IsNotExist(err) {
+		return err
 	}
-	r := Run(repoRoot, "worktree", "add", "-b", branch, path, "HEAD")
+	r := Run(repoRoot, "worktree", "add", "-b", branch, path, startPoint)
 	if r.Err == nil {
 		return nil
 	}
-	// If branch exists, try attaching it. If that still fails, fall back to a safe copy for local fake-runner use.
-	r = Run(repoRoot, "worktree", "add", path, branch)
-	if r.Err == nil {
-		return nil
+	msg := strings.TrimSpace(r.Stderr)
+	if msg == "" {
+		msg = r.Err.Error()
 	}
-	return copyWorkspace(repoRoot, path)
+	return fmt.Errorf("git worktree add from %q failed: %s", startPoint, msg)
 }
 
 func copyWorkspace(src, dst string) error {
