@@ -1,0 +1,33 @@
+{
+  "required_actions": [
+    "create issue",
+    "update issue",
+    "transition issue",
+    "dispatch eligible issue",
+    "dispatch pause issue",
+    "dispatch resume issue",
+    "approve once",
+    "approve for run",
+    "approve for session",
+    "deny approval",
+    "cancel run",
+    "send to rework",
+    "mark done",
+    "workflow validate",
+    "workflow reload",
+    "diagnostics export"
+  ],
+  "forbidden_actions": [
+    "git push",
+    "publish",
+    "create pr",
+    "backup database",
+    "restore database",
+    "migrate database",
+    "workspace delete",
+    "secret read",
+    "project settings mutation",
+    "issue delete",
+    "arbitrary state mutation"
+  ]
+}
