@@ -166,7 +166,10 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id := core.NewID("art_")
-		_ = s.Store.InsertArtifact(store.ArtifactRecord{ID: id, Kind: "diagnostic", Path: p, Redacted: true})
+		if err := s.Store.InsertArtifact(store.ArtifactRecord{ID: id, Kind: "diagnostic", Path: p, Redacted: true}); err != nil {
+			apiErr(w, err)
+			return
+		}
 		ok(w, map[string]any{"artifact_id": id, "path": p})
 	default:
 		apiErr(w, core.NewError(core.ErrNotFound, "route not found", map[string]any{"path": path}))
@@ -649,6 +652,9 @@ func apiErr(w http.ResponseWriter, err error) {
 	}
 	if ae.Code == core.ErrForbidden || ae.Code == core.ErrCSRFRequired {
 		status = 403
+	}
+	if ae.Code == core.ErrInvalidStateTransition || ae.Code == core.ErrApprovalNotPending {
+		status = 409
 	}
 	if ae.Code == core.ErrInternal {
 		status = 500

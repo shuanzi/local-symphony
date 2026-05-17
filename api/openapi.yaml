@@ -228,7 +228,10 @@ paths:
       parameters: [ { $ref: '#/components/parameters/RunId' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { reason: { type: string } } } } } }
-      responses: { "200": { description: Cancelled, content: { application/json: { schema: { $ref: '#/components/schemas/RunEnvelope' } } } } }
+      responses:
+        "200": { description: Cancelled, content: { application/json: { schema: { $ref: '#/components/schemas/RunEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: "invalid_request for malformed JSON." }
+        "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when the run is not active." }
   /approvals:
     get:
       operationId: listApprovals
@@ -332,6 +335,7 @@ paths:
       responses:
         "200": { description: Export created, content: { application/json: { schema: { $ref: '#/components/schemas/DiagnosticsExportEnvelope' } } } }
         "400": { $ref: '#/components/responses/Error', description: "raw_log_access_not_supported when include_raw_logs=true" }
+        "500": { $ref: '#/components/responses/Error', description: "internal_error when the export artifact metadata cannot be persisted." }
 components:
   securitySchemes:
     bearerAuth: { type: http, scheme: bearer }
@@ -1105,8 +1109,9 @@ components:
     DiagnosticsExport:
       type: object
       additionalProperties: false
-      required: [artifact_id]
+      required: [artifact_id, path]
       properties:
         artifact_id: { type: string, pattern: "^art_" }
+        path: { type: string }
     DiagnosticsExportEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/DiagnosticsExport' } } } ]

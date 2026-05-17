@@ -143,7 +143,7 @@ OPENAPI_DIAGNOSTICS_REQUIRED_FIELDS = {
     "DiagnosticsFailureBucket": frozenset({"failure_code", "count"}),
     "DiagnosticsPauseSummary": frozenset({"paused_dispatch_count", "paused_issue_refs"}),
     "DiagnosticsCheck": frozenset({"name", "status"}),
-    "DiagnosticsExport": frozenset({"artifact_id"}),
+    "DiagnosticsExport": frozenset({"artifact_id", "path"}),
 }
 
 REQUIRED_FORBIDDEN_CONCEPTS = frozenset(
@@ -851,6 +851,18 @@ def validate_openapi_diagnostics_contract(data: dict[str, Any]) -> None:
     assert_required_fields(diagnostics, "OpenAPI Diagnostics", REQUIRED_DIAGNOSTICS_FIELDS)
     diagnostics_properties = require_dict(diagnostics.get("properties"), "OpenAPI Diagnostics.properties")
     assert_const(require_dict(diagnostics_properties.get("redacted"), "OpenAPI Diagnostics.properties.redacted"), "OpenAPI Diagnostics.properties.redacted", True)
+
+    diagnostics_export = require_dict(schemas.get("DiagnosticsExport"), "OpenAPI DiagnosticsExport")
+    diagnostics_export_properties = require_dict(diagnostics_export.get("properties"), "OpenAPI DiagnosticsExport.properties")
+    diagnostics_export_artifact_id = require_dict(
+        diagnostics_export_properties.get("artifact_id"),
+        "OpenAPI DiagnosticsExport.properties.artifact_id",
+    )
+    if diagnostics_export_artifact_id.get("type") != "string" or diagnostics_export_artifact_id.get("pattern") != "^art_":
+        fail("OpenAPI DiagnosticsExport.properties.artifact_id must be a string matching ^art_")
+    diagnostics_export_path = require_dict(diagnostics_export_properties.get("path"), "OpenAPI DiagnosticsExport.properties.path")
+    if diagnostics_export_path.get("type") != "string":
+        fail("OpenAPI DiagnosticsExport.properties.path must be a string")
 
     database = require_dict(schemas.get("DiagnosticsDatabase"), "OpenAPI DiagnosticsDatabase")
     assert_required_fields(database, "OpenAPI DiagnosticsDatabase", DIAGNOSTICS_DATABASE_FIELDS)

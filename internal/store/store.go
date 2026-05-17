@@ -972,6 +972,9 @@ func (s *Store) cancelRunInTx(runID string, code core.FailureCode, reason string
 	if err != nil {
 		return err
 	}
+	if !core.IsActiveRunStatus(run.Status) {
+		return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
+	}
 	now := core.Now()
 	if err := s.Project.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(core.RunCancelled), string(code), reason, now, now, runID); err != nil {
 		return err
@@ -1278,6 +1281,9 @@ func (s *Store) PendingApprovals() ([]map[string]any, error) {
 	return out, nil
 }
 func (s *Store) DecideApproval(id, status, reason string) error {
+	if status == "cancel_run" {
+		status = "cancelled"
+	}
 	row, err := s.Project.QueryOne(`SELECT * FROM approval_requests WHERE id=?`, id)
 	if errors.Is(err, os.ErrNotExist) {
 		return core.NewError(core.ErrNotFound, "approval not found", nil)
@@ -1289,11 +1295,30 @@ func (s *Store) DecideApproval(id, status, reason string) error {
 		return core.NewError(core.ErrApprovalNotPending, "approval is not pending", nil)
 	}
 	now := core.Now()
+	if status == "cancelled" {
+		if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
+			return err
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_ = s.Project.Exec(`ROLLBACK`)
+			}
+		}()
+		if err := s.cancelRunInTx(row["run_id"].String(), core.FailureOperatorCancelled, reason, true); err != nil {
+			return err
+		}
+		if err := s.Project.Exec(`UPDATE approval_requests SET status=?, reason=?, resolved_at=? WHERE id=?`, status, reason, now, id); err != nil {
+			return err
+		}
+		if err := s.Project.Exec(`COMMIT`); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	}
 	if err := s.Project.Exec(`UPDATE approval_requests SET status=?, reason=?, resolved_at=? WHERE id=?`, status, reason, now, id); err != nil {
 		return err
-	}
-	if status == "cancelled" {
-		return s.CancelRun(row["run_id"].String(), reason)
 	}
 	return nil
 }

@@ -514,6 +514,106 @@ func TestCancelRunAllowsEmptyBody(t *testing.T) {
 	}
 }
 
+func TestCancelRunCompletedRunReturnsConflict(t *testing.T) {
+	srv := newTestServer(t)
+	run := prepareCompletedHTTPRun(t, srv)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", strings.NewReader(`{"reason":"too late"}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("completed cancel status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidStateTransition) {
+		t.Fatalf("error = %#v, want invalid_state_transition", errData)
+	}
+
+	after, err := srv.Store.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if after.Status != core.RunCompleted {
+		t.Fatalf("run status = %s, want completed", after.Status)
+	}
+}
+
+func TestDiagnosticsExportReturnsErrorWhenArtifactInsertFails(t *testing.T) {
+	srv := newTestServer(t)
+	if err := srv.Store.Project.Exec(`CREATE TRIGGER fail_diagnostic_artifact_insert BEFORE INSERT ON artifacts
+WHEN NEW.kind = 'diagnostic'
+BEGIN
+  SELECT RAISE(FAIL, 'artifact insert failed');
+END;`); err != nil {
+		t.Fatalf("create failing artifact trigger: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/diagnostics/export", nil)
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("diagnostics export status = %d, want 500; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	if data, ok := payload["data"].(map[string]any); ok {
+		if artifactID, _ := data["artifact_id"].(string); artifactID != "" {
+			t.Fatalf("error response included successful artifact_id %q", artifactID)
+		}
+	}
+	if _, ok := payload["error"].(map[string]any); !ok {
+		t.Fatalf("diagnostics export response missing error envelope: %#v", payload)
+	}
+}
+
+func TestDiagnosticsExportReturnsArtifactIDAndPath(t *testing.T) {
+	srv := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/diagnostics/export", nil)
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("diagnostics export status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	data := payload["data"].(map[string]any)
+	if artifactID, _ := data["artifact_id"].(string); !strings.HasPrefix(artifactID, "art_") {
+		t.Fatalf("artifact_id = %q, want art_ prefix", artifactID)
+	}
+	if path, _ := data["path"].(string); path == "" {
+		t.Fatalf("diagnostics export data = %#v, want path", data)
+	}
+}
+
+func TestApprovalNotPendingMapsToConflict(t *testing.T) {
+	srv := newTestServer(t)
+	run := prepareCompletedHTTPRun(t, srv)
+	approvalID := core.NewID("apr_")
+	if err := srv.Store.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at) VALUES(?,?,?,?,?,?,?)`, approvalID, run.ID, run.IssueID, "command", "denied", `{"command":"test"}`, core.Now()); err != nil {
+		t.Fatalf("insert approval: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/"+approvalID+"/decide", strings.NewReader(`{"decision":"deny","reason":"again"}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("approval not pending status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrApprovalNotPending) {
+		t.Fatalf("error = %#v, want approval_not_pending", errData)
+	}
+}
+
 func TestInternalErrorMapsToHTTP500(t *testing.T) {
 	rec := httptest.NewRecorder()
 	apiErr(rec, core.NewError(core.ErrInternal, "boom", nil))
@@ -606,4 +706,43 @@ func insertLocalSession(t *testing.T, srv *Server, kind string) string {
 		t.Fatalf("insert local session: %v", err)
 	}
 	return token
+}
+
+func prepareCompletedHTTPRun(t *testing.T, srv *Server) *core.RunAttempt {
+	t.Helper()
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{
+		Title:              "Completed HTTP cancel",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.Identifier, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	handoff, err := srv.Store.InsertHandoff(issue.Identifier, run.ID, "payload-hash", map[string]any{
+		"summary":      "ready for review",
+		"target_state": "Human Review",
+	})
+	if err != nil {
+		t.Fatalf("InsertHandoff: %v", err)
+	}
+	reviewPacketID, err := srv.Store.InsertReviewPacket(issue.Identifier, run.ID, handoff.ID, srv.Store.RepoRoot, "review.md", "review.json", "patch.diff", "changed.txt", "untracked.txt", "diffstat.txt", "")
+	if err != nil {
+		t.Fatalf("InsertReviewPacket: %v", err)
+	}
+	if err := srv.Store.CompleteRunWithReview(run.ID, reviewPacketID); err != nil {
+		t.Fatalf("CompleteRunWithReview: %v", err)
+	}
+	run, err = srv.Store.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	return run
 }
