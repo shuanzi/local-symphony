@@ -11,6 +11,7 @@ import type {
   ReviewPacketArtifact,
   ReviewPacketSummary,
   RunAttempt,
+  RunSummary,
   RunEvent,
   WorkflowRenderPreviewResponse,
   WorkflowResponse,
@@ -54,6 +55,15 @@ interface RouteState {
   page: PageKey;
   issueRef?: string;
   runId?: string;
+}
+
+type QueueGroupKey = 'needs_action' | 'ready_to_run' | 'watching' | 'all';
+
+interface QueueGroup {
+  key: QueueGroupKey;
+  label: string;
+  helper: string;
+  issues: Issue[];
 }
 
 interface DashboardData {
@@ -115,6 +125,74 @@ function compactJson(value: unknown): string {
 
 function isDispatchable(issue: Issue): boolean {
   return (issue.state === 'Ready' || issue.state === 'Rework') && !issue.dispatch_paused && !issue.active_run_id;
+}
+
+function compareIssuePriority(a: Issue, b: Issue): number {
+  return a.priority - b.priority || a.sequence_no - b.sequence_no || a.identifier.localeCompare(b.identifier);
+}
+
+function runsForIssue(issue: Issue, runs: RunAttempt[]): RunAttempt[] {
+  return runs
+    .filter((run) => run.issue_id === issue.id)
+    .sort((a, b) => new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime());
+}
+
+function latestRunForIssue(issue: Issue, runs: RunAttempt[]): RunAttempt | RunSummary | null {
+  return runsForIssue(issue, runs)[0] || issue.latest_run || null;
+}
+
+function hasActiveRun(issue: Issue, runs: RunAttempt[]): boolean {
+  return Boolean(issue.active_run_id || runsForIssue(issue, runs).some((run) => activeRunStatuses.has(run.status)));
+}
+
+function pendingApprovalsForIssue(issue: Issue, approvals: Approval[]): Approval[] {
+  return approvals.filter((approval) => approval.issue_id === issue.id && approval.status === 'pending');
+}
+
+function isNeedsAction(issue: Issue, runs: RunAttempt[], approvals: Approval[]): boolean {
+  const latestRun = latestRunForIssue(issue, runs);
+  return issue.state === 'Human Review'
+    || issue.state === 'Blocked'
+    || issue.dispatch_paused
+    || latestRun?.status === 'failed'
+    || latestRun?.status === 'completed_without_handoff'
+    || pendingApprovalsForIssue(issue, approvals).length > 0;
+}
+
+function issueSignals(issue: Issue, runs: RunAttempt[], approvals: Approval[]): string[] {
+  const latestRun = latestRunForIssue(issue, runs);
+  const signals: string[] = [];
+  if (issue.state === 'Human Review') signals.push('review');
+  if (issue.state === 'Blocked') signals.push('blocked');
+  if (issue.dispatch_paused) signals.push('paused');
+  if (latestRun?.status === 'failed') signals.push('failed run');
+  if (latestRun?.status === 'completed_without_handoff') signals.push('no handoff');
+  if (pendingApprovalsForIssue(issue, approvals).length) signals.push('approval');
+  if (hasActiveRun(issue, runs)) signals.push('active run');
+  return signals;
+}
+
+function buildQueueGroups(data: DashboardData): QueueGroup[] {
+  const sorted = data.issues.slice().sort(compareIssuePriority);
+  const needsAction = sorted.filter((issue) => isNeedsAction(issue, data.runs, data.approvals));
+  const needsActionIds = new Set(needsAction.map((issue) => issue.id));
+  const readyToRun = sorted.filter((issue) => !needsActionIds.has(issue.id) && isDispatchable(issue));
+  const readyIds = new Set(readyToRun.map((issue) => issue.id));
+  const watching = sorted.filter((issue) => !needsActionIds.has(issue.id) && !readyIds.has(issue.id) && (issue.state === 'Working' || hasActiveRun(issue, data.runs)));
+
+  return [
+    { key: 'needs_action', label: 'Needs action', helper: 'Human review, blocked, paused, failed, or approval pending.', issues: needsAction },
+    { key: 'ready_to_run', label: 'Ready to run', helper: 'Ready or Rework issues eligible for dispatch.', issues: readyToRun },
+    { key: 'watching', label: 'Watching', helper: 'Active work and run attempts to monitor.', issues: watching },
+    { key: 'all', label: 'All issues', helper: 'Complete issue index for quick selection.', issues: sorted }
+  ];
+}
+
+function pickDefaultIssue(data: DashboardData): Issue | undefined {
+  for (const group of buildQueueGroups(data)) {
+    if (group.issues.length) return group.issues[0];
+  }
+  return undefined;
 }
 
 function issueByIdOrRef(issues: Issue[], ref: string | null | undefined): Issue | undefined {
@@ -296,6 +374,39 @@ function StatusPill({ value }: { value: string }) {
   return <Pill tone={tone}>{value}</Pill>;
 }
 
+function PageHeader({ eyebrow, title, description, meta, actions }: {
+  eyebrow: string;
+  title: string;
+  description: string;
+  meta?: ReactNode;
+  actions?: ReactNode;
+}) {
+  return (
+    <section className="page-header">
+      <div>
+        <p className="page-eyebrow">{eyebrow}</p>
+        <h2>{title}</h2>
+        <p>{description}</p>
+        {meta ? <div className="page-header-meta">{meta}</div> : null}
+      </div>
+      {actions ? <div className="page-header-actions">{actions}</div> : null}
+    </section>
+  );
+}
+
+function MetricStrip({ items }: { items: Array<{ label: string; value: ReactNode; tone?: 'neutral' | 'good' | 'warning' | 'danger' | 'muted' }> }) {
+  return (
+    <div className="metric-strip">
+      {items.map((item) => (
+        <div key={item.label} className={item.tone ? `metric-strip-item-${item.tone}` : undefined}>
+          <span>{item.label}</span>
+          <strong>{item.value}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function AppShell({ route, data, loading, mutating, error, authError, daemonUnavailable, sseState, children, reload }: {
   route: RouteState;
   data: DashboardData;
@@ -309,22 +420,32 @@ function AppShell({ route, data, loading, mutating, error, authError, daemonUnav
   reload: () => Promise<void>;
 }) {
   const nav: Array<[PageKey, string]> = [
-    ['overview', 'Overview'],
+    ['overview', 'Workbench'],
     ['board', 'Board'],
     ['approvals', 'Approval Inbox'],
     ['workflow', 'Workflow'],
     ['diagnostics', 'Diagnostics']
   ];
+  const running = data.runs.filter((run) => activeRunStatuses.has(run.status));
+  const failed = data.runs.filter((run) => run.status === 'failed' || run.status === 'completed_without_handoff');
+  const pendingApprovals = data.approvals.filter((approval) => approval.status === 'pending');
+  const humanReview = data.issues.filter((issue) => issue.state === 'Human Review');
+  const paused = data.issues.filter((issue) => issue.dispatch_paused);
   return (
     <div className="app-shell">
       <header className="topbar">
         <div>
           <h1>Local Symphony</h1>
-          <p className="subtitle">Local control plane over the REST/SSE API.</p>
+          <p className="subtitle">Operator workbench for local agent workflows.</p>
         </div>
         <div className="topbar-meta">
           <Pill tone={data.health?.ok ? 'good' : 'muted'}>{data.health?.project_id || 'project unknown'}</Pill>
+          <Pill tone={data.workflow?.validation?.valid ? 'good' : 'danger'}>{data.workflow?.validation?.valid ? 'workflow valid' : 'workflow invalid'}</Pill>
           <Pill tone={sseState === 'connected' ? 'good' : sseState === 'reconnecting' ? 'warning' : 'muted'}>SSE {sseState}</Pill>
+          <Pill tone={running.length ? 'warning' : 'muted'}>{running.length} running</Pill>
+          <Pill tone={pendingApprovals.length ? 'warning' : 'muted'}>{pendingApprovals.length} approvals</Pill>
+          <Pill tone={humanReview.length ? 'warning' : 'muted'}>{humanReview.length} review</Pill>
+          <Pill tone={paused.length || failed.length ? 'danger' : 'muted'}>{paused.length} paused · {failed.length} failed</Pill>
           <button type="button" onClick={() => void reload()} disabled={loading || mutating}>Refresh</button>
         </div>
       </header>
@@ -380,6 +501,377 @@ function OverviewPage({ data }: { data: DashboardData }) {
   );
 }
 
+function WorkbenchPage({ data, runMutation }: {
+  data: DashboardData;
+  runMutation: <T>(operation: () => Promise<T>) => Promise<T | null>;
+}) {
+  const groups = useMemo(() => buildQueueGroups(data), [data]);
+  const [selectedIssueRef, setSelectedIssueRef] = useState<string | null>(null);
+  const selectedIssue = issueByIdOrRef(data.issues, selectedIssueRef) || pickDefaultIssue(data);
+
+  useEffect(() => {
+    if (selectedIssueRef && !issueByIdOrRef(data.issues, selectedIssueRef)) setSelectedIssueRef(null);
+  }, [data.issues, selectedIssueRef]);
+
+  return (
+    <section className="workbench" aria-label="Operator workbench">
+      <WorkQueue groups={groups} data={data} selectedIssueId={selectedIssue?.id || null} onSelect={(issue) => setSelectedIssueRef(issue.identifier)} />
+      <IssueContextPanel issue={selectedIssue || null} data={data} />
+      <ActionRail issue={selectedIssue || null} data={data} runMutation={runMutation} />
+    </section>
+  );
+}
+
+function WorkQueue({ groups, data, selectedIssueId, onSelect }: {
+  groups: QueueGroup[];
+  data: DashboardData;
+  selectedIssueId: string | null;
+  onSelect: (issue: Issue) => void;
+}) {
+  return (
+    <aside className="work-queue" aria-label="Work queue">
+      <div className="panel-heading">
+        <div>
+          <h2>Work Queue</h2>
+          <p>{data.issues.length} local issues</p>
+        </div>
+        <button type="button" onClick={() => navigate({ page: 'board' })}>Board</button>
+      </div>
+      {groups.map((group) => (
+        <section className="queue-group" key={group.key}>
+          <div className="queue-group-heading">
+            <h3>{group.label}</h3>
+            <span>{group.issues.length}</span>
+          </div>
+          <p>{group.helper}</p>
+          {group.issues.length === 0 ? (
+            <div className="queue-empty">None</div>
+          ) : group.issues.map((issue) => {
+            const signals = issueSignals(issue, data.runs, data.approvals);
+            return (
+              <button
+                key={`${group.key}-${issue.id}`}
+                type="button"
+                className={`queue-item ${selectedIssueId === issue.id ? 'active' : ''}`}
+                aria-pressed={selectedIssueId === issue.id}
+                onClick={() => onSelect(issue)}
+              >
+                <span className="queue-item-top">
+                  <strong>{issue.identifier}</strong>
+                  <StatusPill value={issue.state} />
+                </span>
+                <span className="queue-title">{issue.title}</span>
+                <span className="queue-meta">
+                  <Pill tone="muted">p{issue.priority}</Pill>
+                  {signals.slice(0, 3).map((signal) => <Pill key={signal} tone={signal === 'active run' ? 'warning' : 'danger'}>{signal}</Pill>)}
+                </span>
+              </button>
+            );
+          })}
+        </section>
+      ))}
+    </aside>
+  );
+}
+
+function IssueContextPanel({ issue, data }: { issue: Issue | null; data: DashboardData }) {
+  if (!issue) {
+    return (
+      <section className="context-panel">
+        <div className="panel-heading">
+          <div>
+            <h2>No issues</h2>
+            <p>Start with a local issue or inspect system state.</p>
+          </div>
+        </div>
+        <div className="next-actions">
+          <button type="button" onClick={() => navigate({ page: 'board' })}>Create issue</button>
+          <button type="button" onClick={() => navigate({ page: 'board' })}>Open Board</button>
+          <button type="button" onClick={() => navigate({ page: 'diagnostics' })}>Diagnostics</button>
+        </div>
+      </section>
+    );
+  }
+
+  const issueEvents = data.events
+    .filter((event) => event.issue_id === issue.id || event.run_id === issue.active_run_id || event.run_id === issue.latest_run_id)
+    .sort((a, b) => b.seq - a.seq)
+    .slice(0, 8);
+  const runHistory = runsForIssue(issue, data.runs);
+  const latestRun = latestRunForIssue(issue, data.runs);
+
+  return (
+    <section className="context-panel">
+      <div className="context-header">
+        <div>
+          <div className="context-kicker">{issue.identifier}</div>
+          <h2>{issue.title}</h2>
+          <div className="tag-row">
+            <StatusPill value={issue.state} />
+            <Pill tone="muted">p{issue.priority}</Pill>
+            {issue.labels.map((label) => <Pill key={label} tone="muted">{label}</Pill>)}
+            {issue.dispatch_paused ? <Pill tone="warning">dispatch paused</Pill> : null}
+          </div>
+        </div>
+        <button type="button" onClick={() => navigate({ page: 'issue', issueRef: issue.identifier })}>Open detail</button>
+      </div>
+
+      <div className="context-grid">
+        <section className="context-block">
+          <h3>Acceptance</h3>
+          <p>{issue.description || '—'}</p>
+          {issue.acceptance_criteria.length ? (
+            <ul>{issue.acceptance_criteria.map((item) => <li key={item}>{item}</li>)}</ul>
+          ) : <p>—</p>}
+        </section>
+        <section className="context-block">
+          <h3>Relations</h3>
+          <CompactRelationList title="Blocked by" refs={issue.blocked_by} />
+          <CompactRelationList title="Blocks" refs={issue.blocks} />
+          <CompactRelationList title="Duplicates" refs={issue.duplicates} />
+          <CompactRelationList title="Follow-ups" refs={issue.followups} />
+          <KeyValue rows={[
+            ['Duplicate of', issue.duplicate_of ? refLabel(issue.duplicate_of) : '—'],
+            ['Follow-up of', refLabel(issue.followup_of)]
+          ]} />
+        </section>
+      </div>
+
+      <section className="context-block">
+        <div className="context-block-header">
+          <h3>Run and review</h3>
+          <div className="card-actions">
+            {issue.latest_run_id ? <button type="button" onClick={() => navigate({ page: 'run', runId: issue.latest_run_id || undefined })}>Open run</button> : null}
+            {issue.latest_review_packet_id || issue.state === 'Human Review' ? <button type="button" onClick={() => navigate({ page: 'review', issueRef: issue.identifier })}>Open review</button> : null}
+          </div>
+        </div>
+        <KeyValue rows={[
+          ['Latest run', latestRun ? `${latestRun.id} · ${latestRun.status}` : '—'],
+          ['Run attempts', runHistory.length],
+          ['Latest packet', issue.latest_review_packet ? `#${issue.latest_review_packet.packet_no} · ${issue.latest_review_packet.status}` : '—'],
+          ['Failure', latestRun?.failure_code || issue.latest_review_packet?.failure_code || '—']
+        ]} />
+      </section>
+
+      <section className="context-block">
+        <h3>Workspace and Git</h3>
+        <KeyValue rows={[
+          ['Workspace', issue.workspace_path || issue.workspace?.path || '—'],
+          ['Branch', issue.branch_name || issue.git?.branch_name || '—'],
+          ['Base ref', issue.base_ref || issue.git?.base_ref || '—'],
+          ['Base SHA', issue.base_sha || issue.git?.base_sha || '—']
+        ]} />
+      </section>
+
+      <section className="context-block">
+        <div className="context-block-header">
+          <h3>Recent timeline</h3>
+          <span>{issueEvents.length} shown</span>
+        </div>
+        {issueEvents.length ? <EventList events={issueEvents} /> : <EmptyState title="No issue events" body="Run and issue events appear here after work starts." />}
+      </section>
+    </section>
+  );
+}
+
+function CompactRelationList({ title, refs }: { title: string; refs: IssueRefSummary[] }) {
+  return (
+    <div className="compact-relations">
+      <span>{title}</span>
+      {refs.length === 0 ? <strong>—</strong> : (
+        <div>
+          {refs.map((ref) => (
+            <button key={ref.id} type="button" className="link-button" onClick={() => navigate({ page: 'issue', issueRef: ref.identifier })}>{ref.identifier}</button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CommandFeedback({ message }: { message: string | null }) {
+  return message ? <Banner kind="success">{message}</Banner> : null;
+}
+
+function ActionRail({ issue, data, runMutation }: {
+  issue: Issue | null;
+  data: DashboardData;
+  runMutation: <T>(operation: () => Promise<T>) => Promise<T | null>;
+}) {
+  const [pauseReason, setPauseReason] = useState('');
+  const [comment, setComment] = useState('');
+  const [blocker, setBlocker] = useState('');
+  const [target, setTarget] = useState<IssueState>('Ready');
+  const [transitionReason, setTransitionReason] = useState('');
+  const [duplicateOf, setDuplicateOf] = useState('');
+  const [reviewReason, setReviewReason] = useState('operator review decision');
+  const [localMessage, setLocalMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPauseReason('');
+    setComment('');
+    setBlocker('');
+    setTarget('Ready');
+    setTransitionReason('');
+    setDuplicateOf('');
+    setLocalMessage(null);
+  }, [issue?.id]);
+
+  if (!issue) {
+    return (
+      <aside className="action-rail" aria-label="Action rail">
+        <h2>Action rail</h2>
+        <p>Select an issue to see contextual commands.</p>
+        <button type="button" onClick={() => navigate({ page: 'board' })}>Create issue</button>
+        <button type="button" onClick={() => navigate({ page: 'workflow' })}>Workflow</button>
+        <button type="button" onClick={() => navigate({ page: 'diagnostics' })}>Diagnostics</button>
+      </aside>
+    );
+  }
+
+  const selectedIssue = issue;
+  const pendingApprovals = pendingApprovalsForIssue(selectedIssue, data.approvals);
+  const active = hasActiveRun(selectedIssue, data.runs);
+  const latestRun = latestRunForIssue(selectedIssue, data.runs);
+  const workflowInvalid = data.workflow && !data.workflow.validation.valid;
+
+  async function perform<T>(label: string, operation: () => Promise<T>) {
+    const result = await runMutation(operation);
+    if (result) setLocalMessage(label);
+    return result;
+  }
+
+  async function pauseResume() {
+    const reason = pauseReason || (selectedIssue.dispatch_paused ? 'operator resumed dispatch' : 'operator paused dispatch');
+    const label = selectedIssue.dispatch_paused ? 'Dispatch resumed.' : 'Dispatch paused.';
+    const result = await perform(label, () => selectedIssue.dispatch_paused ? api.resumeDispatch(selectedIssue.identifier, reason) : api.pauseDispatch(selectedIssue.identifier, reason));
+    if (result) setPauseReason('');
+  }
+
+  async function addComment() {
+    if (!comment.trim()) return;
+    const result = await perform('Comment added.', () => api.commentIssue(selectedIssue.identifier, comment.trim()));
+    if (result) setComment('');
+  }
+
+  async function addIssueBlocker() {
+    if (!blocker.trim()) return;
+    const result = await perform('Blocker added.', () => api.addBlocker(selectedIssue.identifier, blocker.trim()));
+    if (result) setBlocker('');
+  }
+
+  async function transitionIssue() {
+    const result = await perform('Issue transitioned.', () => api.transitionIssue(selectedIssue.identifier, {
+      state: target,
+      reason: transitionReason || undefined,
+      duplicate_of: target === 'Duplicate' ? duplicateOf || undefined : undefined
+    }));
+    if (result) {
+      setTransitionReason('');
+      setDuplicateOf('');
+    }
+  }
+
+  async function reviewAction(kind: 'rework' | 'done') {
+    const result = await perform(kind === 'rework' ? 'Sent to Rework.' : 'Marked Done.', () => kind === 'rework' ? api.sendToRework(selectedIssue.identifier, reviewReason) : api.markDone(selectedIssue.identifier, reviewReason));
+    if (result) navigate({ page: 'issue', issueRef: result.identifier });
+  }
+
+  return (
+    <aside className="action-rail" aria-label="Action rail">
+      <div className="panel-heading">
+        <div>
+          <h2>Action rail</h2>
+          <p>{selectedIssue.identifier}</p>
+        </div>
+        <StatusPill value={selectedIssue.state} />
+      </div>
+      <CommandFeedback message={localMessage} />
+
+      <section className="rail-group">
+        <h3>Primary</h3>
+        {isDispatchable(selectedIssue) ? (
+          <button type="button" className="primary-action" onClick={() => void perform('Dispatch submitted.', () => api.dispatchIssue(selectedIssue.identifier))}>Dispatch eligible issue</button>
+        ) : null}
+        <label>
+          Pause/resume reason
+          <input value={pauseReason} onChange={(event) => setPauseReason(event.target.value)} placeholder={selectedIssue.dispatch_paused ? 'operator resumed dispatch' : 'operator paused dispatch'} />
+        </label>
+        <button type="button" onClick={() => void pauseResume()} disabled={active && !selectedIssue.dispatch_paused}>
+          {selectedIssue.dispatch_paused ? 'Dispatch resume issue' : 'Dispatch pause issue'}
+        </button>
+        {active && !selectedIssue.dispatch_paused ? <p className="rail-hint">An active run is attached; pause is disabled until it settles.</p> : null}
+      </section>
+
+      {pendingApprovals.length ? (
+        <section className="rail-group rail-warning">
+          <h3>Pending approvals</h3>
+          <p>{pendingApprovals.length} command/file/network request needs a decision.</p>
+          <button type="button" onClick={() => navigate({ page: 'approvals' })}>Open Approval Inbox</button>
+        </section>
+      ) : null}
+
+      {selectedIssue.state === 'Human Review' || selectedIssue.latest_review_packet_id ? (
+        <section className="rail-group">
+          <h3>Review</h3>
+          <button type="button" onClick={() => navigate({ page: 'review', issueRef: selectedIssue.identifier })}>Open review packet</button>
+          <label>
+            Review reason
+            <textarea value={reviewReason} onChange={(event) => setReviewReason(event.target.value)} rows={3} />
+          </label>
+          <div className="rail-split">
+            <button type="button" onClick={() => void reviewAction('rework')}>Send to Rework</button>
+            <button type="button" className="primary-action" onClick={() => void reviewAction('done')}>Mark Done</button>
+          </div>
+        </section>
+      ) : null}
+
+      <section className="rail-group">
+        <h3>Issue edits</h3>
+        <button type="button" onClick={() => navigate({ page: 'issue', issueRef: selectedIssue.identifier })}>Update issue</button>
+        <label>
+          Comment
+          <textarea value={comment} onChange={(event) => setComment(event.target.value)} rows={3} placeholder="Leave an operator comment" />
+        </label>
+        <button type="button" onClick={() => void addComment()} disabled={!comment.trim()}>Add comment</button>
+        <label>
+          Add blocker
+          <input value={blocker} onChange={(event) => setBlocker(event.target.value)} placeholder="LOC-1" />
+        </label>
+        <button type="button" onClick={() => void addIssueBlocker()} disabled={!blocker.trim()}>Add blocker</button>
+      </section>
+
+      <section className="rail-group">
+        <h3>Transition</h3>
+        <label>
+          Target state
+          <select value={target} onChange={(event) => setTarget(event.target.value as IssueState)}>
+            {transitionTargets.map((state) => <option key={state} value={state}>{state}</option>)}
+          </select>
+        </label>
+        <label>
+          Reason
+          <input value={transitionReason} onChange={(event) => setTransitionReason(event.target.value)} placeholder="Reason for state change" />
+        </label>
+        {target === 'Duplicate' ? (
+          <label>
+            Duplicate of
+            <input value={duplicateOf} onChange={(event) => setDuplicateOf(event.target.value)} placeholder="Canonical issue ref" />
+          </label>
+        ) : null}
+        <button type="button" onClick={() => void transitionIssue()}>Apply transition</button>
+      </section>
+
+      <section className="rail-group">
+        <h3>Related views</h3>
+        {latestRun ? <button type="button" onClick={() => navigate({ page: 'run', runId: latestRun.id })}>Open latest run</button> : null}
+        {workflowInvalid ? <button type="button" onClick={() => navigate({ page: 'workflow' })}>Workflow invalid</button> : null}
+        <button type="button" onClick={() => navigate({ page: 'diagnostics' })}>Diagnostics</button>
+      </section>
+    </aside>
+  );
+}
+
 function MetricCard({ label, value, helper, tone }: { label: string; value: ReactNode; helper: string; tone: 'neutral' | 'good' | 'warning' | 'danger' | 'muted' }) {
   return (
     <article className={`metric metric-${tone}`}>
@@ -414,10 +906,28 @@ function BoardPage({ issues, runMutation }: { issues: Issue[]; runMutation: <T>(
     issues.forEach((issue) => grouped.get(issue.state)?.push(issue));
     return grouped;
   }, [issues]);
+  const ready = issues.filter((issue) => isDispatchable(issue)).length;
+  const blocked = issues.filter((issue) => issue.state === 'Blocked').length;
+  const review = issues.filter((issue) => issue.state === 'Human Review').length;
 
   return (
     <>
-      <CreateIssueForm runMutation={runMutation} />
+      <PageHeader
+        eyebrow="Board View"
+        title="Issue board"
+        description="Scan every issue state, then open the workbench or a detail page for focused actions."
+        meta={<MetricStrip items={[
+          { label: 'Total', value: issues.length, tone: 'muted' },
+          { label: 'Ready', value: ready, tone: ready ? 'good' : 'muted' },
+          { label: 'Blocked', value: blocked, tone: blocked ? 'danger' : 'muted' },
+          { label: 'Review', value: review, tone: review ? 'warning' : 'muted' }
+        ]} />}
+        actions={<button type="button" onClick={() => navigate({ page: 'overview' })}>Open Workbench</button>}
+      />
+      <details className="create-drawer">
+        <summary>Create issue</summary>
+        <CreateIssueForm runMutation={runMutation} />
+      </details>
       {issues.length === 0 ? (
         <EmptyState title="No issues" body="Create the first local issue to start the Symphony workflow." />
       ) : null}
@@ -599,6 +1109,7 @@ function IssueDetailPage({ route, issues, runs, events, runMutation }: {
     return <EmptyState title="Issue not found" body={route.issueRef ? `No local issue matches ${route.issueRef}.` : 'Open an issue from the Board to see its facts, relations, workspace, run history, and review packets.'} action={<button type="button" onClick={() => navigate({ page: 'board' })}>Open Board</button>} />;
   }
   const selectedIssue = issue;
+  const latestRun = latestRunForIssue(issue, runs);
 
   async function postComment(event: FormEvent) {
     event.preventDefault();
@@ -620,104 +1131,123 @@ function IssueDetailPage({ route, issues, runs, events, runMutation }: {
 
   return (
     <>
-      <Section title={`${issue.identifier} · ${issue.title}`} actions={<button type="button" onClick={() => navigate({ page: 'board' })}>Back to Board</button>}>
-        <KeyValue rows={[
-          ['State', <StatusPill value={issue.state} />],
-          ['Priority', issue.priority],
-          ['Labels', issue.labels.length ? issue.labels.join(', ') : '—'],
-          ['Dispatch paused', issue.dispatch_paused ? `yes · ${issue.dispatch_pause_reason || ''}` : 'no'],
-          ['Created', formatDate(issue.created_at)],
-          ['Updated', formatDate(issue.updated_at)]
-        ]} />
-        <div className="description-block">
-          <h3>Description</h3>
-          <p>{issue.description || '—'}</p>
-        </div>
-        <div className="description-block">
-          <h3>Acceptance criteria</h3>
-          {issue.acceptance_criteria.length ? <ul>{issue.acceptance_criteria.map((item) => <li key={item}>{item}</li>)}</ul> : <p>—</p>}
-        </div>
-        <div className="card-actions">
-          {isDispatchable(issue) ? <button type="button" onClick={() => void runMutation(() => api.dispatchIssue(issue.identifier))}>Dispatch eligible issue</button> : null}
-          {issue.latest_run_id ? <button type="button" onClick={() => navigate({ page: 'run', runId: issue.latest_run_id || undefined })}>Open latest run</button> : null}
-          {issue.latest_review_packet_id || issue.state === 'Human Review' ? <button type="button" onClick={() => navigate({ page: 'review', issueRef: issue.identifier })}>Open review packet</button> : null}
-        </div>
-      </Section>
+      <PageHeader
+        eyebrow="Issue Detail"
+        title={`${issue.identifier} · ${issue.title}`}
+        description="Review issue facts, edit scope, inspect relations, and operate dispatch from one detail view."
+        meta={<MetricStrip items={[
+          { label: 'State', value: <StatusPill value={issue.state} />, tone: issue.state === 'Ready' ? 'good' : issue.state === 'Blocked' ? 'danger' : 'warning' },
+          { label: 'Priority', value: `p${issue.priority}`, tone: 'muted' },
+          { label: 'Runs', value: runHistory.length, tone: runHistory.length ? 'warning' : 'muted' },
+          { label: 'Latest', value: latestRun?.status || 'none', tone: latestRun?.status === 'failed' ? 'danger' : 'muted' }
+        ]} />}
+        actions={<button type="button" onClick={() => navigate({ page: 'board' })}>Back to Board</button>}
+      />
 
-      <IssueEditForm issue={issue} runMutation={runMutation} />
-
-      <Section title="Dispatch controls">
-        <div className="form-grid compact">
-          <label className="span-2">
-            Reason
-            <input value={pauseReason} onChange={(event) => setPauseReason(event.target.value)} placeholder="Required by API for pause/resume; default text will be used if omitted" />
-          </label>
-          <div className="span-2 form-actions">
-            <button type="button" onClick={() => void pauseResume(issue.dispatch_paused)} disabled={Boolean(issue.active_run_id)}>
-              {issue.dispatch_paused ? 'Dispatch resume issue' : 'Dispatch pause issue'}
-            </button>
-          </div>
-        </div>
-      </Section>
-
-      <Section title="Relations">
-        <div className="relation-grid">
-          <RelationList title="Blocked by" refs={issue.blocked_by} remove={(ref) => runMutation(() => api.removeBlocker(issue.identifier, ref.identifier))} />
-          <RelationList title="Blocks" refs={issue.blocks} />
-          <RelationList title="Duplicates" refs={issue.duplicates} />
-          <RelationList title="Follow-ups" refs={issue.followups} />
-        </div>
-        <KeyValue rows={[
-          ['Duplicate of', issue.duplicate_of ? <span>{refLabel(issue.duplicate_of)} <button type="button" onClick={() => void runMutation(() => api.removeDuplicate(issue.identifier, issue.duplicate_of?.identifier || issue.duplicate_of?.id || ''))}>Remove duplicate relation</button></span> : '—'],
-          ['Follow-up of', refLabel(issue.followup_of)]
-        ]} />
-        <form className="inline-form" onSubmit={(event) => void addBlocker(event)}>
-          <label>
-            Add blocker
-            <input value={blocker} onChange={(event) => setBlocker(event.target.value)} placeholder="Blocking issue ref" />
-          </label>
-          <button type="submit">Add blocker</button>
-        </form>
-      </Section>
-
-      <Section title="Workspace and Git">
-        <KeyValue rows={[
-          ['Workspace path', issue.workspace_path || issue.workspace?.path || '—'],
-          ['Branch', issue.branch_name || issue.git?.branch_name || '—'],
-          ['Base ref', issue.base_ref || issue.git?.base_ref || '—'],
-          ['Base SHA', issue.base_sha || issue.git?.base_sha || '—']
-        ]} />
-      </Section>
-
-      <Section title="Run history">
-        {runHistory.length ? <RunTable runs={runHistory} /> : <EmptyState title="No run history" body="Dispatch a Ready or Rework issue to create the first run attempt." />}
-      </Section>
-
-      <Section title="Review packets">
-        {issue.latest_review_packet ? (
-          <div className="summary-card">
+      <div className="page-split">
+        <div className="page-main">
+          <Section title="Issue facts">
             <KeyValue rows={[
-              ['Packet', `#${issue.latest_review_packet.packet_no}`],
-              ['Status', <StatusPill value={issue.latest_review_packet.status} />],
-              ['Run', issue.latest_review_packet.run_id],
-              ['Created', formatDate(issue.latest_review_packet.created_at)],
-              ['Failure', issue.latest_review_packet.failure_code || '—']
+              ['State', <StatusPill value={issue.state} />],
+              ['Priority', issue.priority],
+              ['Labels', issue.labels.length ? issue.labels.join(', ') : '—'],
+              ['Dispatch paused', issue.dispatch_paused ? `yes · ${issue.dispatch_pause_reason || ''}` : 'no'],
+              ['Created', formatDate(issue.created_at)],
+              ['Updated', formatDate(issue.updated_at)]
             ]} />
-            <button type="button" onClick={() => navigate({ page: 'review', issueRef: issue.identifier })}>Open Review Packet</button>
-          </div>
-        ) : <EmptyState title="No review packet" body="A review packet appears after a completed handoff run reaches Human Review." />}
-      </Section>
+            <div className="description-block">
+              <h3>Description</h3>
+              <p>{issue.description || '—'}</p>
+            </div>
+            <div className="description-block">
+              <h3>Acceptance criteria</h3>
+              {issue.acceptance_criteria.length ? <ul>{issue.acceptance_criteria.map((item) => <li key={item}>{item}</li>)}</ul> : <p>—</p>}
+            </div>
+            <div className="card-actions">
+              {isDispatchable(issue) ? <button type="button" onClick={() => void runMutation(() => api.dispatchIssue(issue.identifier))}>Dispatch eligible issue</button> : null}
+              {issue.latest_run_id ? <button type="button" onClick={() => navigate({ page: 'run', runId: issue.latest_run_id || undefined })}>Open latest run</button> : null}
+              {issue.latest_review_packet_id || issue.state === 'Human Review' ? <button type="button" onClick={() => navigate({ page: 'review', issueRef: issue.identifier })}>Open review packet</button> : null}
+            </div>
+          </Section>
 
-      <Section title="Comments and issue events">
-        <form className="inline-form" onSubmit={(event) => void postComment(event)}>
-          <label>
-            Comment
-            <input value={comment} onChange={(event) => setComment(event.target.value)} placeholder="Leave an operator comment" />
-          </label>
-          <button type="submit">Add comment</button>
-        </form>
-        {issueEvents.length ? <EventList events={issueEvents.slice().reverse()} /> : <EmptyState title="No issue events" body="Comments and state changes are displayed from normalized issue events." />}
-      </Section>
+          <IssueEditForm issue={issue} runMutation={runMutation} />
+
+          <Section title="Relations">
+            <div className="relation-grid">
+              <RelationList title="Blocked by" refs={issue.blocked_by} remove={(ref) => runMutation(() => api.removeBlocker(issue.identifier, ref.identifier))} />
+              <RelationList title="Blocks" refs={issue.blocks} />
+              <RelationList title="Duplicates" refs={issue.duplicates} />
+              <RelationList title="Follow-ups" refs={issue.followups} />
+            </div>
+            <KeyValue rows={[
+              ['Duplicate of', issue.duplicate_of ? <span>{refLabel(issue.duplicate_of)} <button type="button" onClick={() => void runMutation(() => api.removeDuplicate(issue.identifier, issue.duplicate_of?.identifier || issue.duplicate_of?.id || ''))}>Remove duplicate relation</button></span> : '—'],
+              ['Follow-up of', refLabel(issue.followup_of)]
+            ]} />
+            <form className="inline-form" onSubmit={(event) => void addBlocker(event)}>
+              <label>
+                Add blocker
+                <input value={blocker} onChange={(event) => setBlocker(event.target.value)} placeholder="Blocking issue ref" />
+              </label>
+              <button type="submit">Add blocker</button>
+            </form>
+          </Section>
+
+          <Section title="Run history">
+            {runHistory.length ? <RunTable runs={runHistory} /> : <EmptyState title="No run history" body="Dispatch a Ready or Rework issue to create the first run attempt." />}
+          </Section>
+
+          <Section title="Comments and issue events">
+            <form className="inline-form" onSubmit={(event) => void postComment(event)}>
+              <label>
+                Comment
+                <input value={comment} onChange={(event) => setComment(event.target.value)} placeholder="Leave an operator comment" />
+              </label>
+              <button type="submit">Add comment</button>
+            </form>
+            {issueEvents.length ? <EventList events={issueEvents.slice().reverse()} /> : <EmptyState title="No issue events" body="Comments and state changes are displayed from normalized issue events." />}
+          </Section>
+        </div>
+
+        <aside className="page-aside">
+          <Section title="Dispatch controls">
+            <div className="form-grid compact">
+              <label className="span-2">
+                Reason
+                <input value={pauseReason} onChange={(event) => setPauseReason(event.target.value)} placeholder="Required by API for pause/resume; default text will be used if omitted" />
+              </label>
+              <div className="span-2 form-actions">
+                <button type="button" onClick={() => void pauseResume(issue.dispatch_paused)} disabled={Boolean(issue.active_run_id)}>
+                  {issue.dispatch_paused ? 'Dispatch resume issue' : 'Dispatch pause issue'}
+                </button>
+              </div>
+            </div>
+          </Section>
+
+          <Section title="Workspace and Git">
+            <KeyValue rows={[
+              ['Workspace path', issue.workspace_path || issue.workspace?.path || '—'],
+              ['Branch', issue.branch_name || issue.git?.branch_name || '—'],
+              ['Base ref', issue.base_ref || issue.git?.base_ref || '—'],
+              ['Base SHA', issue.base_sha || issue.git?.base_sha || '—']
+            ]} />
+          </Section>
+
+          <Section title="Review packets">
+            {issue.latest_review_packet ? (
+              <div className="summary-card">
+                <KeyValue rows={[
+                  ['Packet', `#${issue.latest_review_packet.packet_no}`],
+                  ['Status', <StatusPill value={issue.latest_review_packet.status} />],
+                  ['Run', issue.latest_review_packet.run_id],
+                  ['Created', formatDate(issue.latest_review_packet.created_at)],
+                  ['Failure', issue.latest_review_packet.failure_code || '—']
+                ]} />
+                <button type="button" onClick={() => navigate({ page: 'review', issueRef: issue.identifier })}>Open Review Packet</button>
+              </div>
+            ) : <EmptyState title="No review packet" body="A review packet appears after a completed handoff run reaches Human Review." />}
+          </Section>
+        </aside>
+      </div>
     </>
   );
 }
@@ -875,36 +1405,66 @@ function RunDetailPage({ route, runs, issues, events, runMutation }: {
   const canCancel = activeRunStatuses.has(run.status);
   return (
     <>
-      <Section title={`Run ${run.id}`} actions={issue ? <button type="button" onClick={() => navigate({ page: 'issue', issueRef: issue.identifier })}>Open issue</button> : null}>
-        <KeyValue rows={[
-          ['Issue', issue ? `${issue.identifier} · ${issue.title}` : run.issue_identifier || run.issue_id],
-          ['Status', <StatusPill value={run.status} />],
-          ['Attempt', run.attempt_no],
-          ['Runner', run.runner_kind],
-          ['Dispatch reason', run.dispatch_reason],
-          ['Source state', run.source_issue_state],
-          ['Branch', run.branch_name || '—'],
-          ['Base ref', run.base_ref || '—'],
-          ['Started', formatDate(run.started_at)],
-          ['Ended', formatDate(run.ended_at)],
-          ['Failure code', run.failure_code || '—'],
-          ['Failure message', run.failure_message || '—']
-        ]} />
-        {canCancel ? (
-          <div className="inline-form">
-            <label>
-              Cancel reason
-              <input value={reason} onChange={(event) => setReason(event.target.value)} />
-            </label>
-            <button type="button" onClick={() => void runMutation(() => api.cancelRun(run.id, reason))}>Cancel run</button>
-          </div>
-        ) : null}
-      </Section>
-      <Section title="Normalized timeline">
-        {runEvents.length === 0 ? (
-          <EmptyState title="No run events" body="Timeline events are replayed from the REST events API and SSE stream. Raw Codex protocol logs are not shown." />
-        ) : <EventList events={runEvents} />}
-      </Section>
+      <PageHeader
+        eyebrow="Run Detail"
+        title={`Run ${run.id}`}
+        description="Inspect normalized run metadata, cancellation state, and event timeline without exposing raw agent logs."
+        meta={<MetricStrip items={[
+          { label: 'Status', value: <StatusPill value={run.status} />, tone: run.status === 'failed' ? 'danger' : activeRunStatuses.has(run.status) ? 'warning' : 'muted' },
+          { label: 'Attempt', value: run.attempt_no, tone: 'muted' },
+          { label: 'Events', value: runEvents.length, tone: runEvents.length ? 'warning' : 'muted' },
+          { label: 'Failure', value: run.failure_code || 'none', tone: run.failure_code ? 'danger' : 'muted' }
+        ]} />}
+        actions={issue ? <button type="button" onClick={() => navigate({ page: 'issue', issueRef: issue.identifier })}>Open issue</button> : null}
+      />
+      <div className="page-split">
+        <div className="page-main">
+          <Section title="Run facts">
+            <KeyValue rows={[
+              ['Issue', issue ? `${issue.identifier} · ${issue.title}` : run.issue_identifier || run.issue_id],
+              ['Status', <StatusPill value={run.status} />],
+              ['Attempt', run.attempt_no],
+              ['Runner', run.runner_kind],
+              ['Dispatch reason', run.dispatch_reason],
+              ['Source state', run.source_issue_state],
+              ['Branch', run.branch_name || '—'],
+              ['Base ref', run.base_ref || '—'],
+              ['Started', formatDate(run.started_at)],
+              ['Ended', formatDate(run.ended_at)],
+              ['Failure code', run.failure_code || '—'],
+              ['Failure message', run.failure_message || '—']
+            ]} />
+          </Section>
+          <Section title="Normalized timeline">
+            {runEvents.length === 0 ? (
+              <EmptyState title="No run events" body="Timeline events are replayed from the REST events API and SSE stream. Raw Codex protocol logs are not shown." />
+            ) : <EventList events={runEvents} />}
+          </Section>
+        </div>
+        <aside className="page-aside">
+          <Section title="Run controls">
+            {canCancel ? (
+              <div className="form-grid compact">
+                <label className="span-2">
+                  Cancel reason
+                  <input value={reason} onChange={(event) => setReason(event.target.value)} />
+                </label>
+                <div className="span-2 form-actions">
+                  <button type="button" onClick={() => void runMutation(() => api.cancelRun(run.id, reason))}>Cancel run</button>
+                </div>
+              </div>
+            ) : <EmptyState title="No active command" body="Completed, failed, and cancelled runs cannot be cancelled." />}
+          </Section>
+          <Section title="Dispatch context">
+            <KeyValue rows={[
+              ['Workflow snapshot', run.workflow_snapshot_id || '—'],
+              ['Workspace ID', run.workspace_id || '—'],
+              ['Base config', run.base_ref_config || '—'],
+              ['Updated', formatDate(run.updated_at)]
+            ]} />
+          </Section>
+        </aside>
+      </div>
     </>
   );
 }
@@ -915,29 +1475,44 @@ function ApprovalInboxPage({ approvals, runMutation }: { approvals: Approval[]; 
 
   return (
     <>
-      <Section title="Pending approvals">
-        {pending.length === 0 ? (
-          <EmptyState title="No pending approvals" body="Command, file, and network approvals requested by active runs will appear here." />
-        ) : pending.map((approval) => <ApprovalCard key={approval.id} approval={approval} runMutation={runMutation} />)}
-      </Section>
-      <Section title="Resolved / expired approvals">
-        {resolved.length === 0 ? (
-          <EmptyState title="No resolved approvals" body="Expired, denied, approved, and cancelled approvals are listed after they leave pending state." />
-        ) : (
-          <table className="data-table">
-            <thead><tr><th>ID</th><th>Kind</th><th>Status</th><th>Run</th><th>Created</th></tr></thead>
-            <tbody>{resolved.map((approval) => (
-              <tr key={approval.id}>
-                <td>{approval.id}</td>
-                <td>{approval.kind}</td>
-                <td><StatusPill value={approval.status} /></td>
-                <td><button type="button" className="link-button" onClick={() => navigate({ page: 'run', runId: approval.run_id })}>{approval.run_id}</button></td>
-                <td>{formatDate(approval.created_at)}</td>
-              </tr>
-            ))}</tbody>
-          </table>
-        )}
-      </Section>
+      <PageHeader
+        eyebrow="Approval Inbox"
+        title="Approval decisions"
+        description="Review command, file, and network approval requests generated by active runs."
+        meta={<MetricStrip items={[
+          { label: 'Pending', value: pending.length, tone: pending.length ? 'warning' : 'muted' },
+          { label: 'Resolved', value: resolved.length, tone: 'muted' },
+          { label: 'Total', value: approvals.length, tone: 'muted' }
+        ]} />}
+        actions={<button type="button" onClick={() => navigate({ page: 'overview' })}>Open Workbench</button>}
+      />
+      <div className="page-split">
+        <div className="page-main">
+          <Section title="Pending approvals">
+            {pending.length === 0 ? (
+              <EmptyState title="No pending approvals" body="Command, file, and network approvals requested by active runs will appear here." />
+            ) : pending.map((approval) => <ApprovalCard key={approval.id} approval={approval} runMutation={runMutation} />)}
+          </Section>
+        </div>
+        <aside className="page-aside">
+          <Section title="Resolved / expired approvals">
+            {resolved.length === 0 ? (
+              <EmptyState title="No resolved approvals" body="Expired, denied, approved, and cancelled approvals are listed after they leave pending state." />
+            ) : (
+              <table className="data-table compact-table">
+                <thead><tr><th>ID</th><th>Status</th><th>Run</th></tr></thead>
+                <tbody>{resolved.map((approval) => (
+                  <tr key={approval.id}>
+                    <td>{approval.id}</td>
+                    <td><StatusPill value={approval.status} /></td>
+                    <td><button type="button" className="link-button" onClick={() => navigate({ page: 'run', runId: approval.run_id })}>{approval.run_id}</button></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            )}
+          </Section>
+        </aside>
+      </div>
     </>
   );
 }
@@ -1032,73 +1607,99 @@ function ReviewPacketPage({ route, issues, runMutation }: { route: RouteState; i
 
   return (
     <>
-      <Section title="Review Packet" actions={<button type="button" onClick={() => issueRef && void loadReview(issueRef)} disabled={!issueRef || loading}>Reload review</button>}>
-        <div className="inline-form">
-          <label>
-            Issue ref
-            <input value={issueRef} onChange={(event) => setIssueRef(event.target.value)} placeholder="LOC-1" list="review-issues" />
-            <datalist id="review-issues">{issues.map((issue) => <option key={issue.id} value={issue.identifier}>{issue.title}</option>)}</datalist>
-          </label>
-          <button type="button" onClick={() => void loadReview(issueRef)} disabled={!issueRef || loading}>Load latest packet</button>
-        </div>
-        {loading ? <Banner kind="info">Loading review packet summary through the Review API…</Banner> : null}
-        {error ? <Banner kind="error">{error}</Banner> : null}
-        {!review && !loading ? <EmptyState title="No review packet loaded" body="Load an issue in Human Review to inspect summary metadata and allowed artifacts." /> : null}
-        {review ? (
-          <div className="summary-card">
-            <KeyValue rows={[
-              ['Packet ID', review.id],
-              ['Run', <button type="button" className="link-button" onClick={() => navigate({ page: 'run', runId: review.run_id })}>{review.run_id}</button>],
-              ['Packet number', review.packet_no],
-              ['Status', <StatusPill value={review.status} />],
-              ['Root path', review.root_path],
-              ['Failure', review.failure_code || review.failure_message || '—'],
-              ['Created', formatDate(review.created_at)]
-            ]} />
-          </div>
-        ) : null}
-      </Section>
+      <PageHeader
+        eyebrow="Review Packet"
+        title="Human review packet"
+        description="Inspect redacted packet metadata and allowed artifacts, then decide whether to rework or mark done."
+        meta={<MetricStrip items={[
+          { label: 'Issue', value: issueRef || 'none', tone: issueRef ? 'muted' : 'warning' },
+          { label: 'Packet', value: review ? `#${review.packet_no}` : 'not loaded', tone: review ? 'good' : 'muted' },
+          { label: 'Artifacts', value: artifacts.length, tone: artifacts.length ? 'warning' : 'muted' },
+          { label: 'Status', value: review?.status || '—', tone: review?.status === 'failed' ? 'danger' : 'muted' }
+        ]} />}
+        actions={<button type="button" onClick={() => issueRef && void loadReview(issueRef)} disabled={!issueRef || loading}>Reload review</button>}
+      />
 
-      {review ? (
-        <Section title="Artifacts and redaction boundary">
-          {artifacts.length === 0 ? <EmptyState title="No artifact metadata" body="The Review API returned a packet summary with no exposed artifact entries." /> : null}
-          <div className="artifact-list">
-            {artifacts.map((artifact) => (
-              <article key={artifact.artifact_id} className="artifact-card">
-                <div className="issue-card-header">
-                  <strong>{artifact.kind}</strong>
-                  {artifact.content_url ? <Pill tone="good">content API</Pill> : <Pill tone="warning">metadata only</Pill>}
-                </div>
+      <div className="page-split">
+        <div className="page-main">
+          <Section title="Packet lookup">
+            <div className="inline-form">
+              <label>
+                Issue ref
+                <input value={issueRef} onChange={(event) => setIssueRef(event.target.value)} placeholder="LOC-1" list="review-issues" />
+                <datalist id="review-issues">{issues.map((issue) => <option key={issue.id} value={issue.identifier}>{issue.title}</option>)}</datalist>
+              </label>
+              <button type="button" onClick={() => void loadReview(issueRef)} disabled={!issueRef || loading}>Load latest packet</button>
+            </div>
+            {loading ? <Banner kind="info">Loading review packet summary through the Review API…</Banner> : null}
+            {error ? <Banner kind="error">{error}</Banner> : null}
+            {!review && !loading ? <EmptyState title="No review packet loaded" body="Load an issue in Human Review to inspect summary metadata and allowed artifacts." /> : null}
+            {review ? (
+              <div className="summary-card">
                 <KeyValue rows={[
-                  ['Artifact ID', artifact.artifact_id],
-                  ['Path', artifact.path],
-                  ['Redacted', artifact.redacted ? 'yes' : 'no']
+                  ['Packet ID', review.id],
+                  ['Run', <button type="button" className="link-button" onClick={() => navigate({ page: 'run', runId: review.run_id })}>{review.run_id}</button>],
+                  ['Packet number', review.packet_no],
+                  ['Status', <StatusPill value={review.status} />],
+                  ['Root path', review.root_path],
+                  ['Failure', review.failure_code || review.failure_message || '—'],
+                  ['Created', formatDate(review.created_at)]
                 ]} />
-                <button type="button" onClick={() => void loadArtifact(artifact)}>{artifact.content_url ? 'Fetch allowed content' : 'Show refusal state'}</button>
-                {artifactContent[artifact.artifact_id] ? (
-                  <div className={artifactContent[artifact.artifact_id].refused ? 'refusal-box' : ''}>
-                    <h4>{artifactContent[artifact.artifact_id].title}</h4>
-                    <JsonBlock value={artifactContent[artifact.artifact_id].text} maxHeight={360} />
-                  </div>
-                ) : null}
-              </article>
-            ))}
-          </div>
-        </Section>
-      ) : null}
+              </div>
+            ) : null}
+          </Section>
 
-      {review ? (
-        <Section title="Human Review actions">
-          <label>
-            Reason
-            <textarea value={reason} onChange={(event) => setReason(event.target.value)} rows={3} />
-          </label>
-          <div className="card-actions">
-            <button type="button" onClick={() => void reviewAction('rework')}>Send to Rework</button>
-            <button type="button" onClick={() => void reviewAction('done')}>Mark Done</button>
-          </div>
-        </Section>
-      ) : null}
+          {review ? (
+            <Section title="Artifacts and redaction boundary">
+              {artifacts.length === 0 ? <EmptyState title="No artifact metadata" body="The Review API returned a packet summary with no exposed artifact entries." /> : null}
+              <div className="artifact-list">
+                {artifacts.map((artifact) => (
+                  <article key={artifact.artifact_id} className="artifact-card">
+                    <div className="issue-card-header">
+                      <strong>{artifact.kind}</strong>
+                      {artifact.content_url ? <Pill tone="good">content API</Pill> : <Pill tone="warning">metadata only</Pill>}
+                    </div>
+                    <KeyValue rows={[
+                      ['Artifact ID', artifact.artifact_id],
+                      ['Path', artifact.path],
+                      ['Redacted', artifact.redacted ? 'yes' : 'no']
+                    ]} />
+                    <button type="button" onClick={() => void loadArtifact(artifact)}>{artifact.content_url ? 'Fetch allowed content' : 'Show refusal state'}</button>
+                    {artifactContent[artifact.artifact_id] ? (
+                      <div className={artifactContent[artifact.artifact_id].refused ? 'refusal-box' : ''}>
+                        <h4>{artifactContent[artifact.artifact_id].title}</h4>
+                        <JsonBlock value={artifactContent[artifact.artifact_id].text} maxHeight={360} />
+                      </div>
+                    ) : null}
+                  </article>
+                ))}
+              </div>
+            </Section>
+          ) : null}
+        </div>
+
+        <aside className="page-aside">
+          {review ? (
+            <Section title="Human Review actions">
+              <label>
+                Reason
+                <textarea value={reason} onChange={(event) => setReason(event.target.value)} rows={3} />
+              </label>
+              <div className="card-actions">
+                <button type="button" onClick={() => void reviewAction('rework')}>Send to Rework</button>
+                <button type="button" onClick={() => void reviewAction('done')}>Mark Done</button>
+              </div>
+            </Section>
+          ) : (
+            <Section title="Human Review actions">
+              <EmptyState title="No packet selected" body="Load a review packet before sending the issue to Rework or marking it Done." />
+            </Section>
+          )}
+          <Section title="Boundary">
+            <p className="rail-hint">This view uses Review and Artifact APIs only. Raw Codex logs and unsupported artifact content remain unavailable.</p>
+          </Section>
+        </aside>
+      </div>
     </>
   );
 }
@@ -1128,49 +1729,66 @@ function WorkflowPage({ workflow, runMutation }: { workflow: WorkflowResponse | 
 
   return (
     <>
-      <Section title="Workflow status">
-        {workflow ? (
-          <>
-            <KeyValue rows={[
-              ['Path', workflow.workflow_path],
-              ['Valid', workflow.validation?.valid ? <Pill tone="good">valid</Pill> : <Pill tone="danger">invalid</Pill>],
-              ['Warnings', workflow.validation?.warnings?.length || 0],
-              ['Errors', workflow.validation?.errors?.length || 0]
-            ]} />
-            {workflow.validation?.warnings?.length ? <Banner kind="warning">{workflow.validation.warnings.join('; ')}</Banner> : null}
-            {workflow.validation?.errors?.length ? <Banner kind="error">{workflow.validation.errors.join('; ')}</Banner> : null}
-          </>
-        ) : <EmptyState title="Workflow not loaded" body="The workflow page reads only through the REST API. Check daemon status if this remains empty." />}
-      </Section>
-      <Section title="Workflow actions">
-        <div className="card-actions">
-          <button type="button" onClick={() => void validate()}>Workflow validate</button>
-          <button type="button" onClick={() => void renderPreview()}>Render preview</button>
-          <button type="button" onClick={() => void runMutation(() => api.reloadWorkflow())}>Workflow reload</button>
+      <PageHeader
+        eyebrow="Workflow"
+        title="Workflow configuration"
+        description="Validate, preview, and reload the local workflow through dry-run oriented API actions."
+        meta={<MetricStrip items={[
+          { label: 'Valid', value: workflow?.validation?.valid ? 'yes' : 'no', tone: workflow?.validation?.valid ? 'good' : 'danger' },
+          { label: 'Warnings', value: workflow?.validation?.warnings?.length || 0, tone: workflow?.validation?.warnings?.length ? 'warning' : 'muted' },
+          { label: 'Errors', value: workflow?.validation?.errors?.length || 0, tone: workflow?.validation?.errors?.length ? 'danger' : 'muted' }
+        ]} />}
+        actions={<button type="button" onClick={() => navigate({ page: 'overview' })}>Open Workbench</button>}
+      />
+      <div className="page-split">
+        <div className="page-main">
+          <Section title="Workflow status">
+            {workflow ? (
+              <>
+                <KeyValue rows={[
+                  ['Path', workflow.workflow_path],
+                  ['Valid', workflow.validation?.valid ? <Pill tone="good">valid</Pill> : <Pill tone="danger">invalid</Pill>],
+                  ['Warnings', workflow.validation?.warnings?.length || 0],
+                  ['Errors', workflow.validation?.errors?.length || 0]
+                ]} />
+                {workflow.validation?.warnings?.length ? <Banner kind="warning">{workflow.validation.warnings.join('; ')}</Banner> : null}
+                {workflow.validation?.errors?.length ? <Banner kind="error">{workflow.validation.errors.join('; ')}</Banner> : null}
+              </>
+            ) : <EmptyState title="Workflow not loaded" body="The workflow page reads only through the REST API. Check daemon status if this remains empty." />}
+          </Section>
+          <Section title="Workflow actions">
+            <div className="card-actions">
+              <button type="button" onClick={() => void validate()}>Workflow validate</button>
+              <button type="button" onClick={() => void renderPreview()}>Render preview</button>
+              <button type="button" onClick={() => void runMutation(() => api.reloadWorkflow())}>Workflow reload</button>
+            </div>
+            {localError ? <Banner kind="error">{localError}</Banner> : null}
+            {validation ? (
+              <div className="summary-card">
+                <h3>Current filesystem validation</h3>
+                <p>This dry-run validation does not replace effective config or dispatch work.</p>
+                <JsonBlock value={validation} maxHeight={320} />
+              </div>
+            ) : null}
+            {preview ? (
+              <div className="summary-card">
+                <h3>Redacted render preview</h3>
+                <JsonBlock value={{ rendered_prompt_preview: preview.rendered_prompt_preview, prompt_metadata: preview.prompt_metadata || {} }} maxHeight={360} />
+                <KeyValue rows={[
+                  ['Source', preview.source],
+                  ['Redactions', preview.redactions_applied.join(', ') || '—'],
+                  ['Preview valid', preview.validation.valid ? 'yes' : 'no']
+                ]} />
+              </div>
+            ) : null}
+          </Section>
         </div>
-        {localError ? <Banner kind="error">{localError}</Banner> : null}
-        {validation ? (
-          <div className="summary-card">
-            <h3>Current filesystem validation</h3>
-            <p>This dry-run validation does not replace effective config or dispatch work.</p>
-            <JsonBlock value={validation} maxHeight={320} />
-          </div>
-        ) : null}
-        {preview ? (
-          <div className="summary-card">
-            <h3>Redacted render preview</h3>
-            <JsonBlock value={{ rendered_prompt_preview: preview.rendered_prompt_preview, prompt_metadata: preview.prompt_metadata || {} }} maxHeight={360} />
-            <KeyValue rows={[
-              ['Source', preview.source],
-              ['Redactions', preview.redactions_applied.join(', ') || '—'],
-              ['Preview valid', preview.validation.valid ? 'yes' : 'no']
-            ]} />
-          </div>
-        ) : null}
-      </Section>
-      <Section title="Last loaded config">
-        {workflow?.config ? <JsonBlock value={workflow.config} maxHeight={420} /> : <EmptyState title="No config object" body="The workflow API returned validation without an effective config payload." />}
-      </Section>
+        <aside className="page-aside">
+          <Section title="Last loaded config">
+            {workflow?.config ? <JsonBlock value={workflow.config} maxHeight={420} /> : <EmptyState title="No config object" body="The workflow API returned validation without an effective config payload." />}
+          </Section>
+        </aside>
+      </div>
     </>
   );
 }
@@ -1189,29 +1807,46 @@ function DiagnosticsPage({ diagnostics, runMutation }: { diagnostics: Diagnostic
 
   return (
     <>
-      <Section title="Diagnostics" actions={<button type="button" onClick={() => void exportDiagnostics()}>Diagnostics export</button>}>
-        <KeyValue rows={[
-          ['Project', diagnostics.project_id],
-          ['Generated', formatDate(diagnostics.generated_at)],
-          ['Repo root', diagnostics.repo_root],
-          ['Redacted export only', diagnostics.redacted ? 'yes' : 'no'],
-          ['Warnings', diagnostics.warnings.length]
-        ]} />
-        {exportResult ? <Banner kind="success">Redacted diagnostics exported as artifact {exportResult.artifact_id} at {exportResult.path}</Banner> : null}
-      </Section>
-      <section className="diagnostics-grid">
-        <DiagnosticCard title="Daemon" value={diagnostics.daemon} />
-        <DiagnosticCard title="Project paths / DB" value={diagnostics.database} />
-        <DiagnosticCard title="Codex" value={diagnostics.codex} />
-        <DiagnosticCard title="Git" value={diagnostics.git} />
-        <DiagnosticCard title="Workflow" value={diagnostics.workflow} />
-        <DiagnosticCard title="Redaction" value={diagnostics.redaction} />
-        <DiagnosticCard title="Failure summary" value={diagnostics.failure_summary} />
-        <DiagnosticCard title="Pause summary" value={diagnostics.pause_summary} />
-      </section>
-      <Section title="Checks and remediation">
-        <JsonBlock value={{ checks: diagnostics.checks, inconsistent_issues: diagnostics.inconsistent_issues, remediation: diagnostics.remediation }} maxHeight={420} />
-      </Section>
+      <PageHeader
+        eyebrow="Diagnostics"
+        title="Redacted system diagnostics"
+        description="Inspect daemon, workflow, Codex, git, and redaction state without exposing raw secrets or logs."
+        meta={<MetricStrip items={[
+          { label: 'Warnings', value: diagnostics.warnings.length, tone: diagnostics.warnings.length ? 'warning' : 'muted' },
+          { label: 'Checks', value: diagnostics.checks.length, tone: 'muted' },
+          { label: 'Redacted', value: diagnostics.redacted ? 'yes' : 'no', tone: diagnostics.redacted ? 'good' : 'danger' }
+        ]} />}
+        actions={<button type="button" onClick={() => void exportDiagnostics()}>Diagnostics export</button>}
+      />
+      <div className="page-split">
+        <div className="page-main">
+          <section className="diagnostics-grid">
+            <DiagnosticCard title="Daemon" value={diagnostics.daemon} />
+            <DiagnosticCard title="Project paths / DB" value={diagnostics.database} />
+            <DiagnosticCard title="Codex" value={diagnostics.codex} />
+            <DiagnosticCard title="Git" value={diagnostics.git} />
+            <DiagnosticCard title="Workflow" value={diagnostics.workflow} />
+            <DiagnosticCard title="Redaction" value={diagnostics.redaction} />
+            <DiagnosticCard title="Failure summary" value={diagnostics.failure_summary} />
+            <DiagnosticCard title="Pause summary" value={diagnostics.pause_summary} />
+          </section>
+          <Section title="Checks and remediation">
+            <JsonBlock value={{ checks: diagnostics.checks, inconsistent_issues: diagnostics.inconsistent_issues, remediation: diagnostics.remediation }} maxHeight={420} />
+          </Section>
+        </div>
+        <aside className="page-aside">
+          <Section title="Export summary">
+            <KeyValue rows={[
+              ['Project', diagnostics.project_id],
+              ['Generated', formatDate(diagnostics.generated_at)],
+              ['Repo root', diagnostics.repo_root],
+              ['Redacted export only', diagnostics.redacted ? 'yes' : 'no'],
+              ['Warnings', diagnostics.warnings.length]
+            ]} />
+            {exportResult ? <Banner kind="success">Redacted diagnostics exported as artifact {exportResult.artifact_id} at {exportResult.path}</Banner> : null}
+          </Section>
+        </aside>
+      </div>
     </>
   );
 }
@@ -1253,7 +1888,7 @@ export function App() {
       content = <DiagnosticsPage diagnostics={data.diagnostics} runMutation={runMutation} />;
       break;
     default:
-      content = <OverviewPage data={data} />;
+      content = <WorkbenchPage data={data} runMutation={runMutation} />;
   }
 
   return (

@@ -25,7 +25,8 @@ for (const path of requiredApiPaths) {
 
 const sharedStates = [
   'Loading dashboard state', 'No issues', 'Session expired', 'Daemon unavailable',
-  'Content is not exposed by the Review/Artifact API', 'Command submitted'
+  'Content is not exposed by the Review/Artifact API', 'Command submitted',
+  'Needs action', 'Ready to run', 'Action rail'
 ];
 for (const phrase of sharedStates) {
   if (!app.includes(phrase)) throw new Error(`missing shared-state phrase: ${phrase}`);
@@ -45,7 +46,7 @@ if (!/setIssueLoadError\(errorLabel\(error\)\)/s.test(app)) throw new Error('iss
 if (!/setRunLoadError\(errorLabel\(error\)\)/s.test(app)) throw new Error('run deep link non-404 errors must stop loading');
 if (!app.includes('prompt_metadata')) throw new Error('workflow preview must display prompt metadata instead of raw prompt text');
 
-for (const selector of ['.board', '.metric-grid', '.approval-card', '.artifact-card', '.diagnostics-grid']) {
+for (const selector of ['.page-header', '.page-split', '.metric-strip', '.workbench', '.work-queue', '.context-panel', '.action-rail', '.board', '.metric-grid', '.approval-card', '.artifact-card', '.diagnostics-grid']) {
   if (!styles.includes(selector)) throw new Error(`missing style selector ${selector}`);
 }
 

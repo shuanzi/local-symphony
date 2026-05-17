@@ -16,7 +16,7 @@ for (const file of requiredFiles) {
 }
 
 const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
-for (const token of ['OverviewPage', 'BoardPage', 'IssueDetailPage', 'RunDetailPage', 'ApprovalInboxPage', 'ReviewPacketPage', 'WorkflowPage', 'DiagnosticsPage']) {
+for (const token of ['PageHeader', 'MetricStrip', 'WorkbenchPage', 'WorkQueue', 'IssueContextPanel', 'ActionRail', 'BoardPage', 'IssueDetailPage', 'RunDetailPage', 'ApprovalInboxPage', 'ReviewPacketPage', 'WorkflowPage', 'DiagnosticsPage']) {
   if (!app.includes(token)) throw new Error(`missing component ${token}`);
 }
 
