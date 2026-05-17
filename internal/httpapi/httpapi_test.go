@@ -192,6 +192,51 @@ func TestOpenTokenRequiresBearerSession(t *testing.T) {
 	}
 }
 
+func TestRotateCLITokenRevokesOldBearerAndReturnsReplacement(t *testing.T) {
+	srv := newTestServer(t)
+
+	noBearerReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/cli-token/rotate", nil)
+	noBearerRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(noBearerRec, noBearerReq)
+	if noBearerRec.Code != http.StatusUnauthorized {
+		t.Fatalf("rotate without bearer status = %d, body = %s", noBearerRec.Code, noBearerRec.Body.String())
+	}
+
+	oldToken := insertLocalSession(t, srv, "cli")
+	rotateReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/cli-token/rotate", nil)
+	rotateReq.Header.Set("Authorization", "Bearer "+oldToken)
+	rotateRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rotateRec, rotateReq)
+	if rotateRec.Code != http.StatusOK {
+		t.Fatalf("rotate status = %d, body = %s", rotateRec.Code, rotateRec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rotateRec.Body.String()))
+	data := payload["data"].(map[string]any)
+	newToken, _ := data["token"].(string)
+	if newToken == "" || newToken == oldToken {
+		t.Fatalf("rotated token = %q, old token = %q", newToken, oldToken)
+	}
+	if _, ok := data["expires_at"]; !ok {
+		t.Fatalf("rotate data = %#v, want expires_at", data)
+	}
+
+	oldReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/open-token", nil)
+	oldReq.Header.Set("Authorization", "Bearer "+oldToken)
+	oldRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(oldRec, oldReq)
+	if oldRec.Code != http.StatusUnauthorized {
+		t.Fatalf("old bearer open-token status = %d, body = %s", oldRec.Code, oldRec.Body.String())
+	}
+
+	newReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/open-token", nil)
+	newReq.Header.Set("Authorization", "Bearer "+newToken)
+	newRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(newRec, newReq)
+	if newRec.Code != http.StatusOK {
+		t.Fatalf("new bearer open-token status = %d, body = %s", newRec.Code, newRec.Body.String())
+	}
+}
+
 func TestLogoutRevokesBrowserSession(t *testing.T) {
 	srv := newTestServer(t)
 	auth := sessionAuth(t, srv)

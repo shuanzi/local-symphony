@@ -126,7 +126,7 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "POST" && path == "/auth/open-token":
 		s.openToken(w, r)
 	case r.Method == "POST" && path == "/auth/cli-token/rotate":
-		ok(w, map[string]any{"rotated": true})
+		s.rotateCLIToken(w, r)
 	case path == "/issues" && r.Method == "GET":
 		s.listIssues(w, r)
 	case path == "/issues" && r.Method == "POST":
@@ -722,7 +722,7 @@ func requiresCSRF(path, method string) bool {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return false
 	}
-	return path != "/auth/exchange" && path != "/auth/open-token"
+	return path != "/auth/exchange" && path != "/auth/open-token" && path != "/auth/cli-token/rotate"
 }
 
 func (s *Server) authorizeCommand(w http.ResponseWriter, r *http.Request) bool {
@@ -811,6 +811,63 @@ func (s *Server) openToken(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"open_token": token, "expires_at": expiresAt})
 }
 
+func (s *Server) rotateCLIToken(w http.ResponseWriter, r *http.Request) {
+	token := bearerToken(r)
+	if token == "" {
+		apiErr(w, core.NewError(core.ErrUnauthorized, "bearer token invalid", nil))
+		return
+	}
+	replacement, expiresAt, err := s.rotateBearerSession(token)
+	if err != nil {
+		apiErr(w, err)
+		return
+	}
+	ok(w, map[string]any{"token": replacement, "expires_at": expiresAt})
+}
+
+func (s *Server) rotateBearerSession(token string) (string, *string, error) {
+	now := core.Now()
+	tokenHash := security.HashToken(token)
+	if err := s.Store.App.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return "", nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.Store.App.Exec(`ROLLBACK`)
+		}
+	}()
+	row, err := s.Store.App.QueryOne(`SELECT id,kind,expires_at,revoked_at,user_label FROM local_sessions WHERE project_id=? AND token_hash=? AND kind IN ('cli','desktop')`, s.Store.ProjectID, tokenHash)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil, core.NewError(core.ErrUnauthorized, "bearer token invalid", nil)
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	if !row["revoked_at"].Null && row["revoked_at"].String() != "" {
+		return "", nil, core.NewError(core.ErrUnauthorized, "bearer token revoked", nil)
+	}
+	if !row["expires_at"].Null && row["expires_at"].String() != "" && row["expires_at"].String() < now {
+		return "", nil, core.NewError(core.ErrUnauthorized, "bearer token expired", nil)
+	}
+	replacement := security.NewToken()
+	label := row["user_label"].String()
+	if label == "" {
+		label = "local-cli"
+	}
+	if err := s.Store.App.Exec(`UPDATE local_sessions SET revoked_at=? WHERE id=?`, now, row["id"].String()); err != nil {
+		return "", nil, err
+	}
+	if err := s.Store.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("ses_"), s.Store.ProjectID, row["kind"].String(), security.HashToken(replacement), label, now); err != nil {
+		return "", nil, err
+	}
+	if err := s.Store.App.Exec(`COMMIT`); err != nil {
+		return "", nil, err
+	}
+	committed = true
+	return replacement, nil, nil
+}
+
 func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
 		_ = s.Store.App.Exec(`UPDATE local_sessions SET revoked_at=? WHERE project_id=? AND token_hash=? AND kind='browser'`, core.Now(), s.Store.ProjectID, security.HashToken(cookie.Value))
@@ -820,11 +877,20 @@ func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) validBearerSession(r *http.Request) bool {
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if token == "" || token == r.Header.Get("Authorization") {
+	token := bearerToken(r)
+	if token == "" {
 		return false
 	}
 	return s.validStoredSession(security.HashToken(token), "cli", "desktop")
+}
+
+func bearerToken(r *http.Request) string {
+	header := r.Header.Get("Authorization")
+	token := strings.TrimPrefix(header, "Bearer ")
+	if token == "" || token == header {
+		return ""
+	}
+	return token
 }
 
 func (s *Server) validSession(r *http.Request) bool {

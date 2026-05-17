@@ -75,10 +75,12 @@ paths:
   /auth/cli-token/rotate:
     post:
       operationId: rotateCliToken
-      parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
-      x-csrf-required-for-cookie-auth: true
+      description: Rotates the bearer CLI credential used for local operator API calls. Requires the current CLI bearer token and returns its replacement.
+      security:
+        - bearerAuth: []
       responses:
         "200": { description: Rotated CLI token, content: { application/json: { schema: { $ref: '#/components/schemas/CliTokenEnvelope' } } } }
+        "401": { $ref: '#/components/responses/Error' }
   /issues:
     get:
       operationId: listIssues

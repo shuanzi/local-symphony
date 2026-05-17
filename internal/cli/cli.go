@@ -85,7 +85,11 @@ func serveOptionsFromArgs(args []string) (app.ServeOptions, error) {
 	opts := app.ServeOptions{Project: flagValue(args, "--project", "."), Host: flagValue(args, "--host", "127.0.0.1"), NoOpen: hasFlag(args, "--no-open")}
 	port := 0
 	if p := flagValue(args, "--port", ""); p != "" {
-		port, _ = strconv.Atoi(p)
+		parsedPort, err := strconv.Atoi(p)
+		if err != nil {
+			return opts, core.NewError(core.ErrInvalidRequest, "--port must be numeric", map[string]any{"port": p})
+		}
+		port = parsedPort
 	}
 	opts.Port = port
 	if addr := flagValue(args, "--addr", ""); addr != "" {
