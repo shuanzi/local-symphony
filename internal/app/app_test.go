@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,6 +70,36 @@ func TestWriteCLISessionWritesProjectScopedSession(t *testing.T) {
 	}
 	if session.ProjectID != st.ProjectID || session.Token != "test-token" {
 		t.Fatalf("session = %#v, want project %q token test-token", session, st.ProjectID)
+	}
+}
+
+func TestServeReturnsErrorWhenRuntimeDescriptorWriteFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	projectID := st.ProjectID
+	runtimePath := filepath.Join(home, ".symphony", "runtime")
+	if err := os.WriteFile(runtimePath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("create runtime path conflict: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	err = prepareServeRuntime(st, ln, "http://"+ln.Addr().String(), "test-token", 1234)
+	if err == nil {
+		t.Fatal("prepareServeRuntime succeeded, want runtime descriptor error")
+	}
+	if _, readErr := os.ReadFile(CLISessionPath(projectID)); readErr != nil {
+		t.Fatalf("CLI session was not written before runtime descriptor failure: %v", readErr)
+	}
+	if closeErr := ln.Close(); closeErr == nil {
+		t.Fatal("listener remained open after runtime descriptor failure")
 	}
 }
 

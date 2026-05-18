@@ -538,12 +538,16 @@ func (s *Server) sse(w http.ResponseWriter, r *http.Request, runID, issueID stri
 	if qAfter, err := strconv.ParseInt(r.URL.Query().Get("after_seq"), 10, 64); err == nil && qAfter > after {
 		after = qAfter
 	}
-	writeEvents := func() {
+	writeEvents := func() error {
 		var ev []core.RunEvent
+		var err error
 		if issueID != "" {
-			ev, _ = s.Store.IssueEvents(issueID, after, 200)
+			ev, err = s.Store.IssueEvents(issueID, after, 200)
 		} else {
-			ev, _ = s.Store.RunEvents(runID, after, 200)
+			ev, err = s.Store.RunEvents(runID, after, 200)
+		}
+		if err != nil {
+			return err
 		}
 		for _, e := range ev {
 			b, _ := json.Marshal(e)
@@ -552,8 +556,18 @@ func (s *Server) sse(w http.ResponseWriter, r *http.Request, runID, issueID stri
 			after = e.Seq
 		}
 		flusher.Flush()
+		return nil
 	}
-	writeEvents()
+	writeSSEError := func(err error) {
+		ae := core.AsAPIError(err)
+		b, _ := json.Marshal(map[string]any{"code": ae.Code, "message": ae.Message})
+		fmt.Fprintf(w, "event: error\ndata: %s\n\n", b)
+		flusher.Flush()
+	}
+	if err := writeEvents(); err != nil {
+		apiErr(w, err)
+		return
+	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	heartbeat := time.NewTicker(15 * time.Second)
@@ -563,7 +577,10 @@ func (s *Server) sse(w http.ResponseWriter, r *http.Request, runID, issueID stri
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
-			writeEvents()
+			if err := writeEvents(); err != nil {
+				writeSSEError(err)
+				return
+			}
 		case <-heartbeat.C:
 			_, _ = io.WriteString(w, ": heartbeat\n\n")
 			flusher.Flush()

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -882,6 +883,134 @@ func TestRunEventStreamUnknownRunReturnsNotFound(t *testing.T) {
 	}
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("stream status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestEventStreamReturnsInternalErrorWhenInitialQueryFails(t *testing.T) {
+	srv := newTestServer(t)
+	auth := sessionAuth(t, srv)
+	if err := srv.Store.Project.Close(); err != nil {
+		t.Fatalf("close project database: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events/stream", nil)
+	addCookies(req, auth.cookies)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		srv.Handler().ServeHTTP(rec, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("event stream did not return after initial query failure")
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("event stream status = %d, want 500; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInternal) {
+		t.Fatalf("error = %#v, want internal_error", errData)
+	}
+}
+
+func TestIssueEventStreamSendsErrorEventWhenQueryFailsAfterStart(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "SSE issue error", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/v1/issues/"+issue.Identifier+"/events/stream", nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	addCookies(req, auth.cookies)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("stream request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("stream status = %d, body = %s", resp.StatusCode, bodyBytes)
+	}
+	if err := srv.Store.Project.Close(); err != nil {
+		t.Fatalf("close project database: %v", err)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+	body := string(bodyBytes)
+	if !strings.Contains(body, "event: error\n") {
+		t.Fatalf("stream body missing error event: %q", body)
+	}
+	if !strings.Contains(body, `"code":"internal_error"`) {
+		t.Fatalf("stream body missing internal_error code: %q", body)
+	}
+}
+
+func TestRunEventStreamSendsErrorEventWhenQueryFailsAfterStart(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{
+		Title:              "SSE run error",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.Identifier, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/v1/runs/"+run.ID+"/events/stream", nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	addCookies(req, auth.cookies)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("stream request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("stream status = %d, body = %s", resp.StatusCode, bodyBytes)
+	}
+	if err := srv.Store.Project.Close(); err != nil {
+		t.Fatalf("close project database: %v", err)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+	body := string(bodyBytes)
+	if !strings.Contains(body, "event: error\n") {
+		t.Fatalf("stream body missing error event: %q", body)
+	}
+	if !strings.Contains(body, `"code":"internal_error"`) {
+		t.Fatalf("stream body missing internal_error code: %q", body)
 	}
 }
 

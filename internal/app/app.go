@@ -43,11 +43,9 @@ func Serve(opts ServeOptions) error {
 	}
 	addr := "http://" + ln.Addr().String()
 	token := security.NewToken()
-	if err := writeCLISession(st, addr, token); err != nil {
-		_ = ln.Close()
+	if err := prepareServeRuntime(st, ln, addr, token, os.Getpid()); err != nil {
 		return err
 	}
-	_ = st.CreateRuntimeDescriptor(addr, addr, os.Getpid())
 	defer st.RemoveRuntimeDescriptor()
 	srv := &http.Server{Handler: httpapi.New(st).Handler()}
 	errs := make(chan error, 1)
@@ -65,6 +63,18 @@ func Serve(opts ServeOptions) error {
 		}
 		return err
 	}
+}
+
+func prepareServeRuntime(st *store.Store, ln net.Listener, addr, token string, pid int) error {
+	if err := writeCLISession(st, addr, token); err != nil {
+		_ = ln.Close()
+		return err
+	}
+	if err := st.CreateRuntimeDescriptor(addr, addr, pid); err != nil {
+		_ = ln.Close()
+		return err
+	}
+	return nil
 }
 
 func writeCLISession(st *store.Store, apiURL, token string) error {
