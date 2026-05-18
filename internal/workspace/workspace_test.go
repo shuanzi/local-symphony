@@ -186,7 +186,7 @@ func TestPrepareFailsWithInvalidBaseRefEvenWhenWorkspacePathExists(t *testing.T)
 	cfg := config.Defaults(repoRoot)
 	cfg.Workspace.Root = filepath.Join(t.TempDir(), "workspaces")
 	cfg.Git.BaseRef = "missing-base"
-	stalePath := filepath.Join(cfg.Workspace.Root, st.ProjectID, issue.Identifier)
+	stalePath := filepath.Join(projectWorkspaceRoot(cfg.Workspace.Root, st.ProjectID), issue.Identifier)
 	if err := os.MkdirAll(stalePath, 0o755); err != nil {
 		t.Fatalf("create stale workspace path: %v", err)
 	}
@@ -203,6 +203,21 @@ func TestPrepareFailsWithInvalidBaseRefEvenWhenWorkspacePathExists(t *testing.T)
 	}
 	if storedRun.WorkspaceID != nil || storedRun.BaseRef != nil || storedRun.BaseSHA != nil {
 		t.Fatalf("run workspace metadata = workspace_id:%v base_ref:%v base_sha:%v, want none", storedRun.WorkspaceID, storedRun.BaseRef, storedRun.BaseSHA)
+	}
+}
+
+func TestProjectWorkspaceRootDoesNotAllowProjectIDPathTraversal(t *testing.T) {
+	root := t.TempDir()
+	path := projectWorkspaceRoot(root, "../../../outside")
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		t.Fatalf("relative workspace root: %v", err)
+	}
+	if filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
+		t.Fatalf("workspace root escaped base: base=%q path=%q rel=%q", root, path, rel)
+	}
+	if got := filepath.Base(path); !strings.HasPrefix(got, "project_") || strings.Contains(got, "..") || strings.ContainsAny(got, `/\`) {
+		t.Fatalf("workspace root segment is not sanitized: %q", got)
 	}
 }
 

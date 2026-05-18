@@ -142,11 +142,15 @@ func openDescriptor(project string) (map[string]any, error) {
 }
 
 func readCLISessionToken(projectID string) (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		home = os.TempDir()
+	token, err := readCLISessionTokenFromPath(app.CLISessionPath(projectID), projectID)
+	if err == nil || !os.IsNotExist(err) {
+		return token, err
 	}
-	b, err := os.ReadFile(filepath.Join(home, ".symphony", "cli-session.json"))
+	return readCLISessionTokenFromPath(app.LegacyCLISessionPath(), projectID)
+}
+
+func readCLISessionTokenFromPath(path, projectID string) (string, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}

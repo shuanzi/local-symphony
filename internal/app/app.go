@@ -68,12 +68,11 @@ func Serve(opts ServeOptions) error {
 }
 
 func writeCLISession(st *store.Store, apiURL, token string) error {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		home = os.TempDir()
-	}
-	path := filepath.Join(home, ".symphony", "cli-session.json")
+	path := CLISessionPath(st.ProjectID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	payload := map[string]any{"project_id": st.ProjectID, "repo_root": st.RepoRoot, "api_url": apiURL, "token": token, "created_at": "redacted"}
@@ -84,11 +83,30 @@ func writeCLISession(st *store.Store, apiURL, token string) error {
 	if err := st.App.Exec(`INSERT OR REPLACE INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at) VALUES(?,?,?,?,?,?)`, "cli_"+st.ProjectID, st.ProjectID, "cli", security.HashToken(token), "local-cli", "redacted"); err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o600)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
+func CLISessionPath(projectID string) string {
+	return filepath.Join(symphonyHomeDir(), ".symphony", "cli-sessions", db.ProjectScopedJSONFileName(projectID))
+}
+
+func LegacyCLISessionPath() string {
+	return filepath.Join(symphonyHomeDir(), ".symphony", "cli-session.json")
+}
+
+func symphonyHomeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return os.TempDir()
+	}
+	return home
 }
 
 func RuntimeDescriptor(projectID string) (map[string]any, error) {
-	b, err := os.ReadFile(filepath.Join(db.RuntimeDir(), projectID+".json"))
+	b, err := os.ReadFile(db.RuntimeDescriptorPath(projectID))
 	if err != nil {
 		return nil, err
 	}

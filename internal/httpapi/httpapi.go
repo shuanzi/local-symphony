@@ -141,7 +141,11 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/issues/"):
 		s.issueRoutes(w, r, strings.TrimPrefix(path, "/issues/"))
 	case path == "/runs" && r.Method == "GET":
-		runs, _ := s.Store.ListRuns()
+		runs, err := s.Store.ListRuns()
+		if err != nil {
+			apiErr(w, err)
+			return
+		}
 		ok(w, runs)
 	case strings.HasPrefix(path, "/runs/"):
 		s.runRoutes(w, r, strings.TrimPrefix(path, "/runs/"))

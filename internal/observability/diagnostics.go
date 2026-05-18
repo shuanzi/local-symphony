@@ -7,6 +7,7 @@ import (
 
 	"local-symphony/internal/config"
 	"local-symphony/internal/core"
+	"local-symphony/internal/db"
 	"local-symphony/internal/gitx"
 	"local-symphony/internal/store"
 )
@@ -48,7 +49,7 @@ func Export(st *store.Store) (string, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(root, "diagnostics-"+st.ProjectID+".json")
+	path := filepath.Join(root, "diagnostics-"+db.ProjectScopedJSONFileName(st.ProjectID))
 	b, _ := json.MarshalIndent(Diagnostics(st), "", "  ")
 	return path, os.WriteFile(path, b, 0o600)
 }

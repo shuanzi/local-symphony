@@ -9,6 +9,7 @@ import (
 
 	"local-symphony/internal/config"
 	"local-symphony/internal/core"
+	"local-symphony/internal/db"
 	"local-symphony/internal/gitx"
 	"local-symphony/internal/store"
 )
@@ -27,7 +28,7 @@ func (m Manager) Prepare(run *core.RunAttempt, issue *core.Issue) (*core.Workspa
 	if root == "" {
 		root = filepath.Join(os.TempDir(), "symphony-workspaces")
 	}
-	projectRoot := filepath.Join(root, m.Store.ProjectID)
+	projectRoot := projectWorkspaceRoot(root, m.Store.ProjectID)
 	if err := os.MkdirAll(projectRoot, 0o755); err != nil {
 		return nil, err
 	}
@@ -59,6 +60,10 @@ func (m Manager) Prepare(run *core.RunAttempt, issue *core.Issue) (*core.Workspa
 		return nil, err
 	}
 	return &core.WorkspaceSummary{ID: wsID, Path: path, BranchName: branch, BaseRef: baseRef, BaseRefConfig: baseRefConfig, BaseSHA: baseSHA, Status: "prepared"}, nil
+}
+
+func projectWorkspaceRoot(root, projectID string) string {
+	return filepath.Join(root, db.ProjectScopedPathName(projectID))
 }
 
 func branchName(prefix, ident, runID string) string {

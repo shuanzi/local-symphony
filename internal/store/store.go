@@ -1489,10 +1489,10 @@ func (s *Store) CreateRuntimeDescriptor(apiURL, toolURL string, pid int) error {
 	payload := map[string]any{"project_id": s.ProjectID, "repo_root": s.RepoRoot, "api_url": apiURL, "tool_gateway_endpoint": toolURL, "daemon_pid": pid, "started_at": core.Now()}
 	b, _ := json.MarshalIndent(payload, "", "  ")
 	_ = s.App.Exec(`INSERT OR REPLACE INTO runtime_descriptors(project_id,api_url,tool_gateway_endpoint,daemon_pid,started_at,updated_at) VALUES(?,?,?,?,?,?)`, s.ProjectID, apiURL, toolURL, pid, core.Now(), core.Now())
-	return os.WriteFile(filepath.Join(db.RuntimeDir(), s.ProjectID+".json"), b, 0o600)
+	return os.WriteFile(db.RuntimeDescriptorPath(s.ProjectID), b, 0o600)
 }
 func (s *Store) RemoveRuntimeDescriptor() {
-	_ = os.Remove(filepath.Join(db.RuntimeDir(), s.ProjectID+".json"))
+	_ = os.Remove(db.RuntimeDescriptorPath(s.ProjectID))
 	_ = s.App.Exec(`DELETE FROM runtime_descriptors WHERE project_id=?`, s.ProjectID)
 }
 

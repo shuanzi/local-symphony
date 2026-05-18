@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"local-symphony/internal/app"
 	"local-symphony/internal/core"
 	"local-symphony/internal/security"
 	"local-symphony/internal/store"
@@ -124,5 +125,148 @@ func TestOpenDescriptorMintsDashboardOpenToken(t *testing.T) {
 	dashboardURL, _ := desc["dashboard_url"].(string)
 	if !strings.HasPrefix(dashboardURL, server.URL+"/?open_token=open_test_token") {
 		t.Fatalf("dashboard_url = %q", dashboardURL)
+	}
+}
+
+func TestReadCLISessionTokenReadsProjectScopedSession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	projectID := "project_a"
+	sessionDir := filepath.Join(home, ".symphony", "cli-sessions")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatalf("mkdir cli session dir: %v", err)
+	}
+	sessionBody, _ := json.Marshal(map[string]any{"project_id": projectID, "token": "scoped-token"})
+	if err := os.WriteFile(filepath.Join(sessionDir, projectID+".json"), sessionBody, 0o600); err != nil {
+		t.Fatalf("write cli session: %v", err)
+	}
+
+	token, err := readCLISessionToken(projectID)
+	if err != nil {
+		t.Fatalf("readCLISessionToken: %v", err)
+	}
+	if token != "scoped-token" {
+		t.Fatalf("token = %q, want scoped-token", token)
+	}
+}
+
+func TestReadCLISessionTokenReadsSanitizedProjectScopedSession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	projectID := "../../cli-session"
+	sessionPath := app.CLISessionPath(projectID)
+	if err := os.MkdirAll(filepath.Dir(sessionPath), 0o700); err != nil {
+		t.Fatalf("mkdir cli session dir: %v", err)
+	}
+	sessionBody, _ := json.Marshal(map[string]any{"project_id": projectID, "token": "sanitized-token"})
+	if err := os.WriteFile(sessionPath, sessionBody, 0o600); err != nil {
+		t.Fatalf("write cli session: %v", err)
+	}
+
+	token, err := readCLISessionToken(projectID)
+	if err != nil {
+		t.Fatalf("readCLISessionToken: %v", err)
+	}
+	if token != "sanitized-token" {
+		t.Fatalf("token = %q, want sanitized-token", token)
+	}
+}
+
+func TestReadCLISessionTokenFallsBackToLegacySession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	projectID := "project_a"
+	sessionDir := filepath.Join(home, ".symphony")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatalf("mkdir cli session dir: %v", err)
+	}
+	sessionBody, _ := json.Marshal(map[string]any{"project_id": projectID, "token": "legacy-token"})
+	if err := os.WriteFile(filepath.Join(sessionDir, "cli-session.json"), sessionBody, 0o600); err != nil {
+		t.Fatalf("write legacy cli session: %v", err)
+	}
+
+	token, err := readCLISessionToken(projectID)
+	if err != nil {
+		t.Fatalf("readCLISessionToken: %v", err)
+	}
+	if token != "legacy-token" {
+		t.Fatalf("token = %q, want legacy-token", token)
+	}
+}
+
+func TestReadCLISessionTokenRejectsWrongProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	projectID := "project_a"
+	sessionDir := filepath.Join(home, ".symphony", "cli-sessions")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatalf("mkdir cli session dir: %v", err)
+	}
+	sessionBody, _ := json.Marshal(map[string]any{"project_id": "project_b", "token": "scoped-token"})
+	if err := os.WriteFile(filepath.Join(sessionDir, projectID+".json"), sessionBody, 0o600); err != nil {
+		t.Fatalf("write cli session: %v", err)
+	}
+
+	_, err := readCLISessionToken(projectID)
+	if err == nil {
+		t.Fatal("readCLISessionToken succeeded, want invalid project error")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrUnauthorized {
+		t.Fatalf("error code = %s, want %s", got, core.ErrUnauthorized)
+	}
+}
+
+func TestReadCLISessionTokenRejectsEmptyToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	projectID := "project_a"
+	sessionDir := filepath.Join(home, ".symphony", "cli-sessions")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatalf("mkdir cli session dir: %v", err)
+	}
+	sessionBody, _ := json.Marshal(map[string]any{"project_id": projectID, "token": " \t\n"})
+	if err := os.WriteFile(filepath.Join(sessionDir, projectID+".json"), sessionBody, 0o600); err != nil {
+		t.Fatalf("write cli session: %v", err)
+	}
+
+	_, err := readCLISessionToken(projectID)
+	if err == nil {
+		t.Fatal("readCLISessionToken succeeded, want empty token error")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrUnauthorized {
+		t.Fatalf("error code = %s, want %s", got, core.ErrUnauthorized)
+	}
+}
+
+func TestReadCLISessionTokenRejectsInvalidLegacySession(t *testing.T) {
+	tests := []struct {
+		name      string
+		projectID string
+		token     string
+	}{
+		{name: "wrong project", projectID: "project_b", token: "legacy-token"},
+		{name: "empty token", projectID: "project_a", token: " \t\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			sessionDir := filepath.Join(home, ".symphony")
+			if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+				t.Fatalf("mkdir cli session dir: %v", err)
+			}
+			sessionBody, _ := json.Marshal(map[string]any{"project_id": tt.projectID, "token": tt.token})
+			if err := os.WriteFile(filepath.Join(sessionDir, "cli-session.json"), sessionBody, 0o600); err != nil {
+				t.Fatalf("write legacy cli session: %v", err)
+			}
+
+			_, err := readCLISessionToken("project_a")
+			if err == nil {
+				t.Fatal("readCLISessionToken succeeded, want invalid legacy session error")
+			}
+			if got := core.AsAPIError(err).Code; got != core.ErrUnauthorized {
+				t.Fatalf("error code = %s, want %s", got, core.ErrUnauthorized)
+			}
+		})
 	}
 }
