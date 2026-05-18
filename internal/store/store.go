@@ -718,7 +718,9 @@ func (s *Store) RemoveBlocker(ref, blocker string) (*core.Issue, error) {
 		return nil, err
 	}
 	now := core.Now()
-	_ = s.Project.Exec(`UPDATE issue_relations SET active=0,resolved_at=? WHERE source_issue_id=? AND target_issue_id=? AND relation_type='blocks' AND active=1`, now, row["id"].String(), brow["id"].String())
+	if err := s.Project.Exec(`UPDATE issue_relations SET active=0,resolved_at=? WHERE source_issue_id=? AND target_issue_id=? AND relation_type='blocks' AND active=1`, now, row["id"].String(), brow["id"].String()); err != nil {
+		return nil, err
+	}
 	return s.GetIssue(ref)
 }
 func (s *Store) RemoveDuplicate(ref, canonical string) (*core.Issue, error) {
@@ -731,7 +733,9 @@ func (s *Store) RemoveDuplicate(ref, canonical string) (*core.Issue, error) {
 		return nil, err
 	}
 	now := core.Now()
-	_ = s.Project.Exec(`UPDATE issue_relations SET active=0,resolved_at=? WHERE source_issue_id=? AND target_issue_id=? AND relation_type='duplicates' AND active=1`, now, row["id"].String(), can["id"].String())
+	if err := s.Project.Exec(`UPDATE issue_relations SET active=0,resolved_at=? WHERE source_issue_id=? AND target_issue_id=? AND relation_type='duplicates' AND active=1`, now, row["id"].String(), can["id"].String()); err != nil {
+		return nil, err
+	}
 	return s.GetIssue(ref)
 }
 
@@ -1103,8 +1107,12 @@ func (s *Store) cancelRunInTx(runID string, code core.FailureCode, reason string
 	if err := s.Project.Exec(`UPDATE issues SET state=?, dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, string(target), string(code), now, now, run.IssueID); err != nil {
 		return err
 	}
-	_ = s.Project.Exec(`UPDATE run_tool_tokens SET revoked_at=? WHERE run_id=? AND revoked_at IS NULL`, now, runID)
-	_ = s.AppendEventTx("run.cancelled", "system", &run.IssueID, &runID, map[string]any{"failure_code": code, "reason": reason})
+	if err := s.Project.Exec(`UPDATE run_tool_tokens SET revoked_at=? WHERE run_id=? AND revoked_at IS NULL`, now, runID); err != nil {
+		return err
+	}
+	if err := s.AppendEventTx("run.cancelled", "system", &run.IssueID, &runID, map[string]any{"failure_code": code, "reason": reason}); err != nil {
+		return err
+	}
 	return nil
 }
 

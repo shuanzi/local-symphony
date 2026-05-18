@@ -595,6 +595,31 @@ func TestListRunsReturnsInternalErrorWhenStoreQueryFails(t *testing.T) {
 	}
 }
 
+func TestListApprovalsReturnsInternalErrorWhenStoreQueryFails(t *testing.T) {
+	srv := newTestServer(t)
+	auth := sessionAuth(t, srv)
+	if err := srv.Store.Project.Close(); err != nil {
+		t.Fatalf("close project database: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/approvals", nil)
+	addCookies(req, auth.cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("list approvals status = %d, want 500; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInternal) {
+		t.Fatalf("error = %#v, want internal_error", errData)
+	}
+	if _, ok := payload["data"]; ok {
+		t.Fatalf("list approvals returned success data on store error: %#v", payload)
+	}
+}
+
 func TestIssueControlRoutesReturnIssueEnvelope(t *testing.T) {
 	srv := newTestServer(t)
 	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Control shape", Description: "desc"})

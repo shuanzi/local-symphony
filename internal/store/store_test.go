@@ -3,6 +3,7 @@ package store
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"local-symphony/internal/core"
 	"local-symphony/internal/db"
@@ -201,6 +202,108 @@ func TestTransitionIssueToReadyCancelsActiveRunAndRevokesToken(t *testing.T) {
 	}
 }
 
+func TestCancelRunRollsBackWhenToolTokenRevokeFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, err := st.CreateIssue(CreateIssueInput{
+		Title:              "Cancel token revoke failure",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue ready: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	if err := st.UpdateRunStatus(run.ID, core.RunRunning, nil); err != nil {
+		t.Fatalf("UpdateRunStatus: %v", err)
+	}
+	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if _, err := st.CreateToolToken(run.ID, "token-hash-revoke-fails", map[string]any{"workspace": "/tmp/workspace"}, expiresAt); err != nil {
+		t.Fatalf("CreateToolToken: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_token_revoke BEFORE UPDATE OF revoked_at ON run_tool_tokens WHEN NEW.revoked_at IS NOT NULL BEGIN SELECT RAISE(ABORT, 'revoke failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err = st.CancelRun(run.ID, "operator cancelled")
+	if err == nil {
+		t.Fatal("CancelRun succeeded, want revoke error")
+	}
+	assertRunStatus(t, st, run.ID, core.RunRunning)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+	row, err := st.Project.QueryOne(`SELECT revoked_at FROM run_tool_tokens WHERE run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("get tool token: %v", err)
+	}
+	if row["revoked_at"].String() != "" {
+		t.Fatalf("tool token revoked_at = %q, want empty after rollback", row["revoked_at"].String())
+	}
+	gotRunID, gotIssueID, err := st.ValidateToolToken("token-hash-revoke-fails")
+	if err != nil {
+		t.Fatalf("ValidateToolToken: %v", err)
+	}
+	if gotRunID != run.ID || gotIssueID != issue.ID {
+		t.Fatalf("ValidateToolToken = (%s, %s), want (%s, %s)", gotRunID, gotIssueID, run.ID, issue.ID)
+	}
+}
+
+func TestCancelRunRollsBackWhenCancelledEventAppendFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, err := st.CreateIssue(CreateIssueInput{
+		Title:              "Cancel event failure",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue ready: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	if err := st.UpdateRunStatus(run.ID, core.RunRunning, nil); err != nil {
+		t.Fatalf("UpdateRunStatus: %v", err)
+	}
+	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if _, err := st.CreateToolToken(run.ID, "token-hash-cancel-event-fails", map[string]any{"workspace": "/tmp/workspace"}, expiresAt); err != nil {
+		t.Fatalf("CreateToolToken: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_run_cancelled_event BEFORE INSERT ON run_events WHEN NEW.event_type='run.cancelled' BEGIN SELECT RAISE(ABORT, 'run cancelled event failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err = st.CancelRun(run.ID, "operator cancelled")
+	if err == nil {
+		t.Fatal("CancelRun succeeded, want event append error")
+	}
+	assertRunStatus(t, st, run.ID, core.RunRunning)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+	row, err := st.Project.QueryOne(`SELECT revoked_at FROM run_tool_tokens WHERE run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("get tool token: %v", err)
+	}
+	if row["revoked_at"].String() != "" {
+		t.Fatalf("tool token revoked_at = %q, want empty after rollback", row["revoked_at"].String())
+	}
+	gotRunID, gotIssueID, err := st.ValidateToolToken("token-hash-cancel-event-fails")
+	if err != nil {
+		t.Fatalf("ValidateToolToken: %v", err)
+	}
+	if gotRunID != run.ID || gotIssueID != issue.ID {
+		t.Fatalf("ValidateToolToken = (%s, %s), want (%s, %s)", gotRunID, gotIssueID, run.ID, issue.ID)
+	}
+}
+
 func TestCreateToolTokenRejectsCancelledRun(t *testing.T) {
 	st := newStoreTestStore(t)
 	_, run := prepareCancelledRun(t, st)
@@ -358,6 +461,82 @@ func TestUpdateIssuePropagatesLabelWriteError(t *testing.T) {
 	_, err = st.UpdateIssue(issue.ID, map[string]any{"labels": []string{"blocked"}})
 	if err == nil {
 		t.Fatal("UpdateIssue succeeded, want label write error")
+	}
+}
+
+func TestRemoveBlockerPropagatesRelationUpdateError(t *testing.T) {
+	st := newStoreTestStore(t)
+	blocked, err := st.CreateIssue(CreateIssueInput{
+		Title:       "Blocked issue",
+		Description: "desc",
+		Priority:    3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue blocked: %v", err)
+	}
+	blocker, err := st.CreateIssue(CreateIssueInput{
+		Title:       "Blocker issue",
+		Description: "desc",
+		Priority:    3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue blocker: %v", err)
+	}
+	if _, err := st.AddBlocker(blocked.ID, blocker.ID); err != nil {
+		t.Fatalf("AddBlocker: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_remove_blocker BEFORE UPDATE OF active ON issue_relations WHEN OLD.relation_type='blocks' AND NEW.active=0 BEGIN SELECT RAISE(ABORT, 'remove blocker failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err = st.RemoveBlocker(blocked.ID, blocker.ID)
+	if err == nil {
+		t.Fatal("RemoveBlocker succeeded, want relation update error")
+	}
+	rows, err := st.Project.Query(`SELECT id FROM issue_relations WHERE source_issue_id=? AND target_issue_id=? AND relation_type='blocks' AND active=1`, blocked.ID, blocker.ID)
+	if err != nil {
+		t.Fatalf("query active blocker relation: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("active blocker relations = %d, want 1", len(rows))
+	}
+}
+
+func TestRemoveDuplicatePropagatesRelationUpdateError(t *testing.T) {
+	st := newStoreTestStore(t)
+	duplicate, err := st.CreateIssue(CreateIssueInput{
+		Title:       "Duplicate issue",
+		Description: "desc",
+		Priority:    3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue duplicate: %v", err)
+	}
+	canonical, err := st.CreateIssue(CreateIssueInput{
+		Title:       "Canonical issue",
+		Description: "desc",
+		Priority:    3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue canonical: %v", err)
+	}
+	if _, err := st.TransitionIssue(duplicate.ID, core.StateDuplicate, "same work", canonical.ID); err != nil {
+		t.Fatalf("TransitionIssue duplicate: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_remove_duplicate BEFORE UPDATE OF active ON issue_relations WHEN OLD.relation_type='duplicates' AND NEW.active=0 BEGIN SELECT RAISE(ABORT, 'remove duplicate failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err = st.RemoveDuplicate(duplicate.ID, canonical.ID)
+	if err == nil {
+		t.Fatal("RemoveDuplicate succeeded, want relation update error")
+	}
+	rows, err := st.Project.Query(`SELECT id FROM issue_relations WHERE source_issue_id=? AND target_issue_id=? AND relation_type='duplicates' AND active=1`, duplicate.ID, canonical.ID)
+	if err != nil {
+		t.Fatalf("query active duplicate relation: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("active duplicate relations = %d, want 1", len(rows))
 	}
 }
 

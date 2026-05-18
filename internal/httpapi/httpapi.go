@@ -150,7 +150,11 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/runs/"):
 		s.runRoutes(w, r, strings.TrimPrefix(path, "/runs/"))
 	case path == "/approvals" && r.Method == "GET":
-		a, _ := s.Store.PendingApprovals()
+		a, err := s.Store.PendingApprovals()
+		if err != nil {
+			apiErr(w, err)
+			return
+		}
 		ok(w, a)
 	case strings.HasPrefix(path, "/approvals/"):
 		s.approvalRoutes(w, r, strings.TrimPrefix(path, "/approvals/"))
