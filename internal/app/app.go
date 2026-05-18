@@ -43,7 +43,10 @@ func Serve(opts ServeOptions) error {
 	}
 	addr := "http://" + ln.Addr().String()
 	token := security.NewToken()
-	_ = writeCLISession(st, addr, token)
+	if err := writeCLISession(st, addr, token); err != nil {
+		_ = ln.Close()
+		return err
+	}
 	_ = st.CreateRuntimeDescriptor(addr, addr, os.Getpid())
 	defer st.RemoveRuntimeDescriptor()
 	srv := &http.Server{Handler: httpapi.New(st).Handler()}
@@ -74,8 +77,13 @@ func writeCLISession(st *store.Store, apiURL, token string) error {
 		return err
 	}
 	payload := map[string]any{"project_id": st.ProjectID, "repo_root": st.RepoRoot, "api_url": apiURL, "token": token, "created_at": "redacted"}
-	b, _ := json.MarshalIndent(payload, "", "  ")
-	_ = st.App.Exec(`INSERT OR REPLACE INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at) VALUES(?,?,?,?,?,?)`, "cli_"+st.ProjectID, st.ProjectID, "cli", security.HashToken(token), "local-cli", "redacted")
+	b, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := st.App.Exec(`INSERT OR REPLACE INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at) VALUES(?,?,?,?,?,?)`, "cli_"+st.ProjectID, st.ProjectID, "cli", security.HashToken(token), "local-cli", "redacted"); err != nil {
+		return err
+	}
 	return os.WriteFile(path, b, 0o600)
 }
 

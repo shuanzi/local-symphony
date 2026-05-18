@@ -540,21 +540,31 @@ func (s *Store) UpdateIssue(ref string, fields map[string]any) (*core.Issue, err
 		}
 	}
 	if desc, ok := fields["description"].(string); ok {
-		_ = s.Project.Exec(`UPDATE issues SET description=?, updated_at=? WHERE id=?`, strings.TrimSpace(desc), now, id)
+		if err := s.Project.Exec(`UPDATE issues SET description=?, updated_at=? WHERE id=?`, strings.TrimSpace(desc), now, id); err != nil {
+			return nil, err
+		}
 	}
 	if ac, ok := fields["acceptance_criteria"].([]string); ok {
-		_ = s.Project.Exec(`UPDATE issues SET acceptance_criteria_json=?, updated_at=? WHERE id=?`, encodeJSON(trimSlice(ac)), now, id)
+		if err := s.Project.Exec(`UPDATE issues SET acceptance_criteria_json=?, updated_at=? WHERE id=?`, encodeJSON(trimSlice(ac)), now, id); err != nil {
+			return nil, err
+		}
 	}
 	if p, ok := fields["priority"].(int); ok {
 		if p < 1 || p > 5 {
 			return nil, core.NewError(core.ErrInvalidRequest, "priority must be between 1 and 5", nil)
 		}
-		_ = s.Project.Exec(`UPDATE issues SET priority=?, updated_at=? WHERE id=?`, p, now, id)
+		if err := s.Project.Exec(`UPDATE issues SET priority=?, updated_at=? WHERE id=?`, p, now, id); err != nil {
+			return nil, err
+		}
 	}
 	if labels, ok := fields["labels"].([]string); ok {
-		_ = s.Project.Exec(`DELETE FROM issue_labels WHERE issue_id=?`, id)
+		if err := s.Project.Exec(`DELETE FROM issue_labels WHERE issue_id=?`, id); err != nil {
+			return nil, err
+		}
 		for _, l := range normalizeLabels(labels) {
-			_ = s.Project.Exec(`INSERT OR IGNORE INTO issue_labels(issue_id,label,created_at) VALUES(?,?,?)`, id, l, now)
+			if err := s.Project.Exec(`INSERT OR IGNORE INTO issue_labels(issue_id,label,created_at) VALUES(?,?,?)`, id, l, now); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return s.GetIssue(id)

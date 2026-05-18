@@ -145,6 +145,53 @@ func TestDecideApprovalCancelCancelsActiveRunAndApproval(t *testing.T) {
 	}
 }
 
+func TestUpdateIssuePropagatesDescriptionWriteError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, err := st.CreateIssue(CreateIssueInput{
+		Title:       "Update error propagation",
+		Description: "original desc",
+		Priority:    3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_issue_description_update BEFORE UPDATE OF description ON issues BEGIN SELECT RAISE(ABORT, 'blocked description update'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err = st.UpdateIssue(issue.ID, map[string]any{"description": "new desc"})
+	if err == nil {
+		t.Fatal("UpdateIssue succeeded, want description write error")
+	}
+	got, err := st.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.Description != "original desc" {
+		t.Fatalf("description = %q, want original desc", got.Description)
+	}
+}
+
+func TestUpdateIssuePropagatesLabelWriteError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, err := st.CreateIssue(CreateIssueInput{
+		Title:       "Label error propagation",
+		Description: "desc",
+		Priority:    3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if err := st.Project.Exec(`DROP TABLE issue_labels`); err != nil {
+		t.Fatalf("drop issue_labels: %v", err)
+	}
+
+	_, err = st.UpdateIssue(issue.ID, map[string]any{"labels": []string{"blocked"}})
+	if err == nil {
+		t.Fatal("UpdateIssue succeeded, want label write error")
+	}
+}
+
 func newStoreTestStore(t *testing.T) *Store {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())

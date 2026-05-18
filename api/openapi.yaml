@@ -246,6 +246,7 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: "invalid_request for malformed JSON or unsupported decision values." }
         "409": { $ref: '#/components/responses/Error', description: "approval_not_pending when approval is not pending; transactionally read-only with no side effects." }
   /reviews/{issue_ref}:
     get:

@@ -659,6 +659,36 @@ func TestApprovalNotPendingMapsToConflict(t *testing.T) {
 	}
 }
 
+func TestApprovalRejectsUnsupportedDecision(t *testing.T) {
+	srv := newTestServer(t)
+	run := prepareCompletedHTTPRun(t, srv)
+	approvalID := core.NewID("apr_")
+	if err := srv.Store.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at) VALUES(?,?,?,?,?,?,?)`, approvalID, run.ID, run.IssueID, "command", "pending", `{"command":"test"}`, core.Now()); err != nil {
+		t.Fatalf("insert approval: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/"+approvalID+"/decide", strings.NewReader(`{"decision":"approve_forever","reason":"bad input"}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported decision status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidRequest) {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	row, err := srv.Store.Project.QueryOne(`SELECT status FROM approval_requests WHERE id=?`, approvalID)
+	if err != nil {
+		t.Fatalf("get approval: %v", err)
+	}
+	if row["status"].String() != "pending" {
+		t.Fatalf("approval status = %s, want pending", row["status"].String())
+	}
+}
+
 func TestInternalErrorMapsToHTTP500(t *testing.T) {
 	rec := httptest.NewRecorder()
 	apiErr(rec, core.NewError(core.ErrInternal, "boom", nil))

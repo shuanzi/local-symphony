@@ -495,7 +495,8 @@ func (s *Server) approvalRoutes(w http.ResponseWriter, r *http.Request, rest str
 		}
 		status := map[string]string{"approve_once": "approved_once", "approve_for_run": "approved_for_run", "approve_for_session": "approved_for_session", "deny": "denied", "cancel_run": "cancelled"}[in.Decision]
 		if status == "" {
-			status = in.Decision
+			apiErr(w, core.NewError(core.ErrInvalidRequest, "unsupported approval decision", map[string]any{"decision": in.Decision}))
+			return
 		}
 		if err := s.Store.DecideApproval(parts[0], status, in.Reason); err != nil {
 			apiErr(w, err)
