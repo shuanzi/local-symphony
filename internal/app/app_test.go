@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"local-symphony/internal/core"
 	"local-symphony/internal/db"
 	"local-symphony/internal/store"
 )
@@ -100,6 +101,43 @@ func TestServeReturnsErrorWhenRuntimeDescriptorWriteFails(t *testing.T) {
 	}
 	if closeErr := ln.Close(); closeErr == nil {
 		t.Fatal("listener remained open after runtime descriptor failure")
+	}
+}
+
+func TestServeReturnsReconcileError(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Serve reconcile failure",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	if _, err := st.ClaimRun(issue.ID, "manual", "fake", 1); err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_serve_reconcile_comment BEFORE INSERT ON issue_comments WHEN NEW.author_type='system' AND NEW.body LIKE 'Run ended with %' BEGIN SELECT RAISE(ABORT, 'serve reconcile failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	repoRoot := st.RepoRoot
+	st.Close()
+
+	err = Serve(ServeOptions{Project: repoRoot, Host: "0.0.0.0", Port: 0, NoOpen: true})
+	if err == nil {
+		t.Fatal("Serve succeeded, want reconcile error")
+	}
+	if !strings.Contains(err.Error(), "serve reconcile failed") {
+		t.Fatalf("Serve error = %v, want reconcile failure", err)
 	}
 }
 

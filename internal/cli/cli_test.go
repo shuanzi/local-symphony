@@ -51,6 +51,106 @@ func TestServeOptionsFromArgsRejectsNonNumericPort(t *testing.T) {
 	}
 }
 
+func TestStatusReturnsErrorWhenQueriesFail(t *testing.T) {
+	tests := []struct {
+		name      string
+		dropTable string
+	}{
+		{name: "issues query", dropTable: "issues"},
+		{name: "runs query", dropTable: "run_attempts"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			st, err := store.InitProject(dir, "APP")
+			if err != nil {
+				t.Fatalf("InitProject: %v", err)
+			}
+			if err := st.Project.Exec("DROP TABLE " + tt.dropTable); err != nil {
+				t.Fatalf("drop %s: %v", tt.dropTable, err)
+			}
+			st.Close()
+
+			code := Main([]string{"status", "--project", dir})
+			if code != core.ExitCodeForError(core.ErrInternal) {
+				t.Fatalf("status exit code = %d, want %d", code, core.ExitCodeForError(core.ErrInternal))
+			}
+		})
+	}
+}
+
+func TestIssueCreateRejectsInvalidPriority(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "non integer", args: []string{"--priority", "abc"}},
+		{name: "fractional", args: []string{"--priority", "2.5"}},
+		{name: "empty equals", args: []string{"--priority="}},
+		{name: "missing value", args: []string{"--priority"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			st, err := store.InitProject(dir, "APP")
+			if err != nil {
+				t.Fatalf("InitProject: %v", err)
+			}
+			st.Close()
+
+			args := []string{"issue", "create", "--project", dir, "--title", "Invalid priority"}
+			args = append(args, tt.args...)
+			code := Main(args)
+			if code != core.ExitCodeForError(core.ErrInvalidRequest) {
+				t.Fatalf("issue create exit code = %d, want %d", code, core.ExitCodeForError(core.ErrInvalidRequest))
+			}
+
+			st, err = store.Open(dir)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer st.Close()
+			issues, err := st.ListIssues(store.ListIssueOptions{Limit: 10})
+			if err != nil {
+				t.Fatalf("ListIssues: %v", err)
+			}
+			if len(issues) != 0 {
+				t.Fatalf("created %d issues with invalid priority, want 0", len(issues))
+			}
+		})
+	}
+}
+
+func TestIssueCreateDefaultsPriorityWhenFlagMissing(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	st.Close()
+
+	code := Main([]string{"issue", "create", "--project", dir, "--title", "Default priority"})
+	if code != 0 {
+		t.Fatalf("issue create exit code = %d, want 0", code)
+	}
+
+	st, err = store.Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	issues, err := st.ListIssues(store.ListIssueOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("created %d issues, want 1", len(issues))
+	}
+	if issues[0].Priority != 3 {
+		t.Fatalf("priority = %d, want default 3", issues[0].Priority)
+	}
+}
+
 func TestRunAcceptsCustomIssuePrefix(t *testing.T) {
 	dir := t.TempDir()
 	st, err := store.InitProject(dir, "APP")

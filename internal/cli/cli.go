@@ -36,8 +36,14 @@ func Main(args []string) int {
 		return cmdOpen(args[1:])
 	case "status":
 		return withStore(args[1:], func(st *store.Store) (any, error) {
-			issues, _ := st.ListIssues(store.ListIssueOptions{Limit: 20})
-			runs, _ := st.ListRuns()
+			issues, err := st.ListIssues(store.ListIssueOptions{Limit: 20})
+			if err != nil {
+				return nil, err
+			}
+			runs, err := st.ListRuns()
+			if err != nil {
+				return nil, err
+			}
 			return map[string]any{"project_id": st.ProjectID, "repo_root": st.RepoRoot, "issues": issues, "runs": runs}, nil
 		})
 	case "issue":
@@ -211,7 +217,14 @@ func cmdIssue(args []string) int {
 	switch args[0] {
 	case "create":
 		return withStore(args[1:], func(st *store.Store) (any, error) {
-			pri := store.ParseInt(flagValue(args[1:], "--priority", "3"), 3)
+			pri := 3
+			if rawPriority, ok := flagValuePresent(args[1:], "--priority"); ok {
+				parsedPriority, err := strconv.Atoi(rawPriority)
+				if err != nil {
+					return nil, core.NewError(core.ErrInvalidRequest, "--priority must be an integer", map[string]any{"priority": rawPriority})
+				}
+				pri = parsedPriority
+			}
 			ac := multiFlag(args[1:], "--acceptance")
 			labels := multiFlag(args[1:], "--label")
 			return st.CreateIssue(store.CreateIssueInput{Title: flagValue(args[1:], "--title", ""), Description: flagValue(args[1:], "--description", ""), AcceptanceCriteria: ac, Priority: pri, Labels: labels})
@@ -590,6 +603,20 @@ func flagValue(args []string, name, def string) string {
 		}
 	}
 	return def
+}
+func flagValuePresent(args []string, name string) (string, bool) {
+	for i := 0; i < len(args); i++ {
+		if args[i] == name {
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
+				return args[i+1], true
+			}
+			return "", true
+		}
+		if strings.HasPrefix(args[i], name+"=") {
+			return strings.TrimPrefix(args[i], name+"="), true
+		}
+	}
+	return "", false
 }
 func hasFlag(args []string, name string) bool {
 	for _, a := range args {

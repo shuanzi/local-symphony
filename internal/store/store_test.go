@@ -68,6 +68,54 @@ func TestFailRunRejectsCancelledRunWithoutChangingRunOrIssue(t *testing.T) {
 	assertIssueState(t, st, issue.ID, core.StateReady)
 }
 
+func TestFailRunRollsBackWhenAuditCommentInsertFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "FailRun comment failure")
+	if err := st.Project.Exec(`CREATE TRIGGER fail_run_failure_comment BEFORE INSERT ON issue_comments WHEN NEW.author_type='system' AND NEW.body LIKE 'Run ended with %' BEGIN SELECT RAISE(ABORT, 'failure comment failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err := st.FailRun(run.ID, core.FailureToolGatewayFailed, "gateway failed", core.RunFailed)
+	if err == nil {
+		t.Fatal("FailRun succeeded, want audit comment error")
+	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+	assertNoRunFailureAudit(t, st, run.ID)
+}
+
+func TestFailRunRollsBackWhenAuditEventInsertFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "FailRun event failure")
+	if err := st.Project.Exec(`CREATE TRIGGER fail_run_failed_event BEFORE INSERT ON run_events WHEN NEW.event_type='run.failed' BEGIN SELECT RAISE(ABORT, 'run failed event failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err := st.FailRun(run.ID, core.FailureToolGatewayFailed, "gateway failed", core.RunFailed)
+	if err == nil {
+		t.Fatal("FailRun succeeded, want audit event error")
+	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+	assertNoRunFailureAudit(t, st, run.ID)
+}
+
+func TestFailRunRollsBackWhenSchedulerPausedEventInsertFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "FailRun scheduler event failure")
+	if err := st.Project.Exec(`CREATE TRIGGER fail_scheduler_paused_event BEFORE INSERT ON run_events WHEN NEW.event_type='scheduler.paused' BEGIN SELECT RAISE(ABORT, 'scheduler paused event failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err := st.FailRun(run.ID, core.FailureToolGatewayFailed, "gateway failed", core.RunFailed)
+	if err == nil {
+		t.Fatal("FailRun succeeded, want scheduler event error")
+	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+	assertNoRunFailureAudit(t, st, run.ID)
+}
+
 func TestCompleteRunWithReviewRejectsCompletedRunWithoutChangingRunOrIssue(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareCompletedReviewRun(t, st)
@@ -98,6 +146,86 @@ func TestCompleteRunWithReviewRejectsCancelledRunWithoutChangingRunOrIssue(t *te
 	}
 	assertRunStatus(t, st, run.ID, core.RunCancelled)
 	assertIssueState(t, st, issue.ID, core.StateReady)
+}
+
+func TestMarkDoneRollsBackWhenAuditCommentInsertFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, _ := prepareCompletedReviewRun(t, st)
+	if err := st.Project.Exec(`CREATE TRIGGER fail_review_audit_comment BEFORE INSERT ON issue_comments WHEN NEW.author_type='operator' AND NEW.body='mark done' BEGIN SELECT RAISE(ABORT, 'review audit comment failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.MarkDone(issue.ID, "mark done")
+	if err == nil {
+		t.Fatal("MarkDone succeeded, want audit insert error")
+	}
+	assertIssueState(t, st, issue.ID, core.StateHumanReview)
+	row, err := st.Project.QueryOne(`SELECT completed_at FROM issues WHERE id=?`, issue.ID)
+	if err != nil {
+		t.Fatalf("get issue completed_at: %v", err)
+	}
+	if row["completed_at"].String() != "" {
+		t.Fatalf("completed_at = %q, want empty after rollback", row["completed_at"].String())
+	}
+	rows, err := st.Project.Query(`SELECT id FROM run_events WHERE issue_id=? AND event_type IN ('review.marked_done','issue.completed')`, issue.ID)
+	if err != nil {
+		t.Fatalf("query review events: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("review completion events = %d, want 0 after rollback", len(rows))
+	}
+}
+
+func TestReviewActionRollsBackWhenAuditEventInsertFails(t *testing.T) {
+	tests := []struct {
+		name       string
+		action     string
+		failEvent  string
+		reason     string
+		wantStatus core.IssueState
+	}{
+		{name: "mark done review event", action: "done", failEvent: "review.marked_done", reason: "mark done event", wantStatus: core.StateHumanReview},
+		{name: "mark done completed event", action: "done", failEvent: "issue.completed", reason: "completed event", wantStatus: core.StateHumanReview},
+		{name: "send to rework event", action: "rework", failEvent: "review.sent_to_rework", reason: "rework event", wantStatus: core.StateHumanReview},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newStoreTestStore(t)
+			issue, _ := prepareCompletedReviewRun(t, st)
+			trigger := `CREATE TRIGGER fail_review_audit_event BEFORE INSERT ON run_events WHEN NEW.event_type='` + tt.failEvent + `' BEGIN SELECT RAISE(ABORT, 'review audit event failed'); END`
+			if err := st.Project.Exec(trigger); err != nil {
+				t.Fatalf("create trigger: %v", err)
+			}
+
+			var err error
+			switch tt.action {
+			case "done":
+				_, err = st.MarkDone(issue.ID, tt.reason)
+			case "rework":
+				_, err = st.SendToRework(issue.ID, tt.reason)
+			default:
+				t.Fatalf("unknown action %q", tt.action)
+			}
+			if err == nil {
+				t.Fatal("review action succeeded, want audit event error")
+			}
+			assertIssueState(t, st, issue.ID, tt.wantStatus)
+			row, err := st.Project.QueryOne(`SELECT completed_at FROM issues WHERE id=?`, issue.ID)
+			if err != nil {
+				t.Fatalf("get issue completed_at: %v", err)
+			}
+			if row["completed_at"].String() != "" {
+				t.Fatalf("completed_at = %q, want empty after rollback", row["completed_at"].String())
+			}
+			rows, err := st.Project.Query(`SELECT id FROM run_events WHERE issue_id=? AND event_type IN ('review.marked_done','issue.completed','review.sent_to_rework')`, issue.ID)
+			if err != nil {
+				t.Fatalf("query review events: %v", err)
+			}
+			if len(rows) != 0 {
+				t.Fatalf("review action events = %d, want 0 after rollback", len(rows))
+			}
+		})
+	}
 }
 
 func TestUpdateRunStatusRejectsCompletedRunWithoutChangingRunOrIssue(t *testing.T) {
@@ -347,6 +475,54 @@ func TestTransitionIssueRollsBackWhenActiveRunCancelFails(t *testing.T) {
 	assertIssueState(t, st, issue.ID, core.StateWorking)
 }
 
+func TestReconcileStaleActiveRunsReturnsFailRunError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, err := st.CreateIssue(CreateIssueInput{
+		Title:              "Reconcile failure",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue ready: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_stale_run_reconcile BEFORE UPDATE OF status ON run_attempts WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT, 'stale reconcile failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err = st.ReconcileStaleActiveRuns()
+	if err == nil {
+		t.Fatal("ReconcileStaleActiveRuns succeeded, want FailRun error")
+	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+}
+
+func TestReconcileStaleActiveRunsContinuesAfterFailRunError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue1, run1 := prepareActiveRunWithMaxConcurrent(t, st, "Reconcile failed run", 2)
+	issue2, run2 := prepareActiveRunWithMaxConcurrent(t, st, "Reconcile successful run", 2)
+	if err := st.Project.Exec(`CREATE TRIGGER fail_one_stale_run_reconcile BEFORE UPDATE OF status ON run_attempts WHEN OLD.id='` + run1.ID + `' AND NEW.status='failed' BEGIN SELECT RAISE(ABORT, 'stale reconcile failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err := st.ReconcileStaleActiveRuns()
+	if err == nil {
+		t.Fatal("ReconcileStaleActiveRuns succeeded, want FailRun error")
+	}
+	assertRunStatus(t, st, run1.ID, core.RunPending)
+	assertIssueState(t, st, issue1.ID, core.StateWorking)
+	assertRunStatus(t, st, run2.ID, core.RunFailed)
+	assertIssueState(t, st, issue2.ID, core.StateReady)
+}
+
 func TestDecideApprovalCancelRejectsCompletedRunWithoutChangingApproval(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareCompletedReviewRun(t, st)
@@ -552,6 +728,32 @@ func newStoreTestStore(t *testing.T) *Store {
 	return st
 }
 
+func prepareActiveRun(t *testing.T, st *Store, title string) (*core.Issue, *core.RunAttempt) {
+	t.Helper()
+	return prepareActiveRunWithMaxConcurrent(t, st, title, 1)
+}
+
+func prepareActiveRunWithMaxConcurrent(t *testing.T, st *Store, title string, maxConcurrent int) (*core.Issue, *core.RunAttempt) {
+	t.Helper()
+	issue, err := st.CreateIssue(CreateIssueInput{
+		Title:              title,
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", maxConcurrent)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	return issue, run
+}
+
 func prepareCompletedReviewRun(t *testing.T, st *Store) (*core.Issue, *core.RunAttempt) {
 	t.Helper()
 	issue, err := st.CreateIssue(CreateIssueInput{
@@ -671,6 +873,24 @@ func assertIssueState(t *testing.T, st *Store, issueID string, want core.IssueSt
 	}
 	if gotIssue.State != want {
 		t.Fatalf("issue state = %s, want %s", gotIssue.State, want)
+	}
+}
+
+func assertNoRunFailureAudit(t *testing.T, st *Store, runID string) {
+	t.Helper()
+	commentRows, err := st.Project.Query(`SELECT id FROM issue_comments WHERE run_id=? AND body LIKE 'Run ended with %'`, runID)
+	if err != nil {
+		t.Fatalf("query failure comments: %v", err)
+	}
+	if len(commentRows) != 0 {
+		t.Fatalf("failure comments = %d, want 0 after rollback", len(commentRows))
+	}
+	eventRows, err := st.Project.Query(`SELECT id FROM run_events WHERE run_id=? AND event_type IN ('run.failed','scheduler.paused')`, runID)
+	if err != nil {
+		t.Fatalf("query failure events: %v", err)
+	}
+	if len(eventRows) != 0 {
+		t.Fatalf("failure events = %d, want 0 after rollback", len(eventRows))
 	}
 }
 

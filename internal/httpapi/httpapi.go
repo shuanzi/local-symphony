@@ -205,8 +205,16 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) state(w http.ResponseWriter) {
-	issues, _ := s.Store.ListIssues(store.ListIssueOptions{Limit: 20})
-	runs, _ := s.Store.ListRuns()
+	issues, err := s.Store.ListIssues(store.ListIssueOptions{Limit: 20})
+	if err != nil {
+		apiErr(w, err)
+		return
+	}
+	runs, err := s.Store.ListRuns()
+	if err != nil {
+		apiErr(w, err)
+		return
+	}
 	ok(w, map[string]any{"project_id": s.Store.ProjectID, "repo_root": s.Store.RepoRoot, "issues": issues, "runs": runs})
 }
 func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
@@ -295,7 +303,10 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 		}
 		if r.Method == "PATCH" {
 			var raw map[string]any
-			if readBody(r, &raw, w) {
+			dec := json.NewDecoder(r.Body)
+			dec.UseNumber()
+			if err := dec.Decode(&raw); err != nil && err != io.EOF {
+				apiErr(w, core.NewError(core.ErrInvalidRequest, err.Error(), nil))
 				return
 			}
 			fields := map[string]any{}
@@ -305,8 +316,18 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 			if v, ok := raw["description"].(string); ok {
 				fields["description"] = v
 			}
-			if v, ok := raw["priority"].(float64); ok {
-				fields["priority"] = int(v)
+			if rawPriority, exists := raw["priority"]; exists {
+				v, ok := rawPriority.(json.Number)
+				if !ok {
+					apiErr(w, core.NewError(core.ErrInvalidRequest, "priority must be an integer", nil))
+					return
+				}
+				parsed, err := strconv.ParseInt(v.String(), 10, 0)
+				if err != nil {
+					apiErr(w, core.NewError(core.ErrInvalidRequest, "priority must be an integer", nil))
+					return
+				}
+				fields["priority"] = int(parsed)
 			}
 			if arr, ok := raw["acceptance_criteria"].([]any); ok {
 				fields["acceptance_criteria"] = toStrings(arr)

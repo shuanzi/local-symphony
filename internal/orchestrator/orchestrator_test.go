@@ -197,3 +197,198 @@ func TestRunAfterHookWithNegativeMaxOutputBytesDoesNotPanic(t *testing.T) {
 		t.Fatalf("hook output = %q, want empty output for negative max_output_bytes", got)
 	}
 }
+
+func TestRunAfterHookStoresOnlyMaxOutputBytesFromLargeOutput(t *testing.T) {
+	st, err := store.InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Large hook output",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	afterRun := `i=0; while [ "$i" -lt 1024 ]; do printf 0123456789abcdef; i=$((i+1)); done`
+	cfg := config.Defaults(st.RepoRoot)
+	cfg.Hooks.AfterRun = &afterRun
+	cfg.Hooks.MaxOutputBytes = 31
+	wf := &config.Workflow{
+		Path:       filepath.Join(st.RepoRoot, "WORKFLOW.md"),
+		Config:     cfg,
+		PromptBody: "Do the work.",
+		Validation: config.Validation{Valid: true},
+	}
+
+	if err := runAfterHook(st, wf, t.TempDir(), run.ID, issue.ID); err != nil {
+		t.Fatalf("runAfterHook: %v", err)
+	}
+
+	rows, err := st.Project.Query(`SELECT data_json FROM run_events WHERE event_type='hook.after_run.output' AND run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("query hook output event: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("hook output event count = %d, want 1", len(rows))
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(rows[0]["data_json"].String()), &data); err != nil {
+		t.Fatalf("decode hook output event: %v", err)
+	}
+	got, _ := data["output"].(string)
+	if len(got) != cfg.Hooks.MaxOutputBytes {
+		t.Fatalf("hook output length = %d, want %d", len(got), cfg.Hooks.MaxOutputBytes)
+	}
+	if want := "0123456789abcdef0123456789abcde"; got != want {
+		t.Fatalf("hook output = %q, want %q", got, want)
+	}
+}
+
+func TestRunAfterHookTimeoutRecordsBoundedOutputBeforeReturning(t *testing.T) {
+	st, err := store.InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Timeout hook output",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	tempDir := t.TempDir()
+	marker := filepath.Join(tempDir, "output-written")
+	afterRun := fmt.Sprintf("printf abcdef; touch %q; sleep 5", marker)
+	cfg := config.Defaults(st.RepoRoot)
+	cfg.Hooks.AfterRun = &afterRun
+	cfg.Hooks.MaxOutputBytes = 3
+	cfg.Hooks.TimeoutMS = 500
+	wf := &config.Workflow{
+		Path:       filepath.Join(st.RepoRoot, "WORKFLOW.md"),
+		Config:     cfg,
+		PromptBody: "Do the work.",
+		Validation: config.Validation{Valid: true},
+	}
+
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- runAfterHook(st, wf, tempDir, run.ID, issue.ID)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("runAfterHook returned before hook wrote output marker: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hook did not write output marker before deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	err = <-done
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("runAfterHook returned after %s, want prompt timeout", elapsed)
+	}
+	if err == nil || err.Error() != "after_run timeout" {
+		t.Fatalf("runAfterHook error = %v, want after_run timeout", err)
+	}
+
+	rows, err := st.Project.Query(`SELECT event_type,data_json FROM run_events WHERE event_type LIKE 'hook.after_run.%' AND run_id=? ORDER BY seq ASC`, run.ID)
+	if err != nil {
+		t.Fatalf("query hook events: %v", err)
+	}
+	wantTypes := []string{"hook.after_run.started", "hook.after_run.output", "hook.after_run.timeout"}
+	if len(rows) != len(wantTypes) {
+		t.Fatalf("hook event count = %d, want %d", len(rows), len(wantTypes))
+	}
+	for i, want := range wantTypes {
+		if got := rows[i]["event_type"].String(); got != want {
+			t.Fatalf("hook event %d = %s, want %s", i, got, want)
+		}
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(rows[1]["data_json"].String()), &data); err != nil {
+		t.Fatalf("decode hook output event: %v", err)
+	}
+	if got := data["output"]; got != "abc" {
+		t.Fatalf("hook output = %q, want bounded output", got)
+	}
+}
+
+func TestRunAfterHookStartFailureDoesNotPanic(t *testing.T) {
+	st, err := store.InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Start failure hook",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	afterRun := "printf should-not-run"
+	cfg := config.Defaults(st.RepoRoot)
+	cfg.Hooks.AfterRun = &afterRun
+	wf := &config.Workflow{
+		Path:       filepath.Join(st.RepoRoot, "WORKFLOW.md"),
+		Config:     cfg,
+		PromptBody: "Do the work.",
+		Validation: config.Validation{Valid: true},
+	}
+	missingCWD := filepath.Join(t.TempDir(), "missing")
+
+	if err := runAfterHook(st, wf, missingCWD, run.ID, issue.ID); err == nil {
+		t.Fatalf("runAfterHook error = nil, want start failure")
+	}
+
+	rows, err := st.Project.Query(`SELECT event_type FROM run_events WHERE event_type LIKE 'hook.after_run.%' AND run_id=? ORDER BY seq ASC`, run.ID)
+	if err != nil {
+		t.Fatalf("query hook events: %v", err)
+	}
+	wantTypes := []string{"hook.after_run.started", "hook.after_run.output", "hook.after_run.failed"}
+	if len(rows) != len(wantTypes) {
+		t.Fatalf("hook event count = %d, want %d", len(rows), len(wantTypes))
+	}
+	for i, want := range wantTypes {
+		if got := rows[i]["event_type"].String(); got != want {
+			t.Fatalf("hook event %d = %s, want %s", i, got, want)
+		}
+	}
+}

@@ -29,7 +29,9 @@ func Serve(opts ServeOptions) error {
 		return err
 	}
 	defer st.Close()
-	_ = st.ReconcileStaleActiveRuns()
+	if err := st.ReconcileStaleActiveRuns(); err != nil {
+		return err
+	}
 	host := opts.Host
 	if host == "" {
 		host = "127.0.0.1"

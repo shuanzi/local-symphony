@@ -188,6 +188,56 @@ func TestStateRequiresSessionButSessionEndpointRemainsPublic(t *testing.T) {
 	}
 }
 
+func TestStateReturnsInternalErrorWhenStoreQueryFails(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *Server)
+	}{
+		{
+			name: "list issues fails",
+			setup: func(t *testing.T, srv *Server) {
+				t.Helper()
+				if err := srv.Store.Project.Close(); err != nil {
+					t.Fatalf("close project database: %v", err)
+				}
+			},
+		},
+		{
+			name: "list runs fails",
+			setup: func(t *testing.T, srv *Server) {
+				t.Helper()
+				if err := srv.Store.Project.Exec(`DROP TABLE run_attempts`); err != nil {
+					t.Fatalf("drop run_attempts: %v", err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			auth := sessionAuth(t, srv)
+			tt.setup(t, srv)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+			addCookies(req, auth.cookies)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("state status = %d, want 500; body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInternal) {
+				t.Fatalf("error = %#v, want internal_error", errData)
+			}
+			if _, ok := payload["data"]; ok {
+				t.Fatalf("state returned success data on store error: %#v", payload)
+			}
+		})
+	}
+}
+
 func TestExchangeRequiresValidOpenTokenAndCreatesSessionCookie(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -770,6 +820,54 @@ func TestIssueControlRoutesReturnIssueEnvelope(t *testing.T) {
 				if got := data[key]; got != want {
 					t.Fatalf("%s %s = %#v, want %#v; data = %#v", tt.name, key, got, want, data)
 				}
+			}
+		})
+	}
+}
+
+func TestPatchIssueRejectsInvalidPriority(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Invalid priority", Description: "desc", Priority: 4})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "fractional", body: `{"priority":2.5}`},
+		{name: "exponent", body: `{"priority":1e0}`},
+		{name: "precision bypass fractional one", body: `{"priority":1.0000000000000001}`},
+		{name: "precision bypass fractional five", body: `{"priority":4.9999999999999999}`},
+		{name: "string", body: `{"priority":"3"}`},
+		{name: "null", body: `{"priority":null}`},
+		{name: "bool", body: `{"priority":true}`},
+		{name: "object", body: `{"priority":{"value":3}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPatch, "/api/v1/issues/"+issue.Identifier, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			applySessionAuth(req, auth)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("patch issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInvalidRequest) {
+				t.Fatalf("error = %#v, want invalid_request", errData)
+			}
+			got, err := srv.Store.GetIssue(issue.Identifier)
+			if err != nil {
+				t.Fatalf("GetIssue: %v", err)
+			}
+			if got.Priority != 4 {
+				t.Fatalf("priority = %d, want unchanged 4", got.Priority)
 			}
 		})
 	}

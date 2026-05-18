@@ -1005,9 +1005,15 @@ func (s *Store) FailRun(runID string, code core.FailureCode, message string, sta
 	if err := s.Project.Exec(`UPDATE issues SET state=?, dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, string(target), string(code), now, now, run.IssueID); err != nil {
 		return err
 	}
-	_ = s.Project.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "system", fmt.Sprintf("Run ended with %s: %s", code, message), now)
-	_ = s.AppendEventTx("run.failed", "system", &run.IssueID, &runID, map[string]any{"failure_code": code, "message": message})
-	_ = s.AppendEventTx("scheduler.paused", "system", &run.IssueID, &runID, map[string]any{"reason": code})
+	if err := s.Project.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "system", fmt.Sprintf("Run ended with %s: %s", code, message), now); err != nil {
+		return err
+	}
+	if err := s.AppendEventTx("run.failed", "system", &run.IssueID, &runID, map[string]any{"failure_code": code, "message": message}); err != nil {
+		return err
+	}
+	if err := s.AppendEventTx("scheduler.paused", "system", &run.IssueID, &runID, map[string]any{"reason": code}); err != nil {
+		return err
+	}
 	if err := s.Project.Exec(`COMMIT`); err != nil {
 		return err
 	}
@@ -1425,15 +1431,23 @@ func (s *Store) reviewAction(issueRef, reason string, target core.IssueState) (*
 	if err := s.Project.Exec(`UPDATE issues SET state=?, completed_at=?, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL, updated_at=? WHERE id=?`, string(target), completedAt, now, issue.ID); err != nil {
 		return nil, err
 	}
-	_ = s.Project.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), issue.ID, string(core.StateHumanReview), string(target), "operator", reason, now)
-	_ = s.Project.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), issue.ID, "operator", reason, now)
+	if err := s.Project.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), issue.ID, string(core.StateHumanReview), string(target), "operator", reason, now); err != nil {
+		return nil, err
+	}
+	if err := s.Project.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), issue.ID, "operator", reason, now); err != nil {
+		return nil, err
+	}
 	event := "review.sent_to_rework"
 	if target == core.StateDone {
 		event = "review.marked_done"
 	}
-	_ = s.AppendEventTx(event, "operator", &issue.ID, nil, map[string]any{"reason": reason})
+	if err := s.AppendEventTx(event, "operator", &issue.ID, nil, map[string]any{"reason": reason}); err != nil {
+		return nil, err
+	}
 	if target == core.StateDone {
-		_ = s.AppendEventTx("issue.completed", "operator", &issue.ID, nil, map[string]any{"reason": reason})
+		if err := s.AppendEventTx("issue.completed", "operator", &issue.ID, nil, map[string]any{"reason": reason}); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.Project.Exec(`COMMIT`); err != nil {
 		return nil, err
@@ -1501,10 +1515,14 @@ func (s *Store) ReconcileStaleActiveRuns() error {
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, r := range rows {
-		_ = s.FailRun(r["id"].String(), core.FailureDaemonRestartedInterrupted, "daemon restarted while run was active", core.RunFailed)
+		runID := r["id"].String()
+		if err := s.FailRun(runID, core.FailureDaemonRestartedInterrupted, "daemon restarted while run was active", core.RunFailed); err != nil {
+			errs = append(errs, fmt.Errorf("reconcile stale run %s: %w", runID, err))
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 func (s *Store) CreateRuntimeDescriptor(apiURL, toolURL string, pid int) error {
 	if err := os.MkdirAll(db.RuntimeDir(), 0o700); err != nil {

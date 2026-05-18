@@ -4,10 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"local-symphony/internal/agent/fake"
@@ -175,6 +178,7 @@ func runAfterHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID stri
 	_ = st.AppendEvent("hook.after_run.started", "hook", &issueID, &runID, map[string]any{"command": "redacted"})
 	cmd := exec.Command("/bin/sh", "-c", cmdText)
 	cmd.Dir = cwd
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	timeout := time.Duration(wf.Config.Hooks.TimeoutMS) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
@@ -183,28 +187,105 @@ func runAfterHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID stri
 	if maxOutputBytes < 0 {
 		maxOutputBytes = 0
 	}
+	output := &boundedHookOutput{limit: maxOutputBytes}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": output.String()})
+		_ = st.AppendEvent("hook.after_run.failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": output.String()})
+		_ = st.AppendEvent("hook.after_run.failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": output.String()})
+		_ = st.AppendEvent("hook.after_run.failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
+		return err
+	}
+	var readers sync.WaitGroup
+	readers.Add(2)
+	go copyHookOutput(&readers, output, stdout)
+	go copyHookOutput(&readers, output, stderr)
 	done := make(chan error, 1)
 	go func() {
-		out, err := cmd.CombinedOutput()
-		if len(out) > maxOutputBytes {
-			out = out[:maxOutputBytes]
-		}
-		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": string(out)})
-		done <- err
+		readers.Wait()
+		done <- cmd.Wait()
 	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case err := <-done:
+		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": output.String()})
 		if err != nil {
 			_ = st.AppendEvent("hook.after_run.failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
 			return err
 		}
 		_ = st.AppendEvent("hook.after_run.completed", "hook", &issueID, &runID, map[string]any{})
 		return nil
-	case <-time.After(timeout):
-		_ = cmd.Process.Kill()
+	case <-timer.C:
+		killHookProcess(cmd.Process)
+		waitForHookReadersAfterKill(done, stdout, stderr)
+		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": output.String()})
 		_ = st.AppendEvent("hook.after_run.timeout", "hook", &issueID, &runID, map[string]any{})
 		return fmt.Errorf("after_run timeout")
 	}
+}
+
+func waitForHookReadersAfterKill(done <-chan error, stdout, stderr io.Closer) {
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		_ = stdout.Close()
+		_ = stderr.Close()
+		<-done
+	}
+}
+
+func copyHookOutput(wg *sync.WaitGroup, output *boundedHookOutput, r io.Reader) {
+	defer wg.Done()
+	_, _ = io.Copy(output, r)
+}
+
+func killHookProcess(process *os.Process) {
+	if process == nil {
+		return
+	}
+	if pgid, err := syscall.Getpgid(process.Pid); err == nil {
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err == nil {
+			return
+		}
+	}
+	_ = process.Kill()
+}
+
+type boundedHookOutput struct {
+	mu    sync.Mutex
+	limit int
+	buf   []byte
+}
+
+func (b *boundedHookOutput) Write(p []byte) (int, error) {
+	n := len(p)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.limit <= 0 || len(b.buf) >= b.limit {
+		return n, nil
+	}
+	remaining := b.limit - len(b.buf)
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	b.buf = append(b.buf, p...)
+	return n, nil
+}
+
+func (b *boundedHookOutput) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
 }
 
 func (o Orchestrator) Tick() error {
