@@ -15,6 +15,7 @@ import (
 	"local-symphony/internal/core"
 	"local-symphony/internal/security"
 	"local-symphony/internal/store"
+	"local-symphony/internal/toolgateway"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -25,6 +26,63 @@ func newTestServer(t *testing.T) *Server {
 	}
 	t.Cleanup(st.Close)
 	return New(st)
+}
+
+func TestToolRoutePassesCWDHeaderToGateway(t *testing.T) {
+	srv := newTestServer(t)
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	subdir := filepath.Join(workspace, "nested")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{
+		Title:              "Tool cwd header",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	wsID, err := srv.Store.CreateOrUpdateWorkspace(issue.ID, workspace, "test", "auto", "main", "base-sha")
+	if err != nil {
+		t.Fatalf("CreateOrUpdateWorkspace: %v", err)
+	}
+	if err := srv.Store.SetRunWorkspace(run.ID, wsID, "test", "auto", "main", "base-sha"); err != nil {
+		t.Fatalf("SetRunWorkspace: %v", err)
+	}
+	if err := srv.Store.UpdateRunStatus(run.ID, core.RunRunning, nil); err != nil {
+		t.Fatalf("UpdateRunStatus: %v", err)
+	}
+	token, err := toolgateway.NewTokenForRun(srv.Store, run, workspace)
+	if err != nil {
+		t.Fatalf("NewTokenForRun: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/tool/v1/call", strings.NewReader(`{"tool":"issue.get","input":{}}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Symphony-Cwd", subdir)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tool route status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp toolgateway.Response
+	if err := json.NewDecoder(strings.NewReader(rec.Body.String())).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("tool route success = false, error = %#v", resp.Error)
+	}
 }
 
 func decodeEnvelope(t *testing.T, body *strings.Reader) map[string]any {
@@ -69,7 +127,7 @@ func TestSessionReturnsCSRFTokenAndMutationsRequireIt(t *testing.T) {
 	applySessionAuth(withCSRFReq, auth)
 	withCSRFRec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(withCSRFRec, withCSRFReq)
-	if withCSRFRec.Code != http.StatusOK {
+	if withCSRFRec.Code != http.StatusCreated {
 		t.Fatalf("valid CSRF status = %d, body = %s", withCSRFRec.Code, withCSRFRec.Body.String())
 	}
 }
@@ -93,6 +151,38 @@ func TestSessionWithoutCookieDoesNotExposeCSRFToken(t *testing.T) {
 	}
 	if token, _ := data["csrf"].(string); token != "" {
 		t.Fatalf("unauthenticated session leaked csrf %q", token)
+	}
+}
+
+func TestStateRequiresSessionButSessionEndpointRemainsPublic(t *testing.T) {
+	srv := newTestServer(t)
+
+	noAuthReq := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	noAuthRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(noAuthRec, noAuthReq)
+	if noAuthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("state without auth status = %d, body = %s", noAuthRec.Code, noAuthRec.Body.String())
+	}
+
+	sessionReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+	sessionRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(sessionRec, sessionReq)
+	if sessionRec.Code != http.StatusOK {
+		t.Fatalf("public session status = %d, body = %s", sessionRec.Code, sessionRec.Body.String())
+	}
+	sessionPayload := decodeEnvelope(t, strings.NewReader(sessionRec.Body.String()))
+	sessionData := sessionPayload["data"].(map[string]any)
+	if token, _ := sessionData["csrf_token"].(string); token != "" {
+		t.Fatalf("unauthenticated session leaked csrf_token %q", token)
+	}
+
+	auth := sessionAuth(t, srv)
+	authReq := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	addCookies(authReq, auth.cookies)
+	authRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusOK {
+		t.Fatalf("state with browser session status = %d, body = %s", authRec.Code, authRec.Body.String())
 	}
 }
 
@@ -237,6 +327,25 @@ func TestRotateCLITokenRevokesOldBearerAndReturnsReplacement(t *testing.T) {
 	}
 }
 
+func TestRotateCLITokenPreservesExistingExpiry(t *testing.T) {
+	srv := newTestServer(t)
+	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	oldToken := insertLocalSessionWithExpiry(t, srv, "cli", expiresAt)
+
+	rotateReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/cli-token/rotate", nil)
+	rotateReq.Header.Set("Authorization", "Bearer "+oldToken)
+	rotateRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rotateRec, rotateReq)
+	if rotateRec.Code != http.StatusOK {
+		t.Fatalf("rotate status = %d, body = %s", rotateRec.Code, rotateRec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rotateRec.Body.String()))
+	data := payload["data"].(map[string]any)
+	if got, _ := data["expires_at"].(string); got != expiresAt {
+		t.Fatalf("rotated expires_at = %q, want %q; data = %#v", got, expiresAt, data)
+	}
+}
+
 func TestLogoutRevokesBrowserSession(t *testing.T) {
 	srv := newTestServer(t)
 	auth := sessionAuth(t, srv)
@@ -287,6 +396,236 @@ func TestSessionCSRFTokenIsRandomPerServer(t *testing.T) {
 	}
 	if firstToken == secondToken {
 		t.Fatalf("tokens should be unique per server instance: %q", firstToken)
+	}
+}
+
+func TestBlockerEndpointsReturnUpdatedIssueEnvelope(t *testing.T) {
+	srv := newTestServer(t)
+	blocked, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Blocked", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue blocked: %v", err)
+	}
+	blocker, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Blocker", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue blocker: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+
+	addReq := httptest.NewRequest(http.MethodPost, "/api/v1/issues/"+blocked.Identifier+"/blockers", strings.NewReader(`{"blocked_by":"`+blocker.Identifier+`"}`))
+	addReq.Header.Set("Content-Type", "application/json")
+	applySessionAuth(addReq, auth)
+	addRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(addRec, addReq)
+	if addRec.Code != http.StatusOK {
+		t.Fatalf("add blocker status = %d, body = %s", addRec.Code, addRec.Body.String())
+	}
+	addPayload := decodeEnvelope(t, strings.NewReader(addRec.Body.String()))
+	addData := addPayload["data"].(map[string]any)
+	if got, _ := addData["identifier"].(string); got != blocked.Identifier {
+		t.Fatalf("add blocker data identifier = %q, want %q; data = %#v", got, blocked.Identifier, addData)
+	}
+	if blockers, _ := addData["blocked_by"].([]any); len(blockers) != 1 {
+		t.Fatalf("add blocker blocked_by = %#v, want one blocker", addData["blocked_by"])
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/issues/"+blocked.Identifier+"/blockers/"+blocker.Identifier, nil)
+	applySessionAuth(deleteReq, auth)
+	deleteRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("delete blocker status = %d, body = %s", deleteRec.Code, deleteRec.Body.String())
+	}
+	deletePayload := decodeEnvelope(t, strings.NewReader(deleteRec.Body.String()))
+	deleteData := deletePayload["data"].(map[string]any)
+	if got, _ := deleteData["identifier"].(string); got != blocked.Identifier {
+		t.Fatalf("delete blocker data identifier = %q, want %q; data = %#v", got, blocked.Identifier, deleteData)
+	}
+	if blockers, _ := deleteData["blocked_by"].([]any); len(blockers) != 0 {
+		t.Fatalf("delete blocker blocked_by = %#v, want no blockers", deleteData["blocked_by"])
+	}
+}
+
+func TestListIssuesSupportsLabelFilterAndCursor(t *testing.T) {
+	srv := newTestServer(t)
+	if _, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Alpha one", Description: "desc", Labels: []string{"alpha"}}); err != nil {
+		t.Fatalf("CreateIssue alpha one: %v", err)
+	}
+	if _, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Beta", Description: "desc", Labels: []string{"beta"}}); err != nil {
+		t.Fatalf("CreateIssue beta: %v", err)
+	}
+	if _, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Alpha two", Description: "desc", Labels: []string{"alpha", "extra"}}); err != nil {
+		t.Fatalf("CreateIssue alpha two: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/api/v1/issues?label=alpha&limit=1&sort=identifier", nil)
+	addCookies(firstReq, auth.cookies)
+	firstRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first list status = %d, body = %s", firstRec.Code, firstRec.Body.String())
+	}
+	firstPayload := decodeEnvelope(t, strings.NewReader(firstRec.Body.String()))
+	firstData := firstPayload["data"].(map[string]any)
+	firstItems := firstData["items"].([]any)
+	if len(firstItems) != 1 {
+		t.Fatalf("first page items = %#v, want one item", firstItems)
+	}
+	firstPage := firstData["page"].(map[string]any)
+	cursor, _ := firstPage["next_cursor"].(string)
+	if cursor == "" {
+		t.Fatalf("first page next_cursor = %#v, want cursor", firstPage["next_cursor"])
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "/api/v1/issues?label=alpha&limit=1&sort=identifier&cursor="+cursor, nil)
+	addCookies(secondReq, auth.cookies)
+	secondRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("second list status = %d, body = %s", secondRec.Code, secondRec.Body.String())
+	}
+	secondPayload := decodeEnvelope(t, strings.NewReader(secondRec.Body.String()))
+	secondData := secondPayload["data"].(map[string]any)
+	secondItems := secondData["items"].([]any)
+	if len(secondItems) != 1 {
+		t.Fatalf("second page items = %#v, want one item", secondItems)
+	}
+	secondPage := secondData["page"].(map[string]any)
+	if secondPage["next_cursor"] != nil {
+		t.Fatalf("second page next_cursor = %#v, want nil", secondPage["next_cursor"])
+	}
+	for _, raw := range append(firstItems, secondItems...) {
+		item := raw.(map[string]any)
+		labels := item["labels"].([]any)
+		hasAlpha := false
+		for _, label := range labels {
+			if label == "alpha" {
+				hasAlpha = true
+			}
+		}
+		if !hasAlpha {
+			t.Fatalf("item labels = %#v, want alpha", labels)
+		}
+	}
+}
+
+func TestListIssuesReportsHasMoreForPlainLimitPagination(t *testing.T) {
+	srv := newTestServer(t)
+	if _, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Plain one", Description: "desc"}); err != nil {
+		t.Fatalf("CreateIssue plain one: %v", err)
+	}
+	if _, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Plain two", Description: "desc"}); err != nil {
+		t.Fatalf("CreateIssue plain two: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/issues?limit=1&sort=identifier", nil)
+	addCookies(req, sessionAuth(t, srv).cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	data := payload["data"].(map[string]any)
+	items := data["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items = %#v, want one item", items)
+	}
+	page := data["page"].(map[string]any)
+	if page["has_more"] != true {
+		t.Fatalf("has_more = %#v, want true; page = %#v", page["has_more"], page)
+	}
+	if cursor, _ := page["next_cursor"].(string); cursor == "" {
+		t.Fatalf("next_cursor = %#v, want cursor; page = %#v", page["next_cursor"], page)
+	}
+}
+
+func TestListIssuesRejectsInvalidQueryParameters(t *testing.T) {
+	tests := []string{
+		"limit=0",
+		"limit=201",
+		"limit=abc",
+		"sort=created",
+		"dispatch_paused=maybe",
+		"state=Unknown",
+		"cursor=-1",
+		"cursor=abc",
+	}
+	for _, query := range tests {
+		t.Run(query, func(t *testing.T) {
+			srv := newTestServer(t)
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/issues?"+query, nil)
+			addCookies(req, sessionAuth(t, srv).cookies)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("list issues status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInvalidRequest) {
+				t.Fatalf("error = %#v, want invalid_request", errData)
+			}
+		})
+	}
+}
+
+func TestIssueControlRoutesReturnIssueEnvelope(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Control shape", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+	tests := []struct {
+		name string
+		path string
+		body string
+		want map[string]any
+	}{
+		{
+			name: "transition",
+			path: "/api/v1/issues/" + issue.Identifier + "/transition",
+			body: `{"state":"Ready","reason":"ready"}`,
+			want: map[string]any{"state": string(core.StateReady)},
+		},
+		{
+			name: "dispatch pause",
+			path: "/api/v1/issues/" + issue.Identifier + "/dispatch-pause",
+			body: `{"reason":"pause queue"}`,
+			want: map[string]any{"dispatch_paused": true, "dispatch_pause_reason": "pause queue"},
+		},
+		{
+			name: "dispatch resume",
+			path: "/api/v1/issues/" + issue.Identifier + "/dispatch-resume",
+			body: `{"reason":"resume queue"}`,
+			want: map[string]any{"dispatch_paused": false},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			applySessionAuth(req, auth)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s status = %d, body = %s", tt.name, rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			data := payload["data"].(map[string]any)
+			if data["issue"] != nil || data["side_effects"] != nil {
+				t.Fatalf("%s data = %#v, want direct issue shape", tt.name, data)
+			}
+			if got, _ := data["identifier"].(string); got != issue.Identifier {
+				t.Fatalf("%s identifier = %q, want %q", tt.name, got, issue.Identifier)
+			}
+			for key, want := range tt.want {
+				if got := data[key]; got != want {
+					t.Fatalf("%s %s = %#v, want %#v; data = %#v", tt.name, key, got, want, data)
+				}
+			}
+		})
 	}
 }
 
@@ -426,6 +765,7 @@ func TestEventStreamIncludesNamedEventAndDefaultMessageData(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/events/stream", nil).WithContext(ctx)
+	addCookies(req, sessionAuth(t, srv).cookies)
 	rec := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -451,6 +791,7 @@ func TestIssueEventStreamUnknownIssueReturnsNotFound(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/issues/LOC-404/events/stream", nil).WithContext(ctx)
+	addCookies(req, sessionAuth(t, srv).cookies)
 	rec := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -475,6 +816,7 @@ func TestRunEventStreamUnknownRunReturnsNotFound(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/run_missing/events/stream", nil).WithContext(ctx)
+	addCookies(req, sessionAuth(t, srv).cookies)
 	rec := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -490,6 +832,71 @@ func TestRunEventStreamUnknownRunReturnsNotFound(t *testing.T) {
 	}
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("stream status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestEventQueriesReturnInternalErrorWhenStoreQueryFails(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "all events", path: "/api/v1/events"},
+		{name: "run events", path: "/api/v1/runs/run_missing/events"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			auth := sessionAuth(t, srv)
+			if err := srv.Store.Project.Close(); err != nil {
+				t.Fatalf("close project database: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			addCookies(req, auth.cookies)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("event query status = %d, want 500; body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInternal) {
+				t.Fatalf("error = %#v, want internal_error", errData)
+			}
+			if _, ok := payload["data"]; ok {
+				t.Fatalf("event query returned success data on store error: %#v", payload)
+			}
+		})
+	}
+}
+
+func TestEventQueriesRejectInvalidAfterSeq(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "all events negative", path: "/api/v1/events?after_seq=-1"},
+		{name: "all events non integer", path: "/api/v1/events?after_seq=abc"},
+		{name: "run events negative", path: "/api/v1/runs/run_missing/events?after_seq=-1"},
+		{name: "run events non integer", path: "/api/v1/runs/run_missing/events?after_seq=abc"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			addCookies(req, sessionAuth(t, srv).cookies)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("event query status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInvalidRequest) {
+				t.Fatalf("error = %#v, want invalid_request", errData)
+			}
+		})
 	}
 }
 
@@ -636,6 +1043,38 @@ func TestDiagnosticsExportReturnsArtifactIDAndPath(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsExportRejectsUnsupportedBodyOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		code core.APIErrorCode
+	}{
+		{name: "malformed JSON", body: `{"include_raw_logs":`, code: core.ErrInvalidRequest},
+		{name: "null body", body: `null`, code: core.ErrInvalidRequest},
+		{name: "raw logs", body: `{"include_raw_logs":true}`, code: core.ErrRawLogAccessUnsupported},
+		{name: "unknown field", body: `{"unexpected":true}`, code: core.ErrInvalidRequest},
+		{name: "wrong type", body: `{"include_raw_logs":"true"}`, code: core.ErrInvalidRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/diagnostics/export", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			applySessionAuth(req, sessionAuth(t, srv))
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("diagnostics export status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if got := errData["code"]; got != string(tt.code) {
+				t.Fatalf("error code = %v, want %s; body = %s", got, tt.code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestApprovalNotPendingMapsToConflict(t *testing.T) {
 	srv := newTestServer(t)
 	run := prepareCompletedHTTPRun(t, srv)
@@ -694,6 +1133,112 @@ func TestInternalErrorMapsToHTTP500(t *testing.T) {
 	apiErr(rec, core.NewError(core.ErrInternal, "boom", nil))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("internal error status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCoreConflictErrorsMapToHTTP409(t *testing.T) {
+	for _, code := range []core.APIErrorCode{
+		core.ErrIssueAlreadyRunning,
+		core.ErrIssueDispatchPaused,
+		core.ErrIssueBlocked,
+		core.ErrConcurrencyLimitReached,
+		core.ErrReviewPacketRequired,
+	} {
+		t.Run(string(code), func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			apiErr(rec, core.NewError(code, "conflict", nil))
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("%s status = %d, body = %s", code, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestWorkflowRoutesReturnImplementedShapes(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		wantFields []string
+	}{
+		{
+			name:       "status",
+			method:     http.MethodGet,
+			path:       "/api/v1/workflow",
+			wantFields: []string{"workflow_path", "validation", "config"},
+		},
+		{
+			name:       "reload",
+			method:     http.MethodPost,
+			path:       "/api/v1/workflow/reload",
+			body:       `{}`,
+			wantFields: []string{"reloaded", "validation"},
+		},
+		{
+			name:       "render preview",
+			method:     http.MethodPost,
+			path:       "/api/v1/workflow/render-preview",
+			body:       `{}`,
+			wantFields: []string{"source", "rendered_prompt_preview", "prompt_metadata", "validation", "redactions_applied", "raw_prompt_exposed", "raw_codex_log_shown"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			if tt.body != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			if tt.method != http.MethodGet {
+				applySessionAuth(req, sessionAuth(t, srv))
+			} else {
+				addCookies(req, sessionAuth(t, srv).cookies)
+			}
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s status = %d, body = %s", tt.name, rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			data := payload["data"].(map[string]any)
+			for _, field := range tt.wantFields {
+				if _, ok := data[field]; !ok {
+					t.Fatalf("%s data missing %q: %#v", tt.name, field, data)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkflowRoutesRejectUnsupportedBodyFields(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "reload unknown field", path: "/api/v1/workflow/reload", body: `{"dry_run":true}`},
+		{name: "reload null", path: "/api/v1/workflow/reload", body: `null`},
+		{name: "render preview candidate source", path: "/api/v1/workflow/render-preview", body: `{"source":"candidate"}`},
+		{name: "render preview malformed", path: "/api/v1/workflow/render-preview", body: `{"source":`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			applySessionAuth(req, sessionAuth(t, srv))
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("workflow route status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInvalidRequest) {
+				t.Fatalf("error = %#v, want invalid_request", errData)
+			}
+		})
 	}
 }
 
@@ -778,6 +1323,15 @@ func insertLocalSession(t *testing.T, srv *Server, kind string) string {
 	t.Helper()
 	token := security.NewToken()
 	if err := srv.Store.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("ses_"), srv.Store.ProjectID, kind, security.HashToken(token), "test-session", core.Now()); err != nil {
+		t.Fatalf("insert local session: %v", err)
+	}
+	return token
+}
+
+func insertLocalSessionWithExpiry(t *testing.T, srv *Server, kind, expiresAt string) string {
+	t.Helper()
+	token := security.NewToken()
+	if err := srv.Store.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at,expires_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("ses_"), srv.Store.ProjectID, kind, security.HashToken(token), "test-session", core.Now(), expiresAt); err != nil {
 		t.Fatalf("insert local session: %v", err)
 	}
 	return token

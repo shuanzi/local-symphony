@@ -23,14 +23,15 @@ paths:
       operationId: getState
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AppStateEnvelope' } } } }
+        "401": { $ref: '#/components/responses/Error' }
   /events:
     get:
       operationId: listEvents
       parameters:
         - { name: after_seq, in: query, schema: { type: integer, minimum: 0 } }
-        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
       responses:
-        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunEventPageEnvelope' } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunEventListEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid after_seq }
   /events/stream:
     get:
       operationId: streamEvents
@@ -50,6 +51,7 @@ paths:
   /auth/session:
     get:
       operationId: getSession
+      security: []
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/AuthSessionEnvelope' } } } }
   /auth/logout:
@@ -58,7 +60,7 @@ paths:
       parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       responses:
-        "204": { description: Logged out }
+        "200": { description: Logged out, content: { application/json: { schema: { $ref: '#/components/schemas/LogoutEnvelope' } } } }
   /auth/open-token:
     post:
       operationId: createOpenToken
@@ -90,7 +92,7 @@ paths:
         - { name: q, in: query, schema: { type: string } }
         - { name: dispatch_paused, in: query, schema: { type: boolean } }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
-        - { name: cursor, in: query, schema: { type: string } }
+        - { name: cursor, in: query, schema: { type: string, pattern: "^[0-9]+$" } }
         - { name: sort, in: query, schema: { type: string, enum: [priority, updated, identifier], default: priority } }
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueListEnvelope' } } } }
@@ -131,7 +133,7 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/IssueTransitionRequest' } } }
       responses:
-        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueTransitionEnvelope' } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
         "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid mutation request body }
         "409": { $ref: '#/components/responses/Error' }
   /issues/{issue_ref}/comments:
@@ -141,7 +143,7 @@ paths:
       x-csrf-required-for-cookie-auth: true
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [body], additionalProperties: false, properties: { body: { type: string, minLength: 1, pattern: "\\S" } } } } } }
       responses:
-        "201": { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/IssueCommentEnvelope' } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }
         "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid mutation request body }
   /issues/{issue_ref}/dispatch:
     post:
@@ -149,7 +151,7 @@ paths:
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       responses:
-        "202": { description: Dispatch accepted, content: { application/json: { schema: { $ref: '#/components/schemas/DispatchEnvelope' } } } }
+        "200": { description: Dispatch accepted, content: { application/json: { schema: { $ref: '#/components/schemas/DispatchEnvelope' } } } }
         "409": { $ref: '#/components/responses/Error' }
   /issues/{issue_ref}/dispatch-pause:
     post:
@@ -158,7 +160,7 @@ paths:
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { description: Operator reason for audit comment/event; must be non-empty after trimming., required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1, pattern: "\\S" } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }, "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue state is Done, Cancelled, or Duplicate; issue_already_running when an active run exists." } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }, "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue state is Done, Cancelled, or Duplicate; issue_already_running when an active run exists." } }
   /issues/{issue_ref}/dispatch-resume:
     post:
       operationId: resumeIssueDispatch
@@ -166,14 +168,14 @@ paths:
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { description: Operator reason for audit comment/event; must be non-empty after trimming., required: true, content: { application/json: { schema: { type: object, required: [reason], additionalProperties: false, properties: { reason: { type: string, minLength: 1, pattern: "\\S" } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueDispatchControlEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }, "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue state is Done, Cancelled, or Duplicate; issue_already_running when an active run exists." } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: "invalid_request when reason is missing or blank." }, "409": { $ref: '#/components/responses/Error', description: "invalid_state_transition when issue state is Done, Cancelled, or Duplicate; issue_already_running when an active run exists." } }
   /issues/{issue_ref}/blockers:
     post:
       operationId: addIssueBlocker
       parameters: [ { $ref: '#/components/parameters/IssueRef' }, { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [blocked_by], additionalProperties: false, properties: { blocked_by: { type: string } } } } } }
-      responses: { "201": { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/IssueRelationEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid mutation request body } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid mutation request body } }
   /issues/{issue_ref}/blockers/{blocker_issue_ref}:
     delete:
       operationId: removeIssueBlocker
@@ -182,7 +184,7 @@ paths:
         - { name: blocker_issue_ref, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/SymphonyCSRF' }
       x-csrf-required-for-cookie-auth: true
-      responses: { "204": { description: Removed } }
+      responses: { "200": { description: Removed, content: { application/json: { schema: { $ref: '#/components/schemas/IssueEnvelope' } } } } }
   /issues/{issue_ref}/duplicates/{canonical_issue_ref}:
     delete:
       operationId: removeIssueDuplicateRelation
@@ -203,9 +205,6 @@ paths:
   /runs:
     get:
       operationId: listRuns
-      parameters:
-        - { name: issue_ref, in: query, schema: { type: string } }
-        - { name: status, in: query, schema: { $ref: '#/components/schemas/RunStatus' } }
       responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunListEnvelope' } } } } }
   /runs/{run_id}:
     get:
@@ -218,7 +217,7 @@ paths:
       parameters:
         - { $ref: '#/components/parameters/RunId' }
         - { name: after_seq, in: query, schema: { type: integer, minimum: 0 } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunEventPageEnvelope' } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RunEventListEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid after_seq } }
   /runs/{run_id}/events/stream:
     get:
       operationId: streamRunEvents
@@ -245,7 +244,7 @@ paths:
       x-csrf-required-for-cookie-auth: true
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionRequest' } } } }
       responses:
-        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalEnvelope' } } } }
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalDecisionEnvelope' } } } }
         "400": { $ref: '#/components/responses/Error', description: "invalid_request for malformed JSON or unsupported decision values." }
         "409": { $ref: '#/components/responses/Error', description: "approval_not_pending when approval is not pending; transactionally read-only with no side effects." }
   /reviews/{issue_ref}:
@@ -323,8 +322,8 @@ paths:
       operationId: reloadWorkflow
       parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
-      requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { dry_run: { type: boolean, default: false } } } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowStatusEnvelope' } } } } }
+      requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, maxProperties: 0, description: "Request body is ignored by the current implementation; omit it or send an empty object." } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowReloadEnvelope' } } } } }
   /diagnostics:
     get:
       operationId: getDiagnostics
@@ -337,7 +336,7 @@ paths:
       requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { include_raw_logs: { type: boolean, default: false } } } } } }
       responses:
         "200": { description: Export created, content: { application/json: { schema: { $ref: '#/components/schemas/DiagnosticsExportEnvelope' } } } }
-        "400": { $ref: '#/components/responses/Error', description: "raw_log_access_not_supported when include_raw_logs=true" }
+        "400": { $ref: '#/components/responses/Error', description: "invalid_request for malformed JSON or unknown fields; raw_log_access_not_supported when include_raw_logs=true" }
         "500": { $ref: '#/components/responses/Error', description: "internal_error when the export artifact metadata cannot be persisted." }
 components:
   securitySchemes:
@@ -358,7 +357,7 @@ components:
       name: approval_id
       in: path
       required: true
-      schema: { type: string, pattern: "^appr_" }
+      schema: { type: string, pattern: "^apr_" }
     ArtifactId:
       name: artifact_id
       in: path
@@ -416,16 +415,22 @@ components:
       enum: [workflow_invalid, workflow_validation_failed, prompt_render_failed, workspace_prepare_failed, workspace_conflict, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_timeout, command_denied, network_denied, protected_path_denied, tool_gateway_failed, missing_handoff, review_packet_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted]
     Health:
       type: object
-      required: [status, project_id]
-      properties: { status: { type: string, enum: [ok] }, project_id: { type: string } }
+      required: [ok, project_id]
+      properties: { ok: { type: boolean }, project_id: { type: string } }
     HealthEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Health' } } } ]
     AppState:
       type: object
-      required: [project_id, repo_root, daemon_pid, daemon, project, workflow, running_runs, pending_approvals, human_review, paused_issues, codex, recent_failures]
+      required: [project_id, repo_root, issues, runs]
       properties:
         project_id: { type: string }
         repo_root: { type: string }
+        issues:
+          type: array
+          items: { $ref: '#/components/schemas/Issue' }
+        runs:
+          type: array
+          items: { $ref: '#/components/schemas/RunAttempt' }
         daemon_pid: { type: integer }
         active_runs: { type: integer }
         daemon:
@@ -477,6 +482,14 @@ components:
         expires_at: { type: string, format: date-time }
     OpenTokenEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/OpenToken' } } } ]
+    LogoutResult:
+      type: object
+      required: [logged_out]
+      additionalProperties: false
+      properties:
+        logged_out: { type: boolean }
+    LogoutEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/LogoutResult' } } } ]
     CliToken:
       type: object
       required: [token, expires_at]
@@ -756,26 +769,24 @@ components:
         next_after_seq: { type: [integer, 'null'] }
     RunEventPageEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/RunEventPage' } } } ]
+    RunEventListEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/RunEvent' } } } } ]
     ApprovalStatus:
       type: string
       enum: [pending, approved_once, approved_for_run, approved_for_session, denied, auto_denied, cancelled, timeout]
     ApprovalRequest:
       type: object
-      required: [id, run_id, issue_id, kind, status, risk_level, policy_match, action_summary, requested_at, created_at]
+      required: [id, run_id, issue_id, kind, status, created_at]
       properties:
-        id: { type: string, pattern: "^appr_" }
+        id: { type: string, pattern: "^apr_" }
         run_id: { type: string }
         issue_id: { type: string }
         kind: { type: string, enum: [command, file_change, network] }
         status: { $ref: '#/components/schemas/ApprovalStatus' }
-        risk_level: { type: string, enum: [low, medium, high, critical] }
-        policy_match: { type: [string, 'null'] }
-        action_summary: { type: string }
         request: { type: object, additionalProperties: true }
         decision: { type: [object, 'null'], additionalProperties: true }
         reason: { type: [string, 'null'] }
         created_at: { type: string, format: date-time }
-        requested_at: { type: string, format: date-time }
         timeout_ms: { type: [integer, 'null'] }
         expires_at: { type: [string, 'null'], format: date-time }
         resolved_at: { type: [string, 'null'], format: date-time }
@@ -786,6 +797,15 @@ components:
       properties:
         decision: { type: string, enum: [approve_once, approve_for_run, approve_for_session, deny, cancel_run] }
         reason: { type: string }
+    ApprovalDecisionResult:
+      type: object
+      required: [id, status]
+      additionalProperties: false
+      properties:
+        id: { type: string, pattern: "^apr_" }
+        status: { $ref: '#/components/schemas/ApprovalStatus' }
+    ApprovalDecisionEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ApprovalDecisionResult' } } } ]
     ApprovalEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ApprovalRequest' } } } ]
     ApprovalListEnvelope:
@@ -795,7 +815,7 @@ components:
       required: [kind, path, artifact_id, redacted, content_url]
       additionalProperties: false
       properties:
-        kind: { type: string, enum: [review_md, review_json, patch, changed_files, untracked_files, diffstat, test_output, agent_final_message, commands, tool_calls, approvals, codex_events, prompt_context, prompt_rendered, prompt_meta, prompt_tool_manifest, other] }
+        kind: { type: string, enum: [review_packet, review_md, review_json, patch, changed_files, untracked_files, diffstat, test_output, agent_final_message, commands, tool_calls, approvals, codex_events, prompt_context, prompt_rendered, prompt_meta, prompt_tool_manifest, other] }
         path: { type: string }
         artifact_id: { type: string, pattern: "^art_" }
         redacted: { type: boolean }
@@ -853,14 +873,23 @@ components:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Artifact' } } } ]
     WorkflowStatus:
       type: object
-      required: [valid]
+      required: [workflow_path, validation, config]
+      additionalProperties: false
       properties:
-        valid: { type: boolean }
-        errors: { type: array, items: { type: string } }
-        warnings: { type: array, items: { type: string } }
-        effective_config: { type: object, additionalProperties: true }
+        workflow_path: { type: string }
+        validation: { $ref: '#/components/schemas/WorkflowValidationSummary' }
+        config: { type: object, additionalProperties: true }
     WorkflowStatusEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/WorkflowStatus' } } } ]
+    WorkflowReload:
+      type: object
+      required: [reloaded, validation]
+      additionalProperties: false
+      properties:
+        reloaded: { type: boolean }
+        validation: { $ref: '#/components/schemas/WorkflowValidationSummary' }
+    WorkflowReloadEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/WorkflowReload' } } } ]
     WorkflowValidateRequest:
       type: object
       additionalProperties: false
@@ -897,20 +926,8 @@ components:
     WorkflowRenderPreviewRequest:
       type: object
       additionalProperties: false
-      allOf:
-        - if:
-            required: [source]
-            properties:
-              source: { const: candidate }
-          then:
-            anyOf:
-              - required: [candidate_workflow_md]
-              - required: [candidate_config]
-      properties:
-        source: { type: string, enum: [effective, candidate], default: effective }
-        candidate_workflow_md: { type: string }
-        candidate_config: { type: object, additionalProperties: true }
-        render_context: { type: object, additionalProperties: true }
+      maxProperties: 0
+      description: Request body is ignored by the current implementation; omit it or send an empty object.
     WorkflowValidationSummary:
       type: object
       required: [valid, warnings, errors]
@@ -921,15 +938,24 @@ components:
         errors: { type: array, items: { type: string } }
     WorkflowRenderPreview:
       type: object
-      required: [source, rendered_prompt_preview, validation, redactions_applied]
+      required: [source, rendered_prompt_preview, prompt_metadata, validation, redactions_applied, raw_prompt_exposed, raw_codex_log_shown]
       additionalProperties: false
       properties:
-        source: { type: string, enum: [effective, candidate] }
+        source: { const: effective }
         rendered_prompt_preview:
           type: [string, 'null']
           description: Redacted rendered prompt preview only; raw secrets, raw environment values, raw prompt artifacts, and raw logs are never returned.
+        prompt_metadata:
+          type: object
+          required: [rendered_prompt_sha256, rendered_prompt_bytes]
+          additionalProperties: false
+          properties:
+            rendered_prompt_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+            rendered_prompt_bytes: { type: integer, minimum: 0 }
         validation: { $ref: '#/components/schemas/WorkflowValidationSummary' }
         redactions_applied: { type: array, items: { type: string } }
+        raw_prompt_exposed: { const: false }
+        raw_codex_log_shown: { const: false }
     WorkflowRenderPreviewEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/WorkflowRenderPreview' } } } ]
     Diagnostics:

@@ -625,8 +625,10 @@ func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, dupl
 		}
 	}()
 	active := s.activeRunID(id)
-	if active != nil && target != core.StateReady && target != core.StateInbox {
-		s.cancelRunInTx(*active, core.FailureIssueStateChanged, "issue state changed", true)
+	if active != nil {
+		if err := s.cancelRunInTx(*active, core.FailureIssueStateChanged, "issue state changed", true); err != nil {
+			return nil, err
+		}
 	}
 	if target == core.StateDuplicate && duplicateOf != "" {
 		can, err := s.issueRowByRef(duplicateOf)
@@ -865,6 +867,22 @@ func (s *Store) ListRuns() ([]*core.RunAttempt, error) {
 }
 func (s *Store) UpdateRunStatus(runID string, status core.RunStatus, fields map[string]any) error {
 	now := core.Now()
+	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.Project.Exec(`ROLLBACK`)
+		}
+	}()
+	run, err := s.GetRun(runID)
+	if err != nil {
+		return err
+	}
+	if !core.IsActiveRunStatus(run.Status) {
+		return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
+	}
 	set := []string{"status=?", "updated_at=?"}
 	args := []any{string(status), now}
 	for k, v := range fields {
@@ -872,7 +890,14 @@ func (s *Store) UpdateRunStatus(runID string, status core.RunStatus, fields map[
 		args = append(args, v)
 	}
 	args = append(args, runID)
-	return s.Project.Exec(`UPDATE run_attempts SET `+strings.Join(set, ",")+` WHERE id=?`, args...)
+	if err := s.Project.Exec(`UPDATE run_attempts SET `+strings.Join(set, ",")+` WHERE id=?`, args...); err != nil {
+		return err
+	}
+	if err := s.Project.Exec(`COMMIT`); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 func (s *Store) SetRunWorkspace(runID, workspaceID, branch, baseRefConfig, baseRef, baseSHA string) error {
 	return s.Project.Exec(`UPDATE run_attempts SET workspace_id=?, branch_name=?, base_ref_config=?, base_ref=?, base_sha=?, updated_at=? WHERE id=?`, workspaceID, branch, baseRefConfig, baseRef, baseSHA, core.Now(), runID)
@@ -902,6 +927,13 @@ func (s *Store) CompleteRunWithReview(runID, reviewPacketID string) error {
 			_ = s.Project.Exec(`ROLLBACK`)
 		}
 	}()
+	run, err = s.GetRun(runID)
+	if err != nil {
+		return err
+	}
+	if !core.IsActiveRunStatus(run.Status) {
+		return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
+	}
 	if err := s.Project.Exec(`UPDATE run_attempts SET status=?, failure_code=NULL, failure_message=NULL, ended_at=?, updated_at=? WHERE id=?`, string(core.RunCompleted), now, now, runID); err != nil {
 		return err
 	}
@@ -934,6 +966,13 @@ func (s *Store) FailRun(runID string, code core.FailureCode, message string, sta
 			_ = s.Project.Exec(`ROLLBACK`)
 		}
 	}()
+	run, err = s.GetRun(runID)
+	if err != nil {
+		return err
+	}
+	if !core.IsActiveRunStatus(run.Status) {
+		return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
+	}
 	if err := s.Project.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(status), string(code), message, now, now, runID); err != nil {
 		return err
 	}
@@ -955,6 +994,72 @@ func (s *Store) FailRun(runID string, code core.FailureCode, message string, sta
 	committed = true
 	return nil
 }
+
+func (s *Store) BlockRunByAgent(runID, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return core.NewError(core.ErrInvalidRequest, "reason is required", nil)
+	}
+	run, err := s.GetRun(runID)
+	if err != nil {
+		return err
+	}
+	now := core.Now()
+	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.Project.Exec(`ROLLBACK`)
+		}
+	}()
+	run, err = s.GetRun(runID)
+	if err != nil {
+		return err
+	}
+	if !core.IsActiveRunStatus(run.Status) {
+		return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
+	}
+	row, err := s.Project.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
+	if err != nil {
+		return err
+	}
+	from := core.IssueState(row["state"].String())
+	if err := s.Project.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "agent", "Blocked by agent: "+reason, now); err != nil {
+		return err
+	}
+	if err := s.Project.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(core.RunCancelled), string(core.FailureAgentBlocked), reason, now, now, runID); err != nil {
+		return err
+	}
+	if err := s.Project.Exec(`UPDATE run_tool_tokens SET revoked_at=? WHERE run_id=? AND revoked_at IS NULL`, now, runID); err != nil {
+		return err
+	}
+	if err := s.Project.Exec(`UPDATE issues SET state=?, dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, string(core.StateBlocked), string(core.FailureAgentBlocked), now, now, run.IssueID); err != nil {
+		return err
+	}
+	if err := s.Project.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), run.IssueID, string(from), string(core.StateBlocked), "agent", runID, reason, now); err != nil {
+		return err
+	}
+	if err := s.Project.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "system", fmt.Sprintf("Run ended with %s: %s", core.FailureAgentBlocked, reason), now); err != nil {
+		return err
+	}
+	if err := s.AppendEventTx("run.failed", "system", &run.IssueID, &runID, map[string]any{"failure_code": core.FailureAgentBlocked, "message": reason}); err != nil {
+		return err
+	}
+	if err := s.AppendEventTx("scheduler.paused", "system", &run.IssueID, &runID, map[string]any{"reason": core.FailureAgentBlocked}); err != nil {
+		return err
+	}
+	if err := s.AppendEventTx("issue.transitioned", "agent", &run.IssueID, &runID, map[string]any{"from_state": from, "to_state": core.StateBlocked}); err != nil {
+		return err
+	}
+	if err := s.Project.Exec(`COMMIT`); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
 func (s *Store) CancelRun(runID, reason string) error {
 	return s.cancelRun(runID, core.FailureOperatorCancelled, reason)
 }
@@ -1059,27 +1164,61 @@ func (s *Store) CreateToolToken(runID string, tokenHash string, scope map[string
 		return "", err
 	}
 	id := core.NewID("tok_")
-	return id, s.Project.Exec(`INSERT INTO run_tool_tokens(id,run_id,issue_id,token_hash,scope_json,created_at,expires_at) VALUES(?,?,?,?,?,?,?)`, id, runID, run.IssueID, tokenHash, encodeJSON(scope), core.Now(), expiresAt)
+	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return "", err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.Project.Exec(`ROLLBACK`)
+		}
+	}()
+	run, err = s.GetRun(runID)
+	if err != nil {
+		return "", err
+	}
+	if run.Status != core.RunStartingAgent && run.Status != core.RunRunning {
+		return "", core.NewError(core.ErrInvalidStateTransition, "run is not starting agent or running", map[string]any{"run_id": runID, "status": run.Status})
+	}
+	if err := s.Project.Exec(`INSERT INTO run_tool_tokens(id,run_id,issue_id,token_hash,scope_json,created_at,expires_at) VALUES(?,?,?,?,?,?,?)`, id, runID, run.IssueID, tokenHash, encodeJSON(scope), core.Now(), expiresAt); err != nil {
+		return "", err
+	}
+	if err := s.Project.Exec(`COMMIT`); err != nil {
+		return "", err
+	}
+	committed = true
+	return id, nil
 }
 func (s *Store) ValidateToolToken(tokenHash string) (runID, issueID string, err error) {
+	runID, issueID, _, err = s.ValidateToolTokenWithScope(tokenHash)
+	return runID, issueID, err
+}
+
+func (s *Store) ValidateToolTokenWithScope(tokenHash string) (runID, issueID string, scope map[string]any, err error) {
 	row, err := s.Project.QueryOne(`SELECT t.*, r.status AS run_status FROM run_tool_tokens t JOIN run_attempts r ON r.id=t.run_id WHERE t.token_hash=?`, tokenHash)
 	if errors.Is(err, os.ErrNotExist) {
-		return "", "", core.NewError(core.ErrToolTokenInvalid, "tool token invalid", nil)
+		return "", "", nil, core.NewError(core.ErrToolTokenInvalid, "tool token invalid", nil)
 	}
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	if !row["revoked_at"].Null && row["revoked_at"].String() != "" {
-		return "", "", core.NewError(core.ErrToolTokenInvalid, "tool token revoked", nil)
+		return "", "", nil, core.NewError(core.ErrToolTokenInvalid, "tool token revoked", nil)
 	}
 	if row["expires_at"].String() < time.Now().UTC().Format(time.RFC3339Nano) {
-		return "", "", core.NewError(core.ErrToolTokenInvalid, "tool token expired", nil)
+		return "", "", nil, core.NewError(core.ErrToolTokenInvalid, "tool token expired", nil)
 	}
 	if core.RunStatus(row["run_status"].String()) != core.RunRunning {
-		return "", "", core.NewError(core.ErrToolTokenInvalid, "run is not running", nil)
+		return "", "", nil, core.NewError(core.ErrToolTokenInvalid, "run is not running", nil)
+	}
+	if err := json.Unmarshal([]byte(row["scope_json"].String()), &scope); err != nil {
+		return "", "", nil, core.NewError(core.ErrToolTokenInvalid, "tool token scope invalid", nil)
+	}
+	if scope == nil {
+		scope = map[string]any{}
 	}
 	_ = s.Project.Exec(`UPDATE run_tool_tokens SET last_used_at=? WHERE id=?`, core.Now(), row["id"].String())
-	return row["run_id"].String(), row["issue_id"].String(), nil
+	return row["run_id"].String(), row["issue_id"].String(), scope, nil
 }
 func (s *Store) RecordToolCall(issueID, runID, tool, status string, input, output any, errCode, errMsg string) error {
 	now := core.Now()

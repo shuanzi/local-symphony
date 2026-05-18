@@ -70,14 +70,18 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	if err != nil {
 		return err
 	}
-	_ = o.Store.UpdateRunStatus(runID, core.RunPreparingWorkspace, map[string]any{})
+	if !o.advanceRun(runID, core.RunPreparingWorkspace, map[string]any{}) {
+		return nil
+	}
 	mgr := workspace.Manager{Store: o.Store, Config: wf.Config}
 	ws, err := mgr.Prepare(run, issue)
 	if err != nil {
 		_ = o.Store.FailRun(runID, core.FailureWorkspacePrepareFailed, err.Error(), core.RunFailed)
 		return nil
 	}
-	_ = o.Store.UpdateRunStatus(runID, core.RunRenderingPrompt, map[string]any{})
+	if !o.advanceRun(runID, core.RunRenderingPrompt, map[string]any{}) {
+		return nil
+	}
 	wfID, _ := o.Store.CreateWorkflowSnapshot("valid", wf.Path, wf.ConfigJSON, wf.PromptHash, "[]")
 	_ = o.Store.AttachWorkflowSnapshot(runID, wfID)
 	prompt, err := config.RenderPrompt(wf, map[string]any{"issue": map[string]any{"identifier": issue.Identifier, "title": issue.Title, "description": issue.Description}, "run": map[string]any{"id": runID}, "workspace": map[string]any{"path": ws.Path}})
@@ -88,13 +92,17 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	ph := sha256.Sum256([]byte(prompt))
 	ch := sha256.Sum256([]byte(issue.ID + runID))
 	_, _ = o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), filepath.Join(o.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, runID))
-	_ = o.Store.UpdateRunStatus(runID, core.RunStartingAgent, map[string]any{})
-	token, err := toolgateway.NewTokenForRun(o.Store, run, ws.Path)
+	if !o.advanceRun(runID, core.RunStartingAgent, map[string]any{}) {
+		return nil
+	}
+	token, err := toolgateway.NewTokenForRunWithOptions(o.Store, run, ws.Path, toolgateway.TokenOptions{ArtifactMaxBytes: wf.Config.Tools.ArtifactMaxBytes})
 	if err != nil {
 		_ = o.Store.FailRun(runID, core.FailureToolGatewayFailed, err.Error(), core.RunFailed)
 		return nil
 	}
-	_ = o.Store.UpdateRunStatus(runID, core.RunRunning, map[string]any{"started_at": core.Now()})
+	if !o.advanceRun(runID, core.RunRunning, map[string]any{"started_at": core.Now()}) {
+		return nil
+	}
 	gw := toolgateway.Gateway{Store: o.Store}
 	switch fake.SelectedOutcome() {
 	case fake.OutcomeFailure:
@@ -103,10 +111,16 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 			code = core.FailureCode(v)
 		}
 		_ = runAfterHook(o.Store, wf, ws.Path, runID, issue.ID)
+		if !o.runIsActive(runID) {
+			return nil
+		}
 		_ = o.Store.FailRun(runID, code, "fake runner failure", core.RunFailed)
 		return nil
 	case fake.OutcomeMissingHandoff:
 		_ = runAfterHook(o.Store, wf, ws.Path, runID, issue.ID)
+		if !o.runIsActive(runID) {
+			return nil
+		}
 		_ = o.Store.FailRun(runID, core.FailureMissingHandoff, "fake runner completed without handoff", core.RunCompletedWithoutHandoff)
 		return nil
 	default:
@@ -115,9 +129,18 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 			return nil
 		}
 	}
+	if !o.runIsActive(runID) {
+		return nil
+	}
 	_ = runAfterHook(o.Store, wf, ws.Path, runID, issue.ID)
+	if !o.runIsActive(runID) {
+		return nil
+	}
 	if _, err := o.Store.GetHandoffByRun(runID); err != nil {
 		_ = o.Store.FailRun(runID, core.FailureMissingHandoff, "handoff missing", core.RunCompletedWithoutHandoff)
+		return nil
+	}
+	if !o.runIsActive(runID) {
 		return nil
 	}
 	rpID, err := review.Generator{Store: o.Store}.Generate(runID)
@@ -126,6 +149,21 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		return nil
 	}
 	return o.Store.CompleteRunWithReview(runID, rpID)
+}
+
+func (o Orchestrator) runIsActive(runID string) bool {
+	run, err := o.Store.GetRun(runID)
+	return err == nil && core.IsActiveRunStatus(run.Status)
+}
+
+func (o Orchestrator) advanceRun(runID string, status core.RunStatus, fields map[string]any) bool {
+	if !o.runIsActive(runID) {
+		return false
+	}
+	if err := o.Store.UpdateRunStatus(runID, status, fields); err != nil {
+		return false
+	}
+	return o.runIsActive(runID)
 }
 
 func runAfterHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID string) error {

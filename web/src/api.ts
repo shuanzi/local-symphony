@@ -131,6 +131,14 @@ export const api = {
     setCsrfToken(session.csrf_token || session.csrf || null);
     return session;
   },
+  exchangeOpenToken: async (openToken: string) => {
+    const session = await apiRequest<SessionInfo>('/auth/exchange', {
+      method: 'POST',
+      body: JSON.stringify({ open_token: openToken })
+    });
+    setCsrfToken(session.csrf_token || session.csrf || null);
+    return session;
+  },
   issues: (query = '') => apiRequest<Page<Issue>>(`/issues${query}`),
   issue: (issueRef: string) => apiRequest<Issue>(`/issues/${encodeURIComponent(issueRef)}`),
   createIssue: (input: { title: string; description: string; acceptance_criteria: string[]; priority: number; labels: string[] }) =>

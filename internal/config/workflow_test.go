@@ -1,0 +1,123 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"slices"
+	"testing"
+)
+
+func TestLoadPathRejectsIntegerWithTrailingCharacters(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "WORKFLOW.md")
+	content := `---
+agent:
+  max_concurrent_agents: 3oops
+---
+Do the work.
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	w, err := LoadPath(path, dir)
+	if err != nil {
+		t.Fatalf("LoadPath returned error: %v", err)
+	}
+	if w.Validation.Valid {
+		t.Fatalf("Validation.Valid = true, want false")
+	}
+	if !slices.Contains(w.Validation.Errors, "max_concurrent_agents must be integer") {
+		t.Fatalf("Validation.Errors = %v, want max_concurrent_agents integer error", w.Validation.Errors)
+	}
+}
+
+func TestLoadPathRejectsTrailingCharactersForDeclaredWorkflowIntegers(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  string
+		wantErr string
+	}{
+		{
+			name: "polling interval",
+			config: `polling:
+  interval_ms: 30000ms`,
+			wantErr: "interval_ms must be integer",
+		},
+		{
+			name: "codex startup timeout",
+			config: `codex:
+  startup_timeout_ms: 60000ms`,
+			wantErr: "startup_timeout_ms must be integer",
+		},
+		{
+			name: "codex read timeout",
+			config: `codex:
+  read_timeout_ms: 5000ms`,
+			wantErr: "read_timeout_ms must be integer",
+		},
+		{
+			name: "hooks max output",
+			config: `hooks:
+  max_output_bytes: 65536bytes`,
+			wantErr: "max_output_bytes must be integer",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "WORKFLOW.md")
+			content := "---\n" + tt.config + "\n---\nDo the work.\n"
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatalf("write workflow: %v", err)
+			}
+
+			w, err := LoadPath(path, dir)
+			if err != nil {
+				t.Fatalf("LoadPath returned error: %v", err)
+			}
+			if w.Validation.Valid {
+				t.Fatalf("Validation.Valid = true, want false")
+			}
+			if !slices.Contains(w.Validation.Errors, tt.wantErr) {
+				t.Fatalf("Validation.Errors = %v, want %q", w.Validation.Errors, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadPathRejectsNonPositiveArtifactMaxBytes(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "zero", value: "0"},
+		{name: "negative", value: "-1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "WORKFLOW.md")
+			content := `---
+tools:
+  artifact_max_bytes: ` + tt.value + `
+---
+Do the work.
+`
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatalf("write workflow: %v", err)
+			}
+
+			w, err := LoadPath(path, dir)
+			if err != nil {
+				t.Fatalf("LoadPath returned error: %v", err)
+			}
+			if w.Validation.Valid {
+				t.Fatalf("Validation.Valid = true, want false")
+			}
+			if !slices.Contains(w.Validation.Errors, "tools.artifact_max_bytes must be greater than 0") {
+				t.Fatalf("Validation.Errors = %v, want artifact_max_bytes positive error", w.Validation.Errors)
+			}
+		})
+	}
+}

@@ -998,8 +998,9 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
         or limit_schema.get("default") != 50
     ):
         fail("OpenAPI GET /issues limit parameter must be integer minimum=1 maximum=200 default=50")
-    if issue_list_query_params["cursor"].get("schema", {}).get("type") != "string":
-        fail("OpenAPI GET /issues cursor parameter must be a string")
+    cursor_schema = issue_list_query_params["cursor"].get("schema", {})
+    if cursor_schema.get("type") != "string" or cursor_schema.get("pattern") != "^[0-9]+$":
+        fail('OpenAPI GET /issues cursor parameter must be a string with pattern "^[0-9]+$"')
     sort_schema = issue_list_query_params["sort"].get("schema", {})
     if sort_schema.get("enum") != ["priority", "updated", "identifier"] or sort_schema.get("default") != "priority":
         fail("OpenAPI GET /issues sort parameter must use priority/updated/identifier enum with priority default")
@@ -1129,32 +1130,10 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
         fail("POST /workflow/render-preview 200 response must use WorkflowRenderPreviewEnvelope")
 
     workflow_render_request = data["components"]["schemas"]["WorkflowRenderPreviewRequest"]
-    render_source = workflow_render_request["properties"]["source"]
-    if render_source.get("enum") != ["effective", "candidate"] or render_source.get("default") != "effective":
-        fail("WorkflowRenderPreviewRequest.source must default to effective with effective/candidate enum")
-    candidate_condition_found = False
-    for condition in workflow_render_request.get("allOf", []):
-        condition_if = condition.get("if", {})
-        condition_then = condition.get("then", {})
-        required_source = "source" in condition_if.get("required", [])
-        source_is_candidate = condition_if.get("properties", {}).get("source", {}).get("const") == "candidate"
-        candidate_required = {
-            tuple(branch.get("required", []))
-            for branch in condition_then.get("anyOf", [])
-            if isinstance(branch, dict)
-        }
-        requires_candidate_input = {
-            ("candidate_workflow_md",),
-            ("candidate_config",),
-        }.issubset(candidate_required)
-        if required_source and source_is_candidate and requires_candidate_input:
-            candidate_condition_found = True
-            break
-    if not candidate_condition_found:
-        fail(
-            "WorkflowRenderPreviewRequest must require candidate_workflow_md or candidate_config "
-            "when source is candidate"
-        )
+    if workflow_render_request.get("type") != "object":
+        fail("WorkflowRenderPreviewRequest must be an object")
+    if workflow_render_request.get("additionalProperties") is not False or workflow_render_request.get("maxProperties") != 0:
+        fail("WorkflowRenderPreviewRequest must not declare ignored candidate/source fields")
 
     workflow_render_preview_required = set(data["components"]["schemas"]["WorkflowRenderPreview"].get("required", []))
     expected_render_preview_required = {"source", "rendered_prompt_preview", "validation", "redactions_applied"}

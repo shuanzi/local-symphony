@@ -99,6 +99,13 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = "/"
 	}
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !isPublicAPI(path, r.Method) && !s.authorizeAPI(w, r) {
+		return
+	}
 	if requiresCSRF(path, r.Method) {
 		if !s.authorizeCommand(w, r) {
 			return
@@ -155,11 +162,24 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case path == "/workflow/render-preview" && r.Method == "POST":
 		s.workflowPreview(w, r)
 	case path == "/workflow/reload" && r.Method == "POST":
+		if err := requireEmptyObjectBody(r); err != nil {
+			apiErr(w, err)
+			return
+		}
 		wf, _ := config.Load(s.Store.RepoRoot)
 		ok(w, map[string]any{"reloaded": wf.Validation.Valid, "validation": wf.Validation})
 	case path == "/diagnostics" && r.Method == "GET":
 		ok(w, observability.Diagnostics(s.Store))
 	case path == "/diagnostics/export" && r.Method == "POST":
+		includeRawLogs, err := diagnosticsExportOptions(r)
+		if err != nil {
+			apiErr(w, err)
+			return
+		}
+		if includeRawLogs {
+			apiErr(w, core.NewError(core.ErrRawLogAccessUnsupported, "raw log export is not supported", nil))
+			return
+		}
 		p, err := observability.Export(s.Store)
 		if err != nil {
 			apiErr(w, err)
@@ -183,17 +203,68 @@ func (s *Server) state(w http.ResponseWriter) {
 }
 func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	opts := store.ListIssueOptions{Limit: store.ParseInt(q.Get("limit"), 50), Sort: q.Get("sort"), Query: q.Get("q")}
-	if st := q.Get("state"); st != "" {
-		opts.States = strings.Split(st, ",")
+	limit, err := parseIssueLimit(q.Get("limit"))
+	if err != nil {
+		apiErr(w, err)
+		return
 	}
-	opts.DispatchPaused = store.ParseBool(q.Get("dispatch_paused"))
+	sort := q.Get("sort")
+	if sort != "" && sort != "priority" && sort != "updated" && sort != "identifier" {
+		apiErr(w, core.NewError(core.ErrInvalidRequest, "sort must be one of priority, updated, or identifier", nil))
+		return
+	}
+	opts := store.ListIssueOptions{Limit: 200, Sort: q.Get("sort"), Query: q.Get("q")}
+	if states := repeatedCSV(q["state"]); len(states) > 0 {
+		for _, state := range states {
+			if !validIssueState(state) {
+				apiErr(w, core.NewError(core.ErrInvalidRequest, "state must be a valid issue state", nil))
+				return
+			}
+		}
+		opts.States = states
+	}
+	dispatchPaused, err := parseOptionalBool(q.Get("dispatch_paused"), "dispatch_paused")
+	if err != nil {
+		apiErr(w, err)
+		return
+	}
+	opts.DispatchPaused = dispatchPaused
+	labels := repeatedCSV(q["label"])
+	cursor := 0
+	if rawCursor := strings.TrimSpace(q.Get("cursor")); rawCursor != "" {
+		n, err := strconv.Atoi(rawCursor)
+		if err != nil || n < 0 {
+			apiErr(w, core.NewError(core.ErrInvalidRequest, "cursor must be a non-negative integer offset", nil))
+			return
+		}
+		cursor = n
+	}
 	items, err := s.Store.ListIssues(opts)
 	if err != nil {
 		apiErr(w, err)
 		return
 	}
-	ok(w, map[string]any{"items": items, "page": map[string]any{"limit": opts.Limit, "next_cursor": nil, "has_more": false}})
+	if len(labels) > 0 {
+		items = filterIssuesByLabels(items, labels)
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if cursor > len(items) {
+		cursor = len(items)
+	}
+	end := cursor + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	var nextCursor any
+	if end < len(items) {
+		nextCursor = strconv.Itoa(end)
+	}
+	ok(w, map[string]any{"items": items[cursor:end], "page": map[string]any{"limit": limit, "next_cursor": nextCursor, "has_more": nextCursor != nil}})
 }
 func (s *Server) createIssue(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -211,7 +282,7 @@ func (s *Server) createIssue(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, err)
 		return
 	}
-	ok(w, iss)
+	created(w, iss)
 }
 
 func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string) {
@@ -434,8 +505,16 @@ func (s *Server) runRoutes(w http.ResponseWriter, r *http.Request, rest string) 
 	apiErr(w, core.NewError(core.ErrNotFound, "run route not found", nil))
 }
 func (s *Server) events(w http.ResponseWriter, r *http.Request, runID string) {
-	after, _ := strconv.ParseInt(r.URL.Query().Get("after_seq"), 10, 64)
-	ev, _ := s.Store.RunEvents(runID, after, 200)
+	after, err := parseAfterSeq(r.URL.Query().Get("after_seq"))
+	if err != nil {
+		apiErr(w, err)
+		return
+	}
+	ev, err := s.Store.RunEvents(runID, after, 200)
+	if err != nil {
+		apiErr(w, err)
+		return
+	}
 	ok(w, ev)
 }
 func (s *Server) sse(w http.ResponseWriter, r *http.Request, runID, issueID string) {
@@ -525,7 +604,19 @@ func (s *Server) reviewRoutes(w http.ResponseWriter, r *http.Request, rest strin
 			}
 			files = append(files, map[string]any{"kind": a.Kind, "artifact_id": a.ID, "path": a.Path, "redacted": a.Redacted, "content_url": cu})
 		}
-		ok(w, map[string]any{"id": row["id"].String(), "run_id": row["run_id"].String(), "packet_no": row["packet_no"].Int(), "status": row["status"].String(), "root_path": row["root_path"].String(), "files": files})
+		ok(w, map[string]any{
+			"id":              row["id"].String(),
+			"issue_id":        row["issue_id"].String(),
+			"run_id":          row["run_id"].String(),
+			"packet_no":       row["packet_no"].Int(),
+			"status":          row["status"].String(),
+			"root_path":       row["root_path"].String(),
+			"artifacts":       files,
+			"files":           files,
+			"created_at":      row["created_at"].String(),
+			"failure_code":    nil,
+			"failure_message": nil,
+		})
 		return
 	}
 	if len(parts) == 2 && r.Method == "POST" {
@@ -607,6 +698,10 @@ func (s *Server) workflowValidate(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"source": "current_filesystem", "workflow_path": wf.Path, "validation": wf.Validation, "side_effects": map[string]any{"effective_config_replaced": false, "last_valid_config_updated": false, "prompt_rendered": false, "run_dispatched": false, "review_artifacts_written": false}})
 }
 func (s *Server) workflowPreview(w http.ResponseWriter, r *http.Request) {
+	if err := requireEmptyObjectBody(r); err != nil {
+		apiErr(w, err)
+		return
+	}
 	wf, _ := config.Load(s.Store.RepoRoot)
 	if !wf.Validation.Valid {
 		apiErr(w, core.NewError(core.ErrWorkflowInvalid, "no effective workflow", nil))
@@ -632,6 +727,64 @@ func (s *Server) workflowPreview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func diagnosticsExportOptions(r *http.Request) (bool, error) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return false, core.NewError(core.ErrInvalidRequest, "read request body failed", nil)
+	}
+	if strings.TrimSpace(string(body)) == "" {
+		return false, nil
+	}
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec.DisallowUnknownFields()
+	var in map[string]json.RawMessage
+	if err := dec.Decode(&in); err != nil {
+		return false, core.NewError(core.ErrInvalidRequest, "malformed JSON", nil)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return false, core.NewError(core.ErrInvalidRequest, "malformed JSON", nil)
+	}
+	if in == nil {
+		return false, core.NewError(core.ErrInvalidRequest, "request body must be an object", nil)
+	}
+	includeRawLogs := false
+	for k, raw := range in {
+		if k != "include_raw_logs" {
+			return false, core.NewError(core.ErrInvalidRequest, "unsupported field: "+k, nil)
+		}
+		if err := json.Unmarshal(raw, &includeRawLogs); err != nil {
+			return false, core.NewError(core.ErrInvalidRequest, "include_raw_logs must be a boolean", nil)
+		}
+	}
+	return includeRawLogs, nil
+}
+
+func requireEmptyObjectBody(r *http.Request) error {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return core.NewError(core.ErrInvalidRequest, "read request body failed", nil)
+	}
+	if strings.TrimSpace(string(body)) == "" {
+		return nil
+	}
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec.DisallowUnknownFields()
+	var in map[string]json.RawMessage
+	if err := dec.Decode(&in); err != nil {
+		return core.NewError(core.ErrInvalidRequest, "malformed JSON", nil)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return core.NewError(core.ErrInvalidRequest, "malformed JSON", nil)
+	}
+	if in == nil {
+		return core.NewError(core.ErrInvalidRequest, "request body must be an object", nil)
+	}
+	if len(in) > 0 {
+		return core.NewError(core.ErrInvalidRequest, "request body must be an empty object", nil)
+	}
+	return nil
+}
+
 func readBody(r *http.Request, v any, w http.ResponseWriter) bool {
 	if err := json.NewDecoder(r.Body).Decode(v); err != nil && err != io.EOF {
 		apiErr(w, core.NewError(core.ErrInvalidRequest, err.Error(), nil))
@@ -641,6 +794,9 @@ func readBody(r *http.Request, v any, w http.ResponseWriter) bool {
 }
 func ok(w http.ResponseWriter, data any) {
 	writeJSON(w, 200, core.SuccessEnvelope{Data: data, Meta: map[string]any{"request_id": core.NewID("req_"), "server_time": core.Now()}})
+}
+func created(w http.ResponseWriter, data any) {
+	writeJSON(w, 201, core.SuccessEnvelope{Data: data, Meta: map[string]any{"request_id": core.NewID("req_"), "server_time": core.Now()}})
 }
 func apiErr(w http.ResponseWriter, err error) {
 	ae := core.AsAPIError(err)
@@ -654,7 +810,13 @@ func apiErr(w http.ResponseWriter, err error) {
 	if ae.Code == core.ErrForbidden || ae.Code == core.ErrCSRFRequired {
 		status = 403
 	}
-	if ae.Code == core.ErrInvalidStateTransition || ae.Code == core.ErrApprovalNotPending {
+	if ae.Code == core.ErrInvalidStateTransition ||
+		ae.Code == core.ErrApprovalNotPending ||
+		ae.Code == core.ErrIssueAlreadyRunning ||
+		ae.Code == core.ErrIssueDispatchPaused ||
+		ae.Code == core.ErrIssueBlocked ||
+		ae.Code == core.ErrConcurrencyLimitReached ||
+		ae.Code == core.ErrReviewPacketRequired {
 		status = 409
 	}
 	if ae.Code == core.ErrInternal {
@@ -675,6 +837,86 @@ func toStrings(a []any) []string {
 		}
 	}
 	return out
+}
+func repeatedCSV(values []string) []string {
+	out := []string{}
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
+}
+
+func parseIssueLimit(raw string) (int, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 50, nil
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < 1 || limit > 200 {
+		return 0, core.NewError(core.ErrInvalidRequest, "limit must be an integer from 1 to 200", nil)
+	}
+	return limit, nil
+}
+
+func parseOptionalBool(raw, name string) (*bool, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "true":
+		v := true
+		return &v, nil
+	case "false":
+		v := false
+		return &v, nil
+	default:
+		return nil, core.NewError(core.ErrInvalidRequest, name+" must be true or false", nil)
+	}
+}
+
+func validIssueState(raw string) bool {
+	switch core.IssueState(raw) {
+	case core.StateInbox, core.StateReady, core.StateWorking, core.StateRework, core.StateBlocked, core.StateHumanReview, core.StateDone, core.StateCancelled, core.StateDuplicate:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseAfterSeq(raw string) (int64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	after, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || after < 0 {
+		return 0, core.NewError(core.ErrInvalidRequest, "after_seq must be a non-negative integer", nil)
+	}
+	return after, nil
+}
+
+func filterIssuesByLabels(items []*core.Issue, labels []string) []*core.Issue {
+	out := []*core.Issue{}
+	for _, item := range items {
+		if issueHasLabels(item, labels) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+func issueHasLabels(item *core.Issue, labels []string) bool {
+	have := map[string]bool{}
+	for _, label := range item.Labels {
+		have[label] = true
+	}
+	for _, label := range labels {
+		if !have[label] {
+			return false
+		}
+	}
+	return true
 }
 func under(p, root string) bool {
 	ap, _ := filepath.Abs(p)
@@ -724,6 +966,19 @@ func requiresCSRF(path, method string) bool {
 		return false
 	}
 	return path != "/auth/exchange" && path != "/auth/open-token" && path != "/auth/cli-token/rotate"
+}
+
+func isPublicAPI(path, method string) bool {
+	return (method == http.MethodGet && (path == "/health" || path == "/auth/session")) ||
+		(method == http.MethodPost && path == "/auth/exchange")
+}
+
+func (s *Server) authorizeAPI(w http.ResponseWriter, r *http.Request) bool {
+	if s.validBearerSession(r) || s.validSession(r) {
+		return true
+	}
+	apiErr(w, core.NewError(core.ErrUnauthorized, "session required", nil))
+	return false
 }
 
 func (s *Server) authorizeCommand(w http.ResponseWriter, r *http.Request) bool {
@@ -851,6 +1106,11 @@ func (s *Server) rotateBearerSession(token string) (string, *string, error) {
 	if !row["expires_at"].Null && row["expires_at"].String() != "" && row["expires_at"].String() < now {
 		return "", nil, core.NewError(core.ErrUnauthorized, "bearer token expired", nil)
 	}
+	var expiresAt *string
+	if !row["expires_at"].Null && row["expires_at"].String() != "" {
+		v := row["expires_at"].String()
+		expiresAt = &v
+	}
 	replacement := security.NewToken()
 	label := row["user_label"].String()
 	if label == "" {
@@ -859,14 +1119,14 @@ func (s *Server) rotateBearerSession(token string) (string, *string, error) {
 	if err := s.Store.App.Exec(`UPDATE local_sessions SET revoked_at=? WHERE id=?`, now, row["id"].String()); err != nil {
 		return "", nil, err
 	}
-	if err := s.Store.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("ses_"), s.Store.ProjectID, row["kind"].String(), security.HashToken(replacement), label, now); err != nil {
+	if err := s.Store.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at,expires_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("ses_"), s.Store.ProjectID, row["kind"].String(), security.HashToken(replacement), label, now, expiresAt); err != nil {
 		return "", nil, err
 	}
 	if err := s.Store.App.Exec(`COMMIT`); err != nil {
 		return "", nil, err
 	}
 	committed = true
-	return replacement, nil, nil
+	return replacement, expiresAt, nil
 }
 
 func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {

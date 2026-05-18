@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -20,6 +19,8 @@ import (
 )
 
 var Registry = []string{"issue.get", "issue.comment", "issue.block", "artifact.attach", "followup.create", "handoff.submit"}
+
+const defaultArtifactMaxBytes int64 = 10 * 1024 * 1024
 
 type Gateway struct{ Store *store.Store }
 
@@ -51,7 +52,7 @@ func (g Gateway) Call(token, cwd string, req Request) Response {
 	if !allowed(req.Tool) {
 		return errResp("tool_gateway_failed", "tool is not registered", nil)
 	}
-	runID, issueID, err := g.Store.ValidateToolToken(security.HashToken(token))
+	runID, issueID, scope, err := g.Store.ValidateToolTokenWithScope(security.HashToken(token))
 	if err != nil {
 		return apiErrResp(err)
 	}
@@ -66,7 +67,7 @@ func (g Gateway) Call(token, cwd string, req Request) Response {
 		return errResp("tool_gateway_failed", "cwd is outside workspace", nil)
 	}
 	_ = g.Store.RecordToolCall(issueID, runID, req.Tool, "started", req.Input, nil, "", "")
-	out, callErr := g.dispatch(issue, runID, req)
+	out, callErr := g.dispatch(issue, runID, scope, req)
 	if callErr != nil {
 		ae := core.AsAPIError(callErr)
 		_ = g.Store.RecordToolCall(issueID, runID, req.Tool, "failed", req.Input, nil, string(ae.Code), ae.Message)
@@ -76,32 +77,38 @@ func (g Gateway) Call(token, cwd string, req Request) Response {
 	return out
 }
 
-func (g Gateway) dispatch(issue *core.Issue, runID string, req Request) (Response, error) {
+func (g Gateway) dispatch(issue *core.Issue, runID string, scope map[string]any, req Request) (Response, error) {
 	switch req.Tool {
 	case "issue.get":
 		return Response{Success: true, Tool: req.Tool, Data: issue}, nil
 	case "issue.comment":
-		body := strings.TrimSpace(fmt.Sprint(req.Input["body"]))
-		if body == "" {
-			return Response{}, core.NewError(core.ErrInvalidRequest, "body is required", nil)
+		body, err := requiredString(req.Input, "body")
+		if err != nil {
+			return Response{}, err
 		}
 		if err := g.Store.AddComment(issue.ID, "agent", body, &runID); err != nil {
 			return Response{}, err
 		}
 		return Response{Success: true, Tool: req.Tool, IssueIdentifier: issue.Identifier, Data: map[string]any{"comment_status": "created"}}, nil
 	case "issue.block":
-		reason := strings.TrimSpace(fmt.Sprint(req.Input["reason"]))
-		if reason == "" {
-			return Response{}, core.NewError(core.ErrInvalidRequest, "reason is required", nil)
+		reason, err := requiredString(req.Input, "reason")
+		if err != nil {
+			return Response{}, err
 		}
-		_ = g.Store.AddComment(issue.ID, "agent", "Blocked by agent: "+reason, &runID)
-		_, _ = g.Store.TransitionIssue(issue.ID, core.StateBlocked, reason, "")
-		_ = g.Store.FailRun(runID, core.FailureAgentBlocked, reason, core.RunCancelled)
+		if err := g.Store.BlockRunByAgent(runID, reason); err != nil {
+			return Response{}, err
+		}
 		return Response{Success: true, Tool: req.Tool, IssueIdentifier: issue.Identifier, Data: map[string]any{"blocked": true}}, nil
 	case "artifact.attach":
-		rel := strings.TrimSpace(fmt.Sprint(req.Input["path"]))
-		kind := strings.TrimSpace(fmt.Sprint(req.Input["kind"]))
-		if kind == "" {
+		rel, err := requiredString(req.Input, "path")
+		if err != nil {
+			return Response{}, err
+		}
+		kind, err := optionalString(req.Input, "kind")
+		if err != nil {
+			return Response{}, err
+		}
+		if strings.TrimSpace(kind) == "" {
 			kind = "agent_file"
 		}
 		target, err := security.ContainedPath(issue.Workspace.Path, rel)
@@ -112,35 +119,57 @@ func (g Gateway) dispatch(issue *core.Issue, runID string, req Request) (Respons
 		if err != nil || !st.Mode().IsRegular() {
 			return Response{}, core.NewError(core.ErrInvalidRequest, "artifact path must exist and be a regular file", nil)
 		}
-		max := int64(10 * 1024 * 1024)
-		if st.Size() > max {
-			return Response{}, core.NewError(core.ErrInvalidRequest, "artifact exceeds max size", nil)
-		}
 		b, err := os.ReadFile(target)
 		if err != nil {
 			return Response{}, core.NewError(core.ErrToolGatewayFailed, "read artifact: "+err.Error(), nil)
+		}
+		sizeBytes := int64(len(b))
+		max := artifactMaxBytesFromScope(scope)
+		if sizeBytes > max {
+			return Response{}, core.NewError(core.ErrInvalidRequest, "artifact exceeds max size", nil)
 		}
 		sha := security.SHA256Bytes(b)
 		artDir := filepath.Join(g.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, runID, "agent")
 		if err := os.MkdirAll(artDir, 0o755); err != nil {
 			return Response{}, core.NewError(core.ErrToolGatewayFailed, "create artifact directory: "+err.Error(), nil)
 		}
-		dst := filepath.Join(artDir, filepath.Base(rel))
-		if err := os.WriteFile(dst, b, 0o644); err != nil {
+		dst := filepath.Join(artDir, filepath.Clean(rel))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return Response{}, core.NewError(core.ErrToolGatewayFailed, "create artifact directory: "+err.Error(), nil)
+		}
+		f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			return Response{}, core.NewError(core.ErrToolGatewayFailed, "write artifact: "+err.Error(), nil)
+		}
+		if _, err := f.Write(b); err != nil {
+			_ = f.Close()
+			_ = os.Remove(dst)
+			return Response{}, core.NewError(core.ErrToolGatewayFailed, "write artifact: "+err.Error(), nil)
+		}
+		if err := f.Close(); err != nil {
+			_ = os.Remove(dst)
 			return Response{}, core.NewError(core.ErrToolGatewayFailed, "write artifact: "+err.Error(), nil)
 		}
 		aid := core.NewID("art_")
-		desc := fmt.Sprint(req.Input["description"])
-		if err := g.Store.InsertArtifact(store.ArtifactRecord{ID: aid, IssueID: &issue.ID, RunID: &runID, Kind: kind, Path: dst, SizeBytes: st.Size(), SHA256: &sha, Redacted: true, Description: core.NullableString(desc)}); err != nil {
+		desc, err := optionalString(req.Input, "description")
+		if err != nil {
+			_ = os.Remove(dst)
+			return Response{}, err
+		}
+		if err := g.Store.InsertArtifact(store.ArtifactRecord{ID: aid, IssueID: &issue.ID, RunID: &runID, Kind: kind, Path: dst, SizeBytes: sizeBytes, SHA256: &sha, Redacted: true, Description: core.NullableString(desc)}); err != nil {
+			_ = os.Remove(dst)
 			return Response{}, core.NewError(core.ErrToolGatewayFailed, "insert artifact metadata: "+err.Error(), nil)
 		}
 		return Response{Success: true, Tool: req.Tool, Data: map[string]any{"artifact_id": aid}}, nil
 	case "followup.create":
-		title := strings.TrimSpace(fmt.Sprint(req.Input["title"]))
-		if title == "" {
-			return Response{}, core.NewError(core.ErrInvalidRequest, "title is required", nil)
+		title, err := requiredString(req.Input, "title")
+		if err != nil {
+			return Response{}, err
 		}
-		desc := fmt.Sprint(req.Input["description"])
+		desc, err := optionalString(req.Input, "description")
+		if err != nil {
+			return Response{}, err
+		}
 		prio := 3
 		if x, ok := req.Input["priority"].(float64); ok {
 			prio = int(x)
@@ -167,6 +196,34 @@ func (g Gateway) dispatch(issue *core.Issue, runID string, req Request) (Respons
 	default:
 		return Response{}, core.NewError(core.ErrToolGatewayFailed, "unsupported tool", nil)
 	}
+}
+
+func requiredString(in map[string]any, key string) (string, error) {
+	v, ok := in[key]
+	if !ok {
+		return "", core.NewError(core.ErrInvalidRequest, key+" is required", nil)
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", core.NewError(core.ErrInvalidRequest, key+" must be string", nil)
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", core.NewError(core.ErrInvalidRequest, key+" is required", nil)
+	}
+	return s, nil
+}
+
+func optionalString(in map[string]any, key string) (string, error) {
+	v, ok := in[key]
+	if !ok || v == nil {
+		return "", nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", core.NewError(core.ErrInvalidRequest, key+" must be string", nil)
+	}
+	return strings.TrimSpace(s), nil
 }
 
 func allowed(t string) bool {
@@ -202,10 +259,35 @@ func toStrings(v any) []string {
 	return out
 }
 
+func artifactMaxBytesFromScope(scope map[string]any) int64 {
+	if scope == nil {
+		return defaultArtifactMaxBytes
+	}
+	switch v := scope["artifact_max_bytes"].(type) {
+	case int:
+		if v > 0 {
+			return int64(v)
+		}
+	case int64:
+		if v > 0 {
+			return v
+		}
+	case float64:
+		if v > 0 {
+			return int64(v)
+		}
+	case json.Number:
+		if n, err := v.Int64(); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultArtifactMaxBytes
+}
+
 func canonicalHandoff(in map[string]any) (map[string]any, error) {
-	summary := strings.TrimSpace(fmt.Sprint(in["summary"]))
-	if summary == "" {
-		return nil, core.NewError(core.ErrInvalidRequest, "summary is required", nil)
+	summary, err := requiredString(in, "summary")
+	if err != nil {
+		return nil, err
 	}
 	target := "Human Review"
 	if x, ok := in["target_state"].(string); ok && strings.TrimSpace(x) != "" {
@@ -272,6 +354,9 @@ func HTTPClientCall(endpoint, token string, req Request) Response {
 	hreq, _ := http.NewRequest("POST", strings.TrimRight(endpoint, "/")+"/tool/v1/call", bytes.NewReader(b))
 	hreq.Header.Set("Authorization", "Bearer "+token)
 	hreq.Header.Set("Content-Type", "application/json")
+	if cwd, err := os.Getwd(); err == nil {
+		hreq.Header.Set("X-Symphony-Cwd", cwd)
+	}
 	resp, err := http.DefaultClient.Do(hreq)
 	if err != nil {
 		return errResp("tool_gateway_failed", err.Error(), nil)
@@ -285,9 +370,21 @@ func HTTPClientCall(endpoint, token string, req Request) Response {
 	return out
 }
 
+type TokenOptions struct {
+	ArtifactMaxBytes int64
+}
+
 func NewTokenForRun(st *store.Store, run *core.RunAttempt, workspacePath string) (string, error) {
+	return NewTokenForRunWithOptions(st, run, workspacePath, TokenOptions{})
+}
+
+func NewTokenForRunWithOptions(st *store.Store, run *core.RunAttempt, workspacePath string, opts TokenOptions) (string, error) {
 	token := security.NewToken()
 	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano)
-	_, err := st.CreateToolToken(run.ID, security.HashToken(token), map[string]any{"run_id": run.ID, "issue_id": run.IssueID, "workspace_path": workspacePath, "tools": Registry}, expires)
+	artifactMaxBytes := opts.ArtifactMaxBytes
+	if artifactMaxBytes <= 0 {
+		artifactMaxBytes = defaultArtifactMaxBytes
+	}
+	_, err := st.CreateToolToken(run.ID, security.HashToken(token), map[string]any{"run_id": run.ID, "issue_id": run.IssueID, "workspace_path": workspacePath, "tools": Registry, "artifact_max_bytes": artifactMaxBytes}, expires)
 	return token, err
 }

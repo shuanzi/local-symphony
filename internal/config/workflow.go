@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -58,6 +59,7 @@ type EffectiveConfig struct {
 		TurnTimeoutMS           int    `json:"turn_timeout_ms"`
 		StallTimeoutMS          int    `json:"stall_timeout_ms"`
 		StartupTimeoutMS        int    `json:"startup_timeout_ms"`
+		ReadTimeoutMS           int    `json:"read_timeout_ms"`
 	} `json:"codex"`
 	Tools struct {
 		Gateway                  string `json:"gateway"`
@@ -137,6 +139,7 @@ func Defaults(repoRoot string) EffectiveConfig {
 	c.Codex.StartupTimeoutMS = 60000
 	c.Codex.TurnTimeoutMS = 3600000
 	c.Codex.StallTimeoutMS = 300000
+	c.Codex.ReadTimeoutMS = 5000
 	c.Tools.Gateway = "cli"
 	c.Tools.RequireHandoffTool = true
 	c.Tools.AllowDynamicTools = false
@@ -270,9 +273,7 @@ func parseScalar(s string) any {
 	if len(s) >= 2 && ((s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'')) {
 		return s[1 : len(s)-1]
 	}
-	if i, err := fmt.Sscanf(s, "%d", new(int)); err == nil && i == 1 {
-		var n int
-		fmt.Sscanf(s, "%d", &n)
+	if n, err := strconv.Atoi(s); err == nil {
 		return n
 	}
 	return s
@@ -296,6 +297,11 @@ func applyMap(c *EffectiveConfig, m map[string]any, baseDir string, warnings, er
 	if w := section("workspace"); w != nil {
 		if v, ok := str(w, "root", errors); ok {
 			c.Workspace.Root = resolvePath(expandEnv(v, errors), baseDir)
+		}
+	}
+	if p := section("polling"); p != nil {
+		if v, ok := intv(p, "interval_ms", errors); ok {
+			c.Polling.IntervalMS = v
 		}
 	}
 	if g := section("git"); g != nil {
@@ -351,6 +357,32 @@ func applyMap(c *EffectiveConfig, m map[string]any, baseDir string, warnings, er
 		if v, ok := intv(h, "timeout_ms", errors); ok {
 			c.Hooks.TimeoutMS = v
 		}
+		if v, ok := intv(h, "max_output_bytes", errors); ok {
+			c.Hooks.MaxOutputBytes = v
+		}
+	}
+	if cx := section("codex"); cx != nil {
+		if v, ok := str(cx, "command", errors); ok {
+			c.Codex.Command = v
+		}
+		if v, ok := boolv(cx, "require_committed_fixture", errors); ok {
+			c.Codex.RequireCommittedFixture = v
+		}
+		if v, ok := boolv(cx, "experimental_api", errors); ok {
+			c.Codex.ExperimentalAPI = v
+		}
+		if v, ok := intv(cx, "startup_timeout_ms", errors); ok {
+			c.Codex.StartupTimeoutMS = v
+		}
+		if v, ok := intv(cx, "turn_timeout_ms", errors); ok {
+			c.Codex.TurnTimeoutMS = v
+		}
+		if v, ok := intv(cx, "stall_timeout_ms", errors); ok {
+			c.Codex.StallTimeoutMS = v
+		}
+		if v, ok := intv(cx, "read_timeout_ms", errors); ok {
+			c.Codex.ReadTimeoutMS = v
+		}
 	}
 	if t := section("tools"); t != nil {
 		if v, ok := boolv(t, "allow_dynamic_tools", errors); ok {
@@ -377,6 +409,23 @@ func applyMap(c *EffectiveConfig, m map[string]any, baseDir string, warnings, er
 		}
 		if v, ok := intv(srv, "port", errors); ok {
 			c.Server.Port = v
+		}
+	}
+	if p := section("prompt"); p != nil {
+		if v, ok := intv(p, "max_context_bytes", errors); ok {
+			c.Prompt.MaxContextBytes = v
+		}
+		if v, ok := boolv(p, "include_previous_runs", errors); ok {
+			c.Prompt.IncludePreviousRuns = v
+		}
+		if v, ok := intv(p, "previous_run_limit", errors); ok {
+			c.Prompt.PreviousRunLimit = v
+		}
+		if v, ok := boolv(p, "include_tool_manifest", errors); ok {
+			c.Prompt.IncludeToolManifest = v
+		}
+		if v, ok := str(p, "save_prompt_snapshot", errors); ok {
+			c.Prompt.SavePromptSnapshot = v
 		}
 	}
 }
@@ -481,6 +530,9 @@ func hardValidate(c EffectiveConfig, errs *[]string) {
 	}
 	if c.Tools.AgentCanSetTerminalState {
 		*errs = append(*errs, "tools.agent_can_set_terminal_state must be false")
+	}
+	if c.Tools.ArtifactMaxBytes <= 0 {
+		*errs = append(*errs, "tools.artifact_max_bytes must be greater than 0")
 	}
 	if c.Git.BranchPrefix != "symphony" {
 		*errs = append(*errs, "git.branch_prefix must equal symphony")

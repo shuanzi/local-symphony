@@ -1,5 +1,5 @@
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
-import { ApiError, api, errorLabel, fetchArtifactContent, isAuthError, setCsrfToken } from './api';
+import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ApiError, api, errorLabel, fetchArtifactContent, isAuthError } from './api';
 import type {
   Approval,
   ApprovalDecision,
@@ -88,7 +88,8 @@ const emptyData: DashboardData = {
 
 function parseRoute(): RouteState {
   const raw = window.location.hash.replace(/^#\/?/, '');
-  const [page = 'overview', id] = raw.split('/').map(decodeURIComponent);
+  const [path] = raw.split('?');
+  const [page = 'overview', id] = path.split('/').map(decodeURIComponent);
   if (page === 'issue' && id) return { page: 'issue', issueRef: id };
   if (page === 'run' && id) return { page: 'run', runId: id };
   if (page === 'review') return { page: 'review', issueRef: id };
@@ -112,6 +113,48 @@ function navigate(route: RouteState): void {
   window.location.hash = `#/${route.page}`;
 }
 
+const openTokenParamNames = ['open_token', 'openToken'];
+
+function openTokenFromParams(params: URLSearchParams): string | null {
+  for (const name of openTokenParamNames) {
+    const token = params.get(name);
+    if (token) return token;
+  }
+  return null;
+}
+
+function getOpenTokenFromUrl(): string | null {
+  const queryToken = openTokenFromParams(new URLSearchParams(window.location.search));
+  if (queryToken) return queryToken;
+
+  const hash = window.location.hash.replace(/^#/, '');
+  const queryStart = hash.indexOf('?');
+  const hashQuery = queryStart >= 0 ? hash.slice(queryStart + 1) : hash;
+  return openTokenFromParams(new URLSearchParams(hashQuery));
+}
+
+function cleanOpenTokenFromUrl(): void {
+  const url = new URL(window.location.href);
+  for (const name of openTokenParamNames) url.searchParams.delete(name);
+
+  const hash = url.hash.replace(/^#/, '');
+  if (hash && (hash.includes('?') || !hash.startsWith('/'))) {
+    const queryStart = hash.indexOf('?');
+    const hashPath = queryStart >= 0 ? hash.slice(0, queryStart) : '';
+    const hashQuery = queryStart >= 0 ? hash.slice(queryStart + 1) : hash;
+    const hashParams = new URLSearchParams(hashQuery);
+    for (const name of openTokenParamNames) hashParams.delete(name);
+    const nextHashQuery = hashParams.toString();
+    if (queryStart >= 0) {
+      url.hash = nextHashQuery ? `${hashPath}?${nextHashQuery}` : hashPath;
+    } else {
+      url.hash = nextHashQuery ? nextHashQuery : '';
+    }
+  }
+
+  window.history.replaceState(window.history.state, '', url);
+}
+
 function formatDate(value: string | null | undefined): string {
   if (!value) return '—';
   const date = new Date(value);
@@ -129,6 +172,71 @@ function isDispatchable(issue: Issue): boolean {
 
 function compareIssuePriority(a: Issue, b: Issue): number {
   return a.priority - b.priority || a.sequence_no - b.sequence_no || a.identifier.localeCompare(b.identifier);
+}
+
+function eventKey(event: RunEvent): string {
+  return event.seq > 0 ? `seq:${event.seq}` : `id:${event.id}`;
+}
+
+function eventMaxSeq(events: RunEvent[]): number {
+  return events.reduce((max, event) => Math.max(max, event.seq || 0), 0);
+}
+
+function mergeEvents(existing: RunEvent[], incoming: RunEvent[]): RunEvent[] {
+  if (incoming.length === 0) return existing;
+  const byKey = new Map(existing.map((event) => [eventKey(event), event]));
+  for (const event of incoming) byKey.set(eventKey(event), event);
+  return Array.from(byKey.values()).sort((a, b) => a.seq - b.seq || a.created_at.localeCompare(b.created_at));
+}
+
+const runEventPageSize = 200;
+
+async function loadRunEvents(runId: string): Promise<RunEvent[]> {
+  const events: RunEvent[] = [];
+  let afterSeq = 0;
+  for (;;) {
+    const loaded = await api.runEvents(runId, afterSeq);
+    events.push(...loaded);
+    const nextAfterSeq = Math.max(afterSeq, eventMaxSeq(loaded));
+    if (loaded.length < runEventPageSize || afterSeq === nextAfterSeq) break;
+    afterSeq = nextAfterSeq;
+  }
+  return events;
+}
+
+function eventFromSseMessage(message: MessageEvent): RunEvent | null {
+  if (!message.data) return null;
+  try {
+    const payload = JSON.parse(message.data) as unknown;
+    if (payload && typeof payload === 'object' && 'seq' in payload && 'event_type' in payload) {
+      return payload as RunEvent;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+const summaryRefreshEvents = new Set([
+  'issue.created',
+  'issue.updated',
+  'issue.transitioned',
+  'issue.state_changed',
+  'issue.dispatch_paused',
+  'issue.dispatch_resumed',
+  'issue.completed',
+  'run.claimed',
+  'run.failed',
+  'run.cancelled',
+  'review.packet_generated',
+  'review.sent_to_rework',
+  'review.marked_done',
+  'approval.requested',
+  'approval.decided'
+]);
+
+function shouldRefreshSummary(event: RunEvent): boolean {
+  return summaryRefreshEvents.has(event.event_type);
 }
 
 function runsForIssue(issue: Issue, runs: RunAttempt[]): RunAttempt[] {
@@ -220,38 +328,106 @@ function useDashboardData() {
   const [loading, setLoading] = useState(true);
   const [mutating, setMutating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [authenticated, setAuthenticated] = useState(false);
   const [authError, setAuthError] = useState(false);
+  const [authMessage, setAuthMessage] = useState<string | null>(null);
   const [daemonUnavailable, setDaemonUnavailable] = useState(false);
   const [sseState, setSseState] = useState<'connecting' | 'connected' | 'reconnecting' | 'disabled'>('connecting');
+  const maxSeqRef = useRef(0);
+  const authEpochRef = useRef(0);
+  const authenticatedRef = useRef(false);
+  const exchangePromiseRef = useRef<Promise<void> | null>(null);
+  const refreshTimerRef = useRef<number | null>(null);
+
+  const markUnauthenticated = useCallback(() => {
+    authEpochRef.current += 1;
+    authenticatedRef.current = false;
+    setAuthenticated(false);
+    setAuthError(true);
+    setAuthMessage('Dashboard is not authenticated. Reopen the local dashboard through the daemon open URL.');
+    setData(emptyData);
+    maxSeqRef.current = 0;
+  }, []);
+
+  const mergeEventBatch = useCallback((incoming: RunEvent[]) => {
+    if (incoming.length === 0) return;
+    setData((current) => {
+      const events = mergeEvents(current.events, incoming);
+      maxSeqRef.current = eventMaxSeq(events);
+      return { ...current, events };
+    });
+  }, []);
+
+  const loadIncrementalEvents = useCallback(async () => {
+    const requestAuthEpoch = authEpochRef.current;
+    const events = await api.events(maxSeqRef.current);
+    if (authEpochRef.current !== requestAuthEpoch || !authenticatedRef.current) return;
+    mergeEventBatch(events);
+  }, [mergeEventBatch]);
+
+  const bootstrapSession = useCallback(async (): Promise<boolean> => {
+    const openToken = getOpenTokenFromUrl();
+    if (openToken && !exchangePromiseRef.current) {
+      cleanOpenTokenFromUrl();
+      exchangePromiseRef.current = api.exchangeOpenToken(openToken)
+        .then(() => undefined)
+        .finally(() => { exchangePromiseRef.current = null; });
+    }
+    if (exchangePromiseRef.current) {
+      try {
+        await exchangePromiseRef.current;
+      } catch (error) {
+        const session = await api.session().catch(() => null);
+        if (!session?.authenticated) throw error;
+      }
+    }
+
+    const session = await api.session();
+    if (!session.authenticated) {
+      markUnauthenticated();
+      return false;
+    }
+    authenticatedRef.current = true;
+    setAuthMessage(null);
+    return true;
+  }, [markUnauthenticated]);
 
   const loadAll = useCallback(async () => {
+    const requestAuthEpoch = authEpochRef.current;
     setError(null);
     setAuthError(false);
+    setAuthMessage(null);
     try {
-      const health = await api.health();
+      const authenticated = await bootstrapSession();
+      if (!authenticated) return;
       setDaemonUnavailable(false);
-      const session = await api.session().catch(() => null);
-      if (session?.csrf_token || session?.csrf) setCsrfToken(session.csrf_token || session.csrf || null);
-      const [issuesPage, runs, approvals, workflow, diagnostics, events] = await Promise.all([
+      const [health, issuesPage, runs, approvals, workflow, diagnostics, events] = await Promise.all([
+        api.health(),
         api.issues('?limit=200'),
         api.runs(),
         api.approvals(),
         api.workflow(),
         api.diagnostics(),
-        api.events()
+        api.events(maxSeqRef.current)
       ]);
-      setData({
-        health,
-        issues: issuesPage.items || [],
-        runs,
-        approvals,
-        workflow,
-        diagnostics,
-        events
+      if (authEpochRef.current !== requestAuthEpoch || !authenticatedRef.current) return;
+      setData((current) => {
+        const mergedEvents = mergeEvents(current.events, events);
+        maxSeqRef.current = eventMaxSeq(mergedEvents);
+        return {
+          health,
+          issues: issuesPage.items || [],
+          runs,
+          approvals,
+          workflow,
+          diagnostics,
+          events: mergedEvents
+        };
       });
+      setAuthenticated(true);
     } catch (err) {
       if (isAuthError(err)) {
-        setAuthError(true);
+        markUnauthenticated();
       } else if (err instanceof TypeError) {
         setDaemonUnavailable(true);
       } else {
@@ -260,25 +436,50 @@ function useDashboardData() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [bootstrapSession, markUnauthenticated]);
+
+  const scheduleSummaryRefresh = useCallback(() => {
+    if (refreshTimerRef.current !== null) return;
+    refreshTimerRef.current = window.setTimeout(() => {
+      refreshTimerRef.current = null;
+      void loadAll();
+    }, 250);
+  }, [loadAll]);
 
   useEffect(() => {
     void loadAll();
     const interval = window.setInterval(() => void loadAll(), 12_000);
-    return () => window.clearInterval(interval);
+    return () => {
+      window.clearInterval(interval);
+      if (refreshTimerRef.current !== null) {
+        window.clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
+    };
   }, [loadAll]);
 
   useEffect(() => {
+    if (!authenticated) {
+      setSseState('disabled');
+      return undefined;
+    }
     if (!('EventSource' in window)) {
       setSseState('disabled');
       return undefined;
     }
     setSseState('connecting');
-    const source = new EventSource('/api/v1/events/stream');
+    const source = new EventSource(`/api/v1/events/stream?after_seq=${maxSeqRef.current}`);
     source.onopen = () => setSseState('connected');
-    source.onmessage = () => {
+    source.onmessage = (message) => {
       setSseState('connected');
-      void loadAll();
+      const event = eventFromSseMessage(message);
+      if (event) {
+        mergeEventBatch([event]);
+        if (shouldRefreshSummary(event)) scheduleSummaryRefresh();
+      } else {
+        void loadIncrementalEvents();
+        scheduleSummaryRefresh();
+      }
     };
     source.addEventListener('run.claimed', () => {
       setSseState('connected');
@@ -288,7 +489,7 @@ function useDashboardData() {
       setSseState('reconnecting');
     };
     return () => source.close();
-  }, [loadAll]);
+  }, [authenticated, loadAll, loadIncrementalEvents, mergeEventBatch, scheduleSummaryRefresh]);
 
   const runMutation = useCallback(async <T,>(operation: () => Promise<T>): Promise<T | null> => {
     setMutating(true);
@@ -300,16 +501,16 @@ function useDashboardData() {
       return result;
     } catch (err) {
       if (isAuthError(err)) {
-        setAuthError(true);
+        markUnauthenticated();
       }
       setError(errorLabel(err));
       return null;
     } finally {
       setMutating(false);
     }
-  }, [loadAll]);
+  }, [loadAll, markUnauthenticated]);
 
-  return { data, loading, mutating, error, authError, daemonUnavailable, sseState, reload: loadAll, runMutation };
+  return { data, loading, mutating, error, authError, authMessage, daemonUnavailable, sseState, reload: loadAll, runMutation, markUnauthenticated };
 }
 
 function Section({ title, children, actions }: { title: string; children: ReactNode; actions?: ReactNode }) {
@@ -407,13 +608,14 @@ function MetricStrip({ items }: { items: Array<{ label: string; value: ReactNode
   );
 }
 
-function AppShell({ route, data, loading, mutating, error, authError, daemonUnavailable, sseState, children, reload }: {
+function AppShell({ route, data, loading, mutating, error, authError, authMessage, daemonUnavailable, sseState, children, reload }: {
   route: RouteState;
   data: DashboardData;
   loading: boolean;
   mutating: boolean;
   error: string | null;
   authError: boolean;
+  authMessage: string | null;
   daemonUnavailable: boolean;
   sseState: string;
   children: ReactNode;
@@ -431,6 +633,7 @@ function AppShell({ route, data, loading, mutating, error, authError, daemonUnav
   const pendingApprovals = data.approvals.filter((approval) => approval.status === 'pending');
   const humanReview = data.issues.filter((issue) => issue.state === 'Human Review');
   const paused = data.issues.filter((issue) => issue.dispatch_paused);
+  const unauthenticated = authError && !loading;
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -457,9 +660,16 @@ function AppShell({ route, data, loading, mutating, error, authError, daemonUnav
       {loading ? <Banner kind="info">Loading dashboard state from the local daemon…</Banner> : null}
       {mutating ? <Banner kind="info">Command submitted. Waiting for API confirmation before updating the UI.</Banner> : null}
       {daemonUnavailable ? <Banner kind="warning">Daemon unavailable. Start the local API with <code>symphony serve</code>, then reopen the dashboard.</Banner> : null}
-      {authError ? <Banner kind="warning">Session expired or CSRF validation failed. Reopen the local dashboard through the daemon open URL or refresh the browser session.</Banner> : null}
+      {authError ? <Banner kind="warning">{authMessage || 'Session expired or CSRF validation failed. Reopen the local dashboard through the daemon open URL or refresh the browser session.'}</Banner> : null}
       {error ? <Banner kind="error">{error}</Banner> : null}
-      <main>{children}</main>
+      <main>
+        {unauthenticated ? (
+          <EmptyState
+            title="Dashboard is not authenticated"
+            body={authMessage || 'Session expired or CSRF validation failed. Reopen the local dashboard through the daemon open URL or refresh the browser session.'}
+          />
+        ) : children}
+      </main>
     </div>
   );
 }
@@ -1356,15 +1566,17 @@ function RunTable({ runs }: { runs: RunAttempt[] }) {
   );
 }
 
-function RunDetailPage({ route, runs, issues, events, runMutation }: {
+function RunDetailPage({ route, runs, issues, events, runMutation, markUnauthenticated }: {
   route: RouteState;
   runs: RunAttempt[];
   issues: Issue[];
   events: RunEvent[];
   runMutation: <T>(operation: () => Promise<T>) => Promise<T | null>;
+  markUnauthenticated: () => void;
 }) {
   const [reason, setReason] = useState('operator cancelled run');
   const [fetchedRun, setFetchedRun] = useState<RunAttempt | null>(null);
+  const [fetchedRunEvents, setFetchedRunEvents] = useState<RunEvent[]>([]);
   const [missingRunId, setMissingRunId] = useState<string | null>(null);
   const [runLoadError, setRunLoadError] = useState<string | null>(null);
   const listedRun = runs.find((item) => item.id === route.runId);
@@ -1388,9 +1600,30 @@ function RunDetailPage({ route, runs, issues, events, runMutation }: {
       });
     return () => { cancelled = true; };
   }, [route.runId, listedRun]);
+  useEffect(() => {
+    setFetchedRunEvents([]);
+    if (!route.runId) return undefined;
+    let cancelled = false;
+    loadRunEvents(route.runId)
+      .then((loaded) => {
+        if (!cancelled) setFetchedRunEvents(loaded);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        if (isAuthError(error)) {
+          markUnauthenticated();
+          return;
+        }
+        setRunLoadError(errorLabel(error));
+      });
+    return () => { cancelled = true; };
+  }, [markUnauthenticated, route.runId]);
   const run = listedRun || (fetchedRun && fetchedRun.id === route.runId ? fetchedRun : undefined);
   const issue = issueByIdOrRef(issues, run?.issue_id);
-  const runEvents = events.filter((event) => event.run_id === run?.id);
+  const runEvents = run ? mergeEvents(
+    events.filter((event) => event.run_id === run.id),
+    fetchedRunEvents.filter((event) => !event.run_id || event.run_id === run.id)
+  ) : [];
 
   if (!run) {
     if (runLoadError) {
@@ -1862,7 +2095,7 @@ function DiagnosticCard({ title, value }: { title: string; value: unknown }) {
 
 export function App() {
   const route = useRoute();
-  const { data, loading, mutating, error, authError, daemonUnavailable, sseState, reload, runMutation } = useDashboardData();
+  const { data, loading, mutating, error, authError, authMessage, daemonUnavailable, sseState, reload, runMutation, markUnauthenticated } = useDashboardData();
 
   let content: ReactNode;
   switch (route.page) {
@@ -1873,7 +2106,7 @@ export function App() {
       content = <IssueDetailPage route={route} issues={data.issues} runs={data.runs} events={data.events} runMutation={runMutation} />;
       break;
     case 'run':
-      content = <RunDetailPage route={route} runs={data.runs} issues={data.issues} events={data.events} runMutation={runMutation} />;
+      content = <RunDetailPage route={route} runs={data.runs} issues={data.issues} events={data.events} runMutation={runMutation} markUnauthenticated={markUnauthenticated} />;
       break;
     case 'approvals':
       content = <ApprovalInboxPage approvals={data.approvals} runMutation={runMutation} />;
@@ -1899,6 +2132,7 @@ export function App() {
       mutating={mutating}
       error={error}
       authError={authError}
+      authMessage={authMessage}
       daemonUnavailable={daemonUnavailable}
       sseState={sseState}
       reload={reload}

@@ -33,6 +33,18 @@ for (const phrase of sharedStates) {
 }
 
 if (!api.includes('csrf_token')) throw new Error('API client must read csrf_token');
+if (!api.includes('/auth/exchange')) throw new Error('API client must exchange open_token');
+if (!/exchangeOpenToken:\s*async\s*\([^)]*openToken[^)]*\)\s*=>\s*\{[\s\S]*method:\s*'POST'[\s\S]*JSON\.stringify\(\{\s*open_token:\s*openToken\s*\}\)/s.test(api)) throw new Error('API client must POST open_token exchange payload');
+if (!app.includes('open_token') || !app.includes('openToken')) throw new Error('dashboard must read open-token aliases from URL');
+if (!app.includes('api.exchangeOpenToken')) throw new Error('dashboard must bootstrap auth with open-token exchange');
+if (!app.includes('history.replaceState')) throw new Error('dashboard must clean exchanged open token from URL');
+if (!app.includes('exchangePromiseRef')) throw new Error('dashboard must guard one-time open-token exchange against duplicate effects');
+if (!/cleanOpenTokenFromUrl\(\);\s*exchangePromiseRef\.current = api\.exchangeOpenToken/s.test(app)) throw new Error('dashboard must clean open token before awaiting exchange');
+if (!app.includes('Dashboard is not authenticated')) throw new Error('dashboard must render explicit unauthenticated state');
+if (!/setData\(emptyData\)/s.test(app)) throw new Error('dashboard must clear protected data after auth loss');
+if (!/authEpochRef\s*=\s*useRef\(0\)/s.test(app)) throw new Error('dashboard must track auth epoch for protected data requests');
+if (!/authEpochRef\.current\s*\+=\s*1[\s\S]*setData\(emptyData\)/s.test(app)) throw new Error('markUnauthenticated must advance auth epoch before clearing protected data');
+if (!/const requestAuthEpoch\s*=\s*authEpochRef\.current[\s\S]*authEpochRef\.current\s*!==\s*requestAuthEpoch[\s\S]*setData/s.test(app)) throw new Error('loadAll must skip stale protected data commits after auth epoch changes');
 if (!app.includes('Update issue')) throw new Error('missing issue update UI');
 if (/const issue = issueByIdOrRef\([^;]+?\)\s*\|\|\s*issues\[0\]/s.test(app)) throw new Error('issue deep link falls back to first issue');
 if (/const run = runs\.find\([^;]+?\)\s*\|\|\s*runs\[0\]/s.test(app)) throw new Error('run deep link falls back to first run');
@@ -45,6 +57,42 @@ if (!app.includes('Run failed to load')) throw new Error('missing run deep link 
 if (!/setIssueLoadError\(errorLabel\(error\)\)/s.test(app)) throw new Error('issue deep link non-404 errors must stop loading');
 if (!/setRunLoadError\(errorLabel\(error\)\)/s.test(app)) throw new Error('run deep link non-404 errors must stop loading');
 if (!app.includes('prompt_metadata')) throw new Error('workflow preview must display prompt metadata instead of raw prompt text');
+if (!/function mergeEvents\(/s.test(app)) throw new Error('events must merge/dedupe incrementally');
+if (!/maxSeqRef/s.test(app)) throw new Error('events must track max seq cursor');
+if (!/api\.events\(maxSeqRef\.current\)/s.test(app)) throw new Error('events must fetch after max seq cursor');
+if (!/new EventSource\(`\/api\/v1\/events\/stream\?after_seq=\$\{maxSeqRef\.current\}`\)/s.test(app)) throw new Error('EventSource URL must include after_seq cursor');
+if (/source\.onmessage\s*=\s*\(\)\s*=>\s*\{?\s*setSseState\('connected'\);\s*void loadAll\(\)/s.test(app)) throw new Error('SSE messages must not reload first events page');
+if (!/loadRunEvents\(route\.runId\)/s.test(app)) throw new Error('run detail must fetch run-specific timeline events');
+if (!/runEvents:\s*\([^)]*afterSeq[^)]*\)\s*=>[\s\S]*after_seq=\$\{afterSeq\}/s.test(api)) throw new Error('API client runEvents must support after_seq');
+if (!/async function loadRunEvents\([^)]*runId[^)]*\)/s.test(app)) throw new Error('run detail must load run events through a paginated helper');
+if (!/api\.runEvents\(runId,\s*afterSeq\)/s.test(app)) throw new Error('run detail pagination must pass after_seq');
+if (!/loaded\.length\s*<\s*runEventPageSize/s.test(app)) throw new Error('run detail pagination must stop after a short page');
+if (!/afterSeq\s*===\s*nextAfterSeq/s.test(app)) throw new Error('run detail pagination must stop when no new seq is returned');
+if (!/RunDetailPage\(\{[\s\S]*markUnauthenticated[\s\S]*\}\s*:/s.test(app)) throw new Error('run detail must receive the global unauthenticated handler');
+if (!/loadRunEvents\(route\.runId\)[\s\S]*catch\(\(error\)[\s\S]*isAuthError\(error\)[\s\S]*markUnauthenticated\(\)/s.test(app)) throw new Error('run detail runEvents auth errors must clear global protected data');
+if (!app.includes('summaryRefreshEvents') || !app.includes('scheduleSummaryRefresh')) throw new Error('SSE event handling must refresh dashboard summaries for state-changing events');
+const summaryRefreshBlock = app.match(/summaryRefreshEvents\s*=\s*new Set\(\[([\s\S]*?)\]\)/);
+if (!summaryRefreshBlock) throw new Error('summaryRefreshEvents must be an explicit event set');
+const summaryRefreshEventSet = new Set(Array.from(summaryRefreshBlock[1].matchAll(/'([^']+)'/g), (match) => match[1]));
+const requiredSummaryRefreshEvents = [
+  'issue.created',
+  'issue.updated',
+  'issue.transitioned',
+  'issue.state_changed',
+  'issue.dispatch_paused',
+  'issue.dispatch_resumed',
+  'issue.completed',
+  'run.claimed',
+  'run.failed',
+  'run.cancelled',
+  'review.packet_generated',
+  'review.sent_to_rework',
+  'review.marked_done',
+  'approval.requested',
+  'approval.decided'
+];
+const missingSummaryRefreshEvents = requiredSummaryRefreshEvents.filter((event) => !summaryRefreshEventSet.has(event));
+if (missingSummaryRefreshEvents.length > 0) throw new Error(`summary refresh missing events: ${missingSummaryRefreshEvents.join(', ')}`);
 
 for (const selector of ['.page-header', '.page-split', '.metric-strip', '.workbench', '.work-queue', '.context-panel', '.action-rail', '.board', '.metric-grid', '.approval-card', '.artifact-card', '.diagnostics-grid']) {
   if (!styles.includes(selector)) throw new Error(`missing style selector ${selector}`);

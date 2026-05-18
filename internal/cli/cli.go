@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -110,16 +111,92 @@ func serveOptionsFromArgs(args []string) (app.ServeOptions, error) {
 	return opts, nil
 }
 func cmdOpen(args []string) int {
-	st, err := store.Open(flagValue(args, "--project", "."))
-	if err != nil {
-		return printErr(err)
-	}
-	defer st.Close()
-	desc, err := app.RuntimeDescriptor(st.ProjectID)
+	desc, err := openDescriptor(flagValue(args, "--project", "."))
 	if err != nil {
 		return printErr(err)
 	}
 	return printJSON(desc)
+}
+
+func openDescriptor(project string) (map[string]any, error) {
+	st, err := store.Open(project)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	desc, err := app.RuntimeDescriptor(st.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	apiURL, _ := desc["api_url"].(string)
+	token, err := readCLISessionToken(st.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	openToken, err := requestOpenToken(apiURL, token)
+	if err != nil {
+		return nil, err
+	}
+	desc["dashboard_url"] = strings.TrimRight(apiURL, "/") + "/?open_token=" + url.QueryEscape(openToken)
+	return desc, nil
+}
+
+func readCLISessionToken(projectID string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.TempDir()
+	}
+	b, err := os.ReadFile(filepath.Join(home, ".symphony", "cli-session.json"))
+	if err != nil {
+		return "", err
+	}
+	var session struct {
+		ProjectID string `json:"project_id"`
+		Token     string `json:"token"`
+	}
+	if err := json.Unmarshal(b, &session); err != nil {
+		return "", err
+	}
+	if session.ProjectID != projectID || strings.TrimSpace(session.Token) == "" {
+		return "", core.NewError(core.ErrUnauthorized, "CLI session is not valid for this project", nil)
+	}
+	return session.Token, nil
+}
+
+func requestOpenToken(apiURL, token string) (string, error) {
+	if strings.TrimSpace(apiURL) == "" {
+		return "", core.NewError(core.ErrInvalidRequest, "runtime descriptor is missing api_url", nil)
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(apiURL, "/")+"/api/v1/auth/open-token", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var payload struct {
+		Data struct {
+			OpenToken string `json:"open_token"`
+		} `json:"data"`
+		Error *core.APIError `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		if payload.Error != nil {
+			return "", payload.Error
+		}
+		return "", core.NewError(core.ErrInternal, string(body), nil)
+	}
+	if payload.Data.OpenToken == "" {
+		return "", core.NewError(core.ErrInternal, "open token response is missing open_token", nil)
+	}
+	return payload.Data.OpenToken, nil
 }
 
 func cmdIssue(args []string) int {
@@ -243,7 +320,7 @@ func cmdRun(args []string) int {
 		printRunHelp()
 		return 2
 	}
-	if strings.HasPrefix(args[0], "LOC-") || strings.HasPrefix(args[0], "iss_") {
+	if isIssueRefArg(args[0]) {
 		return withStore(args[1:], func(st *store.Store) (any, error) {
 			return orchestrator.Orchestrator{Store: st}.DispatchIssue(args[0], "manual")
 		})
@@ -275,6 +352,28 @@ func cmdRun(args []string) int {
 	}
 	return printErr(core.NewError(core.ErrInvalidRequest, "unknown run command", nil))
 }
+
+func isIssueRefArg(s string) bool {
+	if strings.HasPrefix(s, "iss_") {
+		return true
+	}
+	prefix, seq, ok := strings.Cut(s, "-")
+	if !ok || prefix == "" || seq == "" {
+		return false
+	}
+	for _, r := range prefix {
+		if (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	for _, r := range seq {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func cmdApproval(args []string) int {
 	if len(args) == 0 {
 		return printErr(core.NewError(core.ErrInvalidRequest, "approval command required", nil))
