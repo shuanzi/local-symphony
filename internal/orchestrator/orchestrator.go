@@ -179,11 +179,15 @@ func runAfterHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID stri
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
+	maxOutputBytes := wf.Config.Hooks.MaxOutputBytes
+	if maxOutputBytes < 0 {
+		maxOutputBytes = 0
+	}
 	done := make(chan error, 1)
 	go func() {
 		out, err := cmd.CombinedOutput()
-		if len(out) > wf.Config.Hooks.MaxOutputBytes {
-			out = out[:wf.Config.Hooks.MaxOutputBytes]
+		if len(out) > maxOutputBytes {
+			out = out[:maxOutputBytes]
 		}
 		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": string(out)})
 		done <- err

@@ -145,3 +145,55 @@ func TestRunWorkerSkipsReviewGenerationWhenRunCancelledAfterHook(t *testing.T) {
 		t.Fatalf("review packet count = %d, want 0", len(rows))
 	}
 }
+
+func TestRunAfterHookWithNegativeMaxOutputBytesDoesNotPanic(t *testing.T) {
+	st, err := store.InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Negative hook output limit",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	afterRun := "printf abcdef"
+	cfg := config.Defaults(st.RepoRoot)
+	cfg.Hooks.AfterRun = &afterRun
+	cfg.Hooks.MaxOutputBytes = -1
+	wf := &config.Workflow{
+		Path:       filepath.Join(st.RepoRoot, "WORKFLOW.md"),
+		Config:     cfg,
+		PromptBody: "Do the work.",
+		Validation: config.Validation{Valid: true},
+	}
+
+	if err := runAfterHook(st, wf, t.TempDir(), run.ID, issue.ID); err != nil {
+		t.Fatalf("runAfterHook: %v", err)
+	}
+	rows, err := st.Project.Query(`SELECT data_json FROM run_events WHERE event_type='hook.after_run.output' AND run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("query hook output event: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("hook output event count = %d, want 1", len(rows))
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(rows[0]["data_json"].String()), &data); err != nil {
+		t.Fatalf("decode hook output event: %v", err)
+	}
+	if got := data["output"]; got != "" {
+		t.Fatalf("hook output = %q, want empty output for negative max_output_bytes", got)
+	}
+}

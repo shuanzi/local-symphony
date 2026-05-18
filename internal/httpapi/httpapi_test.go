@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -508,6 +509,23 @@ func TestListIssuesSupportsLabelFilterAndCursor(t *testing.T) {
 			t.Fatalf("item labels = %#v, want alpha", labels)
 		}
 	}
+
+	andReq := httptest.NewRequest(http.MethodGet, "/api/v1/issues?label=alpha&label=extra&limit=10&sort=identifier", nil)
+	addCookies(andReq, auth.cookies)
+	andRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(andRec, andReq)
+	if andRec.Code != http.StatusOK {
+		t.Fatalf("multi-label list status = %d, body = %s", andRec.Code, andRec.Body.String())
+	}
+	andPayload := decodeEnvelope(t, strings.NewReader(andRec.Body.String()))
+	andData := andPayload["data"].(map[string]any)
+	andItems := andData["items"].([]any)
+	if len(andItems) != 1 {
+		t.Fatalf("multi-label items = %#v, want one item with both labels", andItems)
+	}
+	if got := andItems[0].(map[string]any)["title"]; got != "Alpha two" {
+		t.Fatalf("multi-label title = %#v, want Alpha two", got)
+	}
 }
 
 func TestListIssuesReportsHasMoreForPlainLimitPagination(t *testing.T) {
@@ -538,6 +556,83 @@ func TestListIssuesReportsHasMoreForPlainLimitPagination(t *testing.T) {
 	}
 	if cursor, _ := page["next_cursor"].(string); cursor == "" {
 		t.Fatalf("next_cursor = %#v, want cursor; page = %#v", page["next_cursor"], page)
+	}
+}
+
+func TestListIssuesCursorCanReachItemsAfterFirstTwoHundred(t *testing.T) {
+	srv := newTestServer(t)
+	for i := 1; i <= 205; i++ {
+		if _, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: fmt.Sprintf("Paged issue %03d", i), Description: "desc"}); err != nil {
+			t.Fatalf("CreateIssue %d: %v", i, err)
+		}
+	}
+	auth := sessionAuth(t, srv)
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/api/v1/issues?limit=200&sort=identifier", nil)
+	addCookies(firstReq, auth.cookies)
+	firstRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first list status = %d, body = %s", firstRec.Code, firstRec.Body.String())
+	}
+	firstPayload := decodeEnvelope(t, strings.NewReader(firstRec.Body.String()))
+	firstData := firstPayload["data"].(map[string]any)
+	firstItems := firstData["items"].([]any)
+	if len(firstItems) != 200 {
+		t.Fatalf("first page items = %d, want 200", len(firstItems))
+	}
+	firstPage := firstData["page"].(map[string]any)
+	cursor, _ := firstPage["next_cursor"].(string)
+	if cursor == "" || firstPage["has_more"] != true {
+		t.Fatalf("first page = %#v, want has_more with next_cursor", firstPage)
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "/api/v1/issues?limit=200&sort=identifier&cursor="+cursor, nil)
+	addCookies(secondReq, auth.cookies)
+	secondRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("second list status = %d, body = %s", secondRec.Code, secondRec.Body.String())
+	}
+	secondPayload := decodeEnvelope(t, strings.NewReader(secondRec.Body.String()))
+	secondData := secondPayload["data"].(map[string]any)
+	secondItems := secondData["items"].([]any)
+	if len(secondItems) != 5 {
+		t.Fatalf("second page items = %d, want 5", len(secondItems))
+	}
+	secondPage := secondData["page"].(map[string]any)
+	if secondPage["next_cursor"] != nil || secondPage["has_more"] != false {
+		t.Fatalf("second page = %#v, want final page", secondPage)
+	}
+}
+
+func TestListIssuesLabelFilterFindsMatchesAfterFirstTwoHundred(t *testing.T) {
+	srv := newTestServer(t)
+	for i := 1; i <= 200; i++ {
+		if _, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: fmt.Sprintf("Unlabeled issue %03d", i), Description: "desc"}); err != nil {
+			t.Fatalf("CreateIssue unlabeled %d: %v", i, err)
+		}
+	}
+	if _, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Late labeled issue", Description: "desc", Labels: []string{"late"}}); err != nil {
+		t.Fatalf("CreateIssue late labeled: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/issues?label=late&limit=1&sort=identifier", nil)
+	addCookies(req, sessionAuth(t, srv).cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	data := payload["data"].(map[string]any)
+	items := data["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items = %#v, want one late-labeled issue", items)
+	}
+	item := items[0].(map[string]any)
+	if item["title"] != "Late labeled issue" {
+		t.Fatalf("title = %#v, want Late labeled issue", item["title"])
 	}
 }
 

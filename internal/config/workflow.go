@@ -534,6 +534,9 @@ func hardValidate(c EffectiveConfig, errs *[]string) {
 	if c.Tools.ArtifactMaxBytes <= 0 {
 		*errs = append(*errs, "tools.artifact_max_bytes must be greater than 0")
 	}
+	if c.Hooks.MaxOutputBytes < 0 {
+		*errs = append(*errs, "hooks.max_output_bytes must be greater than or equal to 0")
+	}
 	if c.Git.BranchPrefix != "symphony" {
 		*errs = append(*errs, "git.branch_prefix must equal symphony")
 	}

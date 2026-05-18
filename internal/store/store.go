@@ -41,10 +41,14 @@ type CreateIssueInput struct {
 type ListIssueOptions struct {
 	States         []string
 	Query          string
+	Labels         []string
 	DispatchPaused *bool
 	Limit          int
+	Offset         int
 	Sort           string
 }
+
+const maxIssueListLimit = 201
 
 type ArtifactRecord struct {
 	ID             string  `json:"id"`
@@ -369,8 +373,12 @@ func (s *Store) ListIssues(opts ListIssueOptions) ([]*core.Issue, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	if limit > 200 {
-		limit = 200
+	if limit > maxIssueListLimit {
+		limit = maxIssueListLimit
+	}
+	offset := opts.Offset
+	if offset < 0 {
+		offset = 0
 	}
 	where := []string{"archived_at IS NULL"}
 	args := []any{}
@@ -399,6 +407,14 @@ func (s *Store) ListIssues(opts ListIssueOptions) ([]*core.Issue, error) {
 			args = append(args, 0)
 		}
 	}
+	for _, label := range opts.Labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		where = append(where, "EXISTS (SELECT 1 FROM issue_labels WHERE issue_labels.issue_id=issues.id AND issue_labels.label=?)")
+		args = append(args, label)
+	}
 	order := "priority ASC, updated_at DESC, identifier ASC"
 	switch opts.Sort {
 	case "updated":
@@ -406,8 +422,8 @@ func (s *Store) ListIssues(opts ListIssueOptions) ([]*core.Issue, error) {
 	case "identifier":
 		order = "sequence_no ASC"
 	}
-	args = append(args, limit)
-	rows, err := s.Project.Query(`SELECT * FROM issues WHERE `+strings.Join(where, " AND ")+` ORDER BY `+order+` LIMIT ?`, args...)
+	args = append(args, limit, offset)
+	rows, err := s.Project.Query(`SELECT * FROM issues WHERE `+strings.Join(where, " AND ")+` ORDER BY `+order+` LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return nil, err
 	}

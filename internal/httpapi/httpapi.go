@@ -221,7 +221,7 @@ func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, core.NewError(core.ErrInvalidRequest, "sort must be one of priority, updated, or identifier", nil))
 		return
 	}
-	opts := store.ListIssueOptions{Limit: 200, Sort: q.Get("sort"), Query: q.Get("q")}
+	opts := store.ListIssueOptions{Sort: q.Get("sort"), Query: q.Get("q")}
 	if states := repeatedCSV(q["state"]); len(states) > 0 {
 		for _, state := range states {
 			if !validIssueState(state) {
@@ -237,7 +237,7 @@ func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts.DispatchPaused = dispatchPaused
-	labels := repeatedCSV(q["label"])
+	opts.Labels = repeatedCSV(q["label"])
 	cursor := 0
 	if rawCursor := strings.TrimSpace(q.Get("cursor")); rawCursor != "" {
 		n, err := strconv.Atoi(rawCursor)
@@ -247,32 +247,19 @@ func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 		}
 		cursor = n
 	}
+	opts.Limit = limit + 1
+	opts.Offset = cursor
 	items, err := s.Store.ListIssues(opts)
 	if err != nil {
 		apiErr(w, err)
 		return
 	}
-	if len(labels) > 0 {
-		items = filterIssuesByLabels(items, labels)
-	}
-	if limit <= 0 {
-		limit = 50
-	}
-	if limit > 200 {
-		limit = 200
-	}
-	if cursor > len(items) {
-		cursor = len(items)
-	}
-	end := cursor + limit
-	if end > len(items) {
-		end = len(items)
-	}
 	var nextCursor any
-	if end < len(items) {
-		nextCursor = strconv.Itoa(end)
+	if len(items) > limit {
+		items = items[:limit]
+		nextCursor = strconv.Itoa(cursor + limit)
 	}
-	ok(w, map[string]any{"items": items[cursor:end], "page": map[string]any{"limit": limit, "next_cursor": nextCursor, "has_more": nextCursor != nil}})
+	ok(w, map[string]any{"items": items, "page": map[string]any{"limit": limit, "next_cursor": nextCursor, "has_more": nextCursor != nil}})
 }
 func (s *Server) createIssue(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -922,27 +909,6 @@ func parseAfterSeq(raw string) (int64, error) {
 	return after, nil
 }
 
-func filterIssuesByLabels(items []*core.Issue, labels []string) []*core.Issue {
-	out := []*core.Issue{}
-	for _, item := range items {
-		if issueHasLabels(item, labels) {
-			out = append(out, item)
-		}
-	}
-	return out
-}
-func issueHasLabels(item *core.Issue, labels []string) bool {
-	have := map[string]bool{}
-	for _, label := range item.Labels {
-		have[label] = true
-	}
-	for _, label := range labels {
-		if !have[label] {
-			return false
-		}
-	}
-	return true
-}
 func under(p, root string) bool {
 	ap, _ := filepath.Abs(p)
 	ar, _ := filepath.Abs(root)

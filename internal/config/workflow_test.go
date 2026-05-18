@@ -121,3 +121,28 @@ Do the work.
 		})
 	}
 }
+
+func TestLoadPathRejectsNegativeHookMaxOutputBytes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "WORKFLOW.md")
+	content := `---
+hooks:
+  max_output_bytes: -1
+---
+Do the work.
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	w, err := LoadPath(path, dir)
+	if err != nil {
+		t.Fatalf("LoadPath returned error: %v", err)
+	}
+	if w.Validation.Valid {
+		t.Fatalf("Validation.Valid = true, want false")
+	}
+	if !slices.Contains(w.Validation.Errors, "hooks.max_output_bytes must be greater than or equal to 0") {
+		t.Fatalf("Validation.Errors = %v, want hooks max_output_bytes non-negative error", w.Validation.Errors)
+	}
+}
