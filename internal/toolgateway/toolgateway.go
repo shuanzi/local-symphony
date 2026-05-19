@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -170,17 +171,16 @@ func (g Gateway) dispatch(issue *core.Issue, runID string, scope map[string]any,
 		if err != nil {
 			return Response{}, err
 		}
-		prio := 3
-		if x, ok := req.Input["priority"].(float64); ok {
-			prio = int(x)
-		}
-		ac := toStrings(req.Input["acceptance_criteria"])
-		labels := toStrings(req.Input["labels"])
-		ni, err := g.Store.CreateIssue(store.CreateIssueInput{Title: title, Description: desc, AcceptanceCriteria: ac, Priority: prio, Labels: labels, CreatedByType: "agent", CreatedByRunID: &runID})
+		prio, err := optionalPriority(req.Input, "priority")
 		if err != nil {
 			return Response{}, err
 		}
-		_ = g.Store.Project.Exec(`INSERT OR IGNORE INTO issue_relations(id,source_issue_id,target_issue_id,relation_type,active,created_by_type,created_by_run_id,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("rel_"), ni.ID, issue.ID, "followup_of", 1, "agent", runID, core.Now())
+		ac := toStrings(req.Input["acceptance_criteria"])
+		labels := toStrings(req.Input["labels"])
+		ni, err := g.Store.CreateFollowupIssue(issue.ID, runID, store.CreateIssueInput{Title: title, Description: desc, AcceptanceCriteria: ac, Priority: prio, Labels: labels, CreatedByType: "agent", CreatedByRunID: &runID})
+		if err != nil {
+			return Response{}, err
+		}
 		return Response{Success: true, Tool: req.Tool, Data: map[string]any{"issue": ni}}, nil
 	case "handoff.submit":
 		payload, err := canonicalHandoff(req.Input)
@@ -224,6 +224,40 @@ func optionalString(in map[string]any, key string) (string, error) {
 		return "", core.NewError(core.ErrInvalidRequest, key+" must be string", nil)
 	}
 	return strings.TrimSpace(s), nil
+}
+
+func optionalPriority(in map[string]any, key string) (int, error) {
+	v, ok := in[key]
+	if !ok {
+		return 3, nil
+	}
+	var n int64
+	switch x := v.(type) {
+	case int:
+		n = int64(x)
+	case int64:
+		n = x
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) || math.Trunc(x) != x {
+			return 0, core.NewError(core.ErrInvalidRequest, key+" must be an integer", nil)
+		}
+		if x < 1 || x > 5 {
+			return 0, core.NewError(core.ErrInvalidRequest, key+" must be between 1 and 5", nil)
+		}
+		n = int64(x)
+	case json.Number:
+		parsed, err := x.Int64()
+		if err != nil {
+			return 0, core.NewError(core.ErrInvalidRequest, key+" must be an integer", nil)
+		}
+		n = parsed
+	default:
+		return 0, core.NewError(core.ErrInvalidRequest, key+" must be number", nil)
+	}
+	if n < 1 || n > 5 {
+		return 0, core.NewError(core.ErrInvalidRequest, key+" must be between 1 and 5", nil)
+	}
+	return int(n), nil
 }
 
 func allowed(t string) bool {

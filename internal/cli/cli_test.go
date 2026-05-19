@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -79,6 +80,54 @@ func TestStatusReturnsErrorWhenQueriesFail(t *testing.T) {
 	}
 }
 
+func TestReviewReturnsErrorWhenArtifactMetadataQueryFails(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Review metadata failure",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	handoff, err := st.InsertHandoff(issue.ID, run.ID, "payload-hash", map[string]any{
+		"summary":      "ready for review",
+		"target_state": "Human Review",
+	})
+	if err != nil {
+		t.Fatalf("InsertHandoff: %v", err)
+	}
+	if _, err := st.InsertReviewPacket(issue.ID, run.ID, handoff.ID, st.RepoRoot, "review.md", "review.json", "patch.diff", "changed.txt", "untracked.txt", "diffstat.txt", ""); err != nil {
+		t.Fatalf("InsertReviewPacket: %v", err)
+	}
+	if err := st.Project.Exec("DROP TABLE artifacts"); err != nil {
+		t.Fatalf("drop artifacts: %v", err)
+	}
+	st.Close()
+
+	code, stdout, _ := captureCLIOutput(t, func() int {
+		return Main([]string{"review", issue.Identifier, "--project", dir})
+	})
+	if code != core.ExitCodeForError(core.ErrInternal) {
+		t.Fatalf("review exit code = %d, want %d; stdout = %s", code, core.ExitCodeForError(core.ErrInternal), stdout)
+	}
+	if stdout != "" {
+		t.Fatalf("review wrote stdout on metadata query failure: %s", stdout)
+	}
+}
+
 func TestIssueCreateRejectsInvalidPriority(t *testing.T) {
 	tests := []struct {
 		name string
@@ -119,6 +168,51 @@ func TestIssueCreateRejectsInvalidPriority(t *testing.T) {
 			}
 		})
 	}
+}
+
+func captureCLIOutput(t *testing.T, fn func() int) (int, string, string) {
+	t.Helper()
+
+	oldStdout := os.Stdout
+	oldStderr := os.Stderr
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	os.Stdout = stdoutW
+	os.Stderr = stderrW
+	defer func() {
+		os.Stdout = oldStdout
+		os.Stderr = oldStderr
+		_ = stdoutR.Close()
+		_ = stderrR.Close()
+		_ = stdoutW.Close()
+		_ = stderrW.Close()
+	}()
+
+	code := fn()
+
+	if err := stdoutW.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	if err := stderrW.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	stdout, err := io.ReadAll(stdoutR)
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	stderr, err := io.ReadAll(stderrR)
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	return code, string(stdout), string(stderr)
 }
 
 func TestIssueCreateDefaultsPriorityWhenFlagMissing(t *testing.T) {

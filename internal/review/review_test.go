@@ -28,6 +28,24 @@ func TestGenerateReturnsErrorAndDoesNotInsertPacketWhenReviewArtifactWriteFails(
 	assertReviewPacketCount(t, st, run.ID, 0)
 }
 
+func TestGenerateInsertsReviewPacketWithinOuterTransaction(t *testing.T) {
+	st := newReviewTestStore(t)
+	issue, run := prepareReviewRun(t, st)
+
+	packetID, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	assertReviewPacketCount(t, st, run.ID, 1)
+	got, err := st.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.LatestReviewPacketID == nil || *got.LatestReviewPacketID != packetID {
+		t.Fatalf("LatestReviewPacketID = %v, want %s", got.LatestReviewPacketID, packetID)
+	}
+}
+
 func newReviewTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())

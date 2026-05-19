@@ -155,7 +155,7 @@ func (g Generator) Generate(runID string) (string, error) {
 		return "", reviewPacketError("write review markdown artifact", err)
 	}
 	// Insert immutable packet with the final ID, then rewrite review.json with the final id.
-	finalID, err := g.Store.InsertReviewPacket(issue.ID, runID, handoff.ID, root, reviewMDPath, reviewJSONPath, patchPath, changedPath, untrackedPath, diffstatPath, promptID)
+	finalID, err := g.Store.InsertReviewPacketInTx(issue.ID, runID, handoff.ID, root, reviewMDPath, reviewJSONPath, patchPath, changedPath, untrackedPath, diffstatPath, promptID)
 	if err != nil {
 		return "", reviewPacketError("insert review packet", err)
 	}

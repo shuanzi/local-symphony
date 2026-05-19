@@ -188,6 +188,72 @@ func TestRequiredStringInputsRejectMissingOrBlank(t *testing.T) {
 	}
 }
 
+func TestFollowupCreateRejectsInvalidPriorityWithoutCreatingIssue(t *testing.T) {
+	tests := []struct {
+		name     string
+		priority any
+	}{
+		{name: "non-integer float", priority: float64(2.5)},
+		{name: "non-integer json number", priority: json.Number("2.5")},
+		{name: "non-number", priority: "high"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newGatewayTestStore(t)
+			_, run, workspace := prepareGatewayRun(t, st)
+			token, err := NewTokenForRun(st, run, workspace)
+			if err != nil {
+				t.Fatalf("NewTokenForRun: %v", err)
+			}
+
+			resp := (Gateway{Store: st}).Call(token, workspace, Request{
+				Tool: "followup.create",
+				Input: map[string]any{
+					"title":    "invalid followup",
+					"priority": tt.priority,
+				},
+			})
+
+			if resp.Success {
+				t.Fatal("followup.create success = true, want invalid priority failure")
+			}
+			if resp.Error == nil || resp.Error.Code != string(core.ErrInvalidRequest) {
+				t.Fatalf("followup.create error = %#v, want %s", resp.Error, core.ErrInvalidRequest)
+			}
+			assertIssueCount(t, st, 1)
+		})
+	}
+}
+
+func TestFollowupCreateRollsBackIssueWhenRelationInsertFails(t *testing.T) {
+	st := newGatewayTestStore(t)
+	_, run, workspace := prepareGatewayRun(t, st)
+	if err := st.Project.Exec(`CREATE TRIGGER fail_followup_relation BEFORE INSERT ON issue_relations WHEN NEW.relation_type='followup_of' BEGIN SELECT RAISE(ABORT, 'followup relation failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	token, err := NewTokenForRun(st, run, workspace)
+	if err != nil {
+		t.Fatalf("NewTokenForRun: %v", err)
+	}
+
+	resp := (Gateway{Store: st}).Call(token, workspace, Request{
+		Tool: "followup.create",
+		Input: map[string]any{
+			"title":    "relation failure followup",
+			"priority": float64(3),
+		},
+	})
+
+	if resp.Success {
+		t.Fatal("followup.create success = true, want relation failure")
+	}
+	if resp.Error == nil {
+		t.Fatal("followup.create error = nil, want error")
+	}
+	assertIssueCount(t, st, 1)
+	assertFollowupRelationCount(t, st, 0)
+}
+
 func TestArtifactAttachPreservesRelativeDirectoriesForSameBaseName(t *testing.T) {
 	st := newGatewayTestStore(t)
 	issue, run, workspace := prepareGatewayRun(t, st)
@@ -458,5 +524,27 @@ func assertArtifactCount(t *testing.T, st *store.Store, runID string, want int) 
 	}
 	if got := row["c"].Int(); got != want {
 		t.Fatalf("artifact count = %d, want %d", got, want)
+	}
+}
+
+func assertIssueCount(t *testing.T, st *store.Store, want int) {
+	t.Helper()
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM issues`)
+	if err != nil {
+		t.Fatalf("count issues: %v", err)
+	}
+	if got := row["c"].Int(); got != want {
+		t.Fatalf("issue count = %d, want %d", got, want)
+	}
+}
+
+func assertFollowupRelationCount(t *testing.T, st *store.Store, want int) {
+	t.Helper()
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM issue_relations WHERE relation_type='followup_of'`)
+	if err != nil {
+		t.Fatalf("count followup relations: %v", err)
+	}
+	if got := row["c"].Int(); got != want {
+		t.Fatalf("followup relation count = %d, want %d", got, want)
 	}
 }

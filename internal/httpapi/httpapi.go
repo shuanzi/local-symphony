@@ -377,7 +377,11 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 					apiErr(w, err)
 					return
 				}
-				iss, _ := s.Store.GetIssue(ref)
+				iss, err := s.Store.GetIssue(ref)
+				if err != nil {
+					apiErr(w, err)
+					return
+				}
 				ok(w, iss)
 				return
 			}
@@ -512,7 +516,11 @@ func (s *Server) runRoutes(w http.ResponseWriter, r *http.Request, rest string) 
 					apiErr(w, err)
 					return
 				}
-				run, _ := s.Store.GetRun(id)
+				run, err := s.Store.GetRun(id)
+				if err != nil {
+					apiErr(w, err)
+					return
+				}
 				ok(w, run)
 				return
 			}
@@ -628,7 +636,11 @@ func (s *Server) reviewRoutes(w http.ResponseWriter, r *http.Request, rest strin
 			apiErr(w, err)
 			return
 		}
-		arts, _ := s.Store.ArtifactsForReview(row["id"].String())
+		arts, err := s.Store.ArtifactsForReview(row["id"].String())
+		if err != nil {
+			apiErr(w, err)
+			return
+		}
 		files := []map[string]any{}
 		for _, a := range arts {
 			cu := any(nil)

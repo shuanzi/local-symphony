@@ -716,6 +716,130 @@ func TestRemoveDuplicatePropagatesRelationUpdateError(t *testing.T) {
 	}
 }
 
+func TestClaimRunPropagatesBlockerQueryError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, err := st.CreateIssue(CreateIssueInput{
+		Title:              "Dispatch blocker query failure",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue ready: %v", err)
+	}
+	if err := st.Project.Exec(`DROP TABLE issue_relations`); err != nil {
+		t.Fatalf("drop issue_relations: %v", err)
+	}
+
+	_, err = st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err == nil {
+		t.Fatal("ClaimRun succeeded, want blocker query error")
+	}
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM run_attempts WHERE issue_id=?`, issue.ID)
+	if err != nil {
+		t.Fatalf("count run attempts: %v", err)
+	}
+	if got := row["c"].Int(); got != 0 {
+		t.Fatalf("run attempts = %d, want 0", got)
+	}
+}
+
+func TestInsertReviewPacketRollsBackWhenIssuePointerUpdateFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Review packet pointer failure")
+	handoff, err := st.InsertHandoff(issue.ID, run.ID, "payload-hash", map[string]any{
+		"summary":      "ready for review",
+		"target_state": "Human Review",
+	})
+	if err != nil {
+		t.Fatalf("InsertHandoff: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_latest_review_packet_update BEFORE UPDATE OF latest_review_packet_id ON issues BEGIN SELECT RAISE(ABORT, 'latest review packet update failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err = st.InsertReviewPacket(issue.ID, run.ID, handoff.ID, st.RepoRoot, "review.md", "review.json", "patch.diff", "changed.txt", "untracked.txt", "diffstat.txt", "")
+	if err == nil {
+		t.Fatal("InsertReviewPacket succeeded, want issue pointer update error")
+	}
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM review_packets WHERE issue_id=?`, issue.ID)
+	if err != nil {
+		t.Fatalf("count review packets: %v", err)
+	}
+	if got := row["c"].Int(); got != 0 {
+		t.Fatalf("review packet count = %d, want 0", got)
+	}
+	got, err := st.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.LatestReviewPacketID != nil {
+		t.Fatalf("LatestReviewPacketID = %v, want nil", *got.LatestReviewPacketID)
+	}
+}
+
+func TestCreateFollowupIssueRollsBackWhenRelationInsertConflicts(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Followup relation conflict")
+	_, err := st.CreateFollowupIssue(issue.ID, run.ID, CreateIssueInput{
+		Title:              "Existing followup",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+		CreatedByType:      "agent",
+		CreatedByRunID:     &run.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateFollowupIssue existing: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE UNIQUE INDEX fail_second_followup_relation ON issue_relations(relation_type) WHERE relation_type='followup_of'`); err != nil {
+		t.Fatalf("create relation conflict index: %v", err)
+	}
+
+	_, err = st.CreateFollowupIssue(issue.ID, run.ID, CreateIssueInput{
+		Title:              "Conflicting followup",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+		CreatedByType:      "agent",
+		CreatedByRunID:     &run.ID,
+	})
+	if err == nil {
+		t.Fatal("CreateFollowupIssue succeeded, want relation insert conflict")
+	}
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM issues`)
+	if err != nil {
+		t.Fatalf("count issues: %v", err)
+	}
+	if got := row["c"].Int(); got != 2 {
+		t.Fatalf("issue count = %d, want 2", got)
+	}
+	row, err = st.Project.QueryOne(`SELECT value FROM counters WHERE name='issue_sequence'`)
+	if err != nil {
+		t.Fatalf("read issue sequence: %v", err)
+	}
+	if got := row["value"].Int(); got != 2 {
+		t.Fatalf("issue sequence = %d, want 2", got)
+	}
+	row, err = st.Project.QueryOne(`SELECT COUNT(*) AS c FROM run_events WHERE event_type='issue.created'`)
+	if err != nil {
+		t.Fatalf("count issue.created events: %v", err)
+	}
+	if got := row["c"].Int(); got != 2 {
+		t.Fatalf("issue.created events = %d, want 2", got)
+	}
+	row, err = st.Project.QueryOne(`SELECT COUNT(*) AS c FROM issue_relations WHERE relation_type='followup_of'`)
+	if err != nil {
+		t.Fatalf("count followup relations: %v", err)
+	}
+	if got := row["c"].Int(); got != 1 {
+		t.Fatalf("followup relations = %d, want 1", got)
+	}
+}
+
 func newStoreTestStore(t *testing.T) *Store {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())

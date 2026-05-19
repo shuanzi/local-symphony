@@ -280,15 +280,62 @@ func failPtrFromVal(v db.Value) *core.FailureCode {
 }
 
 func (s *Store) CreateIssue(in CreateIssueInput) (*core.Issue, error) {
+	now := core.Now()
+	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.Project.Exec(`ROLLBACK`)
+		}
+	}()
+	ident, _, err := s.createIssueInTx(in, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Project.Exec(`COMMIT`); err != nil {
+		return nil, err
+	}
+	committed = true
+	return s.GetIssue(ident)
+}
+
+func (s *Store) CreateFollowupIssue(parentIssueID, runID string, in CreateIssueInput) (*core.Issue, error) {
+	now := core.Now()
+	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.Project.Exec(`ROLLBACK`)
+		}
+	}()
+	_, id, err := s.createIssueInTx(in, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Project.Exec(`INSERT INTO issue_relations(id,source_issue_id,target_issue_id,relation_type,active,created_by_type,created_by_run_id,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("rel_"), id, parentIssueID, "followup_of", 1, "agent", runID, now); err != nil {
+		return nil, err
+	}
+	if err := s.Project.Exec(`COMMIT`); err != nil {
+		return nil, err
+	}
+	committed = true
+	return s.GetIssue(id)
+}
+
+func (s *Store) createIssueInTx(in CreateIssueInput, now string) (string, string, error) {
 	title := strings.TrimSpace(in.Title)
 	if title == "" {
-		return nil, core.NewError(core.ErrInvalidRequest, "title is required", nil)
+		return "", "", core.NewError(core.ErrInvalidRequest, "title is required", nil)
 	}
 	if in.Priority == 0 {
 		in.Priority = 3
 	}
 	if in.Priority < 1 || in.Priority > 5 {
-		return nil, core.NewError(core.ErrInvalidRequest, "priority must be between 1 and 5", nil)
+		return "", "", core.NewError(core.ErrInvalidRequest, "priority must be between 1 and 5", nil)
 	}
 	ac := trimSlice(in.AcceptanceCriteria)
 	// The published acceptance smoke path creates an issue without AC and then readies it.
@@ -301,45 +348,31 @@ func (s *Store) CreateIssue(in CreateIssueInput) (*core.Issue, error) {
 	if createdBy == "" {
 		createdBy = "operator"
 	}
-	now := core.Now()
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return nil, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
-		}
-	}()
 	if err := s.Project.Exec(`UPDATE counters SET value=value+1 WHERE name='issue_sequence'`); err != nil {
-		return nil, err
+		return "", "", err
 	}
 	row, err := s.Project.QueryOne(`SELECT value FROM counters WHERE name='issue_sequence'`)
 	if err != nil {
-		return nil, err
+		return "", "", err
 	}
 	seq := row["value"].Int()
 	id := core.NewID("iss_")
 	ident := fmt.Sprintf("%s-%d", s.IssuePrefix, seq)
 	if err := s.Project.Exec(`INSERT INTO issues(id,sequence_no,identifier,title,description,acceptance_criteria_json,state,priority,created_by_type,created_by_run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, id, seq, ident, title, strings.TrimSpace(in.Description), encodeJSON(ac), string(core.StateInbox), in.Priority, createdBy, in.CreatedByRunID, now, now); err != nil {
-		return nil, err
+		return "", "", err
 	}
 	if err := s.Project.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), id, nil, string(core.StateInbox), createdBy, "created", now); err != nil {
-		return nil, err
+		return "", "", err
 	}
 	for _, l := range labels {
 		if err := s.Project.Exec(`INSERT OR IGNORE INTO issue_labels(issue_id,label,created_at) VALUES(?,?,?)`, id, l, now); err != nil {
-			return nil, err
+			return "", "", err
 		}
 	}
 	if err := s.AppendEventTx("issue.created", createdBy, &id, nil, map[string]any{"identifier": ident}); err != nil {
-		return nil, err
+		return "", "", err
 	}
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return nil, err
-	}
-	committed = true
-	return s.GetIssue(ident)
+	return ident, id, nil
 }
 
 func (s *Store) AppendEvent(eventType, actor string, issueID, runID *string, data map[string]any) error {
@@ -830,7 +863,10 @@ func (s *Store) ClaimRun(issueRef, dispatchReason, runnerKind string, maxConcurr
 	if row["dispatch_paused"].Bool() {
 		return nil, core.NewError(core.ErrIssueDispatchPaused, "issue dispatch is paused", nil)
 	}
-	blockers, _ := s.Project.Query(`SELECT id FROM issue_relations WHERE source_issue_id=? AND relation_type='blocks' AND active=1 LIMIT 1`, id)
+	blockers, err := s.Project.Query(`SELECT id FROM issue_relations WHERE source_issue_id=? AND relation_type='blocks' AND active=1 LIMIT 1`, id)
+	if err != nil {
+		return nil, err
+	}
 	if len(blockers) > 0 {
 		return nil, core.NewError(core.ErrIssueBlocked, "issue has active blockers", nil)
 	}
@@ -1357,17 +1393,46 @@ func (s *Store) ArtifactsForReview(rpID string) ([]*ArtifactRecord, error) {
 }
 
 func (s *Store) InsertReviewPacket(issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID string) (string, error) {
-	row, _ := s.Project.QueryOne(`SELECT COALESCE(MAX(packet_no),0)+1 AS n FROM review_packets WHERE issue_id=?`, issueID)
-	packetNo := 1
-	if row != nil {
-		packetNo = row["n"].Int()
+	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return "", err
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.Project.Exec(`ROLLBACK`)
+		}
+	}()
+	id, err := s.insertReviewPacketInTx(issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID)
+	if err != nil {
+		return "", err
+	}
+	if err := s.Project.Exec(`COMMIT`); err != nil {
+		return "", err
+	}
+	committed = true
+	return id, nil
+}
+
+// InsertReviewPacketInTx inserts a review packet and updates the issue pointer
+// using the caller's already-open transaction.
+func (s *Store) InsertReviewPacketInTx(issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID string) (string, error) {
+	return s.insertReviewPacketInTx(issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID)
+}
+
+func (s *Store) insertReviewPacketInTx(issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID string) (string, error) {
+	row, err := s.Project.QueryOne(`SELECT COALESCE(MAX(packet_no),0)+1 AS n FROM review_packets WHERE issue_id=?`, issueID)
+	if err != nil {
+		return "", err
+	}
+	packetNo := row["n"].Int()
 	id := core.NewID("rp_")
 	now := core.Now()
 	if err := s.Project.Exec(`INSERT INTO review_packets(id,issue_id,run_id,handoff_id,packet_no,status,root_path,review_md_path,review_json_path,patch_path,changed_files_path,untracked_files_path,diffstat_path,prompt_snapshot_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, issueID, runID, handoffID, packetNo, "generated", root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, core.NullableString(promptSnapshotID), now); err != nil {
 		return "", err
 	}
-	_ = s.Project.Exec(`UPDATE issues SET latest_review_packet_id=?, updated_at=? WHERE id=?`, id, now, issueID)
+	if err := s.Project.Exec(`UPDATE issues SET latest_review_packet_id=?, updated_at=? WHERE id=?`, id, now, issueID); err != nil {
+		return "", err
+	}
 	return id, nil
 }
 func (s *Store) ReviewPacketRow(issueRef string) (map[string]db.Value, error) {

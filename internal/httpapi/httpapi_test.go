@@ -825,6 +825,38 @@ func TestIssueControlRoutesReturnIssueEnvelope(t *testing.T) {
 	}
 }
 
+func TestCreateCommentReturnsErrorWhenIssueReloadFails(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Comment reload", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if err := srv.Store.Project.Exec(`CREATE TRIGGER delete_issue_after_comment_insert AFTER INSERT ON issue_comments
+BEGIN
+  DELETE FROM issues WHERE id = NEW.issue_id;
+END;`); err != nil {
+		t.Fatalf("create issue comment trigger: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/issues/"+issue.Identifier+"/comments", strings.NewReader(`{"body":"needs followup"}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("comment status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrNotFound) {
+		t.Fatalf("error = %#v, want not_found", errData)
+	}
+	if _, ok := payload["data"]; ok {
+		t.Fatalf("comment returned success data on issue reload error: %#v", payload)
+	}
+}
+
 func TestPatchIssueRejectsInvalidPriority(t *testing.T) {
 	srv := newTestServer(t)
 	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Invalid priority", Description: "desc", Priority: 4})
@@ -1365,6 +1397,46 @@ func TestCancelRunCompletedRunReturnsConflict(t *testing.T) {
 	}
 }
 
+func TestCancelRunReturnsErrorWhenRunReloadFails(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Cancel reload", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.Identifier, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	if err := srv.Store.Project.Exec(`CREATE TRIGGER delete_issue_after_cancel_event AFTER INSERT ON run_events
+WHEN NEW.event_type = 'run.cancelled'
+BEGIN
+  DELETE FROM issues WHERE id = NEW.issue_id;
+END;`); err != nil {
+		t.Fatalf("create cancel event trigger: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", strings.NewReader(`{"reason":"reload failure"}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("cancel status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrNotFound) {
+		t.Fatalf("error = %#v, want not_found", errData)
+	}
+	if _, ok := payload["data"]; ok {
+		t.Fatalf("cancel returned success data on run reload error: %#v", payload)
+	}
+}
+
 func TestDiagnosticsExportReturnsErrorWhenArtifactInsertFails(t *testing.T) {
 	srv := newTestServer(t)
 	if err := srv.Store.Project.Exec(`CREATE TRIGGER fail_diagnostic_artifact_insert BEFORE INSERT ON artifacts
@@ -1629,6 +1701,55 @@ func TestWorkflowPreviewDoesNotReturnRenderedPromptBody(t *testing.T) {
 	preview, _ := data["rendered_prompt_preview"].(string)
 	if strings.Contains(preview, "Complete the issue") || strings.Contains(preview, "Do not push branches") {
 		t.Fatalf("preview leaked raw prompt body: %q", preview)
+	}
+}
+
+func TestReviewPacketReturnsErrorWhenArtifactsQueryFails(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Review artifact reload", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.Identifier, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	handoff, err := srv.Store.InsertHandoff(issue.ID, run.ID, "payload-hash", map[string]any{
+		"summary":      "ready for review",
+		"target_state": "Human Review",
+	})
+	if err != nil {
+		t.Fatalf("InsertHandoff: %v", err)
+	}
+	reviewPacketID, err := srv.Store.InsertReviewPacket(issue.ID, run.ID, handoff.ID, srv.Store.RepoRoot, "review.md", "review.json", "patch.diff", "changed.txt", "untracked.txt", "diffstat.txt", "")
+	if err != nil {
+		t.Fatalf("InsertReviewPacket: %v", err)
+	}
+	if err := srv.Store.CompleteRunWithReview(run.ID, reviewPacketID); err != nil {
+		t.Fatalf("CompleteRunWithReview: %v", err)
+	}
+	if err := srv.Store.Project.Exec(`DROP TABLE artifacts`); err != nil {
+		t.Fatalf("drop artifacts: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/reviews/"+issue.Identifier, nil)
+	addCookies(req, sessionAuth(t, srv).cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("review status = %d, want 500; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInternal) {
+		t.Fatalf("error = %#v, want internal_error", errData)
+	}
+	if _, ok := payload["data"]; ok {
+		t.Fatalf("review returned success data on artifact query error: %#v", payload)
 	}
 }
 

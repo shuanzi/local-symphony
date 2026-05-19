@@ -458,7 +458,10 @@ func reviewMetaFor(ref string) func(*store.Store) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		arts, _ := st.ArtifactsForReview(row["id"].String())
+		arts, err := st.ArtifactsForReview(row["id"].String())
+		if err != nil {
+			return nil, err
+		}
 		return map[string]any{"id": row["id"].String(), "run_id": row["run_id"].String(), "packet_no": row["packet_no"].Int(), "status": row["status"].String(), "root_path": row["root_path"].String(), "artifacts": arts}, nil
 	}
 }
