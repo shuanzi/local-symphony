@@ -118,7 +118,7 @@ func copyWorkspace(src, dst string) error {
 }
 
 func StatusPorcelain(dir string) ([]string, error) {
-	r := Run(dir, "status", "--porcelain=v1")
+	r := Run(dir, "status", "--porcelain=v1", "-uall")
 	if r.Err != nil {
 		return nil, r.Err
 	}
@@ -132,6 +132,17 @@ func StatusPorcelain(dir string) ([]string, error) {
 }
 func DiffBinary(dir string) string {
 	r := Run(dir, "diff", "--binary", "HEAD", "--")
+	if r.Err != nil {
+		return ""
+	}
+	return r.Stdout
+}
+func DiffBinaryPaths(dir string, paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	args := append([]string{"--literal-pathspecs", "diff", "--binary", "--find-renames", "HEAD", "--"}, paths...)
+	r := Run(dir, args...)
 	if r.Err != nil {
 		return ""
 	}
@@ -152,6 +163,17 @@ func DiffNameOnly(dir string) []string {
 }
 func DiffNumstat(dir string) string {
 	r := Run(dir, "diff", "--numstat", "HEAD", "--")
+	if r.Err != nil {
+		return ""
+	}
+	return r.Stdout
+}
+func DiffNumstatPaths(dir string, paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	args := append([]string{"--literal-pathspecs", "diff", "--numstat", "--find-renames", "HEAD", "--"}, paths...)
+	r := Run(dir, args...)
 	if r.Err != nil {
 		return ""
 	}

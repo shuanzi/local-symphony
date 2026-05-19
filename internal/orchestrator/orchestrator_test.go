@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,38 @@ import (
 	"local-symphony/internal/core"
 	"local-symphony/internal/store"
 )
+
+func TestRunWorkerFailsWhenWorkflowSnapshotInsertFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, run := newRunWorkerTestFixture(t)
+	if err := st.Project.Exec(`CREATE TRIGGER fail_workflow_snapshot_insert BEFORE INSERT ON workflow_snapshots BEGIN SELECT RAISE(ABORT, 'workflow snapshot insert failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	wf := newRunWorkerTestWorkflow(st)
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	assertRunFailedBeforeAgent(t, st, run.ID, "create workflow snapshot")
+}
+
+func TestRunWorkerFailsWhenWorkflowSnapshotAttachFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, run := newRunWorkerTestFixture(t)
+	if err := st.Project.Exec(`CREATE TRIGGER fail_workflow_snapshot_attach BEFORE UPDATE OF workflow_snapshot_id ON run_attempts WHEN NEW.workflow_snapshot_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'workflow snapshot attach failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	wf := newRunWorkerTestWorkflow(st)
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	assertRunFailedBeforeAgent(t, st, run.ID, "attach workflow snapshot")
+}
 
 func TestRunWorkerStoresWorkflowArtifactMaxBytesInToolTokenScope(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -338,6 +371,79 @@ func TestRunAfterHookTimeoutRecordsBoundedOutputBeforeReturning(t *testing.T) {
 	}
 	if got := data["output"]; got != "abc" {
 		t.Fatalf("hook output = %q, want bounded output", got)
+	}
+}
+
+func newRunWorkerTestFixture(t *testing.T) (*store.Store, *core.RunAttempt) {
+	t.Helper()
+	st, err := store.InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Workflow snapshot failure",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	if _, err := st.CreateOrUpdateWorkspace(issue.ID, workspace, "test", "auto", "main", "base-sha"); err != nil {
+		t.Fatalf("CreateOrUpdateWorkspace: %v", err)
+	}
+	return st, run
+}
+
+func newRunWorkerTestWorkflow(st *store.Store) *config.Workflow {
+	return &config.Workflow{
+		Path:       filepath.Join(st.RepoRoot, "WORKFLOW.md"),
+		Config:     config.Defaults(st.RepoRoot),
+		PromptBody: "Do the work.",
+		Validation: config.Validation{Valid: true},
+	}
+}
+
+func assertRunFailedBeforeAgent(t *testing.T, st *store.Store, runID, wantMessage string) {
+	t.Helper()
+	gotRun, err := st.GetRun(runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Status != core.RunFailed {
+		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunFailed)
+	}
+	if gotRun.FailureCode == nil || *gotRun.FailureCode != core.FailurePromptRenderFailed {
+		t.Fatalf("failure code = %v, want %s", gotRun.FailureCode, core.FailurePromptRenderFailed)
+	}
+	if gotRun.FailureMessage == nil || !strings.Contains(*gotRun.FailureMessage, wantMessage) {
+		t.Fatalf("failure message = %v, want containing %q", gotRun.FailureMessage, wantMessage)
+	}
+	tokenRows, err := st.Project.Query(`SELECT id FROM run_tool_tokens WHERE run_id=?`, runID)
+	if err != nil {
+		t.Fatalf("query run tool tokens: %v", err)
+	}
+	if len(tokenRows) != 0 {
+		t.Fatalf("run tool token count = %d, want 0", len(tokenRows))
+	}
+	handoffRows, err := st.Project.Query(`SELECT id FROM handoffs WHERE run_id=?`, runID)
+	if err != nil {
+		t.Fatalf("query handoffs: %v", err)
+	}
+	if len(handoffRows) != 0 {
+		t.Fatalf("handoff count = %d, want 0", len(handoffRows))
 	}
 }
 

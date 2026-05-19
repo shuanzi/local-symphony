@@ -905,6 +905,142 @@ func TestPatchIssueRejectsInvalidPriority(t *testing.T) {
 	}
 }
 
+func TestPatchIssueRejectsOutOfRangePriorityWithoutPartialUpdate(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Original title", Description: "desc", Priority: 4})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/issues/"+issue.Identifier, strings.NewReader(`{"title":"changed","priority":9}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("patch issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidRequest) {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	got, err := srv.Store.GetIssue(issue.Identifier)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.Title != "Original title" {
+		t.Fatalf("title = %q, want unchanged", got.Title)
+	}
+	if got.Priority != 4 {
+		t.Fatalf("priority = %d, want unchanged 4", got.Priority)
+	}
+}
+
+func TestPatchIssueRejectsNonStringArrayElementsWithoutChangingIssue(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "acceptance criteria", body: `{"acceptance_criteria":["keep",123]}`},
+		{name: "labels", body: `{"labels":["keep",false]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			auth := sessionAuth(t, srv)
+			issue, err := srv.Store.CreateIssue(store.CreateIssueInput{
+				Title:              "Invalid array patch",
+				Description:        "desc",
+				AcceptanceCriteria: []string{"existing ac"},
+				Priority:           3,
+				Labels:             []string{"existing-label"},
+			})
+			if err != nil {
+				t.Fatalf("CreateIssue: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPatch, "/api/v1/issues/"+issue.Identifier, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			applySessionAuth(req, auth)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("patch issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInvalidRequest) {
+				t.Fatalf("error = %#v, want invalid_request", errData)
+			}
+			got, err := srv.Store.GetIssue(issue.Identifier)
+			if err != nil {
+				t.Fatalf("GetIssue: %v", err)
+			}
+			if len(got.AcceptanceCriteria) != 1 || got.AcceptanceCriteria[0] != "existing ac" {
+				t.Fatalf("acceptance_criteria = %#v, want unchanged", got.AcceptanceCriteria)
+			}
+			if len(got.Labels) != 1 || got.Labels[0] != "existing-label" {
+				t.Fatalf("labels = %#v, want unchanged", got.Labels)
+			}
+		})
+	}
+}
+
+func TestPatchIssueRejectsInvalidArrayFieldsWithoutChangingIssue(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "blank label", body: `{"labels":[""]}`},
+		{name: "whitespace label", body: `{"labels":["   "]}`},
+		{name: "labels null", body: `{"labels":null}`},
+		{name: "labels string", body: `{"labels":"x"}`},
+		{name: "acceptance criteria object", body: `{"acceptance_criteria":{}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			auth := sessionAuth(t, srv)
+			issue, err := srv.Store.CreateIssue(store.CreateIssueInput{
+				Title:              "Invalid array field patch",
+				Description:        "desc",
+				AcceptanceCriteria: []string{"existing ac"},
+				Priority:           3,
+				Labels:             []string{"existing-label"},
+			})
+			if err != nil {
+				t.Fatalf("CreateIssue: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPatch, "/api/v1/issues/"+issue.Identifier, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			applySessionAuth(req, auth)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("patch issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInvalidRequest) {
+				t.Fatalf("error = %#v, want invalid_request", errData)
+			}
+			got, err := srv.Store.GetIssue(issue.Identifier)
+			if err != nil {
+				t.Fatalf("GetIssue: %v", err)
+			}
+			if len(got.AcceptanceCriteria) != 1 || got.AcceptanceCriteria[0] != "existing ac" {
+				t.Fatalf("acceptance_criteria = %#v, want unchanged", got.AcceptanceCriteria)
+			}
+			if len(got.Labels) != 1 || got.Labels[0] != "existing-label" {
+				t.Fatalf("labels = %#v, want unchanged", got.Labels)
+			}
+		})
+	}
+}
+
 func TestDashboardDoesNotServeProjectRootDistByDefault(t *testing.T) {
 	srv := newTestServer(t)
 	t.Setenv("SYMPHONY_DASHBOARD_DIST", "")

@@ -28,6 +28,10 @@ type DB struct {
 	path string
 }
 
+type Tx struct {
+	db *DB
+}
+
 type Value struct {
 	Text string
 	Null bool
@@ -62,6 +66,10 @@ func Open(path string) (*DB, error) {
 		return nil, errors.New(msg)
 	}
 	db := &DB{ptr: p, path: path}
+	if err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -120,6 +128,10 @@ func (d *DB) ExecScript(sql string) error {
 func (d *DB) Exec(sql string, args ...any) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.execLocked(sql, args...)
+}
+
+func (d *DB) execLocked(sql string, args ...any) error {
 	stmt, err := d.prepareLocked(sql, args...)
 	if err != nil {
 		return err
@@ -135,6 +147,10 @@ func (d *DB) Exec(sql string, args ...any) error {
 func (d *DB) Query(sql string, args ...any) ([]map[string]Value, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.queryLocked(sql, args...)
+}
+
+func (d *DB) queryLocked(sql string, args ...any) ([]map[string]Value, error) {
 	stmt, err := d.prepareLocked(sql, args...)
 	if err != nil {
 		return nil, err
@@ -164,6 +180,48 @@ func (d *DB) Query(sql string, args ...any) ([]map[string]Value, error) {
 		rows = append(rows, row)
 	}
 	return rows, nil
+}
+
+func (d *DB) WithTx(fn func(*Tx) error) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.execLocked(`BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = d.execLocked(`ROLLBACK`)
+		}
+	}()
+	tx := &Tx{db: d}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := d.execLocked(`COMMIT`); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func (tx *Tx) Exec(sql string, args ...any) error {
+	return tx.db.execLocked(sql, args...)
+}
+
+func (tx *Tx) Query(sql string, args ...any) ([]map[string]Value, error) {
+	return tx.db.queryLocked(sql, args...)
+}
+
+func (tx *Tx) QueryOne(sql string, args ...any) (map[string]Value, error) {
+	rows, err := tx.Query(sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, os.ErrNotExist
+	}
+	return rows[0], nil
 }
 
 func (d *DB) QueryOne(sql string, args ...any) (map[string]Value, error) {

@@ -281,6 +281,27 @@ func TestTransitionIssueStillCancelsActiveRun(t *testing.T) {
 	}
 }
 
+func TestTransitionIssueRejectsUnknownStateWithoutChangingIssue(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, err := st.CreateIssue(CreateIssueInput{
+		Title:       "Unknown transition state",
+		Description: "desc",
+		Priority:    3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	_, err = st.TransitionIssue(issue.ID, core.IssueState("Bogus"), "bad state", "")
+	if err == nil {
+		t.Fatal("TransitionIssue succeeded, want invalid_request")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrInvalidRequest {
+		t.Fatalf("TransitionIssue error code = %s, want %s", got, core.ErrInvalidRequest)
+	}
+	assertIssueState(t, st, issue.ID, core.StateInbox)
+}
+
 func TestTransitionIssueToReadyCancelsActiveRunAndRevokesToken(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, err := st.CreateIssue(CreateIssueInput{
@@ -620,6 +641,36 @@ func TestUpdateIssuePropagatesDescriptionWriteError(t *testing.T) {
 	}
 }
 
+func TestUpdateIssueRejectsInvalidPriorityWithoutPartialUpdate(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, err := st.CreateIssue(CreateIssueInput{
+		Title:       "Atomic update",
+		Description: "original desc",
+		Priority:    3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	_, err = st.UpdateIssue(issue.ID, map[string]any{"title": "changed title", "priority": 9})
+	if err == nil {
+		t.Fatal("UpdateIssue succeeded, want invalid priority")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrInvalidRequest {
+		t.Fatalf("UpdateIssue error = %s, want %s", got, core.ErrInvalidRequest)
+	}
+	got, err := st.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.Title != "Atomic update" {
+		t.Fatalf("title = %q, want unchanged", got.Title)
+	}
+	if got.Priority != 3 {
+		t.Fatalf("priority = %d, want unchanged 3", got.Priority)
+	}
+}
+
 func TestUpdateIssuePropagatesLabelWriteError(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, err := st.CreateIssue(CreateIssueInput{
@@ -713,6 +764,104 @@ func TestRemoveDuplicatePropagatesRelationUpdateError(t *testing.T) {
 	}
 	if len(rows) != 1 {
 		t.Fatalf("active duplicate relations = %d, want 1", len(rows))
+	}
+}
+
+func TestDispatchPauseResumeRejectTerminalIssueWithoutChangingDispatchFields(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, st *Store) *core.Issue
+	}{
+		{
+			name: "done",
+			setup: func(t *testing.T, st *Store) *core.Issue {
+				t.Helper()
+				issue, _ := prepareCompletedReviewRun(t, st)
+				done, err := st.MarkDone(issue.ID, "done")
+				if err != nil {
+					t.Fatalf("MarkDone: %v", err)
+				}
+				return done
+			},
+		},
+		{
+			name: "cancelled",
+			setup: func(t *testing.T, st *Store) *core.Issue {
+				t.Helper()
+				issue, err := st.CreateIssue(CreateIssueInput{
+					Title:       "Cancelled issue",
+					Description: "desc",
+					Priority:    3,
+				})
+				if err != nil {
+					t.Fatalf("CreateIssue: %v", err)
+				}
+				cancelled, err := st.TransitionIssue(issue.ID, core.StateCancelled, "cancelled", "")
+				if err != nil {
+					t.Fatalf("TransitionIssue cancelled: %v", err)
+				}
+				return cancelled
+			},
+		},
+		{
+			name: "duplicate",
+			setup: func(t *testing.T, st *Store) *core.Issue {
+				t.Helper()
+				duplicate, err := st.CreateIssue(CreateIssueInput{
+					Title:       "Duplicate issue",
+					Description: "desc",
+					Priority:    3,
+				})
+				if err != nil {
+					t.Fatalf("CreateIssue duplicate: %v", err)
+				}
+				canonical, err := st.CreateIssue(CreateIssueInput{
+					Title:       "Canonical issue",
+					Description: "desc",
+					Priority:    3,
+				})
+				if err != nil {
+					t.Fatalf("CreateIssue canonical: %v", err)
+				}
+				issue, err := st.TransitionIssue(duplicate.ID, core.StateDuplicate, "duplicate", canonical.ID)
+				if err != nil {
+					t.Fatalf("TransitionIssue duplicate: %v", err)
+				}
+				return issue
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		for _, action := range []string{"pause", "resume"} {
+			t.Run(tt.name+"_"+action, func(t *testing.T) {
+				st := newStoreTestStore(t)
+				issue := tt.setup(t, st)
+
+				var err error
+				if action == "pause" {
+					_, err = st.DispatchPause(issue.ID, "pause")
+				} else {
+					_, err = st.DispatchResume(issue.ID, "resume")
+				}
+				if err == nil {
+					t.Fatalf("Dispatch%s succeeded, want invalid_state_transition", action)
+				}
+				if got := core.AsAPIError(err).Code; got != core.ErrInvalidStateTransition {
+					t.Fatalf("Dispatch%s error code = %s, want %s", action, got, core.ErrInvalidStateTransition)
+				}
+				got, err := st.GetIssue(issue.ID)
+				if err != nil {
+					t.Fatalf("GetIssue: %v", err)
+				}
+				if got.DispatchPaused != issue.DispatchPaused {
+					t.Fatalf("dispatch_paused = %v, want unchanged %v", got.DispatchPaused, issue.DispatchPaused)
+				}
+				if got.DispatchPauseReason != nil {
+					t.Fatalf("dispatch_pause_reason = %q, want nil", *got.DispatchPauseReason)
+				}
+			})
+		}
 	}
 }
 

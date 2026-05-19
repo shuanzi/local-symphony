@@ -120,12 +120,16 @@ func (g Gateway) dispatch(issue *core.Issue, runID string, scope map[string]any,
 		if err != nil || !st.Mode().IsRegular() {
 			return Response{}, core.NewError(core.ErrInvalidRequest, "artifact path must exist and be a regular file", nil)
 		}
+		sizeBytes := st.Size()
+		max := artifactMaxBytesFromScope(scope)
+		if sizeBytes > max {
+			return Response{}, core.NewError(core.ErrInvalidRequest, "artifact exceeds max size", nil)
+		}
 		b, err := os.ReadFile(target)
 		if err != nil {
 			return Response{}, core.NewError(core.ErrToolGatewayFailed, "read artifact: "+err.Error(), nil)
 		}
-		sizeBytes := int64(len(b))
-		max := artifactMaxBytesFromScope(scope)
+		sizeBytes = int64(len(b))
 		if sizeBytes > max {
 			return Response{}, core.NewError(core.ErrInvalidRequest, "artifact exceeds max size", nil)
 		}

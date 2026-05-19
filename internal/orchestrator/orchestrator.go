@@ -85,8 +85,15 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	if !o.advanceRun(runID, core.RunRenderingPrompt, map[string]any{}) {
 		return nil
 	}
-	wfID, _ := o.Store.CreateWorkflowSnapshot("valid", wf.Path, wf.ConfigJSON, wf.PromptHash, "[]")
-	_ = o.Store.AttachWorkflowSnapshot(runID, wfID)
+	wfID, err := o.Store.CreateWorkflowSnapshot("valid", wf.Path, wf.ConfigJSON, wf.PromptHash, "[]")
+	if err != nil {
+		_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("create workflow snapshot: %v", err), core.RunFailed)
+		return nil
+	}
+	if err := o.Store.AttachWorkflowSnapshot(runID, wfID); err != nil {
+		_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("attach workflow snapshot: %v", err), core.RunFailed)
+		return nil
+	}
 	prompt, err := config.RenderPrompt(wf, map[string]any{"issue": map[string]any{"identifier": issue.Identifier, "title": issue.Title, "description": issue.Description}, "run": map[string]any{"id": runID}, "workspace": map[string]any{"path": ws.Path}})
 	if err != nil {
 		_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, err.Error(), core.RunFailed)

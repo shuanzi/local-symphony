@@ -50,6 +50,20 @@ type ListIssueOptions struct {
 
 const maxIssueListLimit = 201
 
+type TxRunner interface {
+	Exec(sql string, args ...any) error
+	Query(sql string, args ...any) ([]map[string]db.Value, error)
+	QueryOne(sql string, args ...any) (map[string]db.Value, error)
+}
+
+type sqlRunner = TxRunner
+
+func (s *Store) WithProjectTx(fn func(TxRunner) error) error {
+	return s.Project.WithTx(func(tx *db.Tx) error {
+		return fn(tx)
+	})
+}
+
 type ArtifactRecord struct {
 	ID             string  `json:"id"`
 	IssueID        *string `json:"issue_id"`
@@ -281,52 +295,34 @@ func failPtrFromVal(v db.Value) *core.FailureCode {
 
 func (s *Store) CreateIssue(in CreateIssueInput) (*core.Issue, error) {
 	now := core.Now()
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
+	var ident string
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		var err error
+		ident, _, err = s.createIssueInTx(tx, in, now)
+		return err
+	}); err != nil {
 		return nil, err
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
-		}
-	}()
-	ident, _, err := s.createIssueInTx(in, now)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return nil, err
-	}
-	committed = true
 	return s.GetIssue(ident)
 }
 
 func (s *Store) CreateFollowupIssue(parentIssueID, runID string, in CreateIssueInput) (*core.Issue, error) {
 	now := core.Now()
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return nil, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
+	var id string
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		var err error
+		_, id, err = s.createIssueInTx(tx, in, now)
+		if err != nil {
+			return err
 		}
-	}()
-	_, id, err := s.createIssueInTx(in, now)
-	if err != nil {
+		return tx.Exec(`INSERT INTO issue_relations(id,source_issue_id,target_issue_id,relation_type,active,created_by_type,created_by_run_id,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("rel_"), id, parentIssueID, "followup_of", 1, "agent", runID, now)
+	}); err != nil {
 		return nil, err
 	}
-	if err := s.Project.Exec(`INSERT INTO issue_relations(id,source_issue_id,target_issue_id,relation_type,active,created_by_type,created_by_run_id,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("rel_"), id, parentIssueID, "followup_of", 1, "agent", runID, now); err != nil {
-		return nil, err
-	}
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return nil, err
-	}
-	committed = true
 	return s.GetIssue(id)
 }
 
-func (s *Store) createIssueInTx(in CreateIssueInput, now string) (string, string, error) {
+func (s *Store) createIssueInTx(q sqlRunner, in CreateIssueInput, now string) (string, string, error) {
 	title := strings.TrimSpace(in.Title)
 	if title == "" {
 		return "", "", core.NewError(core.ErrInvalidRequest, "title is required", nil)
@@ -348,45 +344,53 @@ func (s *Store) createIssueInTx(in CreateIssueInput, now string) (string, string
 	if createdBy == "" {
 		createdBy = "operator"
 	}
-	if err := s.Project.Exec(`UPDATE counters SET value=value+1 WHERE name='issue_sequence'`); err != nil {
+	if err := q.Exec(`UPDATE counters SET value=value+1 WHERE name='issue_sequence'`); err != nil {
 		return "", "", err
 	}
-	row, err := s.Project.QueryOne(`SELECT value FROM counters WHERE name='issue_sequence'`)
+	row, err := q.QueryOne(`SELECT value FROM counters WHERE name='issue_sequence'`)
 	if err != nil {
 		return "", "", err
 	}
 	seq := row["value"].Int()
 	id := core.NewID("iss_")
 	ident := fmt.Sprintf("%s-%d", s.IssuePrefix, seq)
-	if err := s.Project.Exec(`INSERT INTO issues(id,sequence_no,identifier,title,description,acceptance_criteria_json,state,priority,created_by_type,created_by_run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, id, seq, ident, title, strings.TrimSpace(in.Description), encodeJSON(ac), string(core.StateInbox), in.Priority, createdBy, in.CreatedByRunID, now, now); err != nil {
+	if err := q.Exec(`INSERT INTO issues(id,sequence_no,identifier,title,description,acceptance_criteria_json,state,priority,created_by_type,created_by_run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, id, seq, ident, title, strings.TrimSpace(in.Description), encodeJSON(ac), string(core.StateInbox), in.Priority, createdBy, in.CreatedByRunID, now, now); err != nil {
 		return "", "", err
 	}
-	if err := s.Project.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), id, nil, string(core.StateInbox), createdBy, "created", now); err != nil {
+	if err := q.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), id, nil, string(core.StateInbox), createdBy, "created", now); err != nil {
 		return "", "", err
 	}
 	for _, l := range labels {
-		if err := s.Project.Exec(`INSERT OR IGNORE INTO issue_labels(issue_id,label,created_at) VALUES(?,?,?)`, id, l, now); err != nil {
+		if err := q.Exec(`INSERT OR IGNORE INTO issue_labels(issue_id,label,created_at) VALUES(?,?,?)`, id, l, now); err != nil {
 			return "", "", err
 		}
 	}
-	if err := s.AppendEventTx("issue.created", createdBy, &id, nil, map[string]any{"identifier": ident}); err != nil {
+	if err := s.appendEventInTx(q, "issue.created", createdBy, &id, nil, map[string]any{"identifier": ident}); err != nil {
 		return "", "", err
 	}
 	return ident, id, nil
 }
 
 func (s *Store) AppendEvent(eventType, actor string, issueID, runID *string, data map[string]any) error {
-	return s.Project.Exec(`INSERT INTO run_events(id,project_id,issue_id,run_id,event_type,actor_type,data_json,redacted,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, core.NewID("evt_"), s.ProjectID, issueID, runID, eventType, actor, encodeJSON(data), 1, core.Now())
+	return s.appendEventInTx(s.Project, eventType, actor, issueID, runID, data)
 }
 func (s *Store) AppendEventTx(eventType, actor string, issueID, runID *string, data map[string]any) error {
 	return s.AppendEvent(eventType, actor, issueID, runID, data)
 }
 
+func (s *Store) appendEventInTx(q sqlRunner, eventType, actor string, issueID, runID *string, data map[string]any) error {
+	return q.Exec(`INSERT INTO run_events(id,project_id,issue_id,run_id,event_type,actor_type,data_json,redacted,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, core.NewID("evt_"), s.ProjectID, issueID, runID, eventType, actor, encodeJSON(data), 1, core.Now())
+}
+
 func (s *Store) issueRowByRef(ref string) (map[string]db.Value, error) {
+	return s.issueRowByRefTx(s.Project, ref)
+}
+
+func (s *Store) issueRowByRefTx(q sqlRunner, ref string) (map[string]db.Value, error) {
 	if strings.TrimSpace(ref) == "" {
 		return nil, core.NewError(core.ErrInvalidRequest, "issue ref is required", nil)
 	}
-	row, err := s.Project.QueryOne(`SELECT * FROM issues WHERE id=? OR identifier=?`, ref, strings.ToUpper(ref))
+	row, err := q.QueryOne(`SELECT * FROM issues WHERE id=? OR identifier=?`, ref, strings.ToUpper(ref))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, core.NewError(core.ErrNotFound, "issue not found", map[string]any{"issue_ref": ref})
 	}
@@ -553,7 +557,11 @@ func (s *Store) latestRunSummary(issueID string) (*core.RunSummary, *string) {
 	return sum, &id
 }
 func (s *Store) activeRunID(issueID string) *string {
-	rows, _ := s.Project.Query(`SELECT id FROM run_attempts WHERE issue_id=? AND status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running') ORDER BY created_at DESC LIMIT 1`, issueID)
+	return s.activeRunIDTx(s.Project, issueID)
+}
+
+func (s *Store) activeRunIDTx(q sqlRunner, issueID string) *string {
+	rows, _ := q.Query(`SELECT id FROM run_attempts WHERE issue_id=? AND status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running') ORDER BY created_at DESC LIMIT 1`, issueID)
 	if len(rows) == 0 {
 		return nil
 	}
@@ -579,42 +587,55 @@ func (s *Store) UpdateIssue(ref string, fields map[string]any) (*core.Issue, err
 	}
 	id := row["id"].String()
 	now := core.Now()
-	if title, ok := fields["title"].(string); ok {
+	title, hasTitle := fields["title"].(string)
+	if hasTitle {
 		title = strings.TrimSpace(title)
 		if title == "" {
 			return nil, core.NewError(core.ErrInvalidRequest, "title is required", nil)
 		}
-		if err := s.Project.Exec(`UPDATE issues SET title=?, updated_at=? WHERE id=?`, title, now, id); err != nil {
-			return nil, err
-		}
 	}
-	if desc, ok := fields["description"].(string); ok {
-		if err := s.Project.Exec(`UPDATE issues SET description=?, updated_at=? WHERE id=?`, strings.TrimSpace(desc), now, id); err != nil {
-			return nil, err
-		}
+	desc, hasDesc := fields["description"].(string)
+	ac, hasAC := fields["acceptance_criteria"].([]string)
+	p, hasPriority := fields["priority"].(int)
+	if hasPriority && (p < 1 || p > 5) {
+		return nil, core.NewError(core.ErrInvalidRequest, "priority must be between 1 and 5", nil)
 	}
-	if ac, ok := fields["acceptance_criteria"].([]string); ok {
-		if err := s.Project.Exec(`UPDATE issues SET acceptance_criteria_json=?, updated_at=? WHERE id=?`, encodeJSON(trimSlice(ac)), now, id); err != nil {
-			return nil, err
-		}
-	}
-	if p, ok := fields["priority"].(int); ok {
-		if p < 1 || p > 5 {
-			return nil, core.NewError(core.ErrInvalidRequest, "priority must be between 1 and 5", nil)
-		}
-		if err := s.Project.Exec(`UPDATE issues SET priority=?, updated_at=? WHERE id=?`, p, now, id); err != nil {
-			return nil, err
-		}
-	}
-	if labels, ok := fields["labels"].([]string); ok {
-		if err := s.Project.Exec(`DELETE FROM issue_labels WHERE issue_id=?`, id); err != nil {
-			return nil, err
-		}
-		for _, l := range normalizeLabels(labels) {
-			if err := s.Project.Exec(`INSERT OR IGNORE INTO issue_labels(issue_id,label,created_at) VALUES(?,?,?)`, id, l, now); err != nil {
-				return nil, err
+	labels, hasLabels := fields["labels"].([]string)
+
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		if hasTitle {
+			if err := tx.Exec(`UPDATE issues SET title=?, updated_at=? WHERE id=?`, title, now, id); err != nil {
+				return err
 			}
 		}
+		if hasDesc {
+			if err := tx.Exec(`UPDATE issues SET description=?, updated_at=? WHERE id=?`, strings.TrimSpace(desc), now, id); err != nil {
+				return err
+			}
+		}
+		if hasAC {
+			if err := tx.Exec(`UPDATE issues SET acceptance_criteria_json=?, updated_at=? WHERE id=?`, encodeJSON(trimSlice(ac)), now, id); err != nil {
+				return err
+			}
+		}
+		if hasPriority {
+			if err := tx.Exec(`UPDATE issues SET priority=?, updated_at=? WHERE id=?`, p, now, id); err != nil {
+				return err
+			}
+		}
+		if hasLabels {
+			if err := tx.Exec(`DELETE FROM issue_labels WHERE issue_id=?`, id); err != nil {
+				return err
+			}
+			for _, l := range normalizeLabels(labels) {
+				if err := tx.Exec(`INSERT OR IGNORE INTO issue_labels(issue_id,label,created_at) VALUES(?,?,?)`, id, l, now); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return s.GetIssue(id)
 }
@@ -634,6 +655,15 @@ func validRequired(row map[string]db.Value) bool {
 	return false
 }
 
+func validIssueState(state core.IssueState) bool {
+	switch state {
+	case core.StateInbox, core.StateReady, core.StateWorking, core.StateRework, core.StateBlocked, core.StateHumanReview, core.StateDone, core.StateCancelled, core.StateDuplicate:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, duplicateOf string) (*core.Issue, error) {
 	reason = strings.TrimSpace(reason)
 	row, err := s.issueRowByRef(ref)
@@ -644,6 +674,9 @@ func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, dupl
 	from := core.IssueState(row["state"].String())
 	if target == "" {
 		return nil, core.NewError(core.ErrInvalidRequest, "state is required", nil)
+	}
+	if !validIssueState(target) {
+		return nil, core.NewError(core.ErrInvalidRequest, "invalid issue state", nil)
 	}
 	if target == core.StateHumanReview || target == core.StateRework || target == core.StateDone || target == core.StateWorking {
 		return nil, core.NewError(core.ErrInvalidStateTransition, "use dispatch or review API for this transition", nil)
@@ -664,58 +697,47 @@ func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, dupl
 		return nil, core.NewError(core.ErrInvalidStateTransition, "terminal issues can reopen only to Inbox or Ready", nil)
 	}
 	now := core.Now()
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return nil, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
-		}
-	}()
-	active := s.activeRunID(id)
-	if active != nil {
-		if err := s.cancelRunInTx(*active, core.FailureIssueStateChanged, "issue state changed", true); err != nil {
-			return nil, err
-		}
-	}
-	if target == core.StateDuplicate && duplicateOf != "" {
-		can, err := s.issueRowByRef(duplicateOf)
-		if err != nil {
-			return nil, err
-		}
-		if can["id"].String() == id {
-			return nil, core.NewError(core.ErrInvalidRequest, "duplicate_of cannot point to current issue", nil)
-		}
-		existing, _ := s.Project.Query(`SELECT * FROM issue_relations WHERE source_issue_id=? AND relation_type='duplicates' AND active=1`, id)
-		if len(existing) > 0 && existing[0]["target_issue_id"].String() != can["id"].String() {
-			return nil, core.NewError(core.ErrInvalidStateTransition, "duplicate relation already points elsewhere", nil)
-		}
-		if len(existing) == 0 {
-			if err := s.Project.Exec(`INSERT OR IGNORE INTO issue_relations(id,source_issue_id,target_issue_id,relation_type,active,created_by_type,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("rel_"), id, can["id"].String(), "duplicates", 1, "operator", now); err != nil {
-				return nil, err
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		active := s.activeRunIDTx(tx, id)
+		if active != nil {
+			if err := s.cancelRunInTx(tx, *active, core.FailureIssueStateChanged, "issue state changed", true); err != nil {
+				return err
 			}
 		}
-	}
-	if core.IsTerminalIssueState(from) && (target == core.StateInbox || target == core.StateReady) {
-		_ = s.Project.Exec(`UPDATE issues SET completed_at=NULL, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL WHERE id=?`, id)
-	}
-	if err := s.Project.Exec(`UPDATE issues SET state=?, updated_at=? WHERE id=?`, string(target), now, id); err != nil {
+		if target == core.StateDuplicate && duplicateOf != "" {
+			can, err := s.issueRowByRefTx(tx, duplicateOf)
+			if err != nil {
+				return err
+			}
+			if can["id"].String() == id {
+				return core.NewError(core.ErrInvalidRequest, "duplicate_of cannot point to current issue", nil)
+			}
+			existing, _ := tx.Query(`SELECT * FROM issue_relations WHERE source_issue_id=? AND relation_type='duplicates' AND active=1`, id)
+			if len(existing) > 0 && existing[0]["target_issue_id"].String() != can["id"].String() {
+				return core.NewError(core.ErrInvalidStateTransition, "duplicate relation already points elsewhere", nil)
+			}
+			if len(existing) == 0 {
+				if err := tx.Exec(`INSERT OR IGNORE INTO issue_relations(id,source_issue_id,target_issue_id,relation_type,active,created_by_type,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("rel_"), id, can["id"].String(), "duplicates", 1, "operator", now); err != nil {
+					return err
+				}
+			}
+		}
+		if core.IsTerminalIssueState(from) && (target == core.StateInbox || target == core.StateReady) {
+			_ = tx.Exec(`UPDATE issues SET completed_at=NULL, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL WHERE id=?`, id)
+		}
+		if err := tx.Exec(`UPDATE issues SET state=?, updated_at=? WHERE id=?`, string(target), now, id); err != nil {
+			return err
+		}
+		if err := tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), id, string(from), string(target), "operator", reason, now); err != nil {
+			return err
+		}
+		if reason != "" {
+			_ = tx.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), id, "operator", reason, now)
+		}
+		return s.appendEventInTx(tx, "issue.transitioned", "operator", &id, nil, map[string]any{"from_state": from, "to_state": target})
+	}); err != nil {
 		return nil, err
 	}
-	if err := s.Project.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), id, string(from), string(target), "operator", reason, now); err != nil {
-		return nil, err
-	}
-	if reason != "" {
-		_ = s.Project.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), id, "operator", reason, now)
-	}
-	if err := s.AppendEventTx("issue.transitioned", "operator", &id, nil, map[string]any{"from_state": from, "to_state": target}); err != nil {
-		return nil, err
-	}
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return nil, err
-	}
-	committed = true
 	return s.GetIssue(id)
 }
 
@@ -798,6 +820,9 @@ func (s *Store) DispatchPause(ref, reason string) (*core.Issue, error) {
 		return nil, err
 	}
 	id := row["id"].String()
+	if core.IsTerminalIssueState(core.IssueState(row["state"].String())) {
+		return nil, core.NewError(core.ErrInvalidStateTransition, "terminal issue dispatch state cannot be changed", nil)
+	}
 	if s.activeRunID(id) != nil {
 		return nil, core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
 	}
@@ -818,6 +843,9 @@ func (s *Store) DispatchResume(ref, reason string) (*core.Issue, error) {
 		return nil, err
 	}
 	id := row["id"].String()
+	if core.IsTerminalIssueState(core.IssueState(row["state"].String())) {
+		return nil, core.NewError(core.ErrInvalidStateTransition, "terminal issue dispatch state cannot be changed", nil)
+	}
 	if s.activeRunID(id) != nil {
 		return nil, core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
 	}
@@ -839,66 +867,63 @@ func (s *Store) ClaimRun(issueRef, dispatchReason, runnerKind string, maxConcurr
 	if maxConcurrent <= 0 {
 		maxConcurrent = 3
 	}
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return nil, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
+	var runID string
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		row, err := s.issueRowByRefTx(tx, issueRef)
+		if err != nil {
+			return err
 		}
-	}()
-	row, err := s.issueRowByRef(issueRef)
-	if err != nil {
+		id := row["id"].String()
+		st := core.IssueState(row["state"].String())
+		if !core.IsDispatchState(st) {
+			return core.NewError(core.ErrInvalidStateTransition, "issue is not Ready/Rework", nil)
+		}
+		if !validRequired(row) {
+			return core.NewError(core.ErrInvalidRequest, "issue required fields are incomplete", nil)
+		}
+		if row["dispatch_paused"].Bool() {
+			return core.NewError(core.ErrIssueDispatchPaused, "issue dispatch is paused", nil)
+		}
+		blockers, err := tx.Query(`SELECT id FROM issue_relations WHERE source_issue_id=? AND relation_type='blocks' AND active=1 LIMIT 1`, id)
+		if err != nil {
+			return err
+		}
+		if len(blockers) > 0 {
+			return core.NewError(core.ErrIssueBlocked, "issue has active blockers", nil)
+		}
+		if s.activeRunIDTx(tx, id) != nil {
+			return core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
+		}
+		activeRows, _ := tx.Query(`SELECT count(*) AS c FROM run_attempts WHERE status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running')`)
+		if len(activeRows) > 0 && activeRows[0]["c"].Int() >= maxConcurrent {
+			return core.NewError(core.ErrConcurrencyLimitReached, "concurrency limit reached", nil)
+		}
+		ar, _ := tx.QueryOne(`SELECT COALESCE(MAX(attempt_no),0)+1 AS n FROM run_attempts WHERE issue_id=?`, id)
+		attempt := ar["n"].Int()
+		now := core.Now()
+		runID = core.NewID("run_")
+		if err := tx.Exec(`INSERT INTO run_attempts(id,issue_id,attempt_no,status,dispatch_reason,source_issue_state,runner_kind,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, runID, id, attempt, string(core.RunPending), dispatchReason, string(st), runnerKind, now, now); err != nil {
+			return err
+		}
+		if err := tx.Exec(`UPDATE issues SET state=?, latest_run_id=?, updated_at=? WHERE id=?`, string(core.StateWorking), runID, now, id); err != nil {
+			return err
+		}
+		_ = tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), id, string(st), string(core.StateWorking), "orchestrator", runID, "dispatch", now)
+		_ = s.appendEventInTx(tx, "run.claimed", "orchestrator", &id, &runID, map[string]any{"source_issue_state": st})
+		_ = s.appendEventInTx(tx, "issue.state_changed", "orchestrator", &id, &runID, map[string]any{"from_state": st, "to_state": core.StateWorking})
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	id := row["id"].String()
-	st := core.IssueState(row["state"].String())
-	if !core.IsDispatchState(st) {
-		return nil, core.NewError(core.ErrInvalidStateTransition, "issue is not Ready/Rework", nil)
-	}
-	if !validRequired(row) {
-		return nil, core.NewError(core.ErrInvalidRequest, "issue required fields are incomplete", nil)
-	}
-	if row["dispatch_paused"].Bool() {
-		return nil, core.NewError(core.ErrIssueDispatchPaused, "issue dispatch is paused", nil)
-	}
-	blockers, err := s.Project.Query(`SELECT id FROM issue_relations WHERE source_issue_id=? AND relation_type='blocks' AND active=1 LIMIT 1`, id)
-	if err != nil {
-		return nil, err
-	}
-	if len(blockers) > 0 {
-		return nil, core.NewError(core.ErrIssueBlocked, "issue has active blockers", nil)
-	}
-	if s.activeRunID(id) != nil {
-		return nil, core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
-	}
-	activeRows, _ := s.Project.Query(`SELECT count(*) AS c FROM run_attempts WHERE status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running')`)
-	if len(activeRows) > 0 && activeRows[0]["c"].Int() >= maxConcurrent {
-		return nil, core.NewError(core.ErrConcurrencyLimitReached, "concurrency limit reached", nil)
-	}
-	ar, _ := s.Project.QueryOne(`SELECT COALESCE(MAX(attempt_no),0)+1 AS n FROM run_attempts WHERE issue_id=?`, id)
-	attempt := ar["n"].Int()
-	now := core.Now()
-	runID := core.NewID("run_")
-	if err := s.Project.Exec(`INSERT INTO run_attempts(id,issue_id,attempt_no,status,dispatch_reason,source_issue_state,runner_kind,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, runID, id, attempt, string(core.RunPending), dispatchReason, string(st), runnerKind, now, now); err != nil {
-		return nil, err
-	}
-	if err := s.Project.Exec(`UPDATE issues SET state=?, latest_run_id=?, updated_at=? WHERE id=?`, string(core.StateWorking), runID, now, id); err != nil {
-		return nil, err
-	}
-	_ = s.Project.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), id, string(st), string(core.StateWorking), "orchestrator", runID, "dispatch", now)
-	_ = s.AppendEventTx("run.claimed", "orchestrator", &id, &runID, map[string]any{"source_issue_state": st})
-	_ = s.AppendEventTx("issue.state_changed", "orchestrator", &id, &runID, map[string]any{"from_state": st, "to_state": core.StateWorking})
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return nil, err
-	}
-	committed = true
 	return s.GetRun(runID)
 }
 
 func (s *Store) GetRun(runID string) (*core.RunAttempt, error) {
-	row, err := s.Project.QueryOne(`SELECT r.*, i.identifier AS issue_identifier FROM run_attempts r JOIN issues i ON i.id=r.issue_id WHERE r.id=?`, runID)
+	return s.getRunTx(s.Project, runID)
+}
+
+func (s *Store) getRunTx(q sqlRunner, runID string) (*core.RunAttempt, error) {
+	row, err := q.QueryOne(`SELECT r.*, i.identifier AS issue_identifier FROM run_attempts r JOIN issues i ON i.id=r.issue_id WHERE r.id=?`, runID)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, core.NewError(core.ErrNotFound, "run not found", nil)
 	}
@@ -923,37 +948,23 @@ func (s *Store) ListRuns() ([]*core.RunAttempt, error) {
 }
 func (s *Store) UpdateRunStatus(runID string, status core.RunStatus, fields map[string]any) error {
 	now := core.Now()
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
+	return s.Project.WithTx(func(tx *db.Tx) error {
+		run, err := s.getRunTx(tx, runID)
+		if err != nil {
+			return err
 		}
-	}()
-	run, err := s.GetRun(runID)
-	if err != nil {
-		return err
-	}
-	if !core.IsActiveRunStatus(run.Status) {
-		return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
-	}
-	set := []string{"status=?", "updated_at=?"}
-	args := []any{string(status), now}
-	for k, v := range fields {
-		set = append(set, k+"=?")
-		args = append(args, v)
-	}
-	args = append(args, runID)
-	if err := s.Project.Exec(`UPDATE run_attempts SET `+strings.Join(set, ",")+` WHERE id=?`, args...); err != nil {
-		return err
-	}
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+		if !core.IsActiveRunStatus(run.Status) {
+			return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
+		}
+		set := []string{"status=?", "updated_at=?"}
+		args := []any{string(status), now}
+		for k, v := range fields {
+			set = append(set, k+"=?")
+			args = append(args, v)
+		}
+		args = append(args, runID)
+		return tx.Exec(`UPDATE run_attempts SET `+strings.Join(set, ",")+` WHERE id=?`, args...)
+	})
 }
 func (s *Store) SetRunWorkspace(runID, workspaceID, branch, baseRefConfig, baseRef, baseSHA string) error {
 	return s.Project.Exec(`UPDATE run_attempts SET workspace_id=?, branch_name=?, base_ref_config=?, base_ref=?, base_sha=?, updated_at=? WHERE id=?`, workspaceID, branch, baseRefConfig, baseRef, baseSHA, core.Now(), runID)
@@ -974,35 +985,24 @@ func (s *Store) CompleteRunWithReview(runID, reviewPacketID string) error {
 		return err
 	}
 	now := core.Now()
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
+	return s.Project.WithTx(func(tx *db.Tx) error {
+		run, err = s.getRunTx(tx, runID)
+		if err != nil {
+			return err
 		}
-	}()
-	run, err = s.GetRun(runID)
-	if err != nil {
-		return err
-	}
-	if !core.IsActiveRunStatus(run.Status) {
-		return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
-	}
-	if err := s.Project.Exec(`UPDATE run_attempts SET status=?, failure_code=NULL, failure_message=NULL, ended_at=?, updated_at=? WHERE id=?`, string(core.RunCompleted), now, now, runID); err != nil {
-		return err
-	}
-	if err := s.Project.Exec(`UPDATE issues SET state=?, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL, latest_review_packet_id=?, updated_at=? WHERE id=?`, string(core.StateHumanReview), reviewPacketID, now, run.IssueID); err != nil {
-		return err
-	}
-	_ = s.Project.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), run.IssueID, string(core.StateWorking), string(core.StateHumanReview), "orchestrator", runID, "review packet generated", now)
-	_ = s.AppendEventTx("review.packet_generated", "system", &run.IssueID, &runID, map[string]any{"review_packet_id": reviewPacketID})
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+		if !core.IsActiveRunStatus(run.Status) {
+			return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
+		}
+		if err := tx.Exec(`UPDATE run_attempts SET status=?, failure_code=NULL, failure_message=NULL, ended_at=?, updated_at=? WHERE id=?`, string(core.RunCompleted), now, now, runID); err != nil {
+			return err
+		}
+		if err := tx.Exec(`UPDATE issues SET state=?, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL, latest_review_packet_id=?, updated_at=? WHERE id=?`, string(core.StateHumanReview), reviewPacketID, now, run.IssueID); err != nil {
+			return err
+		}
+		_ = tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), run.IssueID, string(core.StateWorking), string(core.StateHumanReview), "orchestrator", runID, "review packet generated", now)
+		_ = s.appendEventInTx(tx, "review.packet_generated", "system", &run.IssueID, &runID, map[string]any{"review_packet_id": reviewPacketID})
+		return nil
+	})
 }
 func (s *Store) FailRun(runID string, code core.FailureCode, message string, status core.RunStatus) error {
 	run, err := s.GetRun(runID)
@@ -1013,48 +1013,34 @@ func (s *Store) FailRun(runID string, code core.FailureCode, message string, sta
 		status = core.RunFailed
 	}
 	now := core.Now()
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
+	return s.Project.WithTx(func(tx *db.Tx) error {
+		run, err = s.getRunTx(tx, runID)
+		if err != nil {
+			return err
 		}
-	}()
-	run, err = s.GetRun(runID)
-	if err != nil {
-		return err
-	}
-	if !core.IsActiveRunStatus(run.Status) {
-		return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
-	}
-	if err := s.Project.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(status), string(code), message, now, now, runID); err != nil {
-		return err
-	}
-	row, _ := s.Project.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
-	cur := core.IssueState(row["state"].String())
-	target := cur
-	if !core.IsTerminalIssueState(cur) && cur != core.StateBlocked {
-		target = run.SourceIssueState
-	}
-	if err := s.Project.Exec(`UPDATE issues SET state=?, dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, string(target), string(code), now, now, run.IssueID); err != nil {
-		return err
-	}
-	if err := s.Project.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "system", fmt.Sprintf("Run ended with %s: %s", code, message), now); err != nil {
-		return err
-	}
-	if err := s.AppendEventTx("run.failed", "system", &run.IssueID, &runID, map[string]any{"failure_code": code, "message": message}); err != nil {
-		return err
-	}
-	if err := s.AppendEventTx("scheduler.paused", "system", &run.IssueID, &runID, map[string]any{"reason": code}); err != nil {
-		return err
-	}
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+		if !core.IsActiveRunStatus(run.Status) {
+			return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
+		}
+		if err := tx.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(status), string(code), message, now, now, runID); err != nil {
+			return err
+		}
+		row, _ := tx.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
+		cur := core.IssueState(row["state"].String())
+		target := cur
+		if !core.IsTerminalIssueState(cur) && cur != core.StateBlocked {
+			target = run.SourceIssueState
+		}
+		if err := tx.Exec(`UPDATE issues SET state=?, dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, string(target), string(code), now, now, run.IssueID); err != nil {
+			return err
+		}
+		if err := tx.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "system", fmt.Sprintf("Run ended with %s: %s", code, message), now); err != nil {
+			return err
+		}
+		if err := s.appendEventInTx(tx, "run.failed", "system", &run.IssueID, &runID, map[string]any{"failure_code": code, "message": message}); err != nil {
+			return err
+		}
+		return s.appendEventInTx(tx, "scheduler.paused", "system", &run.IssueID, &runID, map[string]any{"reason": code})
+	})
 }
 
 func (s *Store) BlockRunByAgent(runID, reason string) error {
@@ -1067,85 +1053,57 @@ func (s *Store) BlockRunByAgent(runID, reason string) error {
 		return err
 	}
 	now := core.Now()
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
+	return s.Project.WithTx(func(tx *db.Tx) error {
+		run, err = s.getRunTx(tx, runID)
+		if err != nil {
+			return err
 		}
-	}()
-	run, err = s.GetRun(runID)
-	if err != nil {
-		return err
-	}
-	if !core.IsActiveRunStatus(run.Status) {
-		return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
-	}
-	row, err := s.Project.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
-	if err != nil {
-		return err
-	}
-	from := core.IssueState(row["state"].String())
-	if err := s.Project.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "agent", "Blocked by agent: "+reason, now); err != nil {
-		return err
-	}
-	if err := s.Project.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(core.RunCancelled), string(core.FailureAgentBlocked), reason, now, now, runID); err != nil {
-		return err
-	}
-	if err := s.Project.Exec(`UPDATE run_tool_tokens SET revoked_at=? WHERE run_id=? AND revoked_at IS NULL`, now, runID); err != nil {
-		return err
-	}
-	if err := s.Project.Exec(`UPDATE issues SET state=?, dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, string(core.StateBlocked), string(core.FailureAgentBlocked), now, now, run.IssueID); err != nil {
-		return err
-	}
-	if err := s.Project.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), run.IssueID, string(from), string(core.StateBlocked), "agent", runID, reason, now); err != nil {
-		return err
-	}
-	if err := s.Project.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "system", fmt.Sprintf("Run ended with %s: %s", core.FailureAgentBlocked, reason), now); err != nil {
-		return err
-	}
-	if err := s.AppendEventTx("run.failed", "system", &run.IssueID, &runID, map[string]any{"failure_code": core.FailureAgentBlocked, "message": reason}); err != nil {
-		return err
-	}
-	if err := s.AppendEventTx("scheduler.paused", "system", &run.IssueID, &runID, map[string]any{"reason": core.FailureAgentBlocked}); err != nil {
-		return err
-	}
-	if err := s.AppendEventTx("issue.transitioned", "agent", &run.IssueID, &runID, map[string]any{"from_state": from, "to_state": core.StateBlocked}); err != nil {
-		return err
-	}
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+		if !core.IsActiveRunStatus(run.Status) {
+			return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
+		}
+		row, err := tx.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
+		if err != nil {
+			return err
+		}
+		from := core.IssueState(row["state"].String())
+		if err := tx.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "agent", "Blocked by agent: "+reason, now); err != nil {
+			return err
+		}
+		if err := tx.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(core.RunCancelled), string(core.FailureAgentBlocked), reason, now, now, runID); err != nil {
+			return err
+		}
+		if err := tx.Exec(`UPDATE run_tool_tokens SET revoked_at=? WHERE run_id=? AND revoked_at IS NULL`, now, runID); err != nil {
+			return err
+		}
+		if err := tx.Exec(`UPDATE issues SET state=?, dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, string(core.StateBlocked), string(core.FailureAgentBlocked), now, now, run.IssueID); err != nil {
+			return err
+		}
+		if err := tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), run.IssueID, string(from), string(core.StateBlocked), "agent", runID, reason, now); err != nil {
+			return err
+		}
+		if err := tx.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "system", fmt.Sprintf("Run ended with %s: %s", core.FailureAgentBlocked, reason), now); err != nil {
+			return err
+		}
+		if err := s.appendEventInTx(tx, "run.failed", "system", &run.IssueID, &runID, map[string]any{"failure_code": core.FailureAgentBlocked, "message": reason}); err != nil {
+			return err
+		}
+		if err := s.appendEventInTx(tx, "scheduler.paused", "system", &run.IssueID, &runID, map[string]any{"reason": core.FailureAgentBlocked}); err != nil {
+			return err
+		}
+		return s.appendEventInTx(tx, "issue.transitioned", "agent", &run.IssueID, &runID, map[string]any{"from_state": from, "to_state": core.StateBlocked})
+	})
 }
 
 func (s *Store) CancelRun(runID, reason string) error {
 	return s.cancelRun(runID, core.FailureOperatorCancelled, reason)
 }
 func (s *Store) cancelRun(runID string, code core.FailureCode, reason string) error {
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
-		}
-	}()
-	if err := s.cancelRunInTx(runID, code, reason, true); err != nil {
-		return err
-	}
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+	return s.Project.WithTx(func(tx *db.Tx) error {
+		return s.cancelRunInTx(tx, runID, code, reason, true)
+	})
 }
-func (s *Store) cancelRunInTx(runID string, code core.FailureCode, reason string, restore bool) error {
-	run, err := s.GetRun(runID)
+func (s *Store) cancelRunInTx(q sqlRunner, runID string, code core.FailureCode, reason string, restore bool) error {
+	run, err := s.getRunTx(q, runID)
 	if err != nil {
 		return err
 	}
@@ -1153,22 +1111,22 @@ func (s *Store) cancelRunInTx(runID string, code core.FailureCode, reason string
 		return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
 	}
 	now := core.Now()
-	if err := s.Project.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(core.RunCancelled), string(code), reason, now, now, runID); err != nil {
+	if err := q.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(core.RunCancelled), string(code), reason, now, now, runID); err != nil {
 		return err
 	}
 	target := run.SourceIssueState
-	row, _ := s.Project.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
+	row, _ := q.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
 	cur := core.IssueState(row["state"].String())
 	if !restore || cur == core.StateBlocked || core.IsTerminalIssueState(cur) {
 		target = cur
 	}
-	if err := s.Project.Exec(`UPDATE issues SET state=?, dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, string(target), string(code), now, now, run.IssueID); err != nil {
+	if err := q.Exec(`UPDATE issues SET state=?, dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, string(target), string(code), now, now, run.IssueID); err != nil {
 		return err
 	}
-	if err := s.Project.Exec(`UPDATE run_tool_tokens SET revoked_at=? WHERE run_id=? AND revoked_at IS NULL`, now, runID); err != nil {
+	if err := q.Exec(`UPDATE run_tool_tokens SET revoked_at=? WHERE run_id=? AND revoked_at IS NULL`, now, runID); err != nil {
 		return err
 	}
-	if err := s.AppendEventTx("run.cancelled", "system", &run.IssueID, &runID, map[string]any{"failure_code": code, "reason": reason}); err != nil {
+	if err := s.appendEventInTx(q, "run.cancelled", "system", &run.IssueID, &runID, map[string]any{"failure_code": code, "reason": reason}); err != nil {
 		return err
 	}
 	return nil
@@ -1219,9 +1177,13 @@ func (s *Store) AttachWorkflowSnapshot(runID, wfID string) error {
 	return s.Project.Exec(`UPDATE run_attempts SET workflow_snapshot_id=?, updated_at=? WHERE id=?`, wfID, core.Now(), runID)
 }
 func (s *Store) CreatePromptSnapshot(runID, wfID, ctxHash, promptHash, rootPath string) (string, error) {
+	return s.CreatePromptSnapshotTx(s.Project, runID, wfID, ctxHash, promptHash, rootPath)
+}
+
+func (s *Store) CreatePromptSnapshotTx(q TxRunner, runID, wfID, ctxHash, promptHash, rootPath string) (string, error) {
 	id := core.NewID("ps_")
 	now := core.Now()
-	return id, s.Project.Exec(`INSERT OR REPLACE INTO prompt_snapshots(id,run_id,workflow_snapshot_id,runtime_envelope_version,tool_manifest_version,context_hash,rendered_prompt_hash,context_json_path,redacted_prompt_path,prompt_meta_json_path,tool_manifest_path,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, id, runID, wfID, "v1", "v1", ctxHash, promptHash, filepath.Join(rootPath, "prompt/context.json"), filepath.Join(rootPath, "prompt/rendered_prompt.redacted.md"), filepath.Join(rootPath, "prompt/prompt_meta.json"), filepath.Join(rootPath, "prompt/tool_manifest.md"), now)
+	return id, q.Exec(`INSERT OR REPLACE INTO prompt_snapshots(id,run_id,workflow_snapshot_id,runtime_envelope_version,tool_manifest_version,context_hash,rendered_prompt_hash,context_json_path,redacted_prompt_path,prompt_meta_json_path,tool_manifest_path,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, id, runID, wfID, "v1", "v1", ctxHash, promptHash, filepath.Join(rootPath, "prompt/context.json"), filepath.Join(rootPath, "prompt/rendered_prompt.redacted.md"), filepath.Join(rootPath, "prompt/prompt_meta.json"), filepath.Join(rootPath, "prompt/tool_manifest.md"), now)
 }
 
 func (s *Store) CreateToolToken(runID string, tokenHash string, scope map[string]any, expiresAt string) (string, error) {
@@ -1230,29 +1192,18 @@ func (s *Store) CreateToolToken(runID string, tokenHash string, scope map[string
 		return "", err
 	}
 	id := core.NewID("tok_")
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return "", err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		run, err = s.getRunTx(tx, runID)
+		if err != nil {
+			return err
 		}
-	}()
-	run, err = s.GetRun(runID)
-	if err != nil {
+		if run.Status != core.RunStartingAgent && run.Status != core.RunRunning {
+			return core.NewError(core.ErrInvalidStateTransition, "run is not starting agent or running", map[string]any{"run_id": runID, "status": run.Status})
+		}
+		return tx.Exec(`INSERT INTO run_tool_tokens(id,run_id,issue_id,token_hash,scope_json,created_at,expires_at) VALUES(?,?,?,?,?,?,?)`, id, runID, run.IssueID, tokenHash, encodeJSON(scope), core.Now(), expiresAt)
+	}); err != nil {
 		return "", err
 	}
-	if run.Status != core.RunStartingAgent && run.Status != core.RunRunning {
-		return "", core.NewError(core.ErrInvalidStateTransition, "run is not starting agent or running", map[string]any{"run_id": runID, "status": run.Status})
-	}
-	if err := s.Project.Exec(`INSERT INTO run_tool_tokens(id,run_id,issue_id,token_hash,scope_json,created_at,expires_at) VALUES(?,?,?,?,?,?,?)`, id, runID, run.IssueID, tokenHash, encodeJSON(scope), core.Now(), expiresAt); err != nil {
-		return "", err
-	}
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return "", err
-	}
-	committed = true
 	return id, nil
 }
 func (s *Store) ValidateToolToken(tokenHash string) (runID, issueID string, err error) {
@@ -1358,6 +1309,10 @@ func (s *Store) GetHandoffByRun(runID string) (*core.Handoff, error) {
 }
 
 func (s *Store) InsertArtifact(a ArtifactRecord) error {
+	return s.InsertArtifactTx(s.Project, a)
+}
+
+func (s *Store) InsertArtifactTx(q TxRunner, a ArtifactRecord) error {
 	if a.ID == "" {
 		a.ID = core.NewID("art_")
 	}
@@ -1368,7 +1323,7 @@ func (s *Store) InsertArtifact(a ArtifactRecord) error {
 	if a.Redacted {
 		red = 1
 	}
-	return s.Project.Exec(`INSERT INTO artifacts(id,issue_id,run_id,review_packet_id,kind,path,mime_type,size_bytes,sha256,redacted,description,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, a.ID, a.IssueID, a.RunID, a.ReviewPacketID, a.Kind, a.Path, a.MimeType, a.SizeBytes, a.SHA256, red, a.Description, a.CreatedAt)
+	return q.Exec(`INSERT INTO artifacts(id,issue_id,run_id,review_packet_id,kind,path,mime_type,size_bytes,sha256,redacted,description,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, a.ID, a.IssueID, a.RunID, a.ReviewPacketID, a.Kind, a.Path, a.MimeType, a.SizeBytes, a.SHA256, red, a.Description, a.CreatedAt)
 }
 func (s *Store) GetArtifact(id string) (*ArtifactRecord, error) {
 	row, err := s.Project.QueryOne(`SELECT * FROM artifacts WHERE id=?`, id)
@@ -1393,44 +1348,33 @@ func (s *Store) ArtifactsForReview(rpID string) ([]*ArtifactRecord, error) {
 }
 
 func (s *Store) InsertReviewPacket(issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID string) (string, error) {
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
+	var id string
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		var err error
+		id, err = s.insertReviewPacketInTx(tx, issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID)
+		return err
+	}); err != nil {
 		return "", err
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
-		}
-	}()
-	id, err := s.insertReviewPacketInTx(issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID)
-	if err != nil {
-		return "", err
-	}
-	if err := s.Project.Exec(`COMMIT`); err != nil {
-		return "", err
-	}
-	committed = true
 	return id, nil
 }
 
-// InsertReviewPacketInTx inserts a review packet and updates the issue pointer
-// using the caller's already-open transaction.
-func (s *Store) InsertReviewPacketInTx(issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID string) (string, error) {
-	return s.insertReviewPacketInTx(issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID)
+func (s *Store) InsertReviewPacketTx(q TxRunner, issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID string) (string, error) {
+	return s.insertReviewPacketInTx(q, issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID)
 }
 
-func (s *Store) insertReviewPacketInTx(issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID string) (string, error) {
-	row, err := s.Project.QueryOne(`SELECT COALESCE(MAX(packet_no),0)+1 AS n FROM review_packets WHERE issue_id=?`, issueID)
+func (s *Store) insertReviewPacketInTx(q sqlRunner, issueID, runID, handoffID, root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, promptSnapshotID string) (string, error) {
+	row, err := q.QueryOne(`SELECT COALESCE(MAX(packet_no),0)+1 AS n FROM review_packets WHERE issue_id=?`, issueID)
 	if err != nil {
 		return "", err
 	}
 	packetNo := row["n"].Int()
 	id := core.NewID("rp_")
 	now := core.Now()
-	if err := s.Project.Exec(`INSERT INTO review_packets(id,issue_id,run_id,handoff_id,packet_no,status,root_path,review_md_path,review_json_path,patch_path,changed_files_path,untracked_files_path,diffstat_path,prompt_snapshot_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, issueID, runID, handoffID, packetNo, "generated", root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, core.NullableString(promptSnapshotID), now); err != nil {
+	if err := q.Exec(`INSERT INTO review_packets(id,issue_id,run_id,handoff_id,packet_no,status,root_path,review_md_path,review_json_path,patch_path,changed_files_path,untracked_files_path,diffstat_path,prompt_snapshot_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, issueID, runID, handoffID, packetNo, "generated", root, reviewMD, reviewJSON, patch, changed, untracked, diffstat, core.NullableString(promptSnapshotID), now); err != nil {
 		return "", err
 	}
-	if err := s.Project.Exec(`UPDATE issues SET latest_review_packet_id=?, updated_at=? WHERE id=?`, id, now, issueID); err != nil {
+	if err := q.Exec(`UPDATE issues SET latest_review_packet_id=?, updated_at=? WHERE id=?`, id, now, issueID); err != nil {
 		return "", err
 	}
 	return id, nil
@@ -1480,44 +1424,36 @@ func (s *Store) reviewAction(issueRef, reason string, target core.IssueState) (*
 		return nil, core.NewError(core.ErrReviewPacketRequired, "latest review packet does not belong to latest completed handoff run", nil)
 	}
 	now := core.Now()
-	if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return nil, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Project.Exec(`ROLLBACK`)
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		var completedAt any = nil
+		if target == core.StateDone {
+			completedAt = now
 		}
-	}()
-	var completedAt any = nil
-	if target == core.StateDone {
-		completedAt = now
-	}
-	if err := s.Project.Exec(`UPDATE issues SET state=?, completed_at=?, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL, updated_at=? WHERE id=?`, string(target), completedAt, now, issue.ID); err != nil {
-		return nil, err
-	}
-	if err := s.Project.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), issue.ID, string(core.StateHumanReview), string(target), "operator", reason, now); err != nil {
-		return nil, err
-	}
-	if err := s.Project.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), issue.ID, "operator", reason, now); err != nil {
-		return nil, err
-	}
-	event := "review.sent_to_rework"
-	if target == core.StateDone {
-		event = "review.marked_done"
-	}
-	if err := s.AppendEventTx(event, "operator", &issue.ID, nil, map[string]any{"reason": reason}); err != nil {
-		return nil, err
-	}
-	if target == core.StateDone {
-		if err := s.AppendEventTx("issue.completed", "operator", &issue.ID, nil, map[string]any{"reason": reason}); err != nil {
-			return nil, err
+		if err := tx.Exec(`UPDATE issues SET state=?, completed_at=?, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL, updated_at=? WHERE id=?`, string(target), completedAt, now, issue.ID); err != nil {
+			return err
 		}
-	}
-	if err := s.Project.Exec(`COMMIT`); err != nil {
+		if err := tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), issue.ID, string(core.StateHumanReview), string(target), "operator", reason, now); err != nil {
+			return err
+		}
+		if err := tx.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), issue.ID, "operator", reason, now); err != nil {
+			return err
+		}
+		event := "review.sent_to_rework"
+		if target == core.StateDone {
+			event = "review.marked_done"
+		}
+		if err := s.appendEventInTx(tx, event, "operator", &issue.ID, nil, map[string]any{"reason": reason}); err != nil {
+			return err
+		}
+		if target == core.StateDone {
+			if err := s.appendEventInTx(tx, "issue.completed", "operator", &issue.ID, nil, map[string]any{"reason": reason}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	committed = true
 	return s.GetIssue(issue.ID)
 }
 
@@ -1548,26 +1484,12 @@ func (s *Store) DecideApproval(id, status, reason string) error {
 	}
 	now := core.Now()
 	if status == "cancelled" {
-		if err := s.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-			return err
-		}
-		committed := false
-		defer func() {
-			if !committed {
-				_ = s.Project.Exec(`ROLLBACK`)
+		return s.Project.WithTx(func(tx *db.Tx) error {
+			if err := s.cancelRunInTx(tx, row["run_id"].String(), core.FailureOperatorCancelled, reason, true); err != nil {
+				return err
 			}
-		}()
-		if err := s.cancelRunInTx(row["run_id"].String(), core.FailureOperatorCancelled, reason, true); err != nil {
-			return err
-		}
-		if err := s.Project.Exec(`UPDATE approval_requests SET status=?, reason=?, resolved_at=? WHERE id=?`, status, reason, now, id); err != nil {
-			return err
-		}
-		if err := s.Project.Exec(`COMMIT`); err != nil {
-			return err
-		}
-		committed = true
-		return nil
+			return tx.Exec(`UPDATE approval_requests SET status=?, reason=?, resolved_at=? WHERE id=?`, status, reason, now, id)
+		})
 	}
 	if err := s.Project.Exec(`UPDATE approval_requests SET status=?, reason=?, resolved_at=? WHERE id=?`, status, reason, now, id); err != nil {
 		return err

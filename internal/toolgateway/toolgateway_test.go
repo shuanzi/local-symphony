@@ -112,6 +112,53 @@ func TestArtifactAttachUsesTokenArtifactMaxBytes(t *testing.T) {
 	assertArtifactCount(t, st, run.ID, 1)
 }
 
+func TestArtifactAttachRejectsOversizeUnreadableFileBeforeReading(t *testing.T) {
+	st := newGatewayTestStore(t)
+	issue, run, workspace := prepareGatewayRun(t, st)
+	sourcePath := filepath.Join(workspace, "large.bin")
+	if err := os.WriteFile(sourcePath, []byte("oversize artifact\n"), 0o644); err != nil {
+		t.Fatalf("write source artifact: %v", err)
+	}
+	if err := os.Chmod(sourcePath, 0o000); err != nil {
+		t.Fatalf("chmod source artifact: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sourcePath, 0o644) })
+	if _, err := os.ReadFile(sourcePath); err == nil {
+		t.Skip("chmod did not make source artifact unreadable in this environment")
+	}
+	token := security.NewToken()
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := st.CreateToolToken(run.ID, security.HashToken(token), map[string]any{
+		"run_id":             run.ID,
+		"issue_id":           run.IssueID,
+		"workspace_path":     workspace,
+		"tools":              Registry,
+		"artifact_max_bytes": int64(1),
+	}, expires); err != nil {
+		t.Fatalf("CreateToolToken: %v", err)
+	}
+
+	resp := (Gateway{Store: st}).Call(token, workspace, Request{
+		Tool:  "artifact.attach",
+		Input: map[string]any{"path": "large.bin"},
+	})
+
+	if resp.Success {
+		t.Fatal("artifact.attach success = true, want max size failure")
+	}
+	if resp.Error == nil || resp.Error.Code != string(core.ErrInvalidRequest) {
+		t.Fatalf("artifact.attach error = %#v, want %s", resp.Error, core.ErrInvalidRequest)
+	}
+	if resp.Error.Message != "artifact exceeds max size" {
+		t.Fatalf("artifact.attach message = %q, want max size error before reading", resp.Error.Message)
+	}
+	storedPath := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID, "agent", "large.bin")
+	if _, err := os.Stat(storedPath); !os.IsNotExist(err) {
+		t.Fatalf("stored artifact exists after max size failure, stat err = %v", err)
+	}
+	assertArtifactCount(t, st, run.ID, 0)
+}
+
 func TestArtifactAttachDefaultsKindToAgentFile(t *testing.T) {
 	st := newGatewayTestStore(t)
 	_, run, workspace := prepareGatewayRun(t, st)

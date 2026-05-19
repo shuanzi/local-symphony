@@ -65,6 +65,9 @@ func ContainedPath(root, rel string) (string, error) {
 		if err != nil || strings.HasPrefix(rel2, "..") || filepath.IsAbs(rel2) {
 			return "", errors.New("symlink escape rejected")
 		}
+		if IsProtectedPath(rel2) {
+			return "", errors.New("protected path denied")
+		}
 	} else if !os.IsNotExist(err) {
 		return "", err
 	}

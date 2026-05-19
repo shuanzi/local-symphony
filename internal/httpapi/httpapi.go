@@ -16,6 +16,7 @@ import (
 
 	"local-symphony/internal/config"
 	"local-symphony/internal/core"
+	"local-symphony/internal/db"
 	"local-symphony/internal/observability"
 	"local-symphony/internal/orchestrator"
 	"local-symphony/internal/security"
@@ -329,11 +330,31 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 				}
 				fields["priority"] = int(parsed)
 			}
-			if arr, ok := raw["acceptance_criteria"].([]any); ok {
-				fields["acceptance_criteria"] = toStrings(arr)
+			if rawValue, exists := raw["acceptance_criteria"]; exists {
+				arr, ok := rawValue.([]any)
+				if !ok {
+					apiErr(w, core.NewError(core.ErrInvalidRequest, "acceptance_criteria must be an array", nil))
+					return
+				}
+				values, err := toStrings("acceptance_criteria", arr, false)
+				if err != nil {
+					apiErr(w, err)
+					return
+				}
+				fields["acceptance_criteria"] = values
 			}
-			if arr, ok := raw["labels"].([]any); ok {
-				fields["labels"] = toStrings(arr)
+			if rawValue, exists := raw["labels"]; exists {
+				arr, ok := rawValue.([]any)
+				if !ok {
+					apiErr(w, core.NewError(core.ErrInvalidRequest, "labels must be an array", nil))
+					return
+				}
+				values, err := toStrings("labels", arr, true)
+				if err != nil {
+					apiErr(w, err)
+					return
+				}
+				fields["labels"] = values
 			}
 			iss, err := s.Store.UpdateIssue(ref, fields)
 			if err != nil {
@@ -874,14 +895,19 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
-func toStrings(a []any) []string {
+func toStrings(field string, a []any, rejectBlank bool) ([]string, error) {
 	out := []string{}
 	for _, x := range a {
-		if s, ok := x.(string); ok {
-			out = append(out, s)
+		s, ok := x.(string)
+		if !ok {
+			return nil, core.NewError(core.ErrInvalidRequest, field+" entries must be strings", nil)
 		}
+		if rejectBlank && strings.TrimSpace(s) == "" {
+			return nil, core.NewError(core.ErrInvalidRequest, field+" entries must be non-empty strings", nil)
+		}
+		out = append(out, s)
 	}
-	return out
+	return out, nil
 }
 func repeatedCSV(values []string) []string {
 	out := []string{}
@@ -1043,37 +1069,26 @@ func (s *Server) authExchange(w http.ResponseWriter, r *http.Request) {
 func (s *Server) exchangeOpenToken(openToken string) (string, string, error) {
 	now := core.Now()
 	hash := security.HashToken(openToken)
-	if err := s.Store.App.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return "", "", err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Store.App.Exec(`ROLLBACK`)
-		}
-	}()
-	row, err := s.Store.App.QueryOne(`SELECT id,expires_at FROM open_tokens WHERE project_id=? AND token_hash=? AND consumed_at IS NULL`, s.Store.ProjectID, hash)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", "", core.NewError(core.ErrUnauthorized, "open token invalid", nil)
-	}
-	if err != nil {
-		return "", "", err
-	}
-	if row["expires_at"].String() < now {
-		return "", "", core.NewError(core.ErrUnauthorized, "open token expired", nil)
-	}
 	sessionToken := security.NewToken()
 	expiresAt := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano)
-	if err := s.Store.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,csrf_hash,user_label,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("ses_"), s.Store.ProjectID, "browser", security.HashToken(sessionToken), security.HashToken(s.csrfToken), "local-dashboard", now, expiresAt); err != nil {
+	if err := s.Store.App.WithTx(func(tx *db.Tx) error {
+		row, err := tx.QueryOne(`SELECT id,expires_at FROM open_tokens WHERE project_id=? AND token_hash=? AND consumed_at IS NULL`, s.Store.ProjectID, hash)
+		if errors.Is(err, os.ErrNotExist) {
+			return core.NewError(core.ErrUnauthorized, "open token invalid", nil)
+		}
+		if err != nil {
+			return err
+		}
+		if row["expires_at"].String() < now {
+			return core.NewError(core.ErrUnauthorized, "open token expired", nil)
+		}
+		if err := tx.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,csrf_hash,user_label,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("ses_"), s.Store.ProjectID, "browser", security.HashToken(sessionToken), security.HashToken(s.csrfToken), "local-dashboard", now, expiresAt); err != nil {
+			return err
+		}
+		return tx.Exec(`UPDATE open_tokens SET consumed_at=? WHERE id=?`, now, row["id"].String())
+	}); err != nil {
 		return "", "", err
 	}
-	if err := s.Store.App.Exec(`UPDATE open_tokens SET consumed_at=? WHERE id=?`, now, row["id"].String()); err != nil {
-		return "", "", err
-	}
-	if err := s.Store.App.Exec(`COMMIT`); err != nil {
-		return "", "", err
-	}
-	committed = true
 	return sessionToken, expiresAt, nil
 }
 
@@ -1108,48 +1123,37 @@ func (s *Server) rotateCLIToken(w http.ResponseWriter, r *http.Request) {
 func (s *Server) rotateBearerSession(token string) (string, *string, error) {
 	now := core.Now()
 	tokenHash := security.HashToken(token)
-	if err := s.Store.App.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return "", nil, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = s.Store.App.Exec(`ROLLBACK`)
-		}
-	}()
-	row, err := s.Store.App.QueryOne(`SELECT id,kind,expires_at,revoked_at,user_label FROM local_sessions WHERE project_id=? AND token_hash=? AND kind IN ('cli','desktop')`, s.Store.ProjectID, tokenHash)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", nil, core.NewError(core.ErrUnauthorized, "bearer token invalid", nil)
-	}
-	if err != nil {
-		return "", nil, err
-	}
-	if !row["revoked_at"].Null && row["revoked_at"].String() != "" {
-		return "", nil, core.NewError(core.ErrUnauthorized, "bearer token revoked", nil)
-	}
-	if !row["expires_at"].Null && row["expires_at"].String() != "" && row["expires_at"].String() < now {
-		return "", nil, core.NewError(core.ErrUnauthorized, "bearer token expired", nil)
-	}
 	var expiresAt *string
-	if !row["expires_at"].Null && row["expires_at"].String() != "" {
-		v := row["expires_at"].String()
-		expiresAt = &v
-	}
 	replacement := security.NewToken()
-	label := row["user_label"].String()
-	if label == "" {
-		label = "local-cli"
-	}
-	if err := s.Store.App.Exec(`UPDATE local_sessions SET revoked_at=? WHERE id=?`, now, row["id"].String()); err != nil {
+	if err := s.Store.App.WithTx(func(tx *db.Tx) error {
+		row, err := tx.QueryOne(`SELECT id,kind,expires_at,revoked_at,user_label FROM local_sessions WHERE project_id=? AND token_hash=? AND kind IN ('cli','desktop')`, s.Store.ProjectID, tokenHash)
+		if errors.Is(err, os.ErrNotExist) {
+			return core.NewError(core.ErrUnauthorized, "bearer token invalid", nil)
+		}
+		if err != nil {
+			return err
+		}
+		if !row["revoked_at"].Null && row["revoked_at"].String() != "" {
+			return core.NewError(core.ErrUnauthorized, "bearer token revoked", nil)
+		}
+		if !row["expires_at"].Null && row["expires_at"].String() != "" && row["expires_at"].String() < now {
+			return core.NewError(core.ErrUnauthorized, "bearer token expired", nil)
+		}
+		if !row["expires_at"].Null && row["expires_at"].String() != "" {
+			v := row["expires_at"].String()
+			expiresAt = &v
+		}
+		label := row["user_label"].String()
+		if label == "" {
+			label = "local-cli"
+		}
+		if err := tx.Exec(`UPDATE local_sessions SET revoked_at=? WHERE id=?`, now, row["id"].String()); err != nil {
+			return err
+		}
+		return tx.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at,expires_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("ses_"), s.Store.ProjectID, row["kind"].String(), security.HashToken(replacement), label, now, expiresAt)
+	}); err != nil {
 		return "", nil, err
 	}
-	if err := s.Store.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at,expires_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("ses_"), s.Store.ProjectID, row["kind"].String(), security.HashToken(replacement), label, now, expiresAt); err != nil {
-		return "", nil, err
-	}
-	if err := s.Store.App.Exec(`COMMIT`); err != nil {
-		return "", nil, err
-	}
-	committed = true
 	return replacement, expiresAt, nil
 }
 

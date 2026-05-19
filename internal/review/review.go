@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,6 +27,14 @@ type UntrackedInfo struct {
 	Reason        *string `json:"reason"`
 }
 
+const maxUntrackedPatchBytes int64 = 1024 * 1024
+
+const (
+	untrackedReasonBinaryOrLarge = "binary or large file omitted from patch"
+	untrackedReasonSymlink       = "symlink omitted from patch"
+	untrackedReasonNonRegular    = "non-regular file omitted from patch"
+)
+
 func (g Generator) Generate(runID string) (string, error) {
 	run, err := g.Store.GetRun(runID)
 	if err != nil {
@@ -46,18 +55,22 @@ func (g Generator) Generate(runID string) (string, error) {
 	if err := os.MkdirAll(filepath.Join(root, "prompt"), 0o755); err != nil {
 		return "", reviewPacketError("create review packet directory", err)
 	}
-	changed, untracked := collectChanges(issue.Workspace.Path)
+	changed, untracked, deniedChanged := collectChanges(issue.Workspace.Path)
 	if len(handoff.ChangedFiles) > 0 {
 		for _, f := range handoff.ChangedFiles {
-			if !contains(changed, f) {
-				changed = append(changed, f)
+			if path := reviewSafePath(f); path != "" && !deniedChanged[path] && !contains(changed, path) {
+				changed = append(changed, path)
 			}
 		}
 	}
 	sort.Strings(changed)
-	patch := gitx.DiffBinary(issue.Workspace.Path)
-	if patch == "" {
-		patch = syntheticPatch(issue.Workspace.Path, untracked)
+	diffPaths := reviewDiffPaths(changed)
+	patch := gitx.DiffBinaryPaths(issue.Workspace.Path, diffPaths)
+	if untrackedPatch := syntheticPatch(issue.Workspace.Path, untracked); untrackedPatch != "" {
+		if patch != "" && !strings.HasSuffix(patch, "\n") {
+			patch += "\n"
+		}
+		patch += untrackedPatch
 	}
 	if patch == "" {
 		patch = "# No tracked diff captured.\n"
@@ -74,7 +87,7 @@ func (g Generator) Generate(runID string) (string, error) {
 	if err := os.WriteFile(patchPath, []byte(patch), 0o644); err != nil {
 		return "", reviewPacketError("write patch artifact", err)
 	}
-	diffstat := gitx.DiffNumstat(issue.Workspace.Path)
+	diffstat := gitx.DiffNumstatPaths(issue.Workspace.Path, diffPaths)
 	if diffstat == "" {
 		diffstat = "0\t0\tgenerated\n"
 	}
@@ -114,99 +127,109 @@ func (g Generator) Generate(runID string) (string, error) {
 		promptContextHash = hex.EncodeToString(h[:])
 		promptRenderedHash = hex.EncodeToString(ph[:])
 	}
-	if err := g.Store.Project.Exec(`BEGIN IMMEDIATE`); err != nil {
-		return "", reviewPacketError("begin review packet transaction", err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = g.Store.Project.Exec(`ROLLBACK`)
+	var finalID string
+	if err := g.Store.WithProjectTx(func(tx store.TxRunner) error {
+		if run.WorkflowSnapshotID != nil {
+			pid, err := g.Store.CreatePromptSnapshotTx(tx, runID, *run.WorkflowSnapshotID, promptContextHash, promptRenderedHash, root)
+			if err != nil {
+				return reviewPacketError("create prompt snapshot", err)
+			}
+			promptID = pid
 		}
-	}()
-	if run.WorkflowSnapshotID != nil {
-		pid, err := g.Store.CreatePromptSnapshot(runID, *run.WorkflowSnapshotID, promptContextHash, promptRenderedHash, root)
+		rpID := core.NewID("rp_tmp_")
+		packetNo := nextPacketNo(tx, issue.ID)
+		packet := map[string]any{
+			"id": rpID, "packet_no": packetNo, "status": "generated",
+			"issue":         map[string]any{"id": issue.ID, "identifier": issue.Identifier, "title": issue.Title, "acceptance_criteria": issue.AcceptanceCriteria},
+			"run":           map[string]any{"id": run.ID, "status": "completed", "source_issue_state": run.SourceIssueState},
+			"git":           map[string]any{"branch_name": val(issue.BranchName), "base_ref": val(issue.BaseRef), "base_ref_config": val(issue.BaseRefConfig), "base_sha": val(issue.BaseSHA), "head_sha": gitx.HeadSHA(issue.Workspace.Path), "dirty": len(changed) > 0},
+			"files":         map[string]any{"review_md_path": "review.md", "review_json_path": "review.json", "patch_path": "changes.patch", "changed_files_path": "changed-files.txt", "untracked_files_path": "untracked-files.json", "diffstat_path": "diffstat.txt"},
+			"handoff":       map[string]any{"summary": handoff.Summary, "tests": handoff.Tests, "risks": handoff.Risks, "verification": handoff.Verification, "followups": handoff.Followups, "target_state": "Human Review"},
+			"changed_files": changed, "untracked_files": untracked,
+			"approvals": []any{}, "tool_calls": []any{},
+			"prompt_snapshot": map[string]any{"id": promptID, "rendered_prompt_hash": "redacted", "tool_manifest_path": "prompt/tool_manifest.md"},
+			"failure_code":    nil, "failure_message": nil, "created_at": core.Now(),
+		}
+		jb, err := json.MarshalIndent(packet, "", "  ")
 		if err != nil {
-			return "", reviewPacketError("create prompt snapshot", err)
+			return reviewPacketError("marshal review packet", err)
 		}
-		promptID = pid
-	}
-	rpID := core.NewID("rp_tmp_")
-	packetNo := nextPacketNo(g.Store, issue.ID)
-	packet := map[string]any{
-		"id": rpID, "packet_no": packetNo, "status": "generated",
-		"issue":         map[string]any{"id": issue.ID, "identifier": issue.Identifier, "title": issue.Title, "acceptance_criteria": issue.AcceptanceCriteria},
-		"run":           map[string]any{"id": run.ID, "status": "completed", "source_issue_state": run.SourceIssueState},
-		"git":           map[string]any{"branch_name": val(issue.BranchName), "base_ref": val(issue.BaseRef), "base_ref_config": val(issue.BaseRefConfig), "base_sha": val(issue.BaseSHA), "head_sha": gitx.HeadSHA(issue.Workspace.Path), "dirty": len(changed) > 0},
-		"files":         map[string]any{"review_md_path": "review.md", "review_json_path": "review.json", "patch_path": "changes.patch", "changed_files_path": "changed-files.txt", "untracked_files_path": "untracked-files.json", "diffstat_path": "diffstat.txt"},
-		"handoff":       map[string]any{"summary": handoff.Summary, "tests": handoff.Tests, "risks": handoff.Risks, "verification": handoff.Verification, "followups": handoff.Followups, "target_state": "Human Review"},
-		"changed_files": changed, "untracked_files": untracked,
-		"approvals": []any{}, "tool_calls": []any{},
-		"prompt_snapshot": map[string]any{"id": promptID, "rendered_prompt_hash": "redacted", "tool_manifest_path": "prompt/tool_manifest.md"},
-		"failure_code":    nil, "failure_message": nil, "created_at": core.Now(),
-	}
-	jb, err := json.MarshalIndent(packet, "", "  ")
-	if err != nil {
-		return "", reviewPacketError("marshal review packet", err)
-	}
-	if err := os.WriteFile(reviewJSONPath, jb, 0o644); err != nil {
-		return "", reviewPacketError("write review json artifact", err)
-	}
-	if err := os.WriteFile(reviewMDPath, []byte(renderMarkdown(issue, handoff, changed, run)), 0o644); err != nil {
-		return "", reviewPacketError("write review markdown artifact", err)
-	}
-	// Insert immutable packet with the final ID, then rewrite review.json with the final id.
-	finalID, err := g.Store.InsertReviewPacketInTx(issue.ID, runID, handoff.ID, root, reviewMDPath, reviewJSONPath, patchPath, changedPath, untrackedPath, diffstatPath, promptID)
-	if err != nil {
-		return "", reviewPacketError("insert review packet", err)
-	}
-	packet["id"] = finalID
-	jb, err = json.MarshalIndent(packet, "", "  ")
-	if err != nil {
-		return "", reviewPacketError("marshal final review packet", err)
-	}
-	if err := os.WriteFile(reviewJSONPath, jb, 0o644); err != nil {
-		return "", reviewPacketError("write final review json artifact", err)
-	}
-	for _, item := range []struct{ kind, path string }{{"review_packet", reviewMDPath}, {"review_packet", reviewJSONPath}, {"patch", patchPath}, {"changed_files", changedPath}, {"untracked_files", untrackedPath}, {"diffstat", diffstatPath}} {
-		st, err := os.Stat(item.path)
+		if err := os.WriteFile(reviewJSONPath, jb, 0o644); err != nil {
+			return reviewPacketError("write review json artifact", err)
+		}
+		if err := os.WriteFile(reviewMDPath, []byte(renderMarkdown(issue, handoff, changed, run)), 0o644); err != nil {
+			return reviewPacketError("write review markdown artifact", err)
+		}
+		// Insert immutable packet with the final ID, then rewrite review.json with the final id.
+		finalID, err = g.Store.InsertReviewPacketTx(tx, issue.ID, runID, handoff.ID, root, reviewMDPath, reviewJSONPath, patchPath, changedPath, untrackedPath, diffstatPath, promptID)
 		if err != nil {
-			return "", reviewPacketError("stat review artifact", err)
+			return reviewPacketError("insert review packet", err)
 		}
-		sha, err := fileSHA(item.path)
+		packet["id"] = finalID
+		jb, err = json.MarshalIndent(packet, "", "  ")
 		if err != nil {
-			return "", reviewPacketError("hash review artifact", err)
+			return reviewPacketError("marshal final review packet", err)
 		}
-		if err := g.Store.InsertArtifact(store.ArtifactRecord{ID: core.NewID("art_"), IssueID: &issue.ID, RunID: &runID, ReviewPacketID: &finalID, Kind: item.kind, Path: item.path, SizeBytes: st.Size(), SHA256: &sha, Redacted: true}); err != nil {
-			return "", reviewPacketError("insert review artifact metadata", err)
+		if err := os.WriteFile(reviewJSONPath, jb, 0o644); err != nil {
+			return reviewPacketError("write final review json artifact", err)
 		}
+		for _, item := range []struct{ kind, path string }{{"review_packet", reviewMDPath}, {"review_packet", reviewJSONPath}, {"patch", patchPath}, {"changed_files", changedPath}, {"untracked_files", untrackedPath}, {"diffstat", diffstatPath}} {
+			st, err := os.Stat(item.path)
+			if err != nil {
+				return reviewPacketError("stat review artifact", err)
+			}
+			sha, err := fileSHA(item.path)
+			if err != nil {
+				return reviewPacketError("hash review artifact", err)
+			}
+			if err := g.Store.InsertArtifactTx(tx, store.ArtifactRecord{ID: core.NewID("art_"), IssueID: &issue.ID, RunID: &runID, ReviewPacketID: &finalID, Kind: item.kind, Path: item.path, SizeBytes: st.Size(), SHA256: &sha, Redacted: true}); err != nil {
+				return reviewPacketError("insert review artifact metadata", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return "", err
 	}
-	if err := g.Store.Project.Exec(`COMMIT`); err != nil {
-		return "", reviewPacketError("commit review packet transaction", err)
-	}
-	committed = true
 	return finalID, nil
 }
 
-func collectChanges(root string) ([]string, []UntrackedInfo) {
+func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 	changed := []string{}
 	untracked := []UntrackedInfo{}
+	denied := map[string]bool{}
 	if lines, err := gitx.StatusPorcelain(root); err == nil && len(lines) > 0 {
 		for _, l := range lines {
 			if len(l) < 4 {
 				continue
 			}
-			path := strings.TrimSpace(l[3:])
-			if security.IsProtectedPath(path) {
+			paths := statusPorcelainPaths(l)
+			safePaths := make([]string, 0, len(paths))
+			for _, candidate := range paths {
+				path := reviewSafePath(candidate)
+				if path == "" {
+					if renamedOrCopied(l) && len(paths) > 1 {
+						if dst := reviewSafePath(paths[len(paths)-1]); dst != "" {
+							denied[dst] = true
+						}
+					}
+					safePaths = nil
+					break
+				}
+				safePaths = append(safePaths, path)
+			}
+			if len(safePaths) == 0 {
 				continue
 			}
-			if !contains(changed, path) {
-				changed = append(changed, path)
+			for _, path := range safePaths {
+				if !contains(changed, path) {
+					changed = append(changed, path)
+				}
 			}
 			if strings.HasPrefix(l, "??") {
-				untracked = append(untracked, untrackedInfo(root, path))
+				untracked = append(untracked, untrackedInfo(root, safePaths[0]))
 			}
 		}
-		return changed, untracked
+		return changed, untracked, denied
 	}
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -222,32 +245,39 @@ func collectChanges(root string) ([]string, []UntrackedInfo) {
 			}
 			return nil
 		}
-		if security.IsProtectedPath(rel) {
+		path := reviewSafePath(rel)
+		if path == "" {
 			return nil
 		}
-		changed = append(changed, filepath.ToSlash(rel))
-		untracked = append(untracked, untrackedInfo(root, rel))
+		changed = append(changed, path)
+		untracked = append(untracked, untrackedInfo(root, path))
 		return nil
 	})
-	return changed, untracked
+	return changed, untracked, denied
+}
+func statusPorcelainPaths(line string) []string {
+	path := strings.TrimSpace(line[3:])
+	if renamedOrCopied(line) {
+		if idx := strings.LastIndex(path, " -> "); idx >= 0 {
+			return []string{strings.TrimSpace(path[:idx]), strings.TrimSpace(path[idx+4:])}
+		}
+	}
+	return []string{path}
+}
+func renamedOrCopied(line string) bool {
+	return len(line) >= 2 && (line[0] == 'R' || line[1] == 'R' || line[0] == 'C' || line[1] == 'C')
 }
 func untrackedInfo(root, path string) UntrackedInfo {
-	p := filepath.Join(root, path)
-	st, err := os.Stat(p)
+	path = filepath.ToSlash(path)
+	data, size, reason, err := readUntrackedPatchData(root, path)
 	if err != nil {
-		return UntrackedInfo{Path: path, PatchIncluded: false, Reason: core.StringPtr("stat failed")}
+		return UntrackedInfo{Path: path, SizeBytes: size, PatchIncluded: false, Reason: reason}
 	}
-	b, err := os.ReadFile(p)
-	if err != nil {
-		return UntrackedInfo{Path: path, SizeBytes: st.Size(), PatchIncluded: false, Reason: core.StringPtr("read failed")}
+	sha := ""
+	if data != nil {
+		sha = security.SHA256Bytes(data)
 	}
-	sha := security.SHA256Bytes(b)
-	patchIncluded := st.Size() <= 1024*1024 && !bytesContainNUL(b)
-	var reason *string
-	if !patchIncluded {
-		reason = core.StringPtr("binary or large file omitted from patch")
-	}
-	return UntrackedInfo{Path: filepath.ToSlash(path), SizeBytes: st.Size(), SHA256: sha, PatchIncluded: patchIncluded, Reason: reason}
+	return UntrackedInfo{Path: path, SizeBytes: size, SHA256: sha, PatchIncluded: reason == nil, Reason: reason}
 }
 func syntheticPatch(root string, u []UntrackedInfo) string {
 	var b strings.Builder
@@ -255,8 +285,8 @@ func syntheticPatch(root string, u []UntrackedInfo) string {
 		if !x.PatchIncluded {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(root, x.Path))
-		if err != nil {
+		data, _, reason, err := readUntrackedPatchData(root, x.Path)
+		if err != nil || reason != nil {
 			continue
 		}
 		b.WriteString("diff --git a/")
@@ -266,15 +296,55 @@ func syntheticPatch(root string, u []UntrackedInfo) string {
 		b.WriteString("\nnew file mode 100644\n--- /dev/null\n+++ b/")
 		b.WriteString(x.Path)
 		b.WriteString("\n@@\n")
-		for _, line := range strings.Split(string(data), "\n") {
-			if line != "" {
-				b.WriteByte('+')
-				b.WriteString(line)
-				b.WriteByte('\n')
+		for _, line := range strings.SplitAfter(string(data), "\n") {
+			if line == "" {
+				continue
 			}
+			b.WriteByte('+')
+			b.WriteString(strings.TrimSuffix(line, "\n"))
+			b.WriteByte('\n')
 		}
 	}
 	return b.String()
+}
+func readUntrackedPatchData(root, path string) ([]byte, int64, *string, error) {
+	p := filepath.Join(root, filepath.FromSlash(path))
+	st, err := os.Lstat(p)
+	if err != nil {
+		return nil, 0, core.StringPtr("stat failed"), err
+	}
+	size := st.Size()
+	if st.Mode()&os.ModeSymlink != 0 {
+		return nil, size, core.StringPtr(untrackedReasonSymlink), nil
+	}
+	if !st.Mode().IsRegular() {
+		return nil, size, core.StringPtr(untrackedReasonNonRegular), nil
+	}
+	if size > maxUntrackedPatchBytes {
+		return nil, size, core.StringPtr(untrackedReasonBinaryOrLarge), nil
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, size, core.StringPtr("read failed"), err
+	}
+	defer f.Close()
+	if current, err := f.Stat(); err == nil {
+		size = current.Size()
+		if size > maxUntrackedPatchBytes {
+			return nil, size, core.StringPtr(untrackedReasonBinaryOrLarge), nil
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxUntrackedPatchBytes+1))
+	if err != nil {
+		return nil, size, core.StringPtr("read failed"), err
+	}
+	if int64(len(data)) > maxUntrackedPatchBytes {
+		return nil, int64(len(data)), core.StringPtr(untrackedReasonBinaryOrLarge), nil
+	}
+	if bytesContainNUL(data) {
+		return data, size, core.StringPtr(untrackedReasonBinaryOrLarge), nil
+	}
+	return data, size, nil, nil
 }
 func bytesContainNUL(b []byte) bool {
 	for _, c := range b {
@@ -283,6 +353,27 @@ func bytesContainNUL(b []byte) bool {
 		}
 	}
 	return false
+}
+func reviewSafePath(path string) string {
+	path = filepath.ToSlash(filepath.Clean(path))
+	if path == "." || strings.HasPrefix(path, "../") || path == ".." || filepath.IsAbs(path) {
+		return ""
+	}
+	if security.IsProtectedPath(path) {
+		return ""
+	}
+	return path
+}
+func reviewDiffPaths(changed []string) []string {
+	out := []string{}
+	for _, path := range changed {
+		path = reviewSafePath(path)
+		if path == "" || contains(out, path) {
+			continue
+		}
+		out = append(out, path)
+	}
+	return out
 }
 func contains(a []string, x string) bool {
 	for _, v := range a {
@@ -360,8 +451,8 @@ func fileSHA(path string) (string, error) {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:]), nil
 }
-func nextPacketNo(st *store.Store, issueID string) int {
-	row, err := st.Project.QueryOne(`SELECT COALESCE(MAX(packet_no),0)+1 AS n FROM review_packets WHERE issue_id=?`, issueID)
+func nextPacketNo(q store.TxRunner, issueID string) int {
+	row, err := q.QueryOne(`SELECT COALESCE(MAX(packet_no),0)+1 AS n FROM review_packets WHERE issue_id=?`, issueID)
 	if err != nil {
 		return 1
 	}
