@@ -69,7 +69,7 @@ func TestToolRoutePassesCWDHeaderToGateway(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/tool/v1/call", strings.NewReader(`{"tool":"issue.get","input":{},"client":{"name":"test"}}`))
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Symphony-Cwd", subdir)
 	rec := httptest.NewRecorder()
@@ -425,6 +425,31 @@ func TestOpenTokenRequiresBearerSession(t *testing.T) {
 	srv.Handler().ServeHTTP(exchangeRec, exchangeReq)
 	if exchangeRec.Code != http.StatusOK {
 		t.Fatalf("exchange minted open token status = %d, body = %s", exchangeRec.Code, exchangeRec.Body.String())
+	}
+}
+
+func TestBearerSessionAuthorizationIsCaseInsensitive(t *testing.T) {
+	srv := newTestServer(t)
+	for _, scheme := range []string{"Bearer", "bearer", "BEARER"} {
+		t.Run(scheme, func(t *testing.T) {
+			cliToken := insertLocalSession(t, srv, "cli")
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/open-token", nil)
+			req.Header.Set("Authorization", scheme+" "+cliToken)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("open-token with %s scheme status = %d, body = %s", scheme, rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	cliToken := insertLocalSession(t, srv, "cli")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/open-token", nil)
+	req.Header.Set("Authorization", "Basic "+cliToken)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("open-token with invalid scheme status = %d, want 401; body = %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -1040,6 +1065,117 @@ func TestIssueControlRoutesReturnIssueEnvelope(t *testing.T) {
 	}
 }
 
+func TestMutationRoutesRejectExtraPathSegmentsWithoutMutating(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{
+		Title:              "Extra path segments",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.Identifier, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	dispatchIssue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Dispatch extra segment", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue dispatch: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(dispatchIssue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue dispatch: %v", err)
+	}
+	pauseIssue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Pause extra segment", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue pause: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(pauseIssue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue pause: %v", err)
+	}
+	resumeIssue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Resume extra segment", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue resume: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(resumeIssue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue resume: %v", err)
+	}
+	if _, err := srv.Store.DispatchPause(resumeIssue.Identifier, "pause before route check"); err != nil {
+		t.Fatalf("DispatchPause resume issue: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "issue transition", path: "/api/v1/issues/" + issue.Identifier + "/transition/extra", body: `{"state":"Blocked","reason":"should not mutate"}`},
+		{name: "issue comments", path: "/api/v1/issues/" + issue.Identifier + "/comments/extra", body: `{"body":"should not mutate"}`},
+		{name: "issue dispatch", path: "/api/v1/issues/" + dispatchIssue.Identifier + "/dispatch/extra", body: `{}`},
+		{name: "issue dispatch pause", path: "/api/v1/issues/" + pauseIssue.Identifier + "/dispatch-pause/extra", body: `{"reason":"should not mutate"}`},
+		{name: "issue dispatch resume", path: "/api/v1/issues/" + resumeIssue.Identifier + "/dispatch-resume/extra", body: `{"reason":"should not mutate"}`},
+		{name: "run cancel", path: "/api/v1/runs/" + run.ID + "/cancel/extra", body: `{"reason":"should not mutate"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			applySessionAuth(req, auth)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("%s status = %d, want 404; body = %s", tt.name, rec.Code, rec.Body.String())
+			}
+		})
+	}
+	afterIssue, err := srv.Store.GetIssue(issue.Identifier)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if afterIssue.State != core.StateWorking {
+		t.Fatalf("issue state = %s, want Working", afterIssue.State)
+	}
+	row, err := srv.Store.Project.QueryOne(`SELECT COUNT(*) AS n FROM issue_comments WHERE issue_id=? AND body='should not mutate'`, issue.ID)
+	if err != nil {
+		t.Fatalf("count comments: %v", err)
+	}
+	if row["n"].Int() != 0 {
+		t.Fatalf("inserted %d comments through extra path segment", row["n"].Int())
+	}
+	afterRun, err := srv.Store.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if afterRun.Status == core.RunCancelled {
+		t.Fatalf("run was cancelled through extra path segment")
+	}
+	dispatchRows, err := srv.Store.Project.Query(`SELECT id FROM run_attempts WHERE issue_id=?`, dispatchIssue.ID)
+	if err != nil {
+		t.Fatalf("query dispatch run attempts: %v", err)
+	}
+	if len(dispatchRows) != 0 {
+		t.Fatalf("dispatch extra path created %d run attempts", len(dispatchRows))
+	}
+	afterPauseIssue, err := srv.Store.GetIssue(pauseIssue.Identifier)
+	if err != nil {
+		t.Fatalf("GetIssue pause: %v", err)
+	}
+	if afterPauseIssue.DispatchPaused {
+		t.Fatalf("pause issue was paused through extra path segment")
+	}
+	afterResumeIssue, err := srv.Store.GetIssue(resumeIssue.Identifier)
+	if err != nil {
+		t.Fatalf("GetIssue resume: %v", err)
+	}
+	if !afterResumeIssue.DispatchPaused {
+		t.Fatalf("resume issue was resumed through extra path segment")
+	}
+}
+
 func TestTypedMutationRoutesRejectInvalidJSONBodies(t *testing.T) {
 	srv := newTestServer(t)
 	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Strict bodies", Description: "desc"})
@@ -1560,6 +1696,55 @@ func TestDashboardExplicitDistMayPointInsideProjectRoot(t *testing.T) {
 	srv.Handler().ServeHTTP(rec, req)
 	if !strings.Contains(rec.Body.String(), "explicit project root dashboard") {
 		t.Fatalf("explicit dashboard dist was not served: %s", rec.Body.String())
+	}
+}
+
+func TestDashboardDoesNotServeSymlinkAssetOutsideDist(t *testing.T) {
+	srv := newTestServer(t)
+	dist := filepath.Join(t.TempDir(), "dist")
+	t.Setenv("SYMPHONY_DASHBOARD_DIST", dist)
+	if err := os.MkdirAll(dist, 0o755); err != nil {
+		t.Fatalf("mkdir dist: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dist, "index.html"), []byte("dashboard index"), 0o644); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	secretPath := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("external dashboard secret"), 0o644); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	if err := os.Symlink(secretPath, filepath.Join(dist, "secret.txt")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/secret.txt", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "external dashboard secret") {
+		t.Fatalf("served external dashboard secret through symlink: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDashboardFallbackDoesNotServeSymlinkIndexOutsideDist(t *testing.T) {
+	srv := newTestServer(t)
+	dist := filepath.Join(t.TempDir(), "dist")
+	t.Setenv("SYMPHONY_DASHBOARD_DIST", dist)
+	if err := os.MkdirAll(dist, 0o755); err != nil {
+		t.Fatalf("mkdir dist: %v", err)
+	}
+	secretPath := filepath.Join(t.TempDir(), "index.html")
+	if err := os.WriteFile(secretPath, []byte("external index secret"), 0o644); err != nil {
+		t.Fatalf("write secret index: %v", err)
+	}
+	if err := os.Symlink(secretPath, filepath.Join(dist, "index.html")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/missing-route", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "external index secret") {
+		t.Fatalf("served external dashboard index through symlink fallback: status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -2090,6 +2275,73 @@ END;`); err != nil {
 	}
 	if _, ok := payload["data"]; ok {
 		t.Fatalf("cancel returned success data on run reload error: %#v", payload)
+	}
+}
+
+func TestArtifactContentDoesNotServeSymlinkOutsideAllowedRoots(t *testing.T) {
+	srv := newTestServer(t)
+	artifactsDir := filepath.Join(srv.Store.RepoRoot, ".symphony", "artifacts")
+	if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
+		t.Fatalf("mkdir artifacts: %v", err)
+	}
+	goodPath := filepath.Join(artifactsDir, "good.txt")
+	if err := os.WriteFile(goodPath, []byte("allowed artifact content"), 0o644); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_good", Kind: "diagnostic", Path: goodPath, Redacted: true}); err != nil {
+		t.Fatalf("InsertArtifact good: %v", err)
+	}
+	secretPath := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("external artifact secret"), 0o644); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	linkPath := filepath.Join(artifactsDir, "secret-link.txt")
+	if err := os.Symlink(secretPath, linkPath); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_link", Kind: "diagnostic", Path: linkPath, Redacted: true}); err != nil {
+		t.Fatalf("InsertArtifact link: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+
+	goodReq := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/art_good/content", nil)
+	addCookies(goodReq, auth.cookies)
+	goodRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(goodRec, goodReq)
+	if goodRec.Code != http.StatusOK || !strings.Contains(goodRec.Body.String(), "allowed artifact content") {
+		t.Fatalf("legal artifact status = %d, body = %s", goodRec.Code, goodRec.Body.String())
+	}
+
+	linkReq := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/art_link/content", nil)
+	addCookies(linkReq, auth.cookies)
+	linkRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(linkRec, linkReq)
+	if linkRec.Code != http.StatusForbidden && linkRec.Code != http.StatusNotFound {
+		t.Fatalf("symlink artifact status = %d, want 403 or 404; body = %s", linkRec.Code, linkRec.Body.String())
+	}
+	if strings.Contains(linkRec.Body.String(), "external artifact secret") {
+		t.Fatalf("served external artifact secret through symlink: body = %s", linkRec.Body.String())
+	}
+}
+
+func TestArtifactContentMissingFileUnderAllowedRootReturnsNotFound(t *testing.T) {
+	srv := newTestServer(t)
+	artifactsDir := filepath.Join(srv.Store.RepoRoot, ".symphony", "artifacts")
+	if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
+		t.Fatalf("mkdir artifacts: %v", err)
+	}
+	missingPath := filepath.Join(artifactsDir, "missing.txt")
+	if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_missing", Kind: "diagnostic", Path: missingPath, Redacted: true}); err != nil {
+		t.Fatalf("InsertArtifact missing: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/art_missing/content", nil)
+	addCookies(req, auth.cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing artifact status = %d, want 404; body = %s", rec.Code, rec.Body.String())
 	}
 }
 

@@ -112,6 +112,8 @@ if (!/exchangeOpenToken:\s*async\s*\([^)]*openToken[^)]*\)\s*=>\s*\{[\s\S]*metho
 if (!app.includes('open_token') || !app.includes('openToken')) throw new Error('dashboard must read open-token aliases from URL');
 if (!app.includes('api.exchangeOpenToken')) throw new Error('dashboard must bootstrap auth with open-token exchange');
 if (!app.includes('history.replaceState')) throw new Error('dashboard must clean exchanged open token from URL');
+if (/\.split\(\s*['"]\/['"]\s*\)\.map\(\s*decodeURIComponent\s*\)/s.test(app)) throw new Error('route parsing must not directly map decodeURIComponent over hash segments');
+if (!/function\s+\w*decode\w*Route\w*\([^)]*\)[\s\S]*try\s*\{[\s\S]*decodeURIComponent[\s\S]*\}\s*catch/s.test(app)) throw new Error('route parsing must use a safe decode helper with malformed hash fallback');
 if (!app.includes('exchangePromiseRef')) throw new Error('dashboard must guard one-time open-token exchange against duplicate effects');
 if (!/cleanOpenTokenFromUrl\(\);\s*exchangePromiseRef\.current = api\.exchangeOpenToken/s.test(app)) throw new Error('dashboard must clean open token before awaiting exchange');
 if (!app.includes('Dashboard is not authenticated')) throw new Error('dashboard must render explicit unauthenticated state');

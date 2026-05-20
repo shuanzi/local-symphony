@@ -402,6 +402,26 @@ func TestSyntheticPatchPreservesBlankLines(t *testing.T) {
 	}
 }
 
+func TestSyntheticPatchMarksFileWithoutTrailingNewline(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "notes.txt", "first line\nlast line")
+
+	patch := syntheticPatch(root, []UntrackedInfo{{Path: "notes.txt", PatchIncluded: true}})
+	if !strings.Contains(patch, "+first line\n+last line\n\\ No newline at end of file\n") {
+		t.Fatalf("synthetic patch missing no-newline marker:\n%s", patch)
+	}
+}
+
+func TestSyntheticPatchDoesNotMarkFileWithTrailingNewline(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "notes.txt", "untracked content\n")
+
+	patch := syntheticPatch(root, []UntrackedInfo{{Path: "notes.txt", PatchIncluded: true}})
+	if strings.Contains(patch, "\\ No newline at end of file") {
+		t.Fatalf("synthetic patch incorrectly added no-newline marker:\n%s", patch)
+	}
+}
+
 func TestUntrackedInfoOmitsLargeFileWithoutHashingContents(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "large.txt", strings.Repeat("x", int(testMaxUntrackedPatchBytes)+1))

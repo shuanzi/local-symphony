@@ -408,13 +408,17 @@ func syntheticPatch(root string, u []UntrackedInfo) string {
 		b.WriteString("\nnew file mode 100644\n--- /dev/null\n+++ b/")
 		b.WriteString(x.Path)
 		b.WriteString("\n@@\n")
-		for _, line := range strings.SplitAfter(string(data), "\n") {
+		lines := strings.SplitAfter(string(data), "\n")
+		for i, line := range lines {
 			if line == "" {
 				continue
 			}
 			b.WriteByte('+')
 			b.WriteString(strings.TrimSuffix(line, "\n"))
 			b.WriteByte('\n')
+			if i == len(lines)-1 && !strings.HasSuffix(line, "\n") {
+				b.WriteString("\\ No newline at end of file\n")
+			}
 		}
 	}
 	return b.String()

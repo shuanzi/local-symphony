@@ -57,9 +57,9 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 			requestPath = "index.html"
 		}
 		filePath := filepath.Join(distRoot, requestPath)
-		if under(filePath, distRoot) {
-			if st, err := os.Stat(filePath); err == nil && !st.IsDir() {
-				http.ServeFile(w, r, filePath)
+		if safePath, ok := safeContainedFilePath(filePath, distRoot); ok {
+			if st, err := os.Stat(safePath); err == nil && !st.IsDir() {
+				http.ServeFile(w, r, safePath)
 				return
 			}
 		}
@@ -75,7 +75,7 @@ func (s *Server) handleTool(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method", 405)
 		return
 	}
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	token := bearerTokenFromHeader(r.Header.Get("Authorization"))
 	var req toolgateway.Request
 	if err := readRequiredStrictJSONObjectBody(r, &req, map[string]bool{"tool": true, "input": true, "client": true}); err != nil {
 		writeJSON(w, 400, toolgateway.Response{Success: false, Error: &toolgateway.ToolError{Code: "invalid_request", Message: err.Error()}})
@@ -408,7 +408,7 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 	if len(parts) >= 2 {
 		switch parts[1] {
 		case "transition":
-			if r.Method == "POST" {
+			if len(parts) == 2 && r.Method == "POST" {
 				var in struct {
 					State       string `json:"state"`
 					Reason      string `json:"reason"`
@@ -431,7 +431,7 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 				return
 			}
 		case "comments":
-			if r.Method == "POST" {
+			if len(parts) == 2 && r.Method == "POST" {
 				var in struct {
 					Body string `json:"body"`
 				}
@@ -487,7 +487,7 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 				return
 			}
 		case "dispatch":
-			if r.Method == "POST" {
+			if len(parts) == 2 && r.Method == "POST" {
 				res, err := s.Orch.DispatchIssue(ref, "manual")
 				if err != nil {
 					apiErr(w, err)
@@ -497,7 +497,7 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 				return
 			}
 		case "dispatch-pause":
-			if r.Method == "POST" {
+			if len(parts) == 2 && r.Method == "POST" {
 				var in struct {
 					Reason string `json:"reason"`
 				}
@@ -513,7 +513,7 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 				return
 			}
 		case "dispatch-resume":
-			if r.Method == "POST" {
+			if len(parts) == 2 && r.Method == "POST" {
 				var in struct {
 					Reason string `json:"reason"`
 				}
@@ -571,7 +571,7 @@ func (s *Server) runRoutes(w http.ResponseWriter, r *http.Request, rest string) 
 				return
 			}
 		case "cancel":
-			if r.Method == "POST" {
+			if len(parts) == 2 && r.Method == "POST" {
 				var in struct {
 					Reason string `json:"reason"`
 				}
@@ -776,11 +776,15 @@ func (s *Server) artifactRoutes(w http.ResponseWriter, r *http.Request, rest str
 		}
 		root1 := filepath.Join(s.Store.RepoRoot, ".symphony", "artifacts")
 		root2 := filepath.Join(s.Store.RepoRoot, ".symphony", "exports")
-		if !under(art.Path, root1) && !under(art.Path, root2) {
+		safePath, ok := safeContainedFilePathAllowMissing(art.Path, root1)
+		if !ok {
+			safePath, ok = safeContainedFilePathAllowMissing(art.Path, root2)
+		}
+		if !ok {
 			apiErr(w, core.NewError(core.ErrForbidden, "artifact path is outside allowed roots", nil))
 			return
 		}
-		http.ServeFile(w, r, art.Path)
+		http.ServeFile(w, r, safePath)
 		return
 	}
 	apiErr(w, core.NewError(core.ErrNotFound, "artifact route not found", nil))
@@ -1050,6 +1054,38 @@ func under(p, root string) bool {
 	return err == nil && (rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)))
 }
 
+func safeContainedFilePath(p, root string) (string, bool) {
+	safePath, ok := safeContainedFilePathAllowMissing(p, root)
+	if !ok {
+		return "", false
+	}
+	if _, err := os.Stat(safePath); err != nil {
+		return "", false
+	}
+	return safePath, true
+}
+
+func safeContainedFilePathAllowMissing(p, root string) (string, bool) {
+	if !under(p, root) {
+		return "", false
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", false
+	}
+	resolvedPath, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return p, true
+		}
+		return "", false
+	}
+	if !under(resolvedPath, resolvedRoot) {
+		return "", false
+	}
+	return resolvedPath, true
+}
+
 type dashboardCandidate struct {
 	path     string
 	explicit bool
@@ -1078,8 +1114,10 @@ func dashboardDist(repoRoot string) (string, string, bool) {
 			continue
 		}
 		indexPath := filepath.Join(distRoot, "index.html")
-		if st, err := os.Stat(indexPath); err == nil && !st.IsDir() {
-			return distRoot, indexPath, true
+		if safeIndexPath, ok := safeContainedFilePath(indexPath, distRoot); ok {
+			if st, err := os.Stat(safeIndexPath); err == nil && !st.IsDir() {
+				return distRoot, safeIndexPath, true
+			}
 		}
 	}
 	return "", "", false
@@ -1249,9 +1287,18 @@ func (s *Server) validBearerSession(r *http.Request) bool {
 }
 
 func bearerToken(r *http.Request) string {
-	header := r.Header.Get("Authorization")
-	token := strings.TrimPrefix(header, "Bearer ")
-	if token == "" || token == header {
+	return bearerTokenFromHeader(r.Header.Get("Authorization"))
+}
+
+func bearerTokenFromHeader(header string) string {
+	if len(header) <= len("Bearer ") || header[len("Bearer")] != ' ' {
+		return ""
+	}
+	if !strings.EqualFold(header[:len("Bearer")], "Bearer") {
+		return ""
+	}
+	token := header[len("Bearer "):]
+	if token == "" {
 		return ""
 	}
 	return token

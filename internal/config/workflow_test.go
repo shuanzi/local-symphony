@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -144,5 +145,83 @@ Do the work.
 	}
 	if !slices.Contains(w.Validation.Errors, "hooks.max_output_bytes must be greater than or equal to 0") {
 		t.Fatalf("Validation.Errors = %v, want hooks max_output_bytes non-negative error", w.Validation.Errors)
+	}
+}
+
+func TestLoadPathExpandsOnlyCurrentUserHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("user home is unavailable")
+	}
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "bare tilde", raw: `'~'`, want: home},
+		{name: "tilde slash", raw: `~/ws`, want: filepath.Join(home, "ws")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "WORKFLOW.md")
+			content := `---
+workspace:
+  root: ` + tt.raw + `
+---
+Do the work.
+`
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatalf("write workflow: %v", err)
+			}
+
+			w, err := LoadPath(path, dir)
+			if err != nil {
+				t.Fatalf("LoadPath returned error: %v", err)
+			}
+			if !w.Validation.Valid {
+				t.Fatalf("Validation.Valid = false, errors = %v", w.Validation.Errors)
+			}
+			if got := filepath.Clean(w.Config.Workspace.Root); got != filepath.Clean(tt.want) {
+				t.Fatalf("workspace.root = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadPathRejectsUnsupportedTildeUserExpansion(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("user home is unavailable")
+	}
+	tests := []string{"~user", "~foo", "~../outside"}
+	for _, raw := range tests {
+		t.Run(raw, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "WORKFLOW.md")
+			content := `---
+workspace:
+  root: ` + raw + `
+---
+Do the work.
+`
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatalf("write workflow: %v", err)
+			}
+
+			w, err := LoadPath(path, dir)
+			if err != nil {
+				t.Fatalf("LoadPath returned error: %v", err)
+			}
+			if w.Validation.Valid {
+				t.Fatalf("Validation.Valid = true, want false for %q", raw)
+			}
+			if strings.HasPrefix(filepath.Clean(w.Config.Workspace.Root), filepath.Clean(home)+string(os.PathSeparator)) || filepath.Clean(w.Config.Workspace.Root) == filepath.Clean(home) {
+				t.Fatalf("workspace.root = %q was expanded under home %q", w.Config.Workspace.Root, home)
+			}
+			if !slices.Contains(w.Validation.Errors, "unsupported home directory expansion in config path: "+raw) {
+				t.Fatalf("Validation.Errors = %v, want unsupported tilde error for %q", w.Validation.Errors, raw)
+			}
+		})
 	}
 }

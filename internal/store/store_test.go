@@ -1172,6 +1172,81 @@ func TestRemoveDuplicatePropagatesRelationUpdateError(t *testing.T) {
 	}
 }
 
+func TestTransitionIssuePropagatesDuplicateRelationLookupError(t *testing.T) {
+	st := newStoreTestStore(t)
+	duplicate, err := st.CreateIssue(CreateIssueInput{
+		Title:       "Duplicate issue",
+		Description: "desc",
+		Priority:    3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue duplicate: %v", err)
+	}
+	canonical, err := st.CreateIssue(CreateIssueInput{
+		Title:       "Canonical issue",
+		Description: "desc",
+		Priority:    3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue canonical: %v", err)
+	}
+	other, err := st.CreateIssue(CreateIssueInput{
+		Title:       "Other canonical issue",
+		Description: "desc",
+		Priority:    3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue other: %v", err)
+	}
+	if err := st.Project.Exec(`INSERT INTO issue_relations(id,source_issue_id,target_issue_id,relation_type,active,created_by_type,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("rel_"), duplicate.ID, other.ID, "duplicates", 1, "operator", core.Now()); err != nil {
+		t.Fatalf("insert existing duplicate relation: %v", err)
+	}
+	quotedDuplicateID := "'" + strings.ReplaceAll(duplicate.ID, "'", "''") + "'"
+	if err := st.Project.Exec(`ALTER TABLE issue_relations RENAME TO issue_relations_shadow`); err != nil {
+		t.Fatalf("rename issue_relations: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE VIEW issue_relations AS
+SELECT id, source_issue_id,
+       CASE WHEN source_issue_id=` + quotedDuplicateID + ` AND relation_type='duplicates' THEN json_extract('bad json','$.x') ELSE target_issue_id END AS target_issue_id,
+       relation_type, active, created_by_type, created_by_run_id, created_at, resolved_at
+FROM issue_relations_shadow`); err != nil {
+		t.Fatalf("create failing issue_relations view: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER insert_issue_relations_view INSTEAD OF INSERT ON issue_relations BEGIN
+INSERT INTO issue_relations_shadow(id,source_issue_id,target_issue_id,relation_type,active,created_by_type,created_by_run_id,created_at,resolved_at)
+VALUES(NEW.id,NEW.source_issue_id,NEW.target_issue_id,NEW.relation_type,NEW.active,NEW.created_by_type,NEW.created_by_run_id,NEW.created_at,NEW.resolved_at);
+END`); err != nil {
+		t.Fatalf("create issue_relations insert trigger: %v", err)
+	}
+
+	_, err = st.TransitionIssue(duplicate.ID, core.StateDuplicate, "duplicate", canonical.ID)
+	if err == nil {
+		t.Fatal("TransitionIssue succeeded, want duplicate relation lookup error")
+	}
+	assertErrorContains(t, err, "malformed JSON")
+	row, err := st.Project.QueryOne(`SELECT state FROM issues WHERE id=?`, duplicate.ID)
+	if err != nil {
+		t.Fatalf("query issue state: %v", err)
+	}
+	if got := core.IssueState(row["state"].String()); got != core.StateInbox {
+		t.Fatalf("issue state = %s, want %s", got, core.StateInbox)
+	}
+	rows, err := st.Project.Query(`SELECT id FROM issue_relations_shadow WHERE source_issue_id=? AND relation_type='duplicates' AND active=1`, duplicate.ID)
+	if err != nil {
+		t.Fatalf("query duplicate relations: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("active duplicate relations = %d, want 1", len(rows))
+	}
+	rows, err = st.Project.Query(`SELECT id FROM issue_relations_shadow WHERE source_issue_id=? AND target_issue_id=? AND relation_type='duplicates' AND active=1`, duplicate.ID, canonical.ID)
+	if err != nil {
+		t.Fatalf("query canonical duplicate relation: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("canonical duplicate relations = %d, want 0", len(rows))
+	}
+}
+
 func TestDispatchPauseResumeRejectTerminalIssueWithoutChangingDispatchFields(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -1502,6 +1577,40 @@ func TestClaimRunPropagatesAttemptNumberError(t *testing.T) {
 	assertNoClaimDispatchEvents(t, st, issue.ID)
 }
 
+func TestCreateOrUpdateWorkspacePropagatesLookupError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "Workspace lookup failure")
+	quotedIssueID := "'" + strings.ReplaceAll(issue.ID, "'", "''") + "'"
+	if err := st.Project.Exec(`ALTER TABLE workspaces RENAME TO workspaces_shadow`); err != nil {
+		t.Fatalf("rename workspaces: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE VIEW workspaces AS
+SELECT json_extract('bad json','$.x') AS id, ` + quotedIssueID + ` AS issue_id, '/tmp/poison' AS path, 'poison' AS branch_name, 'auto' AS base_ref_config, 'main' AS base_ref, 'base' AS base_sha, 'prepared' AS status, 'created' AS created_at, 'updated' AS updated_at
+UNION ALL
+SELECT id, issue_id, path, branch_name, base_ref_config, base_ref, base_sha, status, created_at, updated_at FROM workspaces_shadow`); err != nil {
+		t.Fatalf("create failing workspaces view: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER insert_workspaces_view INSTEAD OF INSERT ON workspaces BEGIN
+INSERT INTO workspaces_shadow(id,issue_id,path,branch_name,base_ref_config,base_ref,base_sha,status,created_at,updated_at)
+VALUES(NEW.id,NEW.issue_id,NEW.path,NEW.branch_name,NEW.base_ref_config,NEW.base_ref,NEW.base_sha,NEW.status,NEW.created_at,NEW.updated_at);
+END`); err != nil {
+		t.Fatalf("create workspaces insert trigger: %v", err)
+	}
+
+	_, err := st.CreateOrUpdateWorkspace(issue.ID, "/tmp/workspace", "branch", "auto", "main", "base")
+	if err == nil {
+		t.Fatal("CreateOrUpdateWorkspace succeeded, want lookup error")
+	}
+	assertErrorContains(t, err, "malformed JSON")
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM workspaces_shadow WHERE issue_id=?`, issue.ID)
+	if err != nil {
+		t.Fatalf("count workspaces: %v", err)
+	}
+	if got := row["c"].Int(); got != 0 {
+		t.Fatalf("workspace rows = %d, want 0", got)
+	}
+}
+
 func TestClaimRunRollsBackRunClaimedEventWhenStateChangedEventFails(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue := prepareReadyIssue(t, st, "ClaimRun state changed event failure")
@@ -1573,6 +1682,51 @@ func TestInsertHandoffRollsBackWhenSubmittedEventFails(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("handoff rows = %d, want 0 after rollback", len(rows))
+	}
+}
+
+func TestInsertHandoffPropagatesLookupError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Handoff lookup failure")
+	quotedRunID := "'" + strings.ReplaceAll(run.ID, "'", "''") + "'"
+	quotedIssueID := "'" + strings.ReplaceAll(issue.ID, "'", "''") + "'"
+	if err := st.Project.Exec(`ALTER TABLE handoffs RENAME TO handoffs_shadow`); err != nil {
+		t.Fatalf("rename handoffs: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE VIEW handoffs AS
+SELECT json_extract('bad json','$.x') AS id, ` + quotedIssueID + ` AS issue_id, ` + quotedRunID + ` AS run_id, 'existing-hash' AS payload_hash, '{}' AS payload_json_redacted, 'poison' AS summary, '[]' AS changed_files_json, '[]' AS tests_json, '[]' AS risks_json, '[]' AS verification_json, '[]' AS followups_json, 'Human Review' AS target_state, 'submitted' AS submitted_at
+UNION ALL
+SELECT id, issue_id, run_id, payload_hash, payload_json_redacted, summary, changed_files_json, tests_json, risks_json, verification_json, followups_json, target_state, submitted_at FROM handoffs_shadow`); err != nil {
+		t.Fatalf("create failing handoffs view: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER insert_handoffs_view INSTEAD OF INSERT ON handoffs BEGIN
+INSERT INTO handoffs_shadow(id,issue_id,run_id,payload_hash,payload_json_redacted,summary,changed_files_json,tests_json,risks_json,verification_json,followups_json,target_state,submitted_at)
+VALUES(NEW.id,NEW.issue_id,NEW.run_id,NEW.payload_hash,NEW.payload_json_redacted,NEW.summary,NEW.changed_files_json,NEW.tests_json,NEW.risks_json,NEW.verification_json,NEW.followups_json,NEW.target_state,NEW.submitted_at);
+END`); err != nil {
+		t.Fatalf("create handoffs insert trigger: %v", err)
+	}
+
+	_, err := st.InsertHandoff(issue.ID, run.ID, "payload-hash", map[string]any{
+		"summary":      "ready for review",
+		"target_state": "Human Review",
+	})
+	if err == nil {
+		t.Fatal("InsertHandoff succeeded, want lookup error")
+	}
+	assertErrorContains(t, err, "malformed JSON")
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM handoffs_shadow WHERE run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("count handoffs: %v", err)
+	}
+	if got := row["c"].Int(); got != 0 {
+		t.Fatalf("handoff rows = %d, want 0", got)
+	}
+	rows, err := st.Project.Query(`SELECT id FROM run_events WHERE run_id=? AND event_type='handoff.submitted'`, run.ID)
+	if err != nil {
+		t.Fatalf("query handoff submitted events: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("handoff submitted events = %d, want 0", len(rows))
 	}
 }
 

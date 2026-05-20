@@ -794,7 +794,10 @@ func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, dupl
 			if can["id"].String() == id {
 				return core.NewError(core.ErrInvalidRequest, "duplicate_of cannot point to current issue", nil)
 			}
-			existing, _ := tx.Query(`SELECT * FROM issue_relations WHERE source_issue_id=? AND relation_type='duplicates' AND active=1`, id)
+			existing, err := tx.Query(`SELECT * FROM issue_relations WHERE source_issue_id=? AND relation_type='duplicates' AND active=1`, id)
+			if err != nil {
+				return err
+			}
 			if len(existing) > 0 && existing[0]["target_issue_id"].String() != can["id"].String() {
 				return core.NewError(core.ErrInvalidStateTransition, "duplicate relation already points elsewhere", nil)
 			}
@@ -1149,9 +1152,13 @@ func (s *Store) SetRunWorkspace(runID, workspaceID, branch, baseRefConfig, baseR
 	return s.Project.Exec(`UPDATE run_attempts SET workspace_id=?, branch_name=?, base_ref_config=?, base_ref=?, base_sha=?, updated_at=? WHERE id=?`, workspaceID, branch, baseRefConfig, baseRef, baseSHA, core.Now(), runID)
 }
 func (s *Store) CreateOrUpdateWorkspace(issueID, path, branch, baseRefConfig, baseRef, baseSHA string) (string, error) {
-	if row, err := s.Project.QueryOne(`SELECT id FROM workspaces WHERE issue_id=?`, issueID); err == nil {
+	row, err := s.Project.QueryOne(`SELECT id FROM workspaces WHERE issue_id=?`, issueID)
+	if err == nil {
 		id := row["id"].String()
 		return id, s.Project.Exec(`UPDATE workspaces SET path=?, branch_name=?, base_ref_config=?, base_ref=?, base_sha=?, status='prepared', updated_at=? WHERE id=?`, path, branch, baseRefConfig, baseRef, baseSHA, core.Now(), id)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", err
 	}
 	id := core.NewID("ws_")
 	now := core.Now()
@@ -1521,11 +1528,15 @@ func jsonShape(v any) map[string]any {
 }
 
 func (s *Store) InsertHandoff(issueID, runID, payloadHash string, payload map[string]any) (*core.Handoff, error) {
-	if existing, err := s.GetHandoffByRun(runID); err == nil {
+	existing, err := s.GetHandoffByRun(runID)
+	if err == nil {
 		if existing.PayloadHash == payloadHash {
 			return existing, nil
 		}
 		return nil, core.NewError(core.APIErrorCode("handoff_conflict"), "handoff already exists for this run with a different payload hash", map[string]any{"run_id": runID, "handoff_id": existing.ID, "existing_payload_hash": existing.PayloadHash, "incoming_payload_hash": payloadHash})
+	}
+	if core.AsAPIError(err).Code != core.ErrNotFound {
+		return nil, err
 	}
 	id := core.NewID("hand_")
 	now := core.Now()

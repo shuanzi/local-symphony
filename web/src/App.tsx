@@ -86,10 +86,24 @@ const emptyData: DashboardData = {
   events: []
 };
 
+function decodeRouteSegment(segment: string): string | null {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
+}
+
 function parseRoute(): RouteState {
   const raw = window.location.hash.replace(/^#\/?/, '');
   const [path] = raw.split('?');
-  const [page = 'overview', id] = path.split('/').map(decodeURIComponent);
+  const segments: string[] = [];
+  for (const segment of path.split('/')) {
+    const decoded = decodeRouteSegment(segment);
+    if (decoded === null) return { page: 'overview' };
+    segments.push(decoded);
+  }
+  const [page = 'overview', id] = segments;
   if (page === 'issue' && id) return { page: 'issue', issueRef: id };
   if (page === 'run' && id) return { page: 'run', runId: id };
   if (page === 'review') return { page: 'review', issueRef: id };

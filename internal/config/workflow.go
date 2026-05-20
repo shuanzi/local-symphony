@@ -296,7 +296,7 @@ func applyMap(c *EffectiveConfig, m map[string]any, baseDir string, warnings, er
 	}
 	if w := section("workspace"); w != nil {
 		if v, ok := str(w, "root", errors); ok {
-			c.Workspace.Root = resolvePath(expandEnv(v, errors), baseDir)
+			c.Workspace.Root = resolvePath(expandEnv(v, errors), baseDir, errors)
 		}
 	}
 	if p := section("polling"); p != nil {
@@ -306,7 +306,7 @@ func applyMap(c *EffectiveConfig, m map[string]any, baseDir string, warnings, er
 	}
 	if g := section("git"); g != nil {
 		if v, ok := str(g, "repo_root", errors); ok {
-			c.Git.RepoRoot = resolvePath(expandEnv(v, errors), baseDir)
+			c.Git.RepoRoot = resolvePath(expandEnv(v, errors), baseDir, errors)
 		}
 		if v, ok := str(g, "base_ref", errors); ok {
 			c.Git.BaseRef = v
@@ -486,9 +486,13 @@ func expandEnv(v string, errs *[]string) string {
 	}
 	return v
 }
-func resolvePath(v, base string) string {
-	if strings.HasPrefix(v, "~") {
-		v = filepath.Join(homeDir(), strings.TrimPrefix(v, "~"))
+func resolvePath(v, base string, errs *[]string) string {
+	if v == "~" {
+		v = homeDir()
+	} else if strings.HasPrefix(v, "~/") {
+		v = filepath.Join(homeDir(), strings.TrimPrefix(v, "~/"))
+	} else if strings.HasPrefix(v, "~") {
+		*errs = append(*errs, "unsupported home directory expansion in config path: "+v)
 	}
 	if !filepath.IsAbs(v) {
 		v = filepath.Join(base, v)
