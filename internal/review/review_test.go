@@ -96,6 +96,42 @@ func TestGenerateIncludesTrackedPathWithSpacesInPatch(t *testing.T) {
 	}
 }
 
+func TestGenerateCleanGitWorkspaceDoesNotCreateSyntheticWorkspacePatch(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	writeFile(t, workspace, "notes/space name.txt", "tracked\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, nil)
+
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if strings.Contains(patch, "diff --git a/app.txt b/app.txt") || strings.Contains(patch, "diff --git a/notes/space name.txt b/notes/space name.txt") {
+		t.Fatalf("changes.patch included synthetic clean workspace patch:\n%s", patch)
+	}
+	changed := strings.TrimSpace(readReviewArtifact(t, st, issue, run, "changed-files.txt"))
+	if changed != "" {
+		t.Fatalf("changed-files.txt = %q, want empty", changed)
+	}
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	if len(untracked) != 0 {
+		t.Fatalf("untracked-files.json = %+v, want empty", untracked)
+	}
+	var packet struct {
+		ChangedFiles []string `json:"changed_files"`
+	}
+	if err := json.Unmarshal([]byte(readReviewArtifact(t, st, issue, run, "review.json")), &packet); err != nil {
+		t.Fatalf("unmarshal review.json: %v", err)
+	}
+	if len(packet.ChangedFiles) != 0 {
+		t.Fatalf("review.json changed_files = %+v, want empty", packet.ChangedFiles)
+	}
+}
+
 func TestGenerateTreatsChangedFilesAsLiteralPathspecs(t *testing.T) {
 	st := newReviewTestStore(t)
 	workspace := initGitWorkspace(t)

@@ -297,6 +297,29 @@ func toStrings(v any) []string {
 	return out
 }
 
+func requiredStringSlice(in map[string]any, key string) ([]string, error) {
+	v, ok := in[key]
+	if !ok {
+		return []string{}, nil
+	}
+	switch a := v.(type) {
+	case []string:
+		return a, nil
+	case []any:
+		out := make([]string, 0, len(a))
+		for _, x := range a {
+			s, ok := x.(string)
+			if !ok {
+				return nil, core.NewError(core.ErrInvalidRequest, key+" must be string array", nil)
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	default:
+		return nil, core.NewError(core.ErrInvalidRequest, key+" must be string array", nil)
+	}
+}
+
 func artifactMaxBytesFromScope(scope map[string]any) int64 {
 	if scope == nil {
 		return defaultArtifactMaxBytes
@@ -334,7 +357,27 @@ func canonicalHandoff(in map[string]any) (map[string]any, error) {
 	if target != "Human Review" {
 		return nil, core.NewError(core.ErrInvalidRequest, "target_state must be Human Review", nil)
 	}
-	out := map[string]any{"summary": summary, "changed_files": toStrings(in["changed_files"]), "tests": toStrings(in["tests"]), "risks": toStrings(in["risks"]), "verification": toStrings(in["verification"]), "followups": toStrings(in["followups"]), "target_state": "Human Review"}
+	changedFiles, err := requiredStringSlice(in, "changed_files")
+	if err != nil {
+		return nil, err
+	}
+	tests, err := requiredStringSlice(in, "tests")
+	if err != nil {
+		return nil, err
+	}
+	risks, err := requiredStringSlice(in, "risks")
+	if err != nil {
+		return nil, err
+	}
+	verification, err := requiredStringSlice(in, "verification")
+	if err != nil {
+		return nil, err
+	}
+	followups, err := requiredStringSlice(in, "followups")
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]any{"summary": summary, "changed_files": changedFiles, "tests": tests, "risks": risks, "verification": verification, "followups": followups, "target_state": "Human Review"}
 	return out, nil
 }
 func canonicalHash(v map[string]any) string {

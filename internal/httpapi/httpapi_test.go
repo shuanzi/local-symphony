@@ -494,6 +494,127 @@ func TestLogoutRevokesBrowserSession(t *testing.T) {
 	}
 }
 
+func TestCreateIssueRejectsUnknownFieldsWithoutCreatingIssue(t *testing.T) {
+	srv := newTestServer(t)
+	auth := sessionAuth(t, srv)
+
+	body := `{"title":"Unknown field","description":"desc","acceptance_criteria":["done"],"priority":3,"labels":[],"unexpected":true}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/issues", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, auth)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("create issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidRequest) {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	issues, err := srv.Store.ListIssues(store.ListIssueOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("created %d issues, want none", len(issues))
+	}
+}
+
+func TestCreateIssueRejectsCaseVariantFieldsWithoutCreatingIssue(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "title", body: `{"Title":"Case bypass","description":"desc","acceptance_criteria":["done"],"priority":3,"labels":[]}`},
+		{name: "acceptance criteria", body: `{"title":"Case bypass","description":"desc","Acceptance_Criteria":["done"],"priority":3,"labels":[]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			auth := sessionAuth(t, srv)
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/issues", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			applySessionAuth(req, auth)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("create issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInvalidRequest) {
+				t.Fatalf("error = %#v, want invalid_request", errData)
+			}
+			issues, err := srv.Store.ListIssues(store.ListIssueOptions{Limit: 10})
+			if err != nil {
+				t.Fatalf("ListIssues: %v", err)
+			}
+			if len(issues) != 0 {
+				t.Fatalf("created %d issues, want none", len(issues))
+			}
+		})
+	}
+}
+
+func TestCreateIssueRejectsTrailingJSONWithoutCreatingIssue(t *testing.T) {
+	srv := newTestServer(t)
+	auth := sessionAuth(t, srv)
+
+	body := `{"title":"Trailing","description":"desc","acceptance_criteria":["done"],"priority":3,"labels":[]} {"unexpected":true}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/issues", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, auth)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("create issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidRequest) {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	issues, err := srv.Store.ListIssues(store.ListIssueOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("created %d issues, want none", len(issues))
+	}
+}
+
+func TestCreateIssueRejectsEmptyBodyWithoutCreatingIssue(t *testing.T) {
+	srv := newTestServer(t)
+	auth := sessionAuth(t, srv)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/issues", strings.NewReader(""))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, auth)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("create issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidRequest) {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	issues, err := srv.Store.ListIssues(store.ListIssueOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("created %d issues, want none", len(issues))
+	}
+}
+
 func TestSessionCSRFTokenIsRandomPerServer(t *testing.T) {
 	first := newTestServer(t)
 	second := newTestServer(t)
@@ -973,6 +1094,152 @@ func TestPatchIssueRejectsOutOfRangePriorityWithoutPartialUpdate(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodPatch, "/api/v1/issues/"+issue.Identifier, strings.NewReader(`{"title":"changed","priority":9}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("patch issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidRequest) {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	got, err := srv.Store.GetIssue(issue.Identifier)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.Title != "Original title" {
+		t.Fatalf("title = %q, want unchanged", got.Title)
+	}
+	if got.Priority != 4 {
+		t.Fatalf("priority = %d, want unchanged 4", got.Priority)
+	}
+}
+
+func TestPatchIssueRejectsNonStringTextFieldsWithoutPartialUpdate(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "title", body: `{"title":123,"priority":5}`},
+		{name: "description", body: `{"description":false,"priority":5}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Original title", Description: "desc", Priority: 4})
+			if err != nil {
+				t.Fatalf("CreateIssue: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodPatch, "/api/v1/issues/"+issue.Identifier, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			applySessionAuth(req, sessionAuth(t, srv))
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("patch issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInvalidRequest) {
+				t.Fatalf("error = %#v, want invalid_request", errData)
+			}
+			got, err := srv.Store.GetIssue(issue.Identifier)
+			if err != nil {
+				t.Fatalf("GetIssue: %v", err)
+			}
+			if got.Title != "Original title" {
+				t.Fatalf("title = %q, want unchanged", got.Title)
+			}
+			if got.Description != "desc" {
+				t.Fatalf("description = %q, want unchanged", got.Description)
+			}
+			if got.Priority != 4 {
+				t.Fatalf("priority = %d, want unchanged 4", got.Priority)
+			}
+		})
+	}
+}
+
+func TestPatchIssueRejectsUnknownFieldsWithoutPartialUpdate(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Original title", Description: "desc", Priority: 4})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/issues/"+issue.Identifier, strings.NewReader(`{"title":"changed","unexpected":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("patch issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidRequest) {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	got, err := srv.Store.GetIssue(issue.Identifier)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.Title != "Original title" {
+		t.Fatalf("title = %q, want unchanged", got.Title)
+	}
+	if got.Priority != 4 {
+		t.Fatalf("priority = %d, want unchanged 4", got.Priority)
+	}
+}
+
+func TestPatchIssueRejectsTrailingJSONWithoutPartialUpdate(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Original title", Description: "desc", Priority: 4})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/issues/"+issue.Identifier, strings.NewReader(`{"title":"changed"} {"unexpected":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("patch issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidRequest) {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	got, err := srv.Store.GetIssue(issue.Identifier)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.Title != "Original title" {
+		t.Fatalf("title = %q, want unchanged", got.Title)
+	}
+	if got.Priority != 4 {
+		t.Fatalf("priority = %d, want unchanged 4", got.Priority)
+	}
+}
+
+func TestPatchIssueRejectsEmptyBodyWithoutPartialUpdate(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Original title", Description: "desc", Priority: 4})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/issues/"+issue.Identifier, strings.NewReader(""))
 	req.Header.Set("Content-Type", "application/json")
 	applySessionAuth(req, sessionAuth(t, srv))
 	rec := httptest.NewRecorder()

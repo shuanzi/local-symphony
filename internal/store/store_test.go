@@ -965,6 +965,89 @@ func TestDispatchPauseResumeRejectTerminalIssueWithoutChangingDispatchFields(t *
 	}
 }
 
+func TestDispatchPauseRollsBackWhenActiveRunAppearsDuringUpdate(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "Dispatch pause active race")
+	if err := st.Project.Exec(`CREATE TRIGGER race_pause_active_run BEFORE UPDATE OF dispatch_paused ON issues
+WHEN NEW.id='` + issue.ID + `' AND NEW.dispatch_paused=1 AND OLD.dispatch_paused=0
+BEGIN
+	INSERT INTO run_attempts(id,issue_id,attempt_no,status,dispatch_reason,source_issue_state,runner_kind,created_at,updated_at)
+	VALUES('run_pause_race', NEW.id, 1, 'pending', 'manual', OLD.state, 'fake', NEW.updated_at, NEW.updated_at);
+END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.DispatchPause(issue.ID, "pause")
+	if err == nil {
+		t.Fatal("DispatchPause succeeded, want active run error")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrIssueAlreadyRunning {
+		t.Fatalf("DispatchPause error code = %s, want %s", got, core.ErrIssueAlreadyRunning)
+	}
+	assertDispatchPaused(t, st, issue.ID, false)
+	assertRunAttemptCount(t, st, issue.ID, 0)
+}
+
+func TestDispatchPauseRollsBackWhenEventInsertFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "Dispatch pause event failure")
+	if err := st.Project.Exec(`CREATE TRIGGER fail_dispatch_pause_event BEFORE INSERT ON run_events WHEN NEW.event_type='issue.dispatch_paused' BEGIN SELECT RAISE(ABORT, 'dispatch pause event failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.DispatchPause(issue.ID, "pause")
+	if err == nil {
+		t.Fatal("DispatchPause succeeded, want event insert error")
+	}
+	assertErrorContains(t, err, "dispatch pause event failed")
+	assertDispatchPaused(t, st, issue.ID, false)
+}
+
+func TestDispatchResumeRollsBackWhenEventInsertFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "Dispatch resume event failure")
+	paused, err := st.DispatchPause(issue.ID, "pause")
+	if err != nil {
+		t.Fatalf("DispatchPause: %v", err)
+	}
+	if !paused.DispatchPaused {
+		t.Fatal("DispatchPause did not pause issue")
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_dispatch_resume_event BEFORE INSERT ON run_events WHEN NEW.event_type='issue.dispatch_resumed' BEGIN SELECT RAISE(ABORT, 'dispatch resume event failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err = st.DispatchResume(issue.ID, "resume")
+	if err == nil {
+		t.Fatal("DispatchResume succeeded, want event insert error")
+	}
+	assertErrorContains(t, err, "dispatch resume event failed")
+	assertDispatchPaused(t, st, issue.ID, true)
+}
+
+func TestDispatchPauseResumeRejectActiveRunWithoutChangingDispatchFields(t *testing.T) {
+	for _, action := range []string{"pause", "resume"} {
+		t.Run(action, func(t *testing.T) {
+			st := newStoreTestStore(t)
+			issue, _ := prepareActiveRun(t, st, "Dispatch "+action+" active run")
+
+			var err error
+			if action == "pause" {
+				_, err = st.DispatchPause(issue.ID, "pause")
+			} else {
+				_, err = st.DispatchResume(issue.ID, "resume")
+			}
+			if err == nil {
+				t.Fatalf("Dispatch%s succeeded, want active run error", action)
+			}
+			if got := core.AsAPIError(err).Code; got != core.ErrIssueAlreadyRunning {
+				t.Fatalf("Dispatch%s error code = %s, want %s", action, got, core.ErrIssueAlreadyRunning)
+			}
+			assertDispatchPaused(t, st, issue.ID, false)
+		})
+	}
+}
+
 func TestClaimRunPropagatesBlockerQueryError(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, err := st.CreateIssue(CreateIssueInput{
@@ -1387,6 +1470,17 @@ func assertIssueState(t *testing.T, st *Store, issueID string, want core.IssueSt
 	}
 	if gotIssue.State != want {
 		t.Fatalf("issue state = %s, want %s", gotIssue.State, want)
+	}
+}
+
+func assertDispatchPaused(t *testing.T, st *Store, issueID string, want bool) {
+	t.Helper()
+	gotIssue, err := st.GetIssue(issueID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if gotIssue.DispatchPaused != want {
+		t.Fatalf("dispatch_paused = %v, want %v", gotIssue.DispatchPaused, want)
 	}
 }
 

@@ -821,26 +821,38 @@ func (s *Store) DispatchPause(ref, reason string) (*core.Issue, error) {
 	if reason == "" {
 		return nil, core.NewError(core.ErrInvalidRequest, "reason is required", nil)
 	}
-	row, err := s.issueRowByRef(ref)
-	if err != nil {
-		return nil, err
-	}
-	id := row["id"].String()
-	if core.IsTerminalIssueState(core.IssueState(row["state"].String())) {
-		return nil, core.NewError(core.ErrInvalidStateTransition, "terminal issue dispatch state cannot be changed", nil)
-	}
-	active, err := s.activeRunID(id)
-	if err != nil {
-		return nil, err
-	}
-	if active != nil {
-		return nil, core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
-	}
+	var id string
 	now := core.Now()
-	if err := s.Project.Exec(`UPDATE issues SET dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, reason, now, now, id); err != nil {
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		row, err := s.issueRowByRefTx(tx, ref)
+		if err != nil {
+			return err
+		}
+		id = row["id"].String()
+		if core.IsTerminalIssueState(core.IssueState(row["state"].String())) {
+			return core.NewError(core.ErrInvalidStateTransition, "terminal issue dispatch state cannot be changed", nil)
+		}
+		active, err := s.activeRunIDTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if active != nil {
+			return core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
+		}
+		if err := tx.Exec(`UPDATE issues SET dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, reason, now, now, id); err != nil {
+			return err
+		}
+		active, err = s.activeRunIDTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if active != nil {
+			return core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
+		}
+		return s.appendEventInTx(tx, "issue.dispatch_paused", "operator", &id, nil, map[string]any{"reason": reason})
+	}); err != nil {
 		return nil, err
 	}
-	_ = s.AppendEvent("issue.dispatch_paused", "operator", &id, nil, map[string]any{"reason": reason})
 	return s.GetIssue(id)
 }
 func (s *Store) DispatchResume(ref, reason string) (*core.Issue, error) {
@@ -848,26 +860,38 @@ func (s *Store) DispatchResume(ref, reason string) (*core.Issue, error) {
 	if reason == "" {
 		return nil, core.NewError(core.ErrInvalidRequest, "reason is required", nil)
 	}
-	row, err := s.issueRowByRef(ref)
-	if err != nil {
-		return nil, err
-	}
-	id := row["id"].String()
-	if core.IsTerminalIssueState(core.IssueState(row["state"].String())) {
-		return nil, core.NewError(core.ErrInvalidStateTransition, "terminal issue dispatch state cannot be changed", nil)
-	}
-	active, err := s.activeRunID(id)
-	if err != nil {
-		return nil, err
-	}
-	if active != nil {
-		return nil, core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
-	}
+	var id string
 	now := core.Now()
-	if err := s.Project.Exec(`UPDATE issues SET dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL, updated_at=? WHERE id=?`, now, id); err != nil {
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		row, err := s.issueRowByRefTx(tx, ref)
+		if err != nil {
+			return err
+		}
+		id = row["id"].String()
+		if core.IsTerminalIssueState(core.IssueState(row["state"].String())) {
+			return core.NewError(core.ErrInvalidStateTransition, "terminal issue dispatch state cannot be changed", nil)
+		}
+		active, err := s.activeRunIDTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if active != nil {
+			return core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
+		}
+		if err := tx.Exec(`UPDATE issues SET dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL, updated_at=? WHERE id=?`, now, id); err != nil {
+			return err
+		}
+		active, err = s.activeRunIDTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if active != nil {
+			return core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
+		}
+		return s.appendEventInTx(tx, "issue.dispatch_resumed", "operator", &id, nil, map[string]any{"reason": reason})
+	}); err != nil {
 		return nil, err
 	}
-	_ = s.AppendEvent("issue.dispatch_resumed", "operator", &id, nil, map[string]any{"reason": reason})
 	return s.GetIssue(id)
 }
 

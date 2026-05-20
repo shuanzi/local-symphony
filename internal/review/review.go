@@ -199,7 +199,7 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 	changed := []string{}
 	untracked := []UntrackedInfo{}
 	denied := map[string]bool{}
-	if records, err := statusPorcelainRecords(root); err == nil && len(records) > 0 {
+	if records, err := statusPorcelainRecords(root); err == nil {
 		for _, record := range records {
 			if len(record.paths) == 0 {
 				continue

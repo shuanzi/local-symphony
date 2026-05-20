@@ -272,6 +272,51 @@ func TestFollowupCreateRejectsInvalidPriorityWithoutCreatingIssue(t *testing.T) 
 	}
 }
 
+func TestHandoffSubmitRejectsInvalidListFieldsWithoutCreatingHandoff(t *testing.T) {
+	tests := []struct {
+		name  string
+		input map[string]any
+	}{
+		{
+			name: "changed_files contains non-string item",
+			input: map[string]any{
+				"summary":       "completed work",
+				"changed_files": []any{"ok", 123},
+			},
+		},
+		{
+			name: "tests is not an array",
+			input: map[string]any{
+				"summary": "completed work",
+				"tests":   "go test ./...",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newGatewayTestStore(t)
+			_, run, workspace := prepareGatewayRun(t, st)
+			token, err := NewTokenForRun(st, run, workspace)
+			if err != nil {
+				t.Fatalf("NewTokenForRun: %v", err)
+			}
+
+			resp := (Gateway{Store: st}).Call(token, workspace, Request{
+				Tool:  "handoff.submit",
+				Input: tt.input,
+			})
+
+			if resp.Success {
+				t.Fatal("handoff.submit success = true, want invalid list failure")
+			}
+			if resp.Error == nil || resp.Error.Code != string(core.ErrInvalidRequest) {
+				t.Fatalf("handoff.submit error = %#v, want %s", resp.Error, core.ErrInvalidRequest)
+			}
+			assertHandoffCount(t, st, run.ID, 0)
+		})
+	}
+}
+
 func TestFollowupCreateRollsBackIssueWhenRelationInsertFails(t *testing.T) {
 	st := newGatewayTestStore(t)
 	_, run, workspace := prepareGatewayRun(t, st)
@@ -593,5 +638,16 @@ func assertFollowupRelationCount(t *testing.T, st *store.Store, want int) {
 	}
 	if got := row["c"].Int(); got != want {
 		t.Fatalf("followup relation count = %d, want %d", got, want)
+	}
+}
+
+func assertHandoffCount(t *testing.T, st *store.Store, runID string, want int) {
+	t.Helper()
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM handoffs WHERE run_id=?`, runID)
+	if err != nil {
+		t.Fatalf("count handoffs: %v", err)
+	}
+	if got := row["c"].Int(); got != want {
+		t.Fatalf("handoff count = %d, want %d", got, want)
 	}
 }

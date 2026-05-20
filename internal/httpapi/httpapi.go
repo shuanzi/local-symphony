@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -278,7 +279,14 @@ func (s *Server) createIssue(w http.ResponseWriter, r *http.Request) {
 		Priority           int      `json:"priority"`
 		Labels             []string `json:"labels"`
 	}
-	if readBody(r, &in, w) {
+	allowedFields := map[string]bool{
+		"title":               true,
+		"description":         true,
+		"acceptance_criteria": true,
+		"priority":            true,
+		"labels":              true,
+	}
+	if readBodyDisallowUnknownFields(r, &in, w, allowedFields) {
 		return
 	}
 	iss, err := s.Store.CreateIssue(store.CreateIssueInput{Title: in.Title, Description: in.Description, AcceptanceCriteria: in.AcceptanceCriteria, Priority: in.Priority, Labels: in.Labels})
@@ -304,17 +312,45 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 		}
 		if r.Method == "PATCH" {
 			var raw map[string]any
-			dec := json.NewDecoder(r.Body)
+			rawBody, err := decodeSingleJSONObjectBody(json.NewDecoder(r.Body))
+			if err != nil {
+				apiErr(w, err)
+				return
+			}
+			dec := json.NewDecoder(bytes.NewReader(rawBody))
 			dec.UseNumber()
-			if err := dec.Decode(&raw); err != nil && err != io.EOF {
+			if err := dec.Decode(&raw); err != nil {
 				apiErr(w, core.NewError(core.ErrInvalidRequest, err.Error(), nil))
 				return
 			}
+			allowedFields := map[string]bool{
+				"title":               true,
+				"description":         true,
+				"priority":            true,
+				"acceptance_criteria": true,
+				"labels":              true,
+			}
+			for key := range raw {
+				if !allowedFields[key] {
+					apiErr(w, core.NewError(core.ErrInvalidRequest, "unsupported field: "+key, nil))
+					return
+				}
+			}
 			fields := map[string]any{}
-			if v, ok := raw["title"].(string); ok {
+			if rawValue, exists := raw["title"]; exists {
+				v, ok := rawValue.(string)
+				if !ok {
+					apiErr(w, core.NewError(core.ErrInvalidRequest, "title must be a string", nil))
+					return
+				}
 				fields["title"] = v
 			}
-			if v, ok := raw["description"].(string); ok {
+			if rawValue, exists := raw["description"]; exists {
+				v, ok := rawValue.(string)
+				if !ok {
+					apiErr(w, core.NewError(core.ErrInvalidRequest, "description must be a string", nil))
+					return
+				}
 				fields["description"] = v
 			}
 			if rawPriority, exists := raw["priority"]; exists {
@@ -858,6 +894,52 @@ func readBody(r *http.Request, v any, w http.ResponseWriter) bool {
 	}
 	return false
 }
+
+func readBodyDisallowUnknownFields(r *http.Request, v any, w http.ResponseWriter, allowedFields map[string]bool) bool {
+	rawBody, err := decodeSingleJSONObjectBody(json.NewDecoder(r.Body))
+	if err != nil {
+		apiErr(w, err)
+		return true
+	}
+	if allowedFields != nil {
+		var rawFields map[string]json.RawMessage
+		if err := json.Unmarshal(rawBody, &rawFields); err != nil {
+			apiErr(w, core.NewError(core.ErrInvalidRequest, err.Error(), nil))
+			return true
+		}
+		for key := range rawFields {
+			if !allowedFields[key] {
+				apiErr(w, core.NewError(core.ErrInvalidRequest, "unsupported field: "+key, nil))
+				return true
+			}
+		}
+	}
+	dec := json.NewDecoder(bytes.NewReader(rawBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		apiErr(w, core.NewError(core.ErrInvalidRequest, err.Error(), nil))
+		return true
+	}
+	return false
+}
+
+func decodeSingleJSONObjectBody(dec *json.Decoder) (json.RawMessage, error) {
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		if err == io.EOF {
+			return nil, core.NewError(core.ErrInvalidRequest, "request body must be a JSON object", nil)
+		}
+		return nil, core.NewError(core.ErrInvalidRequest, err.Error(), nil)
+	}
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, core.NewError(core.ErrInvalidRequest, "request body must be a JSON object", nil)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return nil, core.NewError(core.ErrInvalidRequest, "request body must contain a single JSON object", nil)
+	}
+	return raw, nil
+}
+
 func ok(w http.ResponseWriter, data any) {
 	writeJSON(w, 200, core.SuccessEnvelope{Data: data, Meta: map[string]any{"request_id": core.NewID("req_"), "server_time": core.Now()}})
 }
