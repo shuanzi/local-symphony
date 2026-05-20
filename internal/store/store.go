@@ -729,7 +729,9 @@ func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, dupl
 			}
 		}
 		if core.IsTerminalIssueState(from) && (target == core.StateInbox || target == core.StateReady) {
-			_ = tx.Exec(`UPDATE issues SET completed_at=NULL, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL WHERE id=?`, id)
+			if err := tx.Exec(`UPDATE issues SET completed_at=NULL, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL WHERE id=?`, id); err != nil {
+				return err
+			}
 		}
 		if err := tx.Exec(`UPDATE issues SET state=?, updated_at=? WHERE id=?`, string(target), now, id); err != nil {
 			return err
@@ -738,7 +740,9 @@ func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, dupl
 			return err
 		}
 		if reason != "" {
-			_ = tx.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), id, "operator", reason, now)
+			if err := tx.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), id, "operator", reason, now); err != nil {
+				return err
+			}
 		}
 		return s.appendEventInTx(tx, "issue.transitioned", "operator", &id, nil, map[string]any{"from_state": from, "to_state": target})
 	}); err != nil {
@@ -1010,16 +1014,61 @@ func (s *Store) UpdateRunStatus(runID string, status core.RunStatus, fields map[
 		if !core.IsActiveRunStatus(run.Status) {
 			return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
 		}
+		if !core.IsActiveRunStatus(status) {
+			return core.NewError(core.ErrInvalidStateTransition, "use lifecycle-specific APIs for terminal run status", map[string]any{"run_id": runID, "target_status": status})
+		}
 		set := []string{"status=?", "updated_at=?"}
 		args := []any{string(status), now}
 		for k, v := range fields {
-			set = append(set, k+"=?")
+			field, err := validateUpdateRunStatusField(k)
+			if err != nil {
+				return err
+			}
+			set = append(set, field+"=?")
 			args = append(args, v)
 		}
 		args = append(args, runID)
 		return tx.Exec(`UPDATE run_attempts SET `+strings.Join(set, ",")+` WHERE id=?`, args...)
 	})
 }
+
+var updateRunStatusManagedFields = map[string]struct{}{
+	"id":                   {},
+	"issue_id":             {},
+	"attempt_no":           {},
+	"status":               {},
+	"workspace_id":         {},
+	"workflow_snapshot_id": {},
+	"dispatch_reason":      {},
+	"source_issue_state":   {},
+	"runner_kind":          {},
+	"base_ref_config":      {},
+	"base_ref":             {},
+	"base_sha":             {},
+	"branch_name":          {},
+	"failure_code":         {},
+	"failure_message":      {},
+	"ended_at":             {},
+	"created_at":           {},
+	"updated_at":           {},
+}
+
+func validateUpdateRunStatusField(field string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(field))
+	if normalized == "" {
+		return "", core.NewError(core.ErrInvalidRequest, "run status field is required", nil)
+	}
+	if _, ok := updateRunStatusManagedFields[normalized]; ok {
+		return "", core.NewError(core.ErrInvalidRequest, "run status field is managed by lifecycle APIs", map[string]any{"field": normalized})
+	}
+	for _, r := range normalized {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return "", core.NewError(core.ErrInvalidRequest, "invalid run status field", map[string]any{"field": normalized})
+		}
+	}
+	return normalized, nil
+}
+
 func (s *Store) SetRunWorkspace(runID, workspaceID, branch, baseRefConfig, baseRef, baseSHA string) error {
 	return s.Project.Exec(`UPDATE run_attempts SET workspace_id=?, branch_name=?, base_ref_config=?, base_ref=?, base_sha=?, updated_at=? WHERE id=?`, workspaceID, branch, baseRefConfig, baseRef, baseSHA, core.Now(), runID)
 }
@@ -1046,6 +1095,19 @@ func (s *Store) CompleteRunWithReview(runID, reviewPacketID string) error {
 		}
 		if !core.IsActiveRunStatus(run.Status) {
 			return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
+		}
+		packet, err := tx.QueryOne(`SELECT issue_id, run_id, status FROM review_packets WHERE id=?`, reviewPacketID)
+		if errors.Is(err, os.ErrNotExist) {
+			return core.NewError(core.ErrReviewPacketRequired, "review packet required", map[string]any{"review_packet_id": reviewPacketID})
+		}
+		if err != nil {
+			return err
+		}
+		if packet["issue_id"].String() != run.IssueID || packet["run_id"].String() != runID {
+			return core.NewError(core.ErrInvalidRequest, "review packet does not belong to run", map[string]any{"run_id": runID, "review_packet_id": reviewPacketID})
+		}
+		if packet["status"].String() != "generated" {
+			return core.NewError(core.ErrInvalidStateTransition, "review packet is not generated", map[string]any{"review_packet_id": reviewPacketID, "status": packet["status"].String()})
 		}
 		if err := tx.Exec(`UPDATE run_attempts SET status=?, failure_code=NULL, failure_message=NULL, ended_at=?, updated_at=? WHERE id=?`, string(core.RunCompleted), now, now, runID); err != nil {
 			return err
@@ -1082,7 +1144,10 @@ func (s *Store) FailRun(runID string, code core.FailureCode, message string, sta
 		if err := tx.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(status), string(code), message, now, now, runID); err != nil {
 			return err
 		}
-		row, _ := tx.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
+		row, err := tx.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
+		if err != nil {
+			return err
+		}
 		cur := core.IssueState(row["state"].String())
 		target := cur
 		if !core.IsTerminalIssueState(cur) && cur != core.StateBlocked {
@@ -1173,7 +1238,10 @@ func (s *Store) cancelRunInTx(q sqlRunner, runID string, code core.FailureCode, 
 		return err
 	}
 	target := run.SourceIssueState
-	row, _ := q.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
+	row, err := q.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
+	if err != nil {
+		return err
+	}
 	cur := core.IssueState(row["state"].String())
 	if !restore || cur == core.StateBlocked || core.IsTerminalIssueState(cur) {
 		target = cur
@@ -1312,7 +1380,7 @@ func (s *Store) RecordToolCall(issueID, runID, tool, status string, input, outpu
 	}
 	ih := hashJSON(input)
 	oh := hashJSON(output)
-	return s.Project.Exec(`INSERT INTO tool_calls(id,issue_id,run_id,tool_name,status,input_hash,input_json_redacted,output_hash,output_json_redacted,error_code,error_message,started_at,ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, core.NewID("tc_"), issueID, runID, tool, status, ih, encodeJSON(input), oh, encodeJSON(output), errCode, errMsg, now, core.NullableString(ended))
+	return s.Project.Exec(`INSERT INTO tool_calls(id,issue_id,run_id,tool_name,status,input_hash,input_json_redacted,output_hash,output_json_redacted,error_code,error_message,started_at,ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, core.NewID("tc_"), issueID, runID, tool, status, ih, redactedJSONSummary(input), oh, redactedJSONSummary(output), errCode, errMsg, now, core.NullableString(ended))
 }
 func hashJSON(v any) string {
 	if v == nil {
@@ -1321,6 +1389,59 @@ func hashJSON(v any) string {
 	b, _ := json.Marshal(v)
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
+}
+
+func redactedJSONSummary(v any) string {
+	if v == nil {
+		return ""
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return encodeJSON(map[string]any{"type": "unmarshalable"})
+	}
+	var decoded any
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		return encodeJSON(map[string]any{"type": "unparseable", "sha256": hashJSON(v)})
+	}
+	return encodeJSON(jsonShape(decoded))
+}
+
+func jsonShape(v any) map[string]any {
+	switch x := v.(type) {
+	case nil:
+		return map[string]any{"type": "null"}
+	case map[string]any:
+		keys := make([]map[string]any, 0, len(x))
+		for k := range x {
+			sum := sha256.Sum256([]byte(k))
+			keys = append(keys, map[string]any{
+				"len":    len(k),
+				"sha256": hex.EncodeToString(sum[:]),
+			})
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			return keys[i]["sha256"].(string) < keys[j]["sha256"].(string)
+		})
+		if len(keys) > 20 {
+			keys = keys[:20]
+		}
+		return map[string]any{"type": "object", "key_count": len(x), "keys": keys}
+	case []any:
+		items := make([]any, 0, min(len(x), 3))
+		for i := 0; i < len(x) && i < 3; i++ {
+			items = append(items, jsonShape(x[i]))
+		}
+		return map[string]any{"type": "array", "len": len(x), "items": items}
+	case string:
+		sum := sha256.Sum256([]byte(x))
+		return map[string]any{"type": "string", "len": len(x), "sha256": hex.EncodeToString(sum[:])}
+	case bool:
+		return map[string]any{"type": "bool"}
+	case float64:
+		return map[string]any{"type": "number"}
+	default:
+		return map[string]any{"type": "unknown"}
+	}
 }
 
 func (s *Store) InsertHandoff(issueID, runID, payloadHash string, payload map[string]any) (*core.Handoff, error) {
@@ -1342,10 +1463,14 @@ func (s *Store) InsertHandoff(issueID, runID, payloadHash string, payload map[st
 	risks := toStringSlice(payload["risks"])
 	ver := toStringSlice(payload["verification"])
 	follow := toStringSlice(payload["followups"])
-	if err := s.Project.Exec(`INSERT INTO handoffs(id,issue_id,run_id,payload_hash,payload_json_redacted,summary,changed_files_json,tests_json,risks_json,verification_json,followups_json,target_state,submitted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, issueID, runID, payloadHash, encodeJSON(payload), summary, encodeJSON(cf), encodeJSON(tests), encodeJSON(risks), encodeJSON(ver), encodeJSON(follow), target, now); err != nil {
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		if err := tx.Exec(`INSERT INTO handoffs(id,issue_id,run_id,payload_hash,payload_json_redacted,summary,changed_files_json,tests_json,risks_json,verification_json,followups_json,target_state,submitted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, issueID, runID, payloadHash, encodeJSON(payload), summary, encodeJSON(cf), encodeJSON(tests), encodeJSON(risks), encodeJSON(ver), encodeJSON(follow), target, now); err != nil {
+			return err
+		}
+		return s.appendEventInTx(tx, "handoff.submitted", "agent", &issueID, &runID, map[string]any{"handoff_id": id, "payload_hash": payloadHash})
+	}); err != nil {
 		return nil, err
 	}
-	_ = s.AppendEvent("handoff.submitted", "agent", &issueID, &runID, map[string]any{"handoff_id": id, "payload_hash": payloadHash})
 	return s.GetHandoffByRun(runID)
 }
 func toStringSlice(v any) []string {

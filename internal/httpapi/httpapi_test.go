@@ -68,7 +68,7 @@ func TestToolRoutePassesCWDHeaderToGateway(t *testing.T) {
 		t.Fatalf("NewTokenForRun: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/tool/v1/call", strings.NewReader(`{"tool":"issue.get","input":{}}`))
+	req := httptest.NewRequest(http.MethodPost, "/tool/v1/call", strings.NewReader(`{"tool":"issue.get","input":{},"client":{"name":"test"}}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Symphony-Cwd", subdir)
@@ -84,6 +84,40 @@ func TestToolRoutePassesCWDHeaderToGateway(t *testing.T) {
 	}
 	if !resp.Success {
 		t.Fatalf("tool route success = false, error = %#v", resp.Error)
+	}
+}
+
+func TestToolRouteRejectsInvalidTopLevelRequestBody(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty body", body: ``},
+		{name: "non object", body: `[]`},
+		{name: "missing input", body: `{"tool":"issue.get"}`},
+		{name: "missing tool", body: `{"input":{}}`},
+		{name: "unknown field", body: `{"tool":"issue.get","input":{},"extra":true}`},
+		{name: "case variant field", body: `{"Tool":"issue.get","input":{}}`},
+		{name: "trailing json", body: `{"tool":"issue.get","input":{}} {}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			req := httptest.NewRequest(http.MethodPost, "/tool/v1/call", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("tool route status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			var resp toolgateway.Response
+			if err := json.NewDecoder(strings.NewReader(rec.Body.String())).Decode(&resp); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if resp.Success || resp.Error == nil || resp.Error.Code != "invalid_request" {
+				t.Fatalf("response = %#v, want invalid_request failure", resp)
+			}
+		})
 	}
 }
 
@@ -1006,6 +1040,129 @@ func TestIssueControlRoutesReturnIssueEnvelope(t *testing.T) {
 	}
 }
 
+func TestTypedMutationRoutesRejectInvalidJSONBodies(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Strict bodies", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+	tests := []struct {
+		name      string
+		path      string
+		body      string
+		needsAuth bool
+	}{
+		{name: "issue transition unknown field", path: "/api/v1/issues/" + issue.Identifier + "/transition", body: `{"state":"Ready","reason":"ready","extra":true}`, needsAuth: true},
+		{name: "issue transition case variant field", path: "/api/v1/issues/" + issue.Identifier + "/transition", body: `{"State":"Ready","reason":"ready"}`, needsAuth: true},
+		{name: "issue comments trailing json", path: "/api/v1/issues/" + issue.Identifier + "/comments", body: `{"body":"hello"} {}`, needsAuth: true},
+		{name: "issue comments empty required body", path: "/api/v1/issues/" + issue.Identifier + "/comments", body: ``, needsAuth: true},
+		{name: "issue comments null body", path: "/api/v1/issues/" + issue.Identifier + "/comments", body: `{"body":null}`, needsAuth: true},
+		{name: "issue blockers non object", path: "/api/v1/issues/" + issue.Identifier + "/blockers", body: `[]`, needsAuth: true},
+		{name: "dispatch pause case variant field", path: "/api/v1/issues/" + issue.Identifier + "/dispatch-pause", body: `{"Reason":"pause"}`, needsAuth: true},
+		{name: "dispatch resume unknown field", path: "/api/v1/issues/" + issue.Identifier + "/dispatch-resume", body: `{"reason":"resume","extra":true}`, needsAuth: true},
+		{name: "run cancel unknown field", path: "/api/v1/runs/run_missing/cancel", body: `{"reason":"stop","extra":true}`, needsAuth: true},
+		{name: "run cancel null reason", path: "/api/v1/runs/run_missing/cancel", body: `{"reason":null}`, needsAuth: true},
+		{name: "approval decision unknown field", path: "/api/v1/approvals/apr_missing/decide", body: `{"decision":"deny","extra":true}`, needsAuth: true},
+		{name: "approval decision null reason", path: "/api/v1/approvals/apr_missing/decide", body: `{"decision":"deny","reason":null}`, needsAuth: true},
+		{name: "review action unknown field", path: "/api/v1/reviews/" + issue.Identifier + "/send-to-rework", body: `{"reason":"again","extra":true}`, needsAuth: true},
+		{name: "review action null reason", path: "/api/v1/reviews/rvw_missing/send-to-rework", body: `{"reason":null}`, needsAuth: true},
+		{name: "auth exchange unknown field", path: "/api/v1/auth/exchange", body: `{"open_token":"not-valid","extra":true}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			if tt.needsAuth {
+				applySessionAuth(req, auth)
+			}
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("%s status = %d, want 400; body = %s", tt.name, rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInvalidRequest) {
+				t.Fatalf("%s error = %#v, want invalid_request", tt.name, errData)
+			}
+		})
+	}
+}
+
+func TestIssueTransitionRejectsDuplicateOfUnlessDuplicateWithoutMutating(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Duplicate guard", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	canonical, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Canonical", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue canonical: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/issues/"+issue.Identifier+"/transition", strings.NewReader(`{"state":"Ready","reason":"ready","duplicate_of":"`+canonical.Identifier+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("transition status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidRequest) {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	after, err := srv.Store.GetIssue(issue.Identifier)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if after.State != core.StateInbox {
+		t.Fatalf("issue state = %s, want Inbox", after.State)
+	}
+	if after.DuplicateOf != nil {
+		t.Fatalf("duplicate_of = %#v, want nil", after.DuplicateOf)
+	}
+}
+
+func TestDispatchIssueReturnsImplementedResponseShape(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{
+		Title:              "Dispatch shape",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.Identifier, core.StateReady, "ready", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/issues/"+issue.Identifier+"/dispatch", nil)
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dispatch status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	data := payload["data"].(map[string]any)
+	if _, ok := data["run"].(map[string]any); !ok {
+		t.Fatalf("dispatch data missing run object: %#v", data)
+	}
+	if _, ok := data["issue"].(map[string]any); !ok {
+		t.Fatalf("dispatch data missing issue object: %#v", data)
+	}
+	if _, ok := data["accepted"]; ok {
+		t.Fatalf("dispatch data included obsolete accepted field: %#v", data)
+	}
+	if _, ok := data["run_id"]; ok {
+		t.Fatalf("dispatch data included obsolete run_id field: %#v", data)
+	}
+}
+
 func TestCreateCommentReturnsErrorWhenIssueReloadFails(t *testing.T) {
 	srv := newTestServer(t)
 	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Comment reload", Description: "desc"})
@@ -1833,6 +1990,42 @@ func TestCancelRunAllowsEmptyBody(t *testing.T) {
 	}
 }
 
+func TestCancelRunRejectsNonObjectBodyWithoutCancelling(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Cancel non object", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.Identifier, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", strings.NewReader(`null`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("non-object cancel status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidRequest) {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	after, err := srv.Store.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if after.Status == core.RunCancelled {
+		t.Fatalf("non-object cancel request cancelled run %#v", after)
+	}
+}
+
 func TestCancelRunCompletedRunReturnsConflict(t *testing.T) {
 	srv := newTestServer(t)
 	run := prepareCompletedHTTPRun(t, srv)
@@ -1958,6 +2151,7 @@ func TestDiagnosticsExportRejectsUnsupportedBodyOptions(t *testing.T) {
 	}{
 		{name: "malformed JSON", body: `{"include_raw_logs":`, code: core.ErrInvalidRequest},
 		{name: "null body", body: `null`, code: core.ErrInvalidRequest},
+		{name: "null include raw logs", body: `{"include_raw_logs":null}`, code: core.ErrInvalidRequest},
 		{name: "raw logs", body: `{"include_raw_logs":true}`, code: core.ErrRawLogAccessUnsupported},
 		{name: "unknown field", body: `{"unexpected":true}`, code: core.ErrInvalidRequest},
 		{name: "wrong type", body: `{"include_raw_logs":"true"}`, code: core.ErrInvalidRequest},
@@ -2124,6 +2318,10 @@ func TestWorkflowRoutesRejectUnsupportedBodyFields(t *testing.T) {
 		path string
 		body string
 	}{
+		{name: "validate null", path: "/api/v1/workflow/validate", body: `null`},
+		{name: "validate non object", path: "/api/v1/workflow/validate", body: `[]`},
+		{name: "validate null dry run", path: "/api/v1/workflow/validate", body: `{"dry_run":null}`},
+		{name: "validate trailing json", path: "/api/v1/workflow/validate", body: `{"dry_run":true} {}`},
 		{name: "reload unknown field", path: "/api/v1/workflow/reload", body: `{"dry_run":true}`},
 		{name: "reload null", path: "/api/v1/workflow/reload", body: `null`},
 		{name: "render preview candidate source", path: "/api/v1/workflow/render-preview", body: `{"source":"candidate"}`},
@@ -2213,6 +2411,52 @@ func TestReviewPacketReturnsErrorWhenArtifactsQueryFails(t *testing.T) {
 	}
 	if _, ok := payload["data"]; ok {
 		t.Fatalf("review returned success data on artifact query error: %#v", payload)
+	}
+}
+
+func TestReviewPacketReturns404WhenIssueDoesNotExist(t *testing.T) {
+	srv := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/reviews/LOC-404", nil)
+	addCookies(req, sessionAuth(t, srv).cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("review status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrNotFound) {
+		t.Fatalf("error = %#v, want not_found", errData)
+	}
+	if _, ok := payload["data"]; ok {
+		t.Fatalf("review returned success data for missing issue: %#v", payload)
+	}
+}
+
+func TestReviewPacketReturns409WhenPacketIsMissing(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Review packet missing", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/reviews/"+issue.Identifier, nil)
+	addCookies(req, sessionAuth(t, srv).cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("review status = %d, want 409; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrReviewPacketRequired) {
+		t.Fatalf("error = %#v, want review_packet_required", errData)
+	}
+	if _, ok := payload["data"]; ok {
+		t.Fatalf("review returned success data for missing packet: %#v", payload)
 	}
 }
 
@@ -2311,14 +2555,14 @@ func prepareCompletedHTTPRun(t *testing.T, srv *Server) *core.RunAttempt {
 	if err != nil {
 		t.Fatalf("ClaimRun: %v", err)
 	}
-	handoff, err := srv.Store.InsertHandoff(issue.Identifier, run.ID, "payload-hash", map[string]any{
+	handoff, err := srv.Store.InsertHandoff(issue.ID, run.ID, "payload-hash", map[string]any{
 		"summary":      "ready for review",
 		"target_state": "Human Review",
 	})
 	if err != nil {
 		t.Fatalf("InsertHandoff: %v", err)
 	}
-	reviewPacketID, err := srv.Store.InsertReviewPacket(issue.Identifier, run.ID, handoff.ID, srv.Store.RepoRoot, "review.md", "review.json", "patch.diff", "changed.txt", "untracked.txt", "diffstat.txt", "")
+	reviewPacketID, err := srv.Store.InsertReviewPacket(issue.ID, run.ID, handoff.ID, srv.Store.RepoRoot, "review.md", "review.json", "patch.diff", "changed.txt", "untracked.txt", "diffstat.txt", "")
 	if err != nil {
 		t.Fatalf("InsertReviewPacket: %v", err)
 	}

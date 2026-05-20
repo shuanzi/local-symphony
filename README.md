@@ -17,10 +17,10 @@ run-scoped Tool Gateway
 handoff finalizer + review packet 生成
 Human Review 后由 operator Mark Done 或 Send to Rework
 SQLite local tracker
-REST / SSE API skeleton
+REST / SSE API
 CLI 操作入口
 Diagnostics 导出
-TypeScript dashboard skeleton 与前端动作合同检查
+React/Vite dashboard MVP 与前端动作合同检查
 合同校验脚本与本地 acceptance 脚本
 ```
 
@@ -48,7 +48,7 @@ internal/orchestrator/           # dispatch / run lifecycle / fake runner 编排
 internal/workspace/              # git worktree workspace manager
 internal/toolgateway/            # Tool Gateway registry 与 run-scoped token 校验
 internal/review/                 # review packet 生成
-internal/httpapi/                # REST / SSE API skeleton
+internal/httpapi/                # REST / SSE API
 internal/agent/fake/             # 默认 fake runner
 internal/agent/codex/            # fixture-gated Codex adapter skeleton
 internal/observability/          # diagnostics
@@ -57,7 +57,7 @@ schemas/                         # JSON Schema 合同
 db/schema/                       # SQLite schema 合同
 docs/testing/                    # 验收说明与 contract manifest
 scripts/                         # 合同校验与本地验收脚本
-web/                             # TypeScript dashboard skeleton 与动作合同检查
+web/                             # React/Vite dashboard MVP 与动作合同检查
 PRD.md                           # 产品需求说明
 TECH_SPEC.md                     # 技术设计说明
 WORKFLOW.md                      # init 后生成的项目 workflow 配置，若已存在则不会覆盖
@@ -71,7 +71,7 @@ WORKFLOW.md                      # init 后生成的项目 workflow 配置，若
 Go 1.23+
 Git
 Python 3.10+，用于运行合同校验脚本
-Node.js 18+，用于运行 web skeleton 检查
+Node.js 18+，用于运行 React/Vite dashboard 检查
 支持 CGO 的 C 编译工具链
 SQLite3 开发库 / 系统库
 ```
@@ -87,6 +87,12 @@ sudo apt-get install -y build-essential libsqlite3-dev
 xcode-select --install
 # 如系统找不到 sqlite3，可再安装：
 brew install sqlite
+```
+
+合同校验依赖 Python dev 包；首次运行前安装：
+
+```bash
+python3 -m pip install -r requirements-dev.txt
 ```
 
 ## 4. 构建
@@ -141,7 +147,7 @@ WORKFLOW.md                      # 项目 workflow 配置；不存在时自动�
 /path/to/local-symphony/bin/symphony status --project .
 ```
 
-## 6. 启动本地 API / Dashboard skeleton
+## 6. 启动本地 API / Dashboard GUI
 
 启动本地服务：
 
@@ -159,9 +165,9 @@ WORKFLOW.md                      # 项目 workflow 配置；不存在时自动�
 
 ```bash
 curl http://127.0.0.1:7331/api/v1/health
-curl http://127.0.0.1:7331/api/v1/state
-curl http://127.0.0.1:7331/api/v1/events
 ```
+
+`/api/v1/health` 不需要认证。`/api/v1/state`、`/api/v1/events` 和其他受保护 API 需要通过本地 dashboard open URL 建立 session，或携带 daemon 颁发的认证凭据。
 
 服务运行时，可查看 runtime descriptor：
 
@@ -169,7 +175,7 @@ curl http://127.0.0.1:7331/api/v1/events
 /path/to/local-symphony/bin/symphony open --project .
 ```
 
-当前 `web/` 是 TypeScript dashboard skeleton 和动作合同检查，不是完整生产 UI。`symphony serve` 的 `/api/v1/*` 与 `/tool/v1/call` 路由优先于 dashboard 静态资源。根路径只会从可信 dashboard dist 位置读取静态资源：优先使用 `SYMPHONY_DASHBOARD_DIST` 指向的构建产物目录；未设置时从 `symphony` 可执行文件所在目录推导 `web/dist`、`../web/dist`、`../share/local-symphony/web/dist` 等安装位置。被管理项目根目录下的 `web/dist` 不会作为默认候选。
+当前 `web/` 是 React/Vite dashboard MVP 和动作合同检查。`symphony serve` 的 `/api/v1/*` 与 `/tool/v1/call` 路由优先于 dashboard 静态资源。根路径只会从可信 dashboard dist 位置读取静态资源：优先使用 `SYMPHONY_DASHBOARD_DIST` 指向的构建产物目录；未设置时从 `symphony` 可执行文件所在目录推导 `web/dist`、`../web/dist`、`../share/local-symphony/web/dist` 等安装位置。被管理项目根目录下的 `web/dist` 不会作为默认候选。
 
 ## 7. 本地 issue 主流程
 
@@ -347,6 +353,7 @@ go test ./...
 ### 12.2 合同校验
 
 ```bash
+python3 -m pip install -r requirements-dev.txt
 python3 scripts/validate_contracts.py
 ```
 
@@ -386,7 +393,7 @@ init → issue create → Ready → dispatch → review packet → mark-done
 acceptance-local passed
 ```
 
-### 12.4 Web skeleton 检查
+### 12.4 Web dashboard 检查
 
 ```bash
 cd web
@@ -394,7 +401,7 @@ npm run typecheck
 npm test
 ```
 
-当前 web 检查主要验证 dashboard action inventory 中必须存在的动作和 v1 禁止动作，不依赖安装第三方前端包。
+当前 web 检查覆盖 TypeScript 类型检查、dashboard action inventory 全量 required/forbidden 映射、关键 API 路径、认证失效清理、事件增量加载、review/workflow 受保护操作和关键本地表单校验的静态漂移检查。
 
 ### 12.5 fake runner 失败场景
 

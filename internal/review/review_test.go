@@ -177,8 +177,73 @@ func TestGenerateDoesNotReincludeProtectedRenameFromHandoff(t *testing.T) {
 	if strings.Contains(patch, "SECRET=original") || strings.Contains(patch, "safe.txt") || strings.Contains(patch, ".env") {
 		t.Fatalf("changes.patch leaked protected rename via handoff path:\n%s", patch)
 	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if strings.Contains(changed, "safe.txt") || strings.Contains(changed, ".env") {
+		t.Fatalf("changed-files.txt leaked protected rename via handoff path:\n%s", changed)
+	}
+	diffstat := readReviewArtifact(t, st, issue, run, "diffstat.txt")
+	if strings.Contains(diffstat, "safe.txt") || strings.Contains(diffstat, ".env") {
+		t.Fatalf("diffstat.txt leaked protected rename via handoff path:\n%s", diffstat)
+	}
+	var packet struct {
+		ChangedFiles []string `json:"changed_files"`
+	}
+	if err := json.Unmarshal([]byte(readReviewArtifact(t, st, issue, run, "review.json")), &packet); err != nil {
+		t.Fatalf("unmarshal review.json: %v", err)
+	}
+	if contains(packet.ChangedFiles, "safe.txt") || contains(packet.ChangedFiles, ".env") {
+		t.Fatalf("review.json changed_files leaked protected rename: %+v", packet.ChangedFiles)
+	}
 	if !strings.Contains(patch, "diff --git a/app.txt b/app.txt") || !strings.Contains(patch, "+new") {
 		t.Fatalf("changes.patch missing allowed tracked diff:\n%s", patch)
+	}
+}
+
+func TestGenerateOmitsUntrackedRenameOfProtectedDeletedFile(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=original\n")
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	if err := os.Rename(filepath.Join(workspace, ".env"), filepath.Join(workspace, "safe.txt")); err != nil {
+		t.Fatalf("rename protected file through filesystem: %v", err)
+	}
+	writeFile(t, workspace, "notes.txt", "ordinary untracked\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, nil)
+
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if strings.Contains(patch, "SECRET=original") || strings.Contains(patch, "safe.txt") || strings.Contains(patch, ".env") {
+		t.Fatalf("changes.patch leaked protected filesystem rename:\n%s", patch)
+	}
+	if !strings.Contains(patch, "diff --git a/notes.txt b/notes.txt") || !strings.Contains(patch, "+ordinary untracked") {
+		t.Fatalf("changes.patch missing ordinary untracked file:\n%s", patch)
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if strings.Contains(changed, "safe.txt") || strings.Contains(changed, ".env") {
+		t.Fatalf("changed-files.txt leaked protected filesystem rename:\n%s", changed)
+	}
+	if !strings.Contains(changed, "notes.txt\n") {
+		t.Fatalf("changed-files.txt missing ordinary untracked file:\n%s", changed)
+	}
+	diffstat := readReviewArtifact(t, st, issue, run, "diffstat.txt")
+	if strings.Contains(diffstat, "safe.txt") || strings.Contains(diffstat, ".env") {
+		t.Fatalf("diffstat.txt leaked protected filesystem rename:\n%s", diffstat)
+	}
+	if !strings.Contains(diffstat, "1\t0\tnotes.txt") {
+		t.Fatalf("diffstat.txt missing ordinary untracked file:\n%s", diffstat)
+	}
+	reviewJSON := readReviewArtifact(t, st, issue, run, "review.json")
+	if strings.Contains(reviewJSON, "SECRET=original") || strings.Contains(reviewJSON, "safe.txt") || strings.Contains(reviewJSON, ".env") {
+		t.Fatalf("review.json leaked protected filesystem rename:\n%s", reviewJSON)
+	}
+	if !strings.Contains(reviewJSON, `"notes.txt"`) {
+		t.Fatalf("review.json missing ordinary untracked file:\n%s", reviewJSON)
 	}
 }
 
@@ -249,6 +314,33 @@ func TestGenerateIncludesUntrackedFilesInsideDirectories(t *testing.T) {
 	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
 	if !strings.Contains(patch, "diff --git a/notes/todo.txt b/notes/todo.txt") || !strings.Contains(patch, "+nested untracked") {
 		t.Fatalf("changes.patch missing nested untracked file:\n%s", patch)
+	}
+}
+
+func TestGenerateIncludesSyntheticUntrackedNumstat(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	writeFile(t, workspace, "notes/todo.txt", "first\nsecond\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, nil)
+
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/notes/todo.txt b/notes/todo.txt") {
+		t.Fatalf("changes.patch missing untracked synthetic patch:\n%s", patch)
+	}
+	diffstat := readReviewArtifact(t, st, issue, run, "diffstat.txt")
+	if strings.Contains(diffstat, "0\t0\tgenerated") {
+		t.Fatalf("diffstat.txt used generated fallback despite synthetic patch:\n%s", diffstat)
+	}
+	if !strings.Contains(diffstat, "2\t0\tnotes/todo.txt") {
+		t.Fatalf("diffstat.txt missing synthetic untracked numstat:\n%s", diffstat)
 	}
 }
 

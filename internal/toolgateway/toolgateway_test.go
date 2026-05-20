@@ -18,8 +18,12 @@ func TestHTTPClientCallSendsCurrentWorkingDirectoryHeader(t *testing.T) {
 	cwd := t.TempDir()
 	t.Chdir(cwd)
 	seenCWD := ""
+	var seenBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenCWD = r.Header.Get("X-Symphony-Cwd")
+		if err := json.NewDecoder(r.Body).Decode(&seenBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
 		_ = json.NewEncoder(w).Encode(Response{Success: true, Tool: "issue.get"})
 	}))
 	t.Cleanup(server.Close)
@@ -31,6 +35,13 @@ func TestHTTPClientCallSendsCurrentWorkingDirectoryHeader(t *testing.T) {
 	}
 	if seenCWD != cwd {
 		t.Fatalf("X-Symphony-Cwd = %q, want %q", seenCWD, cwd)
+	}
+	input, ok := seenBody["input"].(map[string]any)
+	if !ok {
+		t.Fatalf("input = %#v, want object", seenBody["input"])
+	}
+	if len(input) != 0 {
+		t.Fatalf("input = %#v, want empty object", input)
 	}
 }
 
@@ -87,7 +98,7 @@ func TestArtifactAttachUsesTokenArtifactMaxBytes(t *testing.T) {
 
 	resp := (Gateway{Store: st}).Call(token, workspace, Request{
 		Tool:  "artifact.attach",
-		Input: map[string]any{"path": "artifact.txt"},
+		Input: map[string]any{"path": "artifact.txt", "kind": "agent_file"},
 	})
 
 	if resp.Success {
@@ -104,7 +115,7 @@ func TestArtifactAttachUsesTokenArtifactMaxBytes(t *testing.T) {
 	}
 	resp = (Gateway{Store: st}).Call(defaultToken, workspace, Request{
 		Tool:  "artifact.attach",
-		Input: map[string]any{"path": "artifact.txt"},
+		Input: map[string]any{"path": "artifact.txt", "kind": "agent_file"},
 	})
 	if !resp.Success {
 		t.Fatalf("artifact.attach with default token failed: %#v", resp.Error)
@@ -140,7 +151,7 @@ func TestArtifactAttachRejectsOversizeUnreadableFileBeforeReading(t *testing.T) 
 
 	resp := (Gateway{Store: st}).Call(token, workspace, Request{
 		Tool:  "artifact.attach",
-		Input: map[string]any{"path": "large.bin"},
+		Input: map[string]any{"path": "large.bin", "kind": "agent_file"},
 	})
 
 	if resp.Success {
@@ -159,7 +170,7 @@ func TestArtifactAttachRejectsOversizeUnreadableFileBeforeReading(t *testing.T) 
 	assertArtifactCount(t, st, run.ID, 0)
 }
 
-func TestArtifactAttachDefaultsKindToAgentFile(t *testing.T) {
+func TestArtifactAttachRejectsMissingKind(t *testing.T) {
 	st := newGatewayTestStore(t)
 	_, run, workspace := prepareGatewayRun(t, st)
 	if err := os.WriteFile(filepath.Join(workspace, "artifact.txt"), []byte("artifact\n"), 0o644); err != nil {
@@ -175,16 +186,13 @@ func TestArtifactAttachDefaultsKindToAgentFile(t *testing.T) {
 		Input: map[string]any{"path": "artifact.txt"},
 	})
 
-	if !resp.Success {
-		t.Fatalf("artifact.attach failed: %#v", resp.Error)
+	if resp.Success {
+		t.Fatal("artifact.attach success = true, want missing kind failure")
 	}
-	row, err := st.Project.QueryOne(`SELECT kind FROM artifacts WHERE run_id=?`, run.ID)
-	if err != nil {
-		t.Fatalf("get artifact: %v", err)
+	if resp.Error == nil || resp.Error.Code != string(core.ErrInvalidRequest) {
+		t.Fatalf("artifact.attach error = %#v, want %s", resp.Error, core.ErrInvalidRequest)
 	}
-	if got := row["kind"].String(); got != "agent_file" {
-		t.Fatalf("artifact kind = %q, want agent_file", got)
-	}
+	assertArtifactCount(t, st, run.ID, 0)
 }
 
 func TestRequiredStringInputsRejectMissingOrBlank(t *testing.T) {
@@ -235,6 +243,198 @@ func TestRequiredStringInputsRejectMissingOrBlank(t *testing.T) {
 	}
 }
 
+func TestCallRejectsTokenScopeBeforeDispatch(t *testing.T) {
+	tests := []struct {
+		name     string
+		scope    func(run *core.RunAttempt, workspace string) map[string]any
+		wantCode core.APIErrorCode
+	}{
+		{
+			name: "tool not in scope",
+			scope: func(run *core.RunAttempt, workspace string) map[string]any {
+				return map[string]any{"run_id": run.ID, "issue_id": run.IssueID, "workspace_path": workspace, "tools": []any{"issue.get"}}
+			},
+			wantCode: core.ErrForbidden,
+		},
+		{
+			name: "missing tools",
+			scope: func(run *core.RunAttempt, workspace string) map[string]any {
+				return map[string]any{"run_id": run.ID, "issue_id": run.IssueID, "workspace_path": workspace}
+			},
+			wantCode: core.ErrToolTokenInvalid,
+		},
+		{
+			name: "wrong tools type",
+			scope: func(run *core.RunAttempt, workspace string) map[string]any {
+				return map[string]any{"run_id": run.ID, "issue_id": run.IssueID, "workspace_path": workspace, "tools": "issue.comment"}
+			},
+			wantCode: core.ErrToolTokenInvalid,
+		},
+		{
+			name: "workspace mismatch",
+			scope: func(run *core.RunAttempt, workspace string) map[string]any {
+				return map[string]any{"run_id": run.ID, "issue_id": run.IssueID, "workspace_path": filepath.Join(filepath.Dir(workspace), "other"), "tools": []any{"issue.comment"}}
+			},
+			wantCode: core.ErrForbidden,
+		},
+		{
+			name: "missing workspace",
+			scope: func(run *core.RunAttempt, workspace string) map[string]any {
+				return map[string]any{"run_id": run.ID, "issue_id": run.IssueID, "tools": []any{"issue.comment"}}
+			},
+			wantCode: core.ErrToolTokenInvalid,
+		},
+		{
+			name: "wrong workspace type",
+			scope: func(run *core.RunAttempt, workspace string) map[string]any {
+				return map[string]any{"run_id": run.ID, "issue_id": run.IssueID, "workspace_path": []any{workspace}, "tools": []any{"issue.comment"}}
+			},
+			wantCode: core.ErrToolTokenInvalid,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newGatewayTestStore(t)
+			_, run, workspace := prepareGatewayRun(t, st)
+			token := createGatewayTokenWithScope(t, st, run, tt.scope(run, workspace))
+
+			resp := (Gateway{Store: st}).Call(token, workspace, Request{
+				Tool:  "issue.comment",
+				Input: map[string]any{"body": "must not dispatch"},
+			})
+
+			if resp.Success {
+				t.Fatal("issue.comment success = true, want scope failure")
+			}
+			if resp.Error == nil || resp.Error.Code != string(tt.wantCode) {
+				t.Fatalf("issue.comment error = %#v, want %s", resp.Error, tt.wantCode)
+			}
+			assertCommentCount(t, st, run.IssueID, 0)
+			assertToolCallCount(t, st, run.ID, 0)
+		})
+	}
+}
+
+func TestCallAllowsIssueGetButRejectsCommentOutsideTokenScope(t *testing.T) {
+	st := newGatewayTestStore(t)
+	_, run, workspace := prepareGatewayRun(t, st)
+	token := createGatewayTokenWithScope(t, st, run, map[string]any{
+		"run_id":         run.ID,
+		"issue_id":       run.IssueID,
+		"workspace_path": workspace,
+		"tools":          []any{"issue.get"},
+	})
+
+	getResp := (Gateway{Store: st}).Call(token, workspace, Request{Tool: "issue.get"})
+	if !getResp.Success {
+		t.Fatalf("issue.get success = false, error = %#v", getResp.Error)
+	}
+	toolCallsAfterGet := toolCallCount(t, st, run.ID)
+
+	commentResp := (Gateway{Store: st}).Call(token, workspace, Request{
+		Tool:  "issue.comment",
+		Input: map[string]any{"body": "must not dispatch"},
+	})
+
+	if commentResp.Success {
+		t.Fatal("issue.comment success = true, want scope failure")
+	}
+	if commentResp.Error == nil || commentResp.Error.Code != string(core.ErrForbidden) {
+		t.Fatalf("issue.comment error = %#v, want %s", commentResp.Error, core.ErrForbidden)
+	}
+	assertCommentCount(t, st, run.IssueID, 0)
+	if got := toolCallCount(t, st, run.ID); got != toolCallsAfterGet {
+		t.Fatalf("tool call count after rejected comment = %d, want %d", got, toolCallsAfterGet)
+	}
+}
+
+func TestCallRejectsAdditionalInputPropertiesBeforeDispatch(t *testing.T) {
+	tests := []struct {
+		name  string
+		req   Request
+		setup func(t *testing.T, workspace string)
+	}{
+		{
+			name: "issue.get",
+			req:  Request{Tool: "issue.get", Input: map[string]any{"unexpected": true}},
+		},
+		{
+			name: "issue.comment",
+			req:  Request{Tool: "issue.comment", Input: map[string]any{"body": "comment", "unexpected": true}},
+		},
+		{
+			name: "issue.block",
+			req:  Request{Tool: "issue.block", Input: map[string]any{"reason": "blocked", "unexpected": true}},
+		},
+		{
+			name: "artifact.attach",
+			req:  Request{Tool: "artifact.attach", Input: map[string]any{"path": "artifact.txt", "kind": "agent_file", "unexpected": true}},
+			setup: func(t *testing.T, workspace string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(workspace, "artifact.txt"), []byte("artifact\n"), 0o644); err != nil {
+					t.Fatalf("write artifact: %v", err)
+				}
+			},
+		},
+		{
+			name: "followup.create",
+			req:  Request{Tool: "followup.create", Input: map[string]any{"title": "followup", "unexpected": true}},
+		},
+		{
+			name: "handoff.submit",
+			req:  Request{Tool: "handoff.submit", Input: map[string]any{"summary": "done", "changed_files": []any{}, "tests": []any{}, "risks": []any{}, "verification": []any{}, "followups": []any{}, "unexpected": true}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newGatewayTestStore(t)
+			_, run, workspace := prepareGatewayRun(t, st)
+			if tt.setup != nil {
+				tt.setup(t, workspace)
+			}
+			token, err := NewTokenForRun(st, run, workspace)
+			if err != nil {
+				t.Fatalf("NewTokenForRun: %v", err)
+			}
+
+			resp := (Gateway{Store: st}).Call(token, workspace, tt.req)
+
+			if resp.Success {
+				t.Fatalf("%s success = true, want additional property failure", tt.req.Tool)
+			}
+			if resp.Error == nil || resp.Error.Code != string(core.ErrInvalidRequest) {
+				t.Fatalf("%s error = %#v, want %s", tt.req.Tool, resp.Error, core.ErrInvalidRequest)
+			}
+			assertToolCallCount(t, st, run.ID, 0)
+		})
+	}
+}
+
+func TestArtifactAttachRejectsInvalidKindWithoutStoringArtifact(t *testing.T) {
+	st := newGatewayTestStore(t)
+	_, run, workspace := prepareGatewayRun(t, st)
+	if err := os.WriteFile(filepath.Join(workspace, "artifact.txt"), []byte("artifact\n"), 0o644); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	token, err := NewTokenForRun(st, run, workspace)
+	if err != nil {
+		t.Fatalf("NewTokenForRun: %v", err)
+	}
+
+	resp := (Gateway{Store: st}).Call(token, workspace, Request{
+		Tool:  "artifact.attach",
+		Input: map[string]any{"path": "artifact.txt", "kind": "not_a_kind"},
+	})
+
+	if resp.Success {
+		t.Fatal("artifact.attach success = true, want invalid kind failure")
+	}
+	if resp.Error == nil || resp.Error.Code != string(core.ErrInvalidRequest) {
+		t.Fatalf("artifact.attach error = %#v, want %s", resp.Error, core.ErrInvalidRequest)
+	}
+	assertArtifactCount(t, st, run.ID, 0)
+}
+
 func TestFollowupCreateRejectsInvalidPriorityWithoutCreatingIssue(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -272,11 +472,73 @@ func TestFollowupCreateRejectsInvalidPriorityWithoutCreatingIssue(t *testing.T) 
 	}
 }
 
+func TestFollowupCreateRejectsNonStringListItemsWithoutCreatingIssue(t *testing.T) {
+	tests := []struct {
+		name  string
+		input map[string]any
+	}{
+		{
+			name: "acceptance criteria contains non-string item",
+			input: map[string]any{
+				"title":               "invalid followup",
+				"acceptance_criteria": []any{"done", 123},
+			},
+		},
+		{
+			name: "labels contains non-string item",
+			input: map[string]any{
+				"title":  "invalid followup",
+				"labels": []any{"bug", false},
+			},
+		},
+		{
+			name: "labels contains blank item",
+			input: map[string]any{
+				"title":  "invalid followup",
+				"labels": []any{"bug", "  "},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newGatewayTestStore(t)
+			_, run, workspace := prepareGatewayRun(t, st)
+			token, err := NewTokenForRun(st, run, workspace)
+			if err != nil {
+				t.Fatalf("NewTokenForRun: %v", err)
+			}
+
+			resp := (Gateway{Store: st}).Call(token, workspace, Request{
+				Tool:  "followup.create",
+				Input: tt.input,
+			})
+
+			if resp.Success {
+				t.Fatal("followup.create success = true, want invalid list failure")
+			}
+			if resp.Error == nil || resp.Error.Code != string(core.ErrInvalidRequest) {
+				t.Fatalf("followup.create error = %#v, want %s", resp.Error, core.ErrInvalidRequest)
+			}
+			assertIssueCount(t, st, 1)
+		})
+	}
+}
+
 func TestHandoffSubmitRejectsInvalidListFieldsWithoutCreatingHandoff(t *testing.T) {
 	tests := []struct {
 		name  string
 		input map[string]any
 	}{
+		{
+			name: "missing required list field",
+			input: map[string]any{
+				"summary":       "completed work",
+				"changed_files": []any{},
+				"tests":         []any{},
+				"risks":         []any{},
+				"verification":  []any{},
+			},
+		},
 		{
 			name: "changed_files contains non-string item",
 			input: map[string]any{
@@ -289,6 +551,42 @@ func TestHandoffSubmitRejectsInvalidListFieldsWithoutCreatingHandoff(t *testing.
 			input: map[string]any{
 				"summary": "completed work",
 				"tests":   "go test ./...",
+			},
+		},
+		{
+			name: "target_state is not a string",
+			input: map[string]any{
+				"summary":       "completed work",
+				"changed_files": []any{},
+				"tests":         []any{},
+				"risks":         []any{},
+				"verification":  []any{},
+				"followups":     []any{},
+				"target_state":  123,
+			},
+		},
+		{
+			name: "target_state is blank",
+			input: map[string]any{
+				"summary":       "completed work",
+				"changed_files": []any{},
+				"tests":         []any{},
+				"risks":         []any{},
+				"verification":  []any{},
+				"followups":     []any{},
+				"target_state":  "  ",
+			},
+		},
+		{
+			name: "target_state is unsupported",
+			input: map[string]any{
+				"summary":       "completed work",
+				"changed_files": []any{},
+				"tests":         []any{},
+				"risks":         []any{},
+				"verification":  []any{},
+				"followups":     []any{},
+				"target_state":  "Ready",
 			},
 		},
 	}
@@ -365,7 +663,7 @@ func TestArtifactAttachPreservesRelativeDirectoriesForSameBaseName(t *testing.T)
 	gw := Gateway{Store: st}
 
 	for _, rel := range []string{"a/report.txt", "b/report.txt"} {
-		resp := gw.Call(token, workspace, Request{Tool: "artifact.attach", Input: map[string]any{"path": rel}})
+		resp := gw.Call(token, workspace, Request{Tool: "artifact.attach", Input: map[string]any{"path": rel, "kind": "agent_file"}})
 		if !resp.Success {
 			t.Fatalf("artifact.attach %s failed: %#v", rel, resp.Error)
 		}
@@ -402,7 +700,7 @@ func TestArtifactAttachRejectsDuplicateRelativePathWithoutOverwriting(t *testing
 		t.Fatalf("NewTokenForRun: %v", err)
 	}
 	gw := Gateway{Store: st}
-	first := gw.Call(token, workspace, Request{Tool: "artifact.attach", Input: map[string]any{"path": "report.txt"}})
+	first := gw.Call(token, workspace, Request{Tool: "artifact.attach", Input: map[string]any{"path": "report.txt", "kind": "agent_file"}})
 	if !first.Success {
 		t.Fatalf("first artifact.attach failed: %#v", first.Error)
 	}
@@ -410,7 +708,7 @@ func TestArtifactAttachRejectsDuplicateRelativePathWithoutOverwriting(t *testing
 		t.Fatalf("rewrite workspace artifact: %v", err)
 	}
 
-	second := gw.Call(token, workspace, Request{Tool: "artifact.attach", Input: map[string]any{"path": "report.txt"}})
+	second := gw.Call(token, workspace, Request{Tool: "artifact.attach", Input: map[string]any{"path": "report.txt", "kind": "agent_file"}})
 
 	if second.Success {
 		t.Fatal("second artifact.attach success = true, want duplicate path failure")
@@ -442,7 +740,7 @@ func TestArtifactAttachCleansUpFileWhenMetadataInsertFails(t *testing.T) {
 	}
 	gw := Gateway{Store: st}
 
-	first := gw.Call(token, workspace, Request{Tool: "artifact.attach", Input: map[string]any{"path": "report.txt"}})
+	first := gw.Call(token, workspace, Request{Tool: "artifact.attach", Input: map[string]any{"path": "report.txt", "kind": "agent_file"}})
 	if first.Success {
 		t.Fatal("artifact.attach success = true, want metadata failure")
 	}
@@ -455,7 +753,7 @@ func TestArtifactAttachCleansUpFileWhenMetadataInsertFails(t *testing.T) {
 	if err := st.Project.Exec(`DROP TRIGGER fail_artifact_insert`); err != nil {
 		t.Fatalf("drop trigger: %v", err)
 	}
-	second := gw.Call(token, workspace, Request{Tool: "artifact.attach", Input: map[string]any{"path": "report.txt"}})
+	second := gw.Call(token, workspace, Request{Tool: "artifact.attach", Input: map[string]any{"path": "report.txt", "kind": "agent_file"}})
 	if !second.Success {
 		t.Fatalf("retry artifact.attach failed: %#v", second.Error)
 	}
@@ -608,6 +906,16 @@ func prepareGatewayRun(t *testing.T, st *store.Store) (*core.Issue, *core.RunAtt
 	return issue, run, workspace
 }
 
+func createGatewayTokenWithScope(t *testing.T, st *store.Store, run *core.RunAttempt, scope map[string]any) string {
+	t.Helper()
+	token := security.NewToken()
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := st.CreateToolToken(run.ID, security.HashToken(token), scope, expires); err != nil {
+		t.Fatalf("CreateToolToken: %v", err)
+	}
+	return token
+}
+
 func assertArtifactCount(t *testing.T, st *store.Store, runID string, want int) {
 	t.Helper()
 	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM artifacts WHERE run_id=?`, runID)
@@ -617,6 +925,33 @@ func assertArtifactCount(t *testing.T, st *store.Store, runID string, want int) 
 	if got := row["c"].Int(); got != want {
 		t.Fatalf("artifact count = %d, want %d", got, want)
 	}
+}
+
+func assertCommentCount(t *testing.T, st *store.Store, issueID string, want int) {
+	t.Helper()
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM issue_comments WHERE issue_id=?`, issueID)
+	if err != nil {
+		t.Fatalf("count comments: %v", err)
+	}
+	if got := row["c"].Int(); got != want {
+		t.Fatalf("comment count = %d, want %d", got, want)
+	}
+}
+
+func assertToolCallCount(t *testing.T, st *store.Store, runID string, want int) {
+	t.Helper()
+	if got := toolCallCount(t, st, runID); got != want {
+		t.Fatalf("tool call count = %d, want %d", got, want)
+	}
+}
+
+func toolCallCount(t *testing.T, st *store.Store, runID string) int {
+	t.Helper()
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM tool_calls WHERE run_id=?`, runID)
+	if err != nil {
+		t.Fatalf("count tool calls: %v", err)
+	}
+	return row["c"].Int()
 }
 
 func assertIssueCount(t *testing.T, st *store.Store, want int) {

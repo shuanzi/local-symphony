@@ -185,6 +185,38 @@ func TestCompleteRunWithReviewRollsBackWhenEventInsertFails(t *testing.T) {
 	assertNoReviewGeneratedEvent(t, st, run.ID)
 }
 
+func TestCompleteRunWithReviewRejectsReviewPacketForDifferentRun(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRunWithMaxConcurrent(t, st, "CompleteRunWithReview wrong run", 2)
+	otherIssue, otherRun := prepareActiveRunWithMaxConcurrent(t, st, "CompleteRunWithReview packet owner", 2)
+	reviewPacketID := insertReviewPacketForRun(t, st, otherIssue.ID, otherRun.ID)
+
+	err := st.CompleteRunWithReview(run.ID, reviewPacketID)
+	if err == nil {
+		t.Fatal("CompleteRunWithReview succeeded, want review packet ownership error")
+	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+	assertIssueLatestReviewPacketID(t, st, issue.ID, nil)
+}
+
+func TestCompleteRunWithReviewRejectsNonGeneratedReviewPacket(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "CompleteRunWithReview failed packet")
+	reviewPacketID := insertReviewPacketForRun(t, st, issue.ID, run.ID)
+	if err := st.Project.Exec(`UPDATE review_packets SET status='failed' WHERE id=?`, reviewPacketID); err != nil {
+		t.Fatalf("mark review packet failed: %v", err)
+	}
+
+	err := st.CompleteRunWithReview(run.ID, reviewPacketID)
+	if err == nil {
+		t.Fatal("CompleteRunWithReview succeeded, want review packet status error")
+	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+	assertIssueLatestReviewPacketID(t, st, issue.ID, &reviewPacketID)
+}
+
 func TestMarkDoneRollsBackWhenAuditCommentInsertFails(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, _ := prepareCompletedReviewRun(t, st)
@@ -322,6 +354,36 @@ func TestUpdateRunStatusRejectsCompletedRunWithoutChangingRunOrIssue(t *testing.
 	}
 	assertRunStatus(t, st, run.ID, core.RunCompleted)
 	assertIssueState(t, st, issue.ID, core.StateHumanReview)
+}
+
+func TestUpdateRunStatusRejectsTerminalTargetWithoutChangingRunOrIssue(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "UpdateRunStatus terminal target")
+
+	err := st.UpdateRunStatus(run.ID, core.RunCompleted, map[string]any{"ended_at": core.Now()})
+	if err == nil {
+		t.Fatal("UpdateRunStatus succeeded, want invalid_state_transition")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrInvalidStateTransition {
+		t.Fatalf("UpdateRunStatus error code = %s, want %s", got, core.ErrInvalidStateTransition)
+	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+}
+
+func TestUpdateRunStatusRejectsProtectedFieldWithoutChangingRunOrIssue(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "UpdateRunStatus protected field")
+
+	err := st.UpdateRunStatus(run.ID, core.RunRunning, map[string]any{"status": string(core.RunCompleted)})
+	if err == nil {
+		t.Fatal("UpdateRunStatus succeeded, want invalid_request")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrInvalidRequest {
+		t.Fatalf("UpdateRunStatus error code = %s, want %s", got, core.ErrInvalidRequest)
+	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
 }
 
 func TestTransitionIssueStillCancelsActiveRun(t *testing.T) {
@@ -592,6 +654,76 @@ func TestTransitionIssueRollsBackWhenActiveRunCancelFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("TransitionIssue succeeded, want cancel error")
 	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+}
+
+func TestTransitionIssuePropagatesTerminalReopenResetError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, _ := prepareCompletedReviewRun(t, st)
+	if _, err := st.MarkDone(issue.ID, "done"); err != nil {
+		t.Fatalf("MarkDone: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_terminal_reopen_reset BEFORE UPDATE OF completed_at ON issues WHEN OLD.state='Done' AND NEW.completed_at IS NULL BEGIN SELECT RAISE(ABORT, 'terminal reset failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.TransitionIssue(issue.ID, core.StateReady, "", "")
+	if err == nil {
+		t.Fatal("TransitionIssue succeeded, want terminal reset error")
+	}
+	assertErrorContains(t, err, "terminal reset failed")
+	assertIssueState(t, st, issue.ID, core.StateDone)
+}
+
+func TestTransitionIssueRollsBackWhenReasonCommentInsertFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "TransitionIssue reason comment failure")
+	if err := st.Project.Exec(`CREATE TRIGGER fail_transition_reason_comment BEFORE INSERT ON issue_comments WHEN NEW.author_type='operator' AND NEW.body='blocked by operator' BEGIN SELECT RAISE(ABORT, 'reason comment failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.TransitionIssue(issue.ID, core.StateBlocked, "blocked by operator", "")
+	if err == nil {
+		t.Fatal("TransitionIssue succeeded, want reason comment error")
+	}
+	assertErrorContains(t, err, "reason comment failed")
+	assertIssueState(t, st, issue.ID, core.StateReady)
+	rows, qerr := st.Project.Query(`SELECT id FROM issue_state_history WHERE issue_id=? AND to_state=?`, issue.ID, string(core.StateBlocked))
+	if qerr != nil {
+		t.Fatalf("query state history: %v", qerr)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("blocked state history rows = %d, want 0 after rollback", len(rows))
+	}
+}
+
+func TestFailRunPropagatesIssueStateSelectError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "FailRun select error")
+	replaceIssuesWithStateSelectErrorView(t, st)
+
+	err := st.FailRun(run.ID, core.FailureToolGatewayFailed, "gateway failed", core.RunFailed)
+	if err == nil {
+		t.Fatal("FailRun succeeded, want issue state select error")
+	}
+	assertErrorContains(t, err, "missing_state_source")
+	restoreIssuesTable(t, st)
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+}
+
+func TestCancelRunPropagatesIssueStateSelectError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "CancelRun select error")
+	replaceIssuesWithStateSelectErrorView(t, st)
+
+	err := st.CancelRun(run.ID, "operator cancelled")
+	if err == nil {
+		t.Fatal("CancelRun succeeded, want issue state select error")
+	}
+	assertErrorContains(t, err, "missing_state_source")
+	restoreIssuesTable(t, st)
 	assertRunStatus(t, st, run.ID, core.RunPending)
 	assertIssueState(t, st, issue.ID, core.StateWorking)
 }
@@ -1247,6 +1379,72 @@ func TestInsertReviewPacketRollsBackWhenIssuePointerUpdateFails(t *testing.T) {
 	}
 }
 
+func TestInsertHandoffRollsBackWhenSubmittedEventFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Handoff event failure")
+	if err := st.Project.Exec(`CREATE TRIGGER fail_handoff_submitted_event BEFORE INSERT ON run_events WHEN NEW.event_type='handoff.submitted' BEGIN SELECT RAISE(ABORT, 'handoff submitted event failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.InsertHandoff(issue.ID, run.ID, "payload-hash", map[string]any{
+		"summary":      "ready for review",
+		"target_state": "Human Review",
+	})
+	if err == nil {
+		t.Fatal("InsertHandoff succeeded, want handoff event error")
+	}
+	assertErrorContains(t, err, "handoff submitted event failed")
+	rows, qerr := st.Project.Query(`SELECT id FROM handoffs WHERE run_id=?`, run.ID)
+	if qerr != nil {
+		t.Fatalf("query handoffs: %v", qerr)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("handoff rows = %d, want 0 after rollback", len(rows))
+	}
+}
+
+func TestRecordToolCallStoresRedactedJSONWithoutSecretLikeValues(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Tool call redaction")
+	secretInput := "sk_live_secret_value"
+	secretOutput := "ghp_secret_value"
+	secretInputKey := "prompt: include sk_live_key_from_dynamic_key"
+	secretOutputKey := "stdout ghp_key_from_dynamic_key"
+
+	if err := st.RecordToolCall(issue.ID, run.ID, "shell", "completed", map[string]any{
+		"command":      "deploy",
+		"token":        secretInput,
+		secretInputKey: "redacted by key summary",
+	}, map[string]any{
+		"stdout":        secretOutput,
+		secretOutputKey: "redacted by key summary",
+	}, "", ""); err != nil {
+		t.Fatalf("RecordToolCall: %v", err)
+	}
+
+	row, err := st.Project.QueryOne(`SELECT input_json_redacted, output_json_redacted FROM tool_calls WHERE run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("query tool_call: %v", err)
+	}
+	inputRedacted := row["input_json_redacted"].String()
+	outputRedacted := row["output_json_redacted"].String()
+	if strings.Contains(inputRedacted, secretInput) {
+		t.Fatalf("input_json_redacted contains secret-like input: %q", inputRedacted)
+	}
+	if strings.Contains(outputRedacted, secretOutput) {
+		t.Fatalf("output_json_redacted contains secret-like output: %q", outputRedacted)
+	}
+	if strings.Contains(inputRedacted, secretInputKey) {
+		t.Fatalf("input_json_redacted contains secret-like key: %q", inputRedacted)
+	}
+	if strings.Contains(outputRedacted, secretOutputKey) {
+		t.Fatalf("output_json_redacted contains secret-like key: %q", outputRedacted)
+	}
+	if inputRedacted == "" || outputRedacted == "" {
+		t.Fatalf("redacted JSON fields must be populated, got input=%q output=%q", inputRedacted, outputRedacted)
+	}
+}
+
 func TestCreateFollowupIssueRollsBackWhenRelationInsertConflicts(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareActiveRun(t, st, "Followup relation conflict")
@@ -1424,6 +1622,29 @@ func prepareCancelledRun(t *testing.T, st *Store) (*core.Issue, *core.RunAttempt
 		t.Fatalf("GetRun: %v", err)
 	}
 	return issue, run
+}
+
+func replaceIssuesWithStateSelectErrorView(t *testing.T, st *Store) {
+	t.Helper()
+	if err := st.Project.Exec(`ALTER TABLE issues RENAME TO issues_shadow`); err != nil {
+		t.Fatalf("rename issues table: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE VIEW issues AS SELECT id, identifier, (SELECT value FROM missing_state_source) AS state, dispatch_paused, dispatch_pause_reason, dispatch_paused_at, updated_at FROM issues_shadow`); err != nil {
+		t.Fatalf("create issues error view: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER ignore_issue_update INSTEAD OF UPDATE ON issues BEGIN SELECT 1; END`); err != nil {
+		t.Fatalf("create issue update trigger: %v", err)
+	}
+}
+
+func restoreIssuesTable(t *testing.T, st *Store) {
+	t.Helper()
+	if err := st.Project.Exec(`DROP VIEW issues`); err != nil {
+		t.Fatalf("drop issues error view: %v", err)
+	}
+	if err := st.Project.Exec(`ALTER TABLE issues_shadow RENAME TO issues`); err != nil {
+		t.Fatalf("restore issues table: %v", err)
+	}
 }
 
 func insertReviewPacketForRun(t *testing.T, st *Store, issueID, runID string) string {

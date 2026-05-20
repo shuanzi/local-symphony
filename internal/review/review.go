@@ -90,6 +90,12 @@ func (g Generator) Generate(runID string) (string, error) {
 		return "", reviewPacketError("write patch artifact", err)
 	}
 	diffstat := gitx.DiffNumstatPaths(issue.Workspace.Path, diffPaths)
+	if untrackedStat := syntheticNumstat(issue.Workspace.Path, untracked); untrackedStat != "" {
+		if diffstat != "" && !strings.HasSuffix(diffstat, "\n") {
+			diffstat += "\n"
+		}
+		diffstat += untrackedStat
+	}
 	if diffstat == "" {
 		diffstat = "0\t0\tgenerated\n"
 	}
@@ -200,6 +206,7 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 	untracked := []UntrackedInfo{}
 	denied := map[string]bool{}
 	if records, err := statusPorcelainRecords(root); err == nil {
+		protectedDeleted := protectedDeletedContent(root, records)
 		for _, record := range records {
 			if len(record.paths) == 0 {
 				continue
@@ -220,6 +227,10 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 				safePaths = append(safePaths, path)
 			}
 			if len(safePaths) == 0 {
+				continue
+			}
+			if record.code == "??" && protectedDeleted.matchesUntracked(root, safePaths[0]) {
+				denied[safePaths[0]] = true
 				continue
 			}
 			for _, path := range safePaths {
@@ -258,6 +269,47 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 	return changed, untracked, denied
 }
 
+type protectedDeletedContentSet struct {
+	hashes  map[string]bool
+	unknown bool
+}
+
+func (s protectedDeletedContentSet) matchesUntracked(root, path string) bool {
+	if len(s.hashes) == 0 && !s.unknown {
+		return false
+	}
+	data, _, reason, err := readUntrackedPatchData(root, path)
+	if err != nil || reason != nil {
+		return s.unknown
+	}
+	if s.hashes[security.SHA256Bytes(data)] {
+		return true
+	}
+	return s.unknown
+}
+
+func protectedDeletedContent(root string, records []statusPorcelainRecord) protectedDeletedContentSet {
+	set := protectedDeletedContentSet{hashes: map[string]bool{}}
+	for _, record := range records {
+		if !record.deleted() {
+			continue
+		}
+		for _, candidate := range record.paths {
+			path := reviewCleanPath(candidate)
+			if path == "" || !security.IsProtectedPath(path) {
+				continue
+			}
+			data, err := gitShowHeadPath(root, path)
+			if err != nil {
+				set.unknown = true
+				continue
+			}
+			set.hashes[security.SHA256Bytes(data)] = true
+		}
+	}
+	return set
+}
+
 type statusPorcelainRecord struct {
 	code  string
 	paths []string
@@ -265,6 +317,9 @@ type statusPorcelainRecord struct {
 
 func (r statusPorcelainRecord) renamedOrCopied() bool {
 	return len(r.code) >= 2 && (r.code[0] == 'R' || r.code[1] == 'R' || r.code[0] == 'C' || r.code[1] == 'C')
+}
+func (r statusPorcelainRecord) deleted() bool {
+	return len(r.code) >= 2 && (r.code[0] == 'D' || r.code[1] == 'D')
 }
 
 func statusPorcelainRecords(root string) ([]statusPorcelainRecord, error) {
@@ -319,6 +374,11 @@ func decodeStatusPath(path string) string {
 	}
 	return path
 }
+func gitShowHeadPath(root, path string) ([]byte, error) {
+	cmd := exec.Command("git", "show", "HEAD:"+path)
+	cmd.Dir = root
+	return cmd.Output()
+}
 func untrackedInfo(root, path string) UntrackedInfo {
 	path = filepath.ToSlash(path)
 	data, size, reason, err := readUntrackedPatchData(root, path)
@@ -356,6 +416,29 @@ func syntheticPatch(root string, u []UntrackedInfo) string {
 			b.WriteString(strings.TrimSuffix(line, "\n"))
 			b.WriteByte('\n')
 		}
+	}
+	return b.String()
+}
+func syntheticNumstat(root string, u []UntrackedInfo) string {
+	var b strings.Builder
+	for _, x := range u {
+		if !x.PatchIncluded {
+			continue
+		}
+		data, _, reason, err := readUntrackedPatchData(root, x.Path)
+		if err != nil || reason != nil {
+			continue
+		}
+		added := 0
+		for _, line := range strings.SplitAfter(string(data), "\n") {
+			if line != "" {
+				added++
+			}
+		}
+		b.WriteString(strconv.Itoa(added))
+		b.WriteString("\t0\t")
+		b.WriteString(x.Path)
+		b.WriteByte('\n')
 	}
 	return b.String()
 }
@@ -406,9 +489,16 @@ func bytesContainNUL(b []byte) bool {
 	}
 	return false
 }
-func reviewSafePath(path string) string {
+func reviewCleanPath(path string) string {
 	path = filepath.ToSlash(filepath.Clean(path))
 	if path == "." || strings.HasPrefix(path, "../") || path == ".." || filepath.IsAbs(path) {
+		return ""
+	}
+	return path
+}
+func reviewSafePath(path string) string {
+	path = reviewCleanPath(path)
+	if path == "" {
 		return ""
 	}
 	if security.IsProtectedPath(path) {

@@ -26,8 +26,9 @@ const defaultArtifactMaxBytes int64 = 10 * 1024 * 1024
 type Gateway struct{ Store *store.Store }
 
 type Request struct {
-	Tool  string         `json:"tool"`
-	Input map[string]any `json:"input"`
+	Tool   string         `json:"tool"`
+	Input  map[string]any `json:"input"`
+	Client map[string]any `json:"client,omitempty"`
 }
 
 type Response struct {
@@ -63,6 +64,12 @@ func (g Gateway) Call(token, cwd string, req Request) Response {
 	issue, _ := g.Store.GetIssue(issueID)
 	if issue == nil || issue.Workspace == nil {
 		return errResp("tool_gateway_failed", "workspace not prepared", nil)
+	}
+	if err := validateTokenScope(scope, req.Tool, issue.Workspace.Path); err != nil {
+		return apiErrResp(err)
+	}
+	if err := validateToolInput(req.Tool, req.Input); err != nil {
+		return apiErrResp(err)
 	}
 	if rel, e := filepath.Rel(issue.Workspace.Path, cwd); e != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
 		return errResp("tool_gateway_failed", "cwd is outside workspace", nil)
@@ -105,12 +112,9 @@ func (g Gateway) dispatch(issue *core.Issue, runID string, scope map[string]any,
 		if err != nil {
 			return Response{}, err
 		}
-		kind, err := optionalString(req.Input, "kind")
+		kind, err := requiredString(req.Input, "kind")
 		if err != nil {
 			return Response{}, err
-		}
-		if strings.TrimSpace(kind) == "" {
-			kind = "agent_file"
 		}
 		target, err := security.ContainedPath(issue.Workspace.Path, rel)
 		if err != nil {
@@ -179,8 +183,14 @@ func (g Gateway) dispatch(issue *core.Issue, runID string, scope map[string]any,
 		if err != nil {
 			return Response{}, err
 		}
-		ac := toStrings(req.Input["acceptance_criteria"])
-		labels := toStrings(req.Input["labels"])
+		ac, err := requiredStringSlice(req.Input, "acceptance_criteria")
+		if err != nil {
+			return Response{}, err
+		}
+		labels, err := requiredNonBlankStringSlice(req.Input, "labels")
+		if err != nil {
+			return Response{}, err
+		}
 		ni, err := g.Store.CreateFollowupIssue(issue.ID, runID, store.CreateIssueInput{Title: title, Description: desc, AcceptanceCriteria: ac, Priority: prio, Labels: labels, CreatedByType: "agent", CreatedByRunID: &runID})
 		if err != nil {
 			return Response{}, err
@@ -272,6 +282,134 @@ func allowed(t string) bool {
 	}
 	return false
 }
+
+func validateTokenScope(scope map[string]any, tool, workspacePath string) error {
+	if scope == nil {
+		return core.NewError(core.ErrToolTokenInvalid, "tool token scope invalid", nil)
+	}
+	if err := validateScopedWorkspace(scope, workspacePath); err != nil {
+		return err
+	}
+	tools, err := scopedTools(scope)
+	if err != nil {
+		return err
+	}
+	for _, scopedTool := range tools {
+		if scopedTool == tool {
+			return nil
+		}
+	}
+	return core.NewError(core.ErrForbidden, "tool is not allowed by token scope", map[string]any{"tool": tool})
+}
+
+func validateScopedWorkspace(scope map[string]any, workspacePath string) error {
+	v, ok := scope["workspace_path"]
+	if !ok {
+		return core.NewError(core.ErrToolTokenInvalid, "tool token scope missing workspace_path", nil)
+	}
+	scopedWorkspace, ok := v.(string)
+	if !ok || strings.TrimSpace(scopedWorkspace) == "" {
+		return core.NewError(core.ErrToolTokenInvalid, "tool token scope workspace_path invalid", nil)
+	}
+	if !sameCleanAbsPath(scopedWorkspace, workspacePath) {
+		return core.NewError(core.ErrForbidden, "workspace is not allowed by token scope", nil)
+	}
+	return nil
+}
+
+func scopedTools(scope map[string]any) ([]string, error) {
+	v, ok := scope["tools"]
+	if !ok {
+		return nil, core.NewError(core.ErrToolTokenInvalid, "tool token scope missing tools", nil)
+	}
+	switch a := v.(type) {
+	case []string:
+		return a, nil
+	case []any:
+		out := make([]string, 0, len(a))
+		for _, item := range a {
+			s, ok := item.(string)
+			if !ok || strings.TrimSpace(s) == "" {
+				return nil, core.NewError(core.ErrToolTokenInvalid, "tool token scope tools invalid", nil)
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	default:
+		return nil, core.NewError(core.ErrToolTokenInvalid, "tool token scope tools invalid", nil)
+	}
+}
+
+func sameCleanAbsPath(a, b string) bool {
+	aa, errA := filepath.Abs(filepath.Clean(a))
+	bb, errB := filepath.Abs(filepath.Clean(b))
+	if errA != nil || errB != nil {
+		return false
+	}
+	return aa == bb
+}
+
+func validateToolInput(tool string, in map[string]any) error {
+	allowedKeys, ok := toolInputKeys[tool]
+	if !ok {
+		return core.NewError(core.ErrToolGatewayFailed, "unsupported tool", nil)
+	}
+	for key := range in {
+		if !allowedKeys[key] {
+			return core.NewError(core.ErrInvalidRequest, key+" is not allowed for "+tool, nil)
+		}
+	}
+	if tool == "artifact.attach" {
+		kind, err := requiredString(in, "kind")
+		if err != nil {
+			return err
+		}
+		if !allowedArtifactKind(kind) {
+			return core.NewError(core.ErrInvalidRequest, "kind is invalid", nil)
+		}
+	}
+	if tool == "followup.create" {
+		if _, err := requiredStringSlice(in, "acceptance_criteria"); err != nil {
+			return err
+		}
+		if _, err := requiredNonBlankStringSlice(in, "labels"); err != nil {
+			return err
+		}
+	}
+	if tool == "handoff.submit" {
+		for _, key := range []string{"changed_files", "tests", "risks", "verification", "followups"} {
+			if _, ok := in[key]; !ok {
+				return core.NewError(core.ErrInvalidRequest, key+" is required", nil)
+			}
+		}
+		if v, ok := in["target_state"]; ok {
+			s, ok := v.(string)
+			if !ok || strings.TrimSpace(s) != "Human Review" {
+				return core.NewError(core.ErrInvalidRequest, "target_state must be Human Review", nil)
+			}
+		}
+	}
+	return nil
+}
+
+var toolInputKeys = map[string]map[string]bool{
+	"issue.get":       {},
+	"issue.comment":   {"body": true},
+	"issue.block":     {"reason": true, "details": true},
+	"artifact.attach": {"path": true, "kind": true, "description": true},
+	"followup.create": {"title": true, "description": true, "acceptance_criteria": true, "labels": true, "priority": true},
+	"handoff.submit":  {"summary": true, "changed_files": true, "tests": true, "risks": true, "verification": true, "followups": true, "target_state": true},
+}
+
+func allowedArtifactKind(kind string) bool {
+	switch kind {
+	case "test_output", "patch", "changed_files", "untracked_files", "diffstat", "prompt_snapshot", "codex_log", "review_packet", "agent_file", "diagnostic", "other":
+		return true
+	default:
+		return false
+	}
+}
+
 func apiErrResp(err error) Response {
 	ae := core.AsAPIError(err)
 	return errResp(string(ae.Code), ae.Message, ae.Details)
@@ -282,21 +420,6 @@ func errResp(code, msg string, details map[string]any) Response {
 	}
 	return Response{Success: false, Error: &ToolError{Code: code, Message: msg, Details: details}}
 }
-func toStrings(v any) []string {
-	out := []string{}
-	switch a := v.(type) {
-	case []string:
-		return a
-	case []any:
-		for _, x := range a {
-			if s, ok := x.(string); ok {
-				out = append(out, s)
-			}
-		}
-	}
-	return out
-}
-
 func requiredStringSlice(in map[string]any, key string) ([]string, error) {
 	v, ok := in[key]
 	if !ok {
@@ -318,6 +441,19 @@ func requiredStringSlice(in map[string]any, key string) ([]string, error) {
 	default:
 		return nil, core.NewError(core.ErrInvalidRequest, key+" must be string array", nil)
 	}
+}
+
+func requiredNonBlankStringSlice(in map[string]any, key string) ([]string, error) {
+	values, err := requiredStringSlice(in, key)
+	if err != nil {
+		return nil, err
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return nil, core.NewError(core.ErrInvalidRequest, key+" must contain non-blank strings", nil)
+		}
+	}
+	return values, nil
 }
 
 func artifactMaxBytesFromScope(scope map[string]any) int64 {
@@ -351,8 +487,12 @@ func canonicalHandoff(in map[string]any) (map[string]any, error) {
 		return nil, err
 	}
 	target := "Human Review"
-	if x, ok := in["target_state"].(string); ok && strings.TrimSpace(x) != "" {
-		target = strings.TrimSpace(x)
+	if rawTarget, ok := in["target_state"]; ok {
+		s, ok := rawTarget.(string)
+		if !ok || strings.TrimSpace(s) == "" {
+			return nil, core.NewError(core.ErrInvalidRequest, "target_state must be Human Review", nil)
+		}
+		target = strings.TrimSpace(s)
 	}
 	if target != "Human Review" {
 		return nil, core.NewError(core.ErrInvalidRequest, "target_state must be Human Review", nil)
@@ -431,6 +571,9 @@ func writeCanonical(buf *bytes.Buffer, v any) {
 }
 
 func HTTPClientCall(endpoint, token string, req Request) Response {
+	if req.Input == nil {
+		req.Input = map[string]any{}
+	}
 	b, _ := json.Marshal(req)
 	hreq, _ := http.NewRequest("POST", strings.TrimRight(endpoint, "/")+"/tool/v1/call", bytes.NewReader(b))
 	hreq.Header.Set("Authorization", "Bearer "+token)

@@ -47,6 +47,7 @@ paths:
         content: { application/json: { schema: { type: object, required: [open_token], additionalProperties: false, properties: { open_token: { type: string, minLength: 16 } } } } }
       responses:
         "200": { description: Browser session established, content: { application/json: { schema: { $ref: '#/components/schemas/AuthSessionEnvelope' } } } }
+        "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid mutation request body }
         "401": { $ref: '#/components/responses/Error' }
   /auth/session:
     get:
@@ -251,7 +252,10 @@ paths:
     get:
       operationId: getLatestReview
       parameters: [ { $ref: '#/components/parameters/IssueRef' } ]
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ReviewPacketEnvelope' } } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ReviewPacketEnvelope' } } } }
+        "404": { $ref: '#/components/responses/Error', description: "not_found when issue_ref is unresolved." }
+        "409": { $ref: '#/components/responses/Error', description: "review_packet_required when the issue has no review packet row." }
   /reviews/{issue_ref}/send-to-rework:
     post:
       operationId: sendToRework
@@ -323,7 +327,7 @@ paths:
       parameters: [ { $ref: '#/components/parameters/SymphonyCSRF' } ]
       x-csrf-required-for-cookie-auth: true
       requestBody: { required: false, content: { application/json: { schema: { type: object, additionalProperties: false, maxProperties: 0, description: "Request body is ignored by the current implementation; omit it or send an empty object." } } } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowReloadEnvelope' } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowReloadEnvelope' } } } }, "400": { $ref: '#/components/responses/Error', description: invalid_request for invalid mutation request body } }
   /diagnostics:
     get:
       operationId: getDiagnostics
@@ -703,12 +707,15 @@ components:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/IssueRelation' } } } ]
     DispatchResponse:
       type: object
-      required: [accepted, issue_id]
+      required: [run, issue]
+      additionalProperties: false
       properties:
-        accepted: { type: boolean }
-        issue_id: { type: string }
-        run_id: { type: [string, 'null'] }
-        reason: { type: [string, 'null'] }
+        run: { $ref: '#/components/schemas/RunAttempt' }
+        issue: { $ref: '#/components/schemas/Issue' }
+        workspace:
+          anyOf:
+            - { $ref: '#/components/schemas/WorkspaceSummary' }
+            - { type: 'null' }
     DispatchEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/DispatchResponse' } } } ]
     RunStatus:

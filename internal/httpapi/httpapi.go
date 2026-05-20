@@ -77,8 +77,12 @@ func (s *Server) handleTool(w http.ResponseWriter, r *http.Request) {
 	}
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	var req toolgateway.Request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := readRequiredStrictJSONObjectBody(r, &req, map[string]bool{"tool": true, "input": true, "client": true}); err != nil {
 		writeJSON(w, 400, toolgateway.Response{Success: false, Error: &toolgateway.ToolError{Code: "invalid_request", Message: err.Error()}})
+		return
+	}
+	if strings.TrimSpace(req.Tool) == "" || req.Input == nil {
+		writeJSON(w, 400, toolgateway.Response{Success: false, Error: &toolgateway.ToolError{Code: "invalid_request", Message: "tool and input are required"}})
 		return
 	}
 	cwd := r.Header.Get("X-Symphony-Cwd")
@@ -410,7 +414,12 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 					Reason      string `json:"reason"`
 					DuplicateOf string `json:"duplicate_of"`
 				}
-				if readBody(r, &in, w) {
+				allowedFields := map[string]bool{"state": true, "reason": true, "duplicate_of": true}
+				if readBodyDisallowUnknownFields(r, &in, w, allowedFields) {
+					return
+				}
+				if in.DuplicateOf != "" && core.IssueState(in.State) != core.StateDuplicate {
+					apiErr(w, core.NewError(core.ErrInvalidRequest, "duplicate_of is only valid when state is Duplicate", nil))
 					return
 				}
 				iss, err := s.Store.TransitionIssue(ref, core.IssueState(in.State), in.Reason, in.DuplicateOf)
@@ -426,7 +435,7 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 				var in struct {
 					Body string `json:"body"`
 				}
-				if readBody(r, &in, w) {
+				if readBodyDisallowUnknownFields(r, &in, w, map[string]bool{"body": true}) {
 					return
 				}
 				err := s.Store.AddComment(ref, "operator", in.Body, nil)
@@ -447,7 +456,7 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 				var in struct {
 					BlockedBy string `json:"blocked_by"`
 				}
-				if readBody(r, &in, w) {
+				if readBodyDisallowUnknownFields(r, &in, w, map[string]bool{"blocked_by": true}) {
 					return
 				}
 				iss, err := s.Store.AddBlocker(ref, in.BlockedBy)
@@ -492,7 +501,7 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 				var in struct {
 					Reason string `json:"reason"`
 				}
-				if readBody(r, &in, w) {
+				if readBodyDisallowUnknownFields(r, &in, w, map[string]bool{"reason": true}) {
 					return
 				}
 				iss, err := s.Store.DispatchPause(ref, in.Reason)
@@ -508,7 +517,7 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 				var in struct {
 					Reason string `json:"reason"`
 				}
-				if readBody(r, &in, w) {
+				if readBodyDisallowUnknownFields(r, &in, w, map[string]bool{"reason": true}) {
 					return
 				}
 				iss, err := s.Store.DispatchResume(ref, in.Reason)
@@ -566,7 +575,7 @@ func (s *Server) runRoutes(w http.ResponseWriter, r *http.Request, rest string) 
 				var in struct {
 					Reason string `json:"reason"`
 				}
-				if readBody(r, &in, w) {
+				if readOptionalBodyDisallowUnknownFields(r, &in, w, map[string]bool{"reason": true}) {
 					return
 				}
 				if err := s.Store.CancelRun(id, in.Reason); err != nil {
@@ -667,7 +676,7 @@ func (s *Server) approvalRoutes(w http.ResponseWriter, r *http.Request, rest str
 			Decision string `json:"decision"`
 			Reason   string `json:"reason"`
 		}
-		if readBody(r, &in, w) {
+		if readBodyDisallowUnknownFields(r, &in, w, map[string]bool{"decision": true, "reason": true}) {
 			return
 		}
 		status := map[string]string{"approve_once": "approved_once", "approve_for_run": "approved_for_run", "approve_for_session": "approved_for_session", "deny": "denied", "cancel_run": "cancelled"}[in.Decision]
@@ -725,7 +734,7 @@ func (s *Server) reviewRoutes(w http.ResponseWriter, r *http.Request, rest strin
 		var in struct {
 			Reason string `json:"reason"`
 		}
-		if readBody(r, &in, w) {
+		if readBodyDisallowUnknownFields(r, &in, w, map[string]bool{"reason": true}) {
 			return
 		}
 		if parts[1] == "send-to-rework" {
@@ -778,23 +787,15 @@ func (s *Server) artifactRoutes(w http.ResponseWriter, r *http.Request, rest str
 }
 
 func (s *Server) workflowValidate(w http.ResponseWriter, r *http.Request) {
-	b, _ := io.ReadAll(r.Body)
-	if len(strings.TrimSpace(string(b))) > 0 {
-		var raw map[string]any
-		if err := json.Unmarshal(b, &raw); err != nil {
-			apiErr(w, core.NewError(core.ErrInvalidRequest, "malformed JSON", nil))
-			return
-		}
-		for k, v := range raw {
-			if k != "dry_run" {
-				apiErr(w, core.NewError(core.ErrInvalidRequest, "unsupported field: "+k, nil))
-				return
-			}
-			if bv, ok := v.(bool); !ok || !bv {
-				apiErr(w, core.NewError(core.ErrInvalidRequest, "dry_run must be true", nil))
-				return
-			}
-		}
+	var in struct {
+		DryRun *bool `json:"dry_run"`
+	}
+	if readOptionalBodyDisallowUnknownFields(r, &in, w, map[string]bool{"dry_run": true}) {
+		return
+	}
+	if in.DryRun != nil && !*in.DryRun {
+		apiErr(w, core.NewError(core.ErrInvalidRequest, "dry_run must be true", nil))
+		return
 	}
 	wf, _ := config.Load(s.Store.RepoRoot)
 	ok(w, map[string]any{"source": "current_filesystem", "workflow_path": wf.Path, "validation": wf.Validation, "side_effects": map[string]any{"effective_config_replaced": false, "last_valid_config_updated": false, "prompt_rendered": false, "run_dispatched": false, "review_artifacts_written": false}})
@@ -830,38 +831,54 @@ func (s *Server) workflowPreview(w http.ResponseWriter, r *http.Request) {
 }
 
 func diagnosticsExportOptions(r *http.Request) (bool, error) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return false, core.NewError(core.ErrInvalidRequest, "read request body failed", nil)
+	var in struct {
+		IncludeRawLogs *bool `json:"include_raw_logs"`
 	}
-	if strings.TrimSpace(string(body)) == "" {
-		return false, nil
+	if err := readOptionalStrictJSONObjectBody(r, &in, map[string]bool{"include_raw_logs": true}); err != nil {
+		return false, err
 	}
-	dec := json.NewDecoder(strings.NewReader(string(body)))
-	dec.DisallowUnknownFields()
-	var in map[string]json.RawMessage
-	if err := dec.Decode(&in); err != nil {
-		return false, core.NewError(core.ErrInvalidRequest, "malformed JSON", nil)
+	if in.IncludeRawLogs != nil {
+		return *in.IncludeRawLogs, nil
 	}
-	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		return false, core.NewError(core.ErrInvalidRequest, "malformed JSON", nil)
-	}
-	if in == nil {
-		return false, core.NewError(core.ErrInvalidRequest, "request body must be an object", nil)
-	}
-	includeRawLogs := false
-	for k, raw := range in {
-		if k != "include_raw_logs" {
-			return false, core.NewError(core.ErrInvalidRequest, "unsupported field: "+k, nil)
-		}
-		if err := json.Unmarshal(raw, &includeRawLogs); err != nil {
-			return false, core.NewError(core.ErrInvalidRequest, "include_raw_logs must be a boolean", nil)
-		}
-	}
-	return includeRawLogs, nil
+	return false, nil
 }
 
 func requireEmptyObjectBody(r *http.Request) error {
+	var in map[string]json.RawMessage
+	if err := readOptionalStrictJSONObjectBody(r, &in, nil); err != nil {
+		return err
+	}
+	if in != nil && len(in) > 0 {
+		return core.NewError(core.ErrInvalidRequest, "request body must be an empty object", nil)
+	}
+	return nil
+}
+
+func readBodyDisallowUnknownFields(r *http.Request, v any, w http.ResponseWriter, allowedFields map[string]bool) bool {
+	if err := readRequiredStrictJSONObjectBody(r, v, allowedFields); err != nil {
+		apiErr(w, err)
+		return true
+	}
+	return false
+}
+
+func readOptionalBodyDisallowUnknownFields(r *http.Request, v any, w http.ResponseWriter, allowedFields map[string]bool) bool {
+	if err := readOptionalStrictJSONObjectBody(r, v, allowedFields); err != nil {
+		apiErr(w, err)
+		return true
+	}
+	return false
+}
+
+func readRequiredStrictJSONObjectBody(r *http.Request, v any, allowedFields map[string]bool) error {
+	rawBody, err := decodeSingleJSONObjectBody(json.NewDecoder(r.Body))
+	if err != nil {
+		return err
+	}
+	return decodeStrictJSONObject(rawBody, v, allowedFields)
+}
+
+func readOptionalStrictJSONObjectBody(r *http.Request, v any, allowedFields map[string]bool) error {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return core.NewError(core.ErrInvalidRequest, "read request body failed", nil)
@@ -869,58 +886,34 @@ func requireEmptyObjectBody(r *http.Request) error {
 	if strings.TrimSpace(string(body)) == "" {
 		return nil
 	}
-	dec := json.NewDecoder(strings.NewReader(string(body)))
-	dec.DisallowUnknownFields()
-	var in map[string]json.RawMessage
-	if err := dec.Decode(&in); err != nil {
-		return core.NewError(core.ErrInvalidRequest, "malformed JSON", nil)
-	}
-	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		return core.NewError(core.ErrInvalidRequest, "malformed JSON", nil)
-	}
-	if in == nil {
-		return core.NewError(core.ErrInvalidRequest, "request body must be an object", nil)
-	}
-	if len(in) > 0 {
-		return core.NewError(core.ErrInvalidRequest, "request body must be an empty object", nil)
-	}
-	return nil
-}
-
-func readBody(r *http.Request, v any, w http.ResponseWriter) bool {
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil && err != io.EOF {
-		apiErr(w, core.NewError(core.ErrInvalidRequest, err.Error(), nil))
-		return true
-	}
-	return false
-}
-
-func readBodyDisallowUnknownFields(r *http.Request, v any, w http.ResponseWriter, allowedFields map[string]bool) bool {
-	rawBody, err := decodeSingleJSONObjectBody(json.NewDecoder(r.Body))
+	rawBody, err := decodeSingleJSONObjectBody(json.NewDecoder(bytes.NewReader(body)))
 	if err != nil {
-		apiErr(w, err)
-		return true
+		return err
 	}
+	return decodeStrictJSONObject(rawBody, v, allowedFields)
+}
+
+func decodeStrictJSONObject(rawBody json.RawMessage, v any, allowedFields map[string]bool) error {
 	if allowedFields != nil {
 		var rawFields map[string]json.RawMessage
 		if err := json.Unmarshal(rawBody, &rawFields); err != nil {
-			apiErr(w, core.NewError(core.ErrInvalidRequest, err.Error(), nil))
-			return true
+			return core.NewError(core.ErrInvalidRequest, err.Error(), nil)
 		}
-		for key := range rawFields {
+		for key, raw := range rawFields {
 			if !allowedFields[key] {
-				apiErr(w, core.NewError(core.ErrInvalidRequest, "unsupported field: "+key, nil))
-				return true
+				return core.NewError(core.ErrInvalidRequest, "unsupported field: "+key, nil)
+			}
+			if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return core.NewError(core.ErrInvalidRequest, key+" must not be null", nil)
 			}
 		}
 	}
 	dec := json.NewDecoder(bytes.NewReader(rawBody))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		apiErr(w, core.NewError(core.ErrInvalidRequest, err.Error(), nil))
-		return true
+		return core.NewError(core.ErrInvalidRequest, err.Error(), nil)
 	}
-	return false
+	return nil
 }
 
 func decodeSingleJSONObjectBody(dec *json.Decoder) (json.RawMessage, error) {
@@ -1132,7 +1125,7 @@ func (s *Server) authExchange(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		OpenToken string `json:"open_token"`
 	}
-	if readBody(r, &in, w) {
+	if readBodyDisallowUnknownFields(r, &in, w, map[string]bool{"open_token": true}) {
 		return
 	}
 	if strings.TrimSpace(in.OpenToken) == "" {

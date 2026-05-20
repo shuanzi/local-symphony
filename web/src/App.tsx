@@ -170,6 +170,25 @@ function isDispatchable(issue: Issue): boolean {
   return (issue.state === 'Ready' || issue.state === 'Rework') && !issue.dispatch_paused && !issue.active_run_id;
 }
 
+function canOpenReviewPacket(issue: Issue): boolean {
+  return Boolean(issue.latest_review_packet_id) || Boolean(issue.latest_review_packet?.id);
+}
+
+function canPerformReviewAction(issue: Issue): boolean {
+  return issue.state === 'Human Review' && issue.latest_review_packet?.status === 'generated';
+}
+
+function requiresTransitionReason(state: IssueState): boolean {
+  return state === 'Blocked' || state === 'Cancelled' || state === 'Duplicate';
+}
+
+function transitionValidationError(target: IssueState, reason: string): string | null {
+  if (requiresTransitionReason(target) && !reason.trim()) {
+    return 'Reason is required for Blocked, Cancelled, and Duplicate transitions.';
+  }
+  return null;
+}
+
 function compareIssuePriority(a: Issue, b: Issue): number {
   return a.priority - b.priority || a.sequence_no - b.sequence_no || a.identifier.localeCompare(b.identifier);
 }
@@ -331,6 +350,7 @@ function useDashboardData() {
   const [authenticated, setAuthenticated] = useState(false);
   const [authError, setAuthError] = useState(false);
   const [authMessage, setAuthMessage] = useState<string | null>(null);
+  const [authResetKey, setAuthResetKey] = useState(0);
   const [daemonUnavailable, setDaemonUnavailable] = useState(false);
   const [sseState, setSseState] = useState<'connecting' | 'connected' | 'reconnecting' | 'disabled'>('connecting');
   const maxSeqRef = useRef(0);
@@ -345,6 +365,7 @@ function useDashboardData() {
     setAuthenticated(false);
     setAuthError(true);
     setAuthMessage('Dashboard is not authenticated. Reopen the local dashboard through the daemon open URL.');
+    setAuthResetKey((value) => value + 1);
     setData(emptyData);
     maxSeqRef.current = 0;
   }, []);
@@ -360,10 +381,16 @@ function useDashboardData() {
 
   const loadIncrementalEvents = useCallback(async () => {
     const requestAuthEpoch = authEpochRef.current;
-    const events = await api.events(maxSeqRef.current);
-    if (authEpochRef.current !== requestAuthEpoch || !authenticatedRef.current) return;
-    mergeEventBatch(events);
-  }, [mergeEventBatch]);
+    try {
+      const events = await api.events(maxSeqRef.current);
+      if (authEpochRef.current !== requestAuthEpoch || !authenticatedRef.current) return;
+      mergeEventBatch(events);
+    } catch (err) {
+      if (isAuthError(err)) {
+        markUnauthenticated();
+      }
+    }
+  }, [markUnauthenticated, mergeEventBatch]);
 
   const bootstrapSession = useCallback(async (): Promise<boolean> => {
     const openToken = getOpenTokenFromUrl();
@@ -525,7 +552,7 @@ function useDashboardData() {
     }
   }, [loadAll, markUnauthenticated]);
 
-  return { data, loading, mutating, error, authError, authMessage, daemonUnavailable, sseState, reload: loadAll, runMutation, markUnauthenticated };
+  return { data, loading, mutating, error, authenticated, authError, authMessage, authResetKey, daemonUnavailable, sseState, reload: loadAll, runMutation, markUnauthenticated };
 }
 
 function Section({ title, children, actions }: { title: string; children: ReactNode; actions?: ReactNode }) {
@@ -867,7 +894,7 @@ function IssueContextPanel({ issue, data }: { issue: Issue | null; data: Dashboa
           <h3>Run and review</h3>
           <div className="card-actions">
             {issue.latest_run_id ? <button type="button" onClick={() => navigate({ page: 'run', runId: issue.latest_run_id || undefined })}>Open run</button> : null}
-            {issue.latest_review_packet_id || issue.state === 'Human Review' ? <button type="button" onClick={() => navigate({ page: 'review', issueRef: issue.identifier })}>Open review</button> : null}
+            {canOpenReviewPacket(issue) ? <button type="button" onClick={() => navigate({ page: 'review', issueRef: issue.identifier })}>Open review</button> : null}
           </div>
         </div>
         <KeyValue rows={[
@@ -959,6 +986,7 @@ function ActionRail({ issue, data, runMutation }: {
   const active = hasActiveRun(selectedIssue, data.runs);
   const latestRun = latestRunForIssue(selectedIssue, data.runs);
   const workflowInvalid = data.workflow && !data.workflow.validation.valid;
+  const transitionValidation = transitionValidationError(target, transitionReason);
 
   async function perform<T>(label: string, operation: () => Promise<T>) {
     const result = await runMutation(operation);
@@ -986,10 +1014,11 @@ function ActionRail({ issue, data, runMutation }: {
   }
 
   async function transitionIssue() {
+    if (transitionValidation) return;
     const result = await perform('Issue transitioned.', () => api.transitionIssue(selectedIssue.identifier, {
       state: target,
-      reason: transitionReason || undefined,
-      duplicate_of: target === 'Duplicate' ? duplicateOf || undefined : undefined
+      reason: transitionReason.trim() || undefined,
+      duplicate_of: target === 'Duplicate' ? duplicateOf.trim() || undefined : undefined
     }));
     if (result) {
       setTransitionReason('');
@@ -998,7 +1027,8 @@ function ActionRail({ issue, data, runMutation }: {
   }
 
   async function reviewAction(kind: 'rework' | 'done') {
-    const result = await perform(kind === 'rework' ? 'Sent to Rework.' : 'Marked Done.', () => kind === 'rework' ? api.sendToRework(selectedIssue.identifier, reviewReason) : api.markDone(selectedIssue.identifier, reviewReason));
+    if (!canPerformReviewAction(selectedIssue) || !reviewReason.trim()) return;
+    const result = await perform(kind === 'rework' ? 'Sent to Rework.' : 'Marked Done.', () => kind === 'rework' ? api.sendToRework(selectedIssue.identifier, reviewReason.trim()) : api.markDone(selectedIssue.identifier, reviewReason.trim()));
     if (result) navigate({ page: 'issue', issueRef: result.identifier });
   }
 
@@ -1036,7 +1066,7 @@ function ActionRail({ issue, data, runMutation }: {
         </section>
       ) : null}
 
-      {selectedIssue.state === 'Human Review' || selectedIssue.latest_review_packet_id ? (
+      {canPerformReviewAction(selectedIssue) ? (
         <section className="rail-group">
           <h3>Review</h3>
           <button type="button" onClick={() => navigate({ page: 'review', issueRef: selectedIssue.identifier })}>Open review packet</button>
@@ -1045,8 +1075,8 @@ function ActionRail({ issue, data, runMutation }: {
             <textarea value={reviewReason} onChange={(event) => setReviewReason(event.target.value)} rows={3} />
           </label>
           <div className="rail-split">
-            <button type="button" onClick={() => void reviewAction('rework')}>Send to Rework</button>
-            <button type="button" className="primary-action" onClick={() => void reviewAction('done')}>Mark Done</button>
+            <button type="button" onClick={() => void reviewAction('rework')} disabled={!reviewReason.trim()}>Send to Rework</button>
+            <button type="button" className="primary-action" onClick={() => void reviewAction('done')} disabled={!reviewReason.trim()}>Mark Done</button>
           </div>
         </section>
       ) : null}
@@ -1084,7 +1114,8 @@ function ActionRail({ issue, data, runMutation }: {
             <input value={duplicateOf} onChange={(event) => setDuplicateOf(event.target.value)} placeholder="Canonical issue ref" />
           </label>
         ) : null}
-        <button type="button" onClick={() => void transitionIssue()}>Apply transition</button>
+        {transitionValidation ? <p className="rail-hint">{transitionValidation}</p> : null}
+        <button type="button" onClick={() => void transitionIssue()} disabled={Boolean(transitionValidation)}>Apply transition</button>
       </section>
 
       <section className="rail-group">
@@ -1233,9 +1264,15 @@ function IssueCard({ issue, runMutation }: { issue: Issue; runMutation: <T>(oper
   const [target, setTarget] = useState<IssueState>('Ready');
   const [reason, setReason] = useState('');
   const [duplicateOf, setDuplicateOf] = useState('');
+  const transitionValidation = transitionValidationError(target, reason);
 
   async function transition() {
-    const changed = await runMutation(() => api.transitionIssue(issue.identifier, { state: target, reason, duplicate_of: duplicateOf || undefined }));
+    if (transitionValidation) return;
+    const changed = await runMutation(() => api.transitionIssue(issue.identifier, {
+      state: target,
+      reason: reason.trim() || undefined,
+      duplicate_of: target === 'Duplicate' ? duplicateOf.trim() || undefined : undefined
+    }));
     if (changed) {
       setReason('');
       setDuplicateOf('');
@@ -1258,7 +1295,7 @@ function IssueCard({ issue, runMutation }: { issue: Issue; runMutation: <T>(oper
       <div className="card-actions">
         {isDispatchable(issue) ? <button type="button" onClick={() => void runMutation(() => api.dispatchIssue(issue.identifier))}>Dispatch</button> : null}
         {issue.latest_run_id ? <button type="button" onClick={() => navigate({ page: 'run', runId: issue.latest_run_id || undefined })}>Run</button> : null}
-        {issue.latest_review_packet_id || issue.state === 'Human Review' ? <button type="button" onClick={() => navigate({ page: 'review', issueRef: issue.identifier })}>Review</button> : null}
+        {canOpenReviewPacket(issue) ? <button type="button" onClick={() => navigate({ page: 'review', issueRef: issue.identifier })}>Review</button> : null}
       </div>
       <details className="inline-command">
         <summary>Transition issue</summary>
@@ -1268,7 +1305,7 @@ function IssueCard({ issue, runMutation }: { issue: Issue; runMutation: <T>(oper
             {transitionTargets.map((state) => <option key={state} value={state}>{state}</option>)}
           </select>
         </label>
-        {(target === 'Blocked' || target === 'Cancelled' || target === 'Duplicate') ? (
+        {requiresTransitionReason(target) ? (
           <label>
             Reason
             <input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Required for this transition" />
@@ -1280,18 +1317,22 @@ function IssueCard({ issue, runMutation }: { issue: Issue; runMutation: <T>(oper
             <input value={duplicateOf} onChange={(event) => setDuplicateOf(event.target.value)} placeholder="Canonical issue ref, e.g. LOC-1" />
           </label>
         ) : null}
-        <button type="button" onClick={() => void transition()}>Apply transition</button>
+        {transitionValidation ? <p className="rail-hint">{transitionValidation}</p> : null}
+        <button type="button" onClick={() => void transition()} disabled={Boolean(transitionValidation)}>Apply transition</button>
       </details>
     </article>
   );
 }
 
-function IssueDetailPage({ route, issues, runs, events, runMutation }: {
+function IssueDetailPage({ route, issues, runs, events, runMutation, markUnauthenticated, authenticated, authResetKey }: {
   route: RouteState;
   issues: Issue[];
   runs: RunAttempt[];
   events: RunEvent[];
   runMutation: <T>(operation: () => Promise<T>) => Promise<T | null>;
+  markUnauthenticated: () => void;
+  authenticated: boolean;
+  authResetKey: number;
 }) {
   const [comment, setComment] = useState('');
   const [blocker, setBlocker] = useState('');
@@ -1304,7 +1345,12 @@ function IssueDetailPage({ route, issues, runs, events, runMutation }: {
     setFetchedIssue(null);
     setMissingIssueRef(null);
     setIssueLoadError(null);
-    if (!route.issueRef || listedIssue) return undefined;
+  }, [authResetKey]);
+  useEffect(() => {
+    setFetchedIssue(null);
+    setMissingIssueRef(null);
+    setIssueLoadError(null);
+    if (!authenticated || !route.issueRef || listedIssue) return undefined;
     let cancelled = false;
     api.issue(route.issueRef)
       .then((loaded) => {
@@ -1316,10 +1362,14 @@ function IssueDetailPage({ route, issues, runs, events, runMutation }: {
           setMissingIssueRef(route.issueRef || null);
           return;
         }
+        if (isAuthError(error)) {
+          markUnauthenticated();
+          return;
+        }
         setIssueLoadError(errorLabel(error));
       });
     return () => { cancelled = true; };
-  }, [route.issueRef, listedIssue]);
+  }, [authenticated, markUnauthenticated, route.issueRef, listedIssue]);
   const issue = listedIssue || (fetchedIssue && (fetchedIssue.id === route.issueRef || fetchedIssue.identifier === route.issueRef) ? fetchedIssue : undefined);
   const issueEvents = issue ? events.filter((event) => event.issue_id === issue.id) : [];
   const runHistory = issue ? runs.filter((run) => run.issue_id === issue.id) : [];
@@ -1338,13 +1388,15 @@ function IssueDetailPage({ route, issues, runs, events, runMutation }: {
 
   async function postComment(event: FormEvent) {
     event.preventDefault();
-    const result = await runMutation(() => api.commentIssue(selectedIssue.identifier, comment));
+    if (!comment.trim()) return;
+    const result = await runMutation(() => api.commentIssue(selectedIssue.identifier, comment.trim()));
     if (result) setComment('');
   }
 
   async function addBlocker(event: FormEvent) {
     event.preventDefault();
-    const result = await runMutation(() => api.addBlocker(selectedIssue.identifier, blocker));
+    if (!blocker.trim()) return;
+    const result = await runMutation(() => api.addBlocker(selectedIssue.identifier, blocker.trim()));
     if (result) setBlocker('');
   }
 
@@ -1391,7 +1443,7 @@ function IssueDetailPage({ route, issues, runs, events, runMutation }: {
             <div className="card-actions">
               {isDispatchable(issue) ? <button type="button" onClick={() => void runMutation(() => api.dispatchIssue(issue.identifier))}>Dispatch eligible issue</button> : null}
               {issue.latest_run_id ? <button type="button" onClick={() => navigate({ page: 'run', runId: issue.latest_run_id || undefined })}>Open latest run</button> : null}
-              {issue.latest_review_packet_id || issue.state === 'Human Review' ? <button type="button" onClick={() => navigate({ page: 'review', issueRef: issue.identifier })}>Open review packet</button> : null}
+              {canOpenReviewPacket(issue) ? <button type="button" onClick={() => navigate({ page: 'review', issueRef: issue.identifier })}>Open review packet</button> : null}
             </div>
           </Section>
 
@@ -1413,7 +1465,7 @@ function IssueDetailPage({ route, issues, runs, events, runMutation }: {
                 Add blocker
                 <input value={blocker} onChange={(event) => setBlocker(event.target.value)} placeholder="Blocking issue ref" />
               </label>
-              <button type="submit">Add blocker</button>
+              <button type="submit" disabled={!blocker.trim()}>Add blocker</button>
             </form>
           </Section>
 
@@ -1427,7 +1479,7 @@ function IssueDetailPage({ route, issues, runs, events, runMutation }: {
                 Comment
                 <input value={comment} onChange={(event) => setComment(event.target.value)} placeholder="Leave an operator comment" />
               </label>
-              <button type="submit">Add comment</button>
+              <button type="submit" disabled={!comment.trim()}>Add comment</button>
             </form>
             {issueEvents.length ? <EventList events={issueEvents.slice().reverse()} /> : <EmptyState title="No issue events" body="Comments and state changes are displayed from normalized issue events." />}
           </Section>
@@ -1581,13 +1633,15 @@ function RunTable({ runs }: { runs: RunAttempt[] }) {
   );
 }
 
-function RunDetailPage({ route, runs, issues, events, runMutation, markUnauthenticated }: {
+function RunDetailPage({ route, runs, issues, events, runMutation, markUnauthenticated, authenticated, authResetKey }: {
   route: RouteState;
   runs: RunAttempt[];
   issues: Issue[];
   events: RunEvent[];
   runMutation: <T>(operation: () => Promise<T>) => Promise<T | null>;
   markUnauthenticated: () => void;
+  authenticated: boolean;
+  authResetKey: number;
 }) {
   const [reason, setReason] = useState('operator cancelled run');
   const [fetchedRun, setFetchedRun] = useState<RunAttempt | null>(null);
@@ -1597,9 +1651,15 @@ function RunDetailPage({ route, runs, issues, events, runMutation, markUnauthent
   const listedRun = runs.find((item) => item.id === route.runId);
   useEffect(() => {
     setFetchedRun(null);
+    setFetchedRunEvents([]);
     setMissingRunId(null);
     setRunLoadError(null);
-    if (!route.runId || listedRun) return undefined;
+  }, [authResetKey]);
+  useEffect(() => {
+    setFetchedRun(null);
+    setMissingRunId(null);
+    setRunLoadError(null);
+    if (!authenticated || !route.runId || listedRun) return undefined;
     let cancelled = false;
     api.run(route.runId)
       .then((loaded) => {
@@ -1611,13 +1671,17 @@ function RunDetailPage({ route, runs, issues, events, runMutation, markUnauthent
           setMissingRunId(route.runId || null);
           return;
         }
+        if (isAuthError(error)) {
+          markUnauthenticated();
+          return;
+        }
         setRunLoadError(errorLabel(error));
       });
     return () => { cancelled = true; };
-  }, [route.runId, listedRun]);
+  }, [authenticated, markUnauthenticated, route.runId, listedRun]);
   useEffect(() => {
     setFetchedRunEvents([]);
-    if (!route.runId) return undefined;
+    if (!authenticated || !route.runId) return undefined;
     let cancelled = false;
     loadRunEvents(route.runId)
       .then((loaded) => {
@@ -1632,7 +1696,7 @@ function RunDetailPage({ route, runs, issues, events, runMutation, markUnauthent
         setRunLoadError(errorLabel(error));
       });
     return () => { cancelled = true; };
-  }, [markUnauthenticated, route.runId]);
+  }, [authenticated, markUnauthenticated, route.runId]);
   const run = listedRun || (fetchedRun && fetchedRun.id === route.runId ? fetchedRun : undefined);
   const issue = issueByIdOrRef(issues, run?.issue_id);
   const runEvents = run ? mergeEvents(
@@ -1798,8 +1862,15 @@ function ApprovalCard({ approval, runMutation }: { approval: Approval; runMutati
   );
 }
 
-function ReviewPacketPage({ route, issues, runMutation }: { route: RouteState; issues: Issue[]; runMutation: <T>(operation: () => Promise<T>) => Promise<T | null> }) {
-  const defaultIssue = route.issueRef || issues.find((issue) => issue.state === 'Human Review')?.identifier || issues[0]?.identifier || '';
+function ReviewPacketPage({ route, issues, runMutation, markUnauthenticated, authenticated, authResetKey }: {
+  route: RouteState;
+  issues: Issue[];
+  runMutation: <T>(operation: () => Promise<T>) => Promise<T | null>;
+  markUnauthenticated: () => void;
+  authenticated: boolean;
+  authResetKey: number;
+}) {
+  const defaultIssue = route.issueRef || issues.find((issue) => canOpenReviewPacket(issue))?.identifier || '';
   const [issueRef, setIssueRef] = useState(defaultIssue);
   const [review, setReview] = useState<ReviewPacketSummary | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1811,8 +1882,15 @@ function ReviewPacketPage({ route, issues, runMutation }: { route: RouteState; i
     if (route.issueRef) setIssueRef(route.issueRef);
   }, [route.issueRef]);
 
+  useEffect(() => {
+    setReview(null);
+    setArtifactContent({});
+    setError(null);
+    setLoading(false);
+  }, [authResetKey]);
+
   const loadReview = useCallback(async (ref: string) => {
-    if (!ref) return;
+    if (!authenticated || !ref) return;
     setLoading(true);
     setError(null);
     setArtifactContent({});
@@ -1820,16 +1898,22 @@ function ReviewPacketPage({ route, issues, runMutation }: { route: RouteState; i
       const result = await api.review(ref);
       setReview(result);
     } catch (err) {
+      if (isAuthError(err)) {
+        setReview(null);
+        setArtifactContent({});
+        markUnauthenticated();
+        return;
+      }
       setReview(null);
       setError(errorLabel(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [authenticated, markUnauthenticated]);
 
   useEffect(() => {
-    if (issueRef) void loadReview(issueRef);
-  }, [issueRef, loadReview]);
+    if (authenticated && issueRef) void loadReview(issueRef);
+  }, [authenticated, issueRef, loadReview]);
 
   const artifacts: ReviewPacketArtifact[] = review?.artifacts || review?.files || [];
 
@@ -1843,15 +1927,23 @@ function ReviewPacketPage({ route, issues, runMutation }: { route: RouteState; i
       const text = await fetchArtifactContent(artifact.content_url);
       setArtifactContent((current) => ({ ...current, [artifact.artifact_id]: { title: artifact.kind, text } }));
     } catch (err) {
+      if (isAuthError(err)) {
+        setArtifactContent({});
+        markUnauthenticated();
+        return;
+      }
       const refused = err instanceof ApiError && (err.code === 'raw_log_access_not_supported' || err.status === 403);
       setArtifactContent((current) => ({ ...current, [artifact.artifact_id]: { title: artifact.kind, text: errorLabel(err), refused } }));
     }
   }
 
   async function reviewAction(kind: 'rework' | 'done') {
-    const result = await runMutation(() => kind === 'rework' ? api.sendToRework(issueRef, reason) : api.markDone(issueRef, reason));
+    if (!reviewActionsAvailable || !reason.trim()) return;
+    const result = await runMutation(() => kind === 'rework' ? api.sendToRework(issueRef, reason.trim()) : api.markDone(issueRef, reason.trim()));
     if (result) navigate({ page: 'issue', issueRef: result.identifier });
   }
+  const reviewIssue = issueByIdOrRef(issues, issueRef);
+  const reviewActionsAvailable = Boolean(review && review.status === 'generated' && reviewIssue && canPerformReviewAction(reviewIssue));
 
   return (
     <>
@@ -1927,20 +2019,20 @@ function ReviewPacketPage({ route, issues, runMutation }: { route: RouteState; i
         </div>
 
         <aside className="page-aside">
-          {review ? (
+          {reviewActionsAvailable ? (
             <Section title="Human Review actions">
               <label>
                 Reason
                 <textarea value={reason} onChange={(event) => setReason(event.target.value)} rows={3} />
               </label>
               <div className="card-actions">
-                <button type="button" onClick={() => void reviewAction('rework')}>Send to Rework</button>
-                <button type="button" onClick={() => void reviewAction('done')}>Mark Done</button>
+                <button type="button" onClick={() => void reviewAction('rework')} disabled={!reason.trim()}>Send to Rework</button>
+                <button type="button" onClick={() => void reviewAction('done')} disabled={!reason.trim()}>Mark Done</button>
               </div>
             </Section>
           ) : (
             <Section title="Human Review actions">
-              <EmptyState title="No packet selected" body="Load a review packet before sending the issue to Rework or marking it Done." />
+              <EmptyState title="No packet selected" body="Load a Human Review issue with a latest review packet before sending it to Rework or marking it Done." />
             </Section>
           )}
           <Section title="Boundary">
@@ -1952,16 +2044,33 @@ function ReviewPacketPage({ route, issues, runMutation }: { route: RouteState; i
   );
 }
 
-function WorkflowPage({ workflow, runMutation }: { workflow: WorkflowResponse | null; runMutation: <T>(operation: () => Promise<T>) => Promise<T | null> }) {
+function WorkflowPage({ workflow, runMutation, markUnauthenticated, authResetKey }: {
+  workflow: WorkflowResponse | null;
+  runMutation: <T>(operation: () => Promise<T>) => Promise<T | null>;
+  markUnauthenticated: () => void;
+  authResetKey: number;
+}) {
   const [validation, setValidation] = useState<WorkflowValidateResponse | null>(null);
   const [preview, setPreview] = useState<WorkflowRenderPreviewResponse | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setValidation(null);
+    setPreview(null);
+    setLocalError(null);
+  }, [authResetKey]);
 
   async function validate() {
     setLocalError(null);
     try {
       setValidation(await api.validateWorkflow());
     } catch (err) {
+      if (isAuthError(err)) {
+        setValidation(null);
+        setPreview(null);
+        markUnauthenticated();
+        return;
+      }
       setLocalError(errorLabel(err));
     }
   }
@@ -1971,6 +2080,12 @@ function WorkflowPage({ workflow, runMutation }: { workflow: WorkflowResponse | 
     try {
       setPreview(await api.renderWorkflowPreview());
     } catch (err) {
+      if (isAuthError(err)) {
+        setValidation(null);
+        setPreview(null);
+        markUnauthenticated();
+        return;
+      }
       setLocalError(errorLabel(err));
     }
   }
@@ -2110,7 +2225,7 @@ function DiagnosticCard({ title, value }: { title: string; value: unknown }) {
 
 export function App() {
   const route = useRoute();
-  const { data, loading, mutating, error, authError, authMessage, daemonUnavailable, sseState, reload, runMutation, markUnauthenticated } = useDashboardData();
+  const { data, loading, mutating, error, authenticated, authError, authMessage, authResetKey, daemonUnavailable, sseState, reload, runMutation, markUnauthenticated } = useDashboardData();
 
   let content: ReactNode;
   switch (route.page) {
@@ -2118,19 +2233,19 @@ export function App() {
       content = <BoardPage issues={data.issues} runMutation={runMutation} />;
       break;
     case 'issue':
-      content = <IssueDetailPage route={route} issues={data.issues} runs={data.runs} events={data.events} runMutation={runMutation} />;
+      content = <IssueDetailPage key={authResetKey} route={route} issues={data.issues} runs={data.runs} events={data.events} runMutation={runMutation} markUnauthenticated={markUnauthenticated} authenticated={authenticated} authResetKey={authResetKey} />;
       break;
     case 'run':
-      content = <RunDetailPage route={route} runs={data.runs} issues={data.issues} events={data.events} runMutation={runMutation} markUnauthenticated={markUnauthenticated} />;
+      content = <RunDetailPage key={authResetKey} route={route} runs={data.runs} issues={data.issues} events={data.events} runMutation={runMutation} markUnauthenticated={markUnauthenticated} authenticated={authenticated} authResetKey={authResetKey} />;
       break;
     case 'approvals':
       content = <ApprovalInboxPage approvals={data.approvals} runMutation={runMutation} />;
       break;
     case 'review':
-      content = <ReviewPacketPage route={route} issues={data.issues} runMutation={runMutation} />;
+      content = <ReviewPacketPage key={authResetKey} route={route} issues={data.issues} runMutation={runMutation} markUnauthenticated={markUnauthenticated} authenticated={authenticated} authResetKey={authResetKey} />;
       break;
     case 'workflow':
-      content = <WorkflowPage workflow={data.workflow} runMutation={runMutation} />;
+      content = <WorkflowPage key={authResetKey} workflow={data.workflow} runMutation={runMutation} markUnauthenticated={markUnauthenticated} authResetKey={authResetKey} />;
       break;
     case 'diagnostics':
       content = <DiagnosticsPage diagnostics={data.diagnostics} runMutation={runMutation} />;
