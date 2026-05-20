@@ -293,6 +293,10 @@ func (s *Server) createIssue(w http.ResponseWriter, r *http.Request) {
 	if readBodyDisallowUnknownFields(r, &in, w, allowedFields) {
 		return
 	}
+	if err := validateNonBlankStrings("labels", in.Labels); err != nil {
+		apiErr(w, err)
+		return
+	}
 	iss, err := s.Store.CreateIssue(store.CreateIssueInput{Title: in.Title, Description: in.Description, AcceptanceCriteria: in.AcceptanceCriteria, Priority: in.Priority, Labels: in.Labels})
 	if err != nil {
 		apiErr(w, err)
@@ -410,19 +414,27 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 		case "transition":
 			if len(parts) == 2 && r.Method == "POST" {
 				var in struct {
-					State       string `json:"state"`
-					Reason      string `json:"reason"`
-					DuplicateOf string `json:"duplicate_of"`
+					State       string  `json:"state"`
+					Reason      *string `json:"reason"`
+					DuplicateOf string  `json:"duplicate_of"`
 				}
 				allowedFields := map[string]bool{"state": true, "reason": true, "duplicate_of": true}
 				if readBodyDisallowUnknownFields(r, &in, w, allowedFields) {
 					return
 				}
+				reason := ""
+				if in.Reason != nil {
+					if strings.TrimSpace(*in.Reason) == "" {
+						apiErr(w, core.NewError(core.ErrInvalidRequest, "reason must be a non-empty string", nil))
+						return
+					}
+					reason = *in.Reason
+				}
 				if in.DuplicateOf != "" && core.IssueState(in.State) != core.StateDuplicate {
 					apiErr(w, core.NewError(core.ErrInvalidRequest, "duplicate_of is only valid when state is Duplicate", nil))
 					return
 				}
-				iss, err := s.Store.TransitionIssue(ref, core.IssueState(in.State), in.Reason, in.DuplicateOf)
+				iss, err := s.Store.TransitionIssue(ref, core.IssueState(in.State), reason, in.DuplicateOf)
 				if err != nil {
 					apiErr(w, err)
 					return
@@ -1003,6 +1015,14 @@ func toStrings(field string, a []any, rejectBlank bool) ([]string, error) {
 		out = append(out, s)
 	}
 	return out, nil
+}
+func validateNonBlankStrings(field string, values []string) error {
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return core.NewError(core.ErrInvalidRequest, field+" entries must be non-empty strings", nil)
+		}
+	}
+	return nil
 }
 func repeatedCSV(values []string) []string {
 	out := []string{}

@@ -63,8 +63,11 @@ func (g Gateway) Call(token, cwd string, req Request) Response {
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
-	issue, _ := g.Store.GetIssue(issueID)
-	if issue == nil || issue.Workspace == nil {
+	issue, err := g.Store.GetIssue(issueID)
+	if err != nil {
+		return apiErrResp(err)
+	}
+	if issue.Workspace == nil {
 		return errResp("tool_gateway_failed", "workspace not prepared", nil)
 	}
 	if err := validateTokenScope(scope, req.Tool, issue.Workspace.Path); err != nil {

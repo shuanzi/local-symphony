@@ -116,6 +116,42 @@ func TestRunWorkerStoresWorkflowArtifactMaxBytesInToolTokenScope(t *testing.T) {
 	}
 }
 
+func TestDispatchIssuePropagatesIssueReloadFailureOnHold(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "hold")
+	st, err := store.InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Dispatch reload failure",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	if err := st.Project.Exec(`DROP TABLE issue_labels`); err != nil {
+		t.Fatalf("drop issue_labels: %v", err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("DispatchIssue panicked on issue reload failure: %v", r)
+		}
+	}()
+
+	_, err = (Orchestrator{Store: st}).DispatchIssue(issue.Identifier, "manual")
+
+	if err == nil || !strings.Contains(err.Error(), "load issue labels") {
+		t.Fatalf("DispatchIssue error = %v, want issue reload failure", err)
+	}
+}
+
 func TestRunWorkerSkipsReviewGenerationWhenRunCancelledAfterHook(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")

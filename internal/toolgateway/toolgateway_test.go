@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +96,28 @@ func TestHTTPClientCallReturnsToolGatewayFailedOnMalformedEndpoint(t *testing.T)
 	if resp.Error == nil || resp.Error.Code != string(core.ErrToolGatewayFailed) {
 		t.Fatalf("HTTPClientCall error = %#v, want %s", resp.Error, core.ErrToolGatewayFailed)
 	}
+}
+
+func TestGatewayCallPropagatesIssueLookupFailure(t *testing.T) {
+	st := newGatewayTestStore(t)
+	_, run, workspace := prepareGatewayRun(t, st)
+	token, err := NewTokenForRun(st, run, workspace)
+	if err != nil {
+		t.Fatalf("NewTokenForRun: %v", err)
+	}
+	if err := st.Project.Exec(`DROP TABLE issue_labels`); err != nil {
+		t.Fatalf("drop issue_labels: %v", err)
+	}
+
+	resp := (Gateway{Store: st}).Call(token, workspace, Request{Tool: "issue.get", Input: map[string]any{}})
+
+	if resp.Success {
+		t.Fatal("Gateway.Call success = true, want issue lookup failure")
+	}
+	if resp.Error == nil || resp.Error.Code != string(core.ErrInternal) || !strings.Contains(resp.Error.Message, "load issue labels") {
+		t.Fatalf("Gateway.Call error = %#v, want internal issue lookup failure", resp.Error)
+	}
+	assertToolCallCount(t, st, run.ID, 0)
 }
 
 func TestArtifactAttachReturnsFailureAndDoesNotInsertArtifactWhenWriteFails(t *testing.T) {

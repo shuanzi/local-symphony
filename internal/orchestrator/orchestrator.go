@@ -42,18 +42,35 @@ func (o Orchestrator) DispatchIssue(issueRef, reason string) (*DispatchResult, e
 	if err != nil {
 		return nil, err
 	}
-	issue, _ := o.Store.GetIssue(run.IssueID)
+	issue, err := o.Store.GetIssue(run.IssueID)
+	if err != nil {
+		return nil, err
+	}
 	if fake.SelectedOutcome() == fake.OutcomeHold {
-		_ = o.Store.UpdateRunStatus(run.ID, core.RunRunning, map[string]any{"started_at": core.Now()})
-		run, _ = o.Store.GetRun(run.ID)
-		issue, _ = o.Store.GetIssue(run.IssueID)
+		if err := o.Store.UpdateRunStatus(run.ID, core.RunRunning, map[string]any{"started_at": core.Now()}); err != nil {
+			return nil, err
+		}
+		run, err = o.Store.GetRun(run.ID)
+		if err != nil {
+			return nil, err
+		}
+		issue, err = o.Store.GetIssue(run.IssueID)
+		if err != nil {
+			return nil, err
+		}
 		return &DispatchResult{Run: run, Issue: issue, Workspace: issue.Workspace}, nil
 	}
 	if err := o.runWorker(run.ID, wf); err != nil {
 		return nil, err
 	}
-	run, _ = o.Store.GetRun(run.ID)
-	issue, _ = o.Store.GetIssue(run.IssueID)
+	run, err = o.Store.GetRun(run.ID)
+	if err != nil {
+		return nil, err
+	}
+	issue, err = o.Store.GetIssue(run.IssueID)
+	if err != nil {
+		return nil, err
+	}
 	return &DispatchResult{Run: run, Issue: issue, Workspace: issue.Workspace}, nil
 }
 

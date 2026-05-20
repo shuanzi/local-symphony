@@ -190,6 +190,42 @@ func TestSessionWithoutCookieDoesNotExposeCSRFToken(t *testing.T) {
 	}
 }
 
+func TestCreateIssueRejectsBlankLabels(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty label", body: `{"title":"Invalid label","description":"desc","labels":[""]}`},
+		{name: "whitespace label", body: `{"title":"Invalid label","description":"desc","labels":["   "]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/issues", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			applySessionAuth(req, sessionAuth(t, srv))
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("create issue status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+			errData := payload["error"].(map[string]any)
+			if errData["code"] != string(core.ErrInvalidRequest) {
+				t.Fatalf("error = %#v, want invalid_request", errData)
+			}
+			items, err := srv.Store.ListIssues(store.ListIssueOptions{})
+			if err != nil {
+				t.Fatalf("ListIssues: %v", err)
+			}
+			if len(items) != 0 {
+				t.Fatalf("created %d issues for invalid label payload", len(items))
+			}
+		})
+	}
+}
+
 func TestStateRequiresSessionButSessionEndpointRemainsPublic(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -1259,6 +1295,40 @@ func TestIssueTransitionRejectsDuplicateOfUnlessDuplicateWithoutMutating(t *test
 	}
 	if after.DuplicateOf != nil {
 		t.Fatalf("duplicate_of = %#v, want nil", after.DuplicateOf)
+	}
+}
+
+func TestIssueTransitionRejectsBlankProvidedReason(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{
+		Title:              "Blank reason",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/issues/"+issue.Identifier+"/transition", strings.NewReader(`{"state":"Ready","reason":"   "}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("transition status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if errData["code"] != string(core.ErrInvalidRequest) {
+		t.Fatalf("error = %#v, want invalid_request", errData)
+	}
+	after, err := srv.Store.GetIssue(issue.Identifier)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if after.State != core.StateInbox {
+		t.Fatalf("issue state = %s, want Inbox", after.State)
 	}
 }
 
