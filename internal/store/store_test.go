@@ -1,6 +1,7 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,6 +10,178 @@ import (
 	"local-symphony/internal/core"
 	"local-symphony/internal/db"
 )
+
+func TestInitProjectClosesDBsAfterInitInsertFailureCanRetry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	schemaDir := filepath.Join(repoRoot, "db", "schema")
+	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
+		t.Fatalf("mkdir schema dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(schemaDir, "v1_project.sql"), []byte(`
+CREATE TABLE project_info (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	repo_root TEXT NOT NULL,
+	issue_prefix TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+CREATE TRIGGER fail_project_info_insert BEFORE INSERT ON project_info BEGIN SELECT RAISE(ABORT, 'init insert failed'); END;
+`), 0o644); err != nil {
+		t.Fatalf("write bad schema: %v", err)
+	}
+
+	if st, err := InitProject(repoRoot, "TST"); err == nil {
+		st.Close()
+		t.Fatal("InitProject succeeded, want insert failure")
+	}
+	assertNoOpenSQLiteFile(t, filepath.Join(repoRoot, ".symphony", "project.db"))
+	assertNoOpenSQLiteFile(t, db.AppDBPath())
+
+	if err := os.RemoveAll(filepath.Join(repoRoot, "db")); err != nil {
+		t.Fatalf("remove bad schema: %v", err)
+	}
+	removeSQLiteFiles(t, filepath.Join(repoRoot, ".symphony", "project.db"))
+	removeSQLiteFiles(t, db.AppDBPath())
+
+	st, err := InitProject(repoRoot, "TST")
+	if err != nil {
+		t.Fatalf("InitProject retry: %v", err)
+	}
+	st.Close()
+}
+
+func TestOpenReturnsProjectInfoQueryError(t *testing.T) {
+	tests := []struct {
+		name    string
+		breakDB func(t *testing.T, st *Store)
+	}{
+		{
+			name: "missing table",
+			breakDB: func(t *testing.T, st *Store) {
+				t.Helper()
+				if err := st.Project.Exec(`DROP TABLE project_info`); err != nil {
+					t.Fatalf("drop project_info: %v", err)
+				}
+			},
+		},
+		{
+			name: "empty table",
+			breakDB: func(t *testing.T, st *Store) {
+				t.Helper()
+				if err := st.Project.Exec(`DELETE FROM project_info`); err != nil {
+					t.Fatalf("delete project_info: %v", err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			repoRoot := filepath.Join(t.TempDir(), "repo")
+			st, err := InitProject(repoRoot, "TST")
+			if err != nil {
+				t.Fatalf("InitProject: %v", err)
+			}
+			tt.breakDB(t, st)
+			st.Close()
+
+			opened, err := Open(repoRoot)
+			if err == nil {
+				opened.Close()
+				t.Fatal("Open succeeded, want project_info query error")
+			}
+			assertNoOpenSQLiteFile(t, filepath.Join(repoRoot, ".symphony", "project.db"))
+			assertNoOpenSQLiteFile(t, db.AppDBPath())
+
+			removeSQLiteFiles(t, filepath.Join(repoRoot, ".symphony", "project.db"))
+			removeSQLiteFiles(t, db.AppDBPath())
+		})
+	}
+}
+
+func TestGetAndListIssuesPropagateLabelQueryError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, err := st.CreateIssue(CreateIssueInput{
+		Title:              "Label query failure",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+		Labels:             []string{"store"},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if err := st.Project.Exec(`DROP TABLE issue_labels`); err != nil {
+		t.Fatalf("drop issue_labels: %v", err)
+	}
+
+	if _, err := st.GetIssue(issue.ID); err == nil {
+		t.Fatal("GetIssue succeeded, want label query error")
+	}
+	if _, err := st.ListIssues(ListIssueOptions{}); err == nil {
+		t.Fatal("ListIssues succeeded, want label query error")
+	}
+}
+
+func TestGetIssuePropagatesActiveRunLookupError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, err := st.CreateIssue(CreateIssueInput{
+		Title:              "Active run lookup failure",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if err := st.Project.Exec(`ALTER TABLE run_attempts RENAME TO run_attempts_shadow`); err != nil {
+		t.Fatalf("rename run_attempts: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TABLE run_attempts (id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create malformed run_attempts: %v", err)
+	}
+	if err := st.Project.Exec(`INSERT INTO run_attempts(id, issue_id, attempt_no, status) VALUES(?,?,?,?)`, "run_active_lookup", issue.ID, 1, string(core.RunCompleted)); err != nil {
+		t.Fatalf("insert malformed run_attempts row: %v", err)
+	}
+
+	if _, err := st.GetIssue(issue.ID); err == nil {
+		t.Fatal("GetIssue succeeded, want active run lookup error")
+	}
+}
+
+func TestGetIssuePropagatesHydrationQueryErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		tableName string
+	}{
+		{name: "workspace summary", tableName: "workspaces"},
+		{name: "latest review packet", tableName: "review_packets"},
+		{name: "relations", tableName: "issue_relations"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newStoreTestStore(t)
+			issue, err := st.CreateIssue(CreateIssueInput{
+				Title:              "Hydration query failure",
+				Description:        "desc",
+				AcceptanceCriteria: []string{"done"},
+				Priority:           3,
+			})
+			if err != nil {
+				t.Fatalf("CreateIssue: %v", err)
+			}
+			if err := st.Project.Exec(`DROP TABLE ` + tt.tableName); err != nil {
+				t.Fatalf("drop %s: %v", tt.tableName, err)
+			}
+
+			if _, err := st.GetIssue(issue.ID); err == nil {
+				t.Fatalf("GetIssue succeeded after dropping %s, want hydration query error", tt.tableName)
+			}
+		})
+	}
+}
 
 func TestCancelRunRejectsCompletedRunWithoutChangingIssue(t *testing.T) {
 	st := newStoreTestStore(t)
@@ -1514,6 +1687,61 @@ func newStoreTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(st.Close)
 	return st
+}
+
+func removeSQLiteFiles(t *testing.T, path string) {
+	t.Helper()
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("remove %s: %v", p, err)
+		}
+	}
+}
+
+func assertNoOpenSQLiteFile(t *testing.T, path string) {
+	t.Helper()
+	count, ok := openFileDescriptorCount(t, path)
+	if !ok {
+		t.Skip("cannot inspect process file descriptors")
+	}
+	if count != 0 {
+		t.Fatalf("%s has %d open file descriptors, want 0", path, count)
+	}
+}
+
+func openFileDescriptorCount(t *testing.T, path string) (int, bool) {
+	t.Helper()
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatalf("abs path: %v", err)
+	}
+	canonicalAbs := abs
+	if evaluated, err := filepath.EvalSymlinks(abs); err == nil {
+		canonicalAbs = evaluated
+	}
+	for _, dir := range []string{"/proc/self/fd", "/dev/fd"} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		count := 0
+		for _, entry := range entries {
+			target, err := os.Readlink(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				continue
+			}
+			target = strings.TrimSuffix(target, " (deleted)")
+			canonicalTarget := target
+			if evaluated, err := filepath.EvalSymlinks(target); err == nil {
+				canonicalTarget = evaluated
+			}
+			if target == abs || canonicalTarget == canonicalAbs || strings.HasPrefix(target, abs+" ") {
+				count++
+			}
+		}
+		return count, true
+	}
+	return 0, false
 }
 
 func prepareActiveRun(t *testing.T, st *Store, title string) (*core.Issue, *core.RunAttempt) {

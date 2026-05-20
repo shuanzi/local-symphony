@@ -16,7 +16,22 @@ import (
 
 func TestHTTPClientCallSendsCurrentWorkingDirectoryHeader(t *testing.T) {
 	cwd := t.TempDir()
-	t.Chdir(cwd)
+	oldCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get old cwd: %v", err)
+	}
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatalf("chdir to test cwd: %v", err)
+	}
+	wantCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get test cwd: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldCWD); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	})
 	seenCWD := ""
 	var seenBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -33,8 +48,8 @@ func TestHTTPClientCallSendsCurrentWorkingDirectoryHeader(t *testing.T) {
 	if !resp.Success {
 		t.Fatalf("HTTPClientCall success = false, error = %#v", resp.Error)
 	}
-	if seenCWD != cwd {
-		t.Fatalf("X-Symphony-Cwd = %q, want %q", seenCWD, cwd)
+	if seenCWD != wantCWD {
+		t.Fatalf("X-Symphony-Cwd = %q, want %q", seenCWD, wantCWD)
 	}
 	input, ok := seenBody["input"].(map[string]any)
 	if !ok {
@@ -42,6 +57,32 @@ func TestHTTPClientCallSendsCurrentWorkingDirectoryHeader(t *testing.T) {
 	}
 	if len(input) != 0 {
 		t.Fatalf("input = %#v, want empty object", input)
+	}
+}
+
+func TestHTTPClientCallReturnsToolGatewayFailedOnTimeout(t *testing.T) {
+	oldClient := httpClient
+	httpClient = &http.Client{Timeout: 10 * time.Millisecond}
+	t.Cleanup(func() { httpClient = oldClient })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(Response{Success: true, Tool: "issue.get"})
+	}))
+	t.Cleanup(server.Close)
+
+	start := time.Now()
+	resp := HTTPClientCall(server.URL, "token", Request{Tool: "issue.get"})
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Fatalf("HTTPClientCall took %s, want bounded timeout", elapsed)
+	}
+	if resp.Success {
+		t.Fatal("HTTPClientCall success = true, want timeout failure")
+	}
+	if resp.Error == nil || resp.Error.Code != string(core.ErrToolGatewayFailed) {
+		t.Fatalf("HTTPClientCall error = %#v, want %s", resp.Error, core.ErrToolGatewayFailed)
 	}
 }
 

@@ -23,6 +23,8 @@ var Registry = []string{"issue.get", "issue.comment", "issue.block", "artifact.a
 
 const defaultArtifactMaxBytes int64 = 10 * 1024 * 1024
 
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 type Gateway struct{ Store *store.Store }
 
 type Request struct {
@@ -581,7 +583,7 @@ func HTTPClientCall(endpoint, token string, req Request) Response {
 	if cwd, err := os.Getwd(); err == nil {
 		hreq.Header.Set("X-Symphony-Cwd", cwd)
 	}
-	resp, err := http.DefaultClient.Do(hreq)
+	resp, err := httpClient.Do(hreq)
 	if err != nil {
 		return errResp("tool_gateway_failed", err.Error(), nil)
 	}

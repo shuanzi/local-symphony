@@ -129,11 +129,16 @@ func InitProject(repoRoot, issuePrefix string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{RepoRoot: root, ProjectDBPath: filepath.Join(root, ".symphony", "project.db"), AppDBPath: db.AppDBPath(), ProjectID: ProjectIDForRoot(root), IssuePrefix: issuePrefix}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			s.Close()
+		}
+	}()
 	if s.Project, err = db.Open(s.ProjectDBPath); err != nil {
 		return nil, err
 	}
 	if s.App, err = db.Open(s.AppDBPath); err != nil {
-		_ = s.Project.Close()
 		return nil, err
 	}
 	appSchema, err := db.ReadSchema(root, "db/schema/v1_app.sql")
@@ -171,6 +176,7 @@ func InitProject(repoRoot, issuePrefix string) (*Store, error) {
 			return nil, writeErr
 		}
 	}
+	cleanup = false
 	return s, nil
 }
 
@@ -190,11 +196,19 @@ func Open(repoRoot string) (*Store, error) {
 		_ = s.Project.Close()
 		return nil, err
 	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			s.Close()
+		}
+	}()
 	row, err := s.Project.QueryOne(`SELECT id, issue_prefix FROM project_info LIMIT 1`)
-	if err == nil {
-		s.ProjectID = row["id"].String()
-		s.IssuePrefix = row["issue_prefix"].String()
+	if err != nil {
+		return nil, fmt.Errorf("read project_info: %w", err)
 	}
+	s.ProjectID = row["id"].String()
+	s.IssuePrefix = row["issue_prefix"].String()
+	cleanup = false
 	return s, nil
 }
 
@@ -478,11 +492,17 @@ func (s *Store) ListIssues(opts ListIssueOptions) ([]*core.Issue, error) {
 func (s *Store) issueFromRow(r map[string]db.Value) (*core.Issue, error) {
 	id := r["id"].String()
 	labels := []string{}
-	lrows, _ := s.Project.Query(`SELECT label FROM issue_labels WHERE issue_id=? ORDER BY label`, id)
+	lrows, err := s.Project.Query(`SELECT label FROM issue_labels WHERE issue_id=? ORDER BY label`, id)
+	if err != nil {
+		return nil, fmt.Errorf("load issue labels: %w", err)
+	}
 	for _, lr := range lrows {
 		labels = append(labels, lr["label"].String())
 	}
-	ws := s.workspaceSummary(id)
+	ws, err := s.workspaceSummary(id)
+	if err != nil {
+		return nil, fmt.Errorf("load workspace summary: %w", err)
+	}
 	var git *core.GitSummary
 	var branchName, workspacePath, baseRef, baseRefConfig, baseSHA *string
 	if ws != nil {
@@ -495,66 +515,119 @@ func (s *Store) issueFromRow(r map[string]db.Value) (*core.Issue, error) {
 	} else {
 		git = &core.GitSummary{}
 	}
-	latestRun, latestRunID := s.latestRunSummary(id)
-	activeRunID, _ := s.activeRunID(id)
-	latestRP, latestRPID := s.latestReviewSummary(id)
+	latestRun, latestRunID, err := s.latestRunSummary(id)
+	if err != nil {
+		return nil, fmt.Errorf("load latest run: %w", err)
+	}
+	activeRunID, err := s.activeRunID(id)
+	if err != nil {
+		return nil, fmt.Errorf("load active run: %w", err)
+	}
+	latestRP, latestRPID, err := s.latestReviewSummary(id)
+	if err != nil {
+		return nil, fmt.Errorf("load latest review packet: %w", err)
+	}
+	blockedBy, err := s.relationRefs(id, "blocks", "source")
+	if err != nil {
+		return nil, fmt.Errorf("load blocked_by relations: %w", err)
+	}
+	blocks, err := s.relationRefs(id, "blocks", "target")
+	if err != nil {
+		return nil, fmt.Errorf("load blocks relations: %w", err)
+	}
+	duplicateOf, err := s.singleRelationRef(id, "duplicates")
+	if err != nil {
+		return nil, fmt.Errorf("load duplicate relation: %w", err)
+	}
+	duplicates, err := s.relationRefs(id, "duplicates", "target")
+	if err != nil {
+		return nil, fmt.Errorf("load duplicate references: %w", err)
+	}
+	followupOf, err := s.singleRelationRef(id, "followup_of")
+	if err != nil {
+		return nil, fmt.Errorf("load followup relation: %w", err)
+	}
+	followups, err := s.relationRefs(id, "followup_of", "target")
+	if err != nil {
+		return nil, fmt.Errorf("load followup references: %w", err)
+	}
 	return &core.Issue{
 		ID: id, Identifier: r["identifier"].String(), SequenceNo: r["sequence_no"].Int(), Title: r["title"].String(), Description: r["description"].String(), AcceptanceCriteria: decodeStringSlice(r["acceptance_criteria_json"].String()), Priority: r["priority"].Int(), State: core.IssueState(r["state"].String()), URL: nil, Labels: labels,
-		BlockedBy: s.relationRefs(id, "blocks", "source"), Blocks: s.relationRefs(id, "blocks", "target"), DuplicateOf: s.singleRelationRef(id, "duplicates"), Duplicates: s.relationRefs(id, "duplicates", "target"), FollowupOf: s.singleRelationRef(id, "followup_of"), Followups: s.relationRefs(id, "followup_of", "target"),
+		BlockedBy: blockedBy, Blocks: blocks, DuplicateOf: duplicateOf, Duplicates: duplicates, FollowupOf: followupOf, Followups: followups,
 		DispatchPaused: r["dispatch_paused"].Bool(), DispatchPauseReason: ptrFromVal(r["dispatch_pause_reason"]), DispatchPausedAt: ptrFromVal(r["dispatch_paused_at"]), BranchName: branchName, WorkspacePath: workspacePath, BaseRef: baseRef, BaseRefConfig: baseRefConfig, BaseSHA: baseSHA, Workspace: ws, Git: git, LatestRun: latestRun, ActiveRunID: activeRunID, LatestRunID: latestRunID, LatestReviewPacket: latestRP, LatestReviewPacketID: latestRPID, CreatedAt: r["created_at"].String(), UpdatedAt: r["updated_at"].String(), CompletedAt: ptrFromVal(r["completed_at"]), ArchivedAt: ptrFromVal(r["archived_at"]),
 	}, nil
 }
 
-func (s *Store) issueRefFromID(id string) core.IssueRef {
+func (s *Store) issueRefFromID(id string) (core.IssueRef, error) {
 	row, err := s.Project.QueryOne(`SELECT id,identifier,title,state FROM issues WHERE id=?`, id)
 	if err != nil {
-		return core.IssueRef{}
+		return core.IssueRef{}, err
 	}
-	return core.IssueRef{ID: row["id"].String(), Identifier: row["identifier"].String(), Title: row["title"].String(), State: core.IssueState(row["state"].String())}
+	return core.IssueRef{ID: row["id"].String(), Identifier: row["identifier"].String(), Title: row["title"].String(), State: core.IssueState(row["state"].String())}, nil
 }
-func (s *Store) relationRefs(id, typ, mode string) []core.IssueRef {
+func (s *Store) relationRefs(id, typ, mode string) ([]core.IssueRef, error) {
 	var rows []map[string]db.Value
+	var err error
 	if mode == "source" {
-		rows, _ = s.Project.Query(`SELECT target_issue_id AS id FROM issue_relations WHERE source_issue_id=? AND relation_type=? AND active=1 ORDER BY created_at`, id, typ)
+		rows, err = s.Project.Query(`SELECT target_issue_id AS id FROM issue_relations WHERE source_issue_id=? AND relation_type=? AND active=1 ORDER BY created_at`, id, typ)
 	} else {
-		rows, _ = s.Project.Query(`SELECT source_issue_id AS id FROM issue_relations WHERE target_issue_id=? AND relation_type=? AND active=1 ORDER BY created_at`, id, typ)
+		rows, err = s.Project.Query(`SELECT source_issue_id AS id FROM issue_relations WHERE target_issue_id=? AND relation_type=? AND active=1 ORDER BY created_at`, id, typ)
+	}
+	if err != nil {
+		return nil, err
 	}
 	out := []core.IssueRef{}
 	for _, r := range rows {
-		ref := s.issueRefFromID(r["id"].String())
-		if ref.ID != "" {
-			out = append(out, ref)
+		ref, err := s.issueRefFromID(r["id"].String())
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
 		}
+		out = append(out, ref)
 	}
-	return out
+	return out, nil
 }
-func (s *Store) singleRelationRef(id, typ string) *core.IssueRef {
-	rows, _ := s.Project.Query(`SELECT target_issue_id AS id FROM issue_relations WHERE source_issue_id=? AND relation_type=? AND active=1 ORDER BY created_at DESC LIMIT 1`, id, typ)
+func (s *Store) singleRelationRef(id, typ string) (*core.IssueRef, error) {
+	rows, err := s.Project.Query(`SELECT target_issue_id AS id FROM issue_relations WHERE source_issue_id=? AND relation_type=? AND active=1 ORDER BY created_at DESC LIMIT 1`, id, typ)
+	if err != nil {
+		return nil, err
+	}
 	if len(rows) == 0 {
-		return nil
+		return nil, nil
 	}
-	ref := s.issueRefFromID(rows[0]["id"].String())
-	if ref.ID == "" {
-		return nil
+	ref, err := s.issueRefFromID(rows[0]["id"].String())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	return &ref
+	return &ref, nil
 }
-func (s *Store) workspaceSummary(issueID string) *core.WorkspaceSummary {
+func (s *Store) workspaceSummary(issueID string) (*core.WorkspaceSummary, error) {
 	row, err := s.Project.QueryOne(`SELECT * FROM workspaces WHERE issue_id=?`, issueID)
 	if err != nil {
-		return nil
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	return &core.WorkspaceSummary{ID: row["id"].String(), Path: row["path"].String(), BranchName: row["branch_name"].String(), BaseRef: row["base_ref"].String(), BaseRefConfig: row["base_ref_config"].String(), BaseSHA: row["base_sha"].String(), Status: row["status"].String()}
+	return &core.WorkspaceSummary{ID: row["id"].String(), Path: row["path"].String(), BranchName: row["branch_name"].String(), BaseRef: row["base_ref"].String(), BaseRefConfig: row["base_ref_config"].String(), BaseSHA: row["base_sha"].String(), Status: row["status"].String()}, nil
 }
-func (s *Store) latestRunSummary(issueID string) (*core.RunSummary, *string) {
+func (s *Store) latestRunSummary(issueID string) (*core.RunSummary, *string, error) {
 	row, err := s.Project.QueryOne(`SELECT * FROM run_attempts WHERE issue_id=? ORDER BY attempt_no DESC LIMIT 1`, issueID)
 	if err != nil {
-		return nil, nil
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
 	}
 	fc := failPtrFromVal(row["failure_code"])
 	sum := &core.RunSummary{ID: row["id"].String(), Status: core.RunStatus(row["status"].String()), AttemptNo: row["attempt_no"].Int(), FailureCode: fc, CreatedAt: row["created_at"].String()}
 	id := sum.ID
-	return sum, &id
+	return sum, &id, nil
 }
 func (s *Store) activeRunID(issueID string) (*string, error) {
 	return s.activeRunIDTx(s.Project, issueID)
@@ -571,16 +644,19 @@ func (s *Store) activeRunIDTx(q sqlRunner, issueID string) (*string, error) {
 	id := rows[0]["id"].String()
 	return &id, nil
 }
-func (s *Store) latestReviewSummary(issueID string) (*core.ReviewPacketSummary, *string) {
+func (s *Store) latestReviewSummary(issueID string) (*core.ReviewPacketSummary, *string, error) {
 	row, err := s.Project.QueryOne(`SELECT * FROM review_packets WHERE issue_id=? ORDER BY packet_no DESC LIMIT 1`, issueID)
 	if err != nil {
-		return nil, nil
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
 	}
 	fc := failPtrFromVal(row["failure_code"])
 	fm := ptrFromVal(row["failure_message"])
 	sum := &core.ReviewPacketSummary{ID: row["id"].String(), RunID: row["run_id"].String(), PacketNo: row["packet_no"].Int(), Status: row["status"].String(), CreatedAt: row["created_at"].String(), FailureCode: fc, FailureMessage: fm}
 	id := sum.ID
-	return sum, &id
+	return sum, &id, nil
 }
 
 func (s *Store) UpdateIssue(ref string, fields map[string]any) (*core.Issue, error) {
