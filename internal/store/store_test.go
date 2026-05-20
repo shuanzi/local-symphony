@@ -2,6 +2,7 @@ package store
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +149,42 @@ func TestCompleteRunWithReviewRejectsCancelledRunWithoutChangingRunOrIssue(t *te
 	assertIssueState(t, st, issue.ID, core.StateReady)
 }
 
+func TestCompleteRunWithReviewRollsBackWhenStateHistoryInsertFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "CompleteRunWithReview history failure")
+	reviewPacketID := insertReviewPacketForRun(t, st, issue.ID, run.ID)
+	if err := st.Project.Exec(`CREATE TRIGGER fail_complete_review_history BEFORE INSERT ON issue_state_history WHEN NEW.reason='review packet generated' BEGIN SELECT RAISE(ABORT, 'review history failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err := st.CompleteRunWithReview(run.ID, reviewPacketID)
+	if err == nil {
+		t.Fatal("CompleteRunWithReview succeeded, want state history error")
+	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+	assertIssueLatestReviewPacketID(t, st, issue.ID, &reviewPacketID)
+	assertNoReviewGeneratedEvent(t, st, run.ID)
+}
+
+func TestCompleteRunWithReviewRollsBackWhenEventInsertFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "CompleteRunWithReview event failure")
+	reviewPacketID := insertReviewPacketForRun(t, st, issue.ID, run.ID)
+	if err := st.Project.Exec(`CREATE TRIGGER fail_complete_review_event BEFORE INSERT ON run_events WHEN NEW.event_type='review.packet_generated' BEGIN SELECT RAISE(ABORT, 'review event failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err := st.CompleteRunWithReview(run.ID, reviewPacketID)
+	if err == nil {
+		t.Fatal("CompleteRunWithReview succeeded, want event insert error")
+	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+	assertIssueLatestReviewPacketID(t, st, issue.ID, &reviewPacketID)
+	assertNoReviewGeneratedEvent(t, st, run.ID)
+}
+
 func TestMarkDoneRollsBackWhenAuditCommentInsertFails(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, _ := prepareCompletedReviewRun(t, st)
@@ -225,6 +262,50 @@ func TestReviewActionRollsBackWhenAuditEventInsertFails(t *testing.T) {
 				t.Fatalf("review action events = %d, want 0 after rollback", len(rows))
 			}
 		})
+	}
+}
+
+func TestMarkDonePropagatesActiveRunLookupErrorWithoutChangingIssue(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareCompletedReviewRun(t, st)
+	poisonRunID := core.NewID("run_")
+	now := core.Now()
+	if err := st.Project.Exec(`ALTER TABLE run_attempts RENAME TO run_attempts_shadow`); err != nil {
+		t.Fatalf("rename run_attempts: %v", err)
+	}
+	if err := st.Project.Exec(`INSERT INTO run_attempts_shadow(id,issue_id,attempt_no,status,dispatch_reason,source_issue_state,runner_kind,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, poisonRunID, issue.ID, 2, string(core.RunPending), "manual", string(core.StateReady), "fake", now, now); err != nil {
+		t.Fatalf("insert poison run: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE INDEX idx_run_attempts_shadow_issue ON run_attempts_shadow(issue_id)`); err != nil {
+		t.Fatalf("create shadow issue index: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE VIEW run_attempts AS SELECT id,issue_id,attempt_no,workspace_id,workflow_snapshot_id,CASE WHEN id='` + poisonRunID + `' THEN json_extract('bad json','$.x') ELSE status END AS status,dispatch_reason,source_issue_state,runner_kind,base_ref_config,base_ref,base_sha,branch_name,failure_code,failure_message,started_at,ended_at,created_at,updated_at FROM run_attempts_shadow`); err != nil {
+		t.Fatalf("create run_attempts view: %v", err)
+	}
+
+	_, err := st.MarkDone(issue.ID, "active lookup should fail")
+
+	if dropErr := st.Project.Exec(`DROP VIEW run_attempts`); dropErr != nil {
+		t.Fatalf("drop run_attempts view: %v", dropErr)
+	}
+	if deleteErr := st.Project.Exec(`DELETE FROM run_attempts_shadow WHERE id=?`, poisonRunID); deleteErr != nil {
+		t.Fatalf("delete poison run: %v", deleteErr)
+	}
+	if restoreErr := st.Project.Exec(`ALTER TABLE run_attempts_shadow RENAME TO run_attempts`); restoreErr != nil {
+		t.Fatalf("restore run_attempts: %v", restoreErr)
+	}
+	if err == nil {
+		t.Fatal("MarkDone succeeded, want active run lookup error")
+	}
+	assertErrorContains(t, err, "malformed JSON")
+	assertIssueState(t, st, issue.ID, core.StateHumanReview)
+	assertRunStatus(t, st, run.ID, core.RunCompleted)
+	rows, qerr := st.Project.Query(`SELECT id FROM run_events WHERE issue_id=? AND event_type IN ('review.marked_done','issue.completed')`, issue.ID)
+	if qerr != nil {
+		t.Fatalf("query review events: %v", qerr)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("review completion events = %d, want 0", len(rows))
 	}
 }
 
@@ -915,6 +996,140 @@ func TestClaimRunPropagatesBlockerQueryError(t *testing.T) {
 	}
 }
 
+func TestClaimRunRollsBackWhenStateHistoryInsertFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "ClaimRun history failure")
+	if err := st.Project.Exec(`CREATE TRIGGER fail_claim_history BEFORE INSERT ON issue_state_history WHEN NEW.reason='dispatch' BEGIN SELECT RAISE(ABORT, 'claim history failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err == nil {
+		t.Fatal("ClaimRun succeeded, want state history error")
+	}
+	assertIssueState(t, st, issue.ID, core.StateReady)
+	assertRunAttemptCount(t, st, issue.ID, 0)
+	assertNoClaimDispatchEvents(t, st, issue.ID)
+}
+
+func TestClaimRunRollsBackWhenEventInsertFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "ClaimRun event failure")
+	if err := st.Project.Exec(`CREATE TRIGGER fail_claim_event BEFORE INSERT ON run_events WHEN NEW.event_type='run.claimed' BEGIN SELECT RAISE(ABORT, 'claim event failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err == nil {
+		t.Fatal("ClaimRun succeeded, want event insert error")
+	}
+	assertIssueState(t, st, issue.ID, core.StateReady)
+	assertRunAttemptCount(t, st, issue.ID, 0)
+	assertNoClaimDispatchEvents(t, st, issue.ID)
+}
+
+func TestClaimRunPropagatesActiveRunLookupError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "ClaimRun active lookup failure")
+	if err := st.Project.Exec(`ALTER TABLE run_attempts RENAME TO run_attempts_shadow`); err != nil {
+		t.Fatalf("rename run_attempts: %v", err)
+	}
+
+	_, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err == nil {
+		t.Fatal("ClaimRun succeeded, want active run lookup error")
+	}
+
+	if err := st.Project.Exec(`ALTER TABLE run_attempts_shadow RENAME TO run_attempts`); err != nil {
+		t.Fatalf("restore run_attempts: %v", err)
+	}
+	assertIssueState(t, st, issue.ID, core.StateReady)
+	assertRunAttemptCount(t, st, issue.ID, 0)
+	assertNoClaimDispatchEvents(t, st, issue.ID)
+}
+
+func TestClaimRunPropagatesConcurrencyCountError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "ClaimRun concurrency count failure")
+	if err := st.Project.Exec(`ALTER TABLE run_attempts RENAME TO run_attempts_shadow`); err != nil {
+		t.Fatalf("rename run_attempts: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TABLE run_attempts_probe(id TEXT, issue_id TEXT, attempt_no INTEGER, status_raw TEXT, created_at TEXT)`); err != nil {
+		t.Fatalf("create probe table: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE INDEX idx_run_attempts_probe_issue ON run_attempts_probe(issue_id)`); err != nil {
+		t.Fatalf("create probe issue index: %v", err)
+	}
+	if err := st.Project.Exec(`INSERT INTO run_attempts_probe(id,issue_id,attempt_no,status_raw,created_at) VALUES(?,?,?,?,?)`, core.NewID("run_"), "issue_poison", 1, string(core.RunPending), core.Now()); err != nil {
+		t.Fatalf("insert poison run: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE VIEW run_attempts AS SELECT id,issue_id,attempt_no,CASE WHEN issue_id='issue_poison' THEN json_extract('bad json','$.x') ELSE status_raw END AS status,created_at FROM run_attempts_probe`); err != nil {
+		t.Fatalf("create run_attempts view: %v", err)
+	}
+
+	_, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+
+	if dropErr := st.Project.Exec(`DROP VIEW run_attempts`); dropErr != nil {
+		t.Fatalf("drop run_attempts view: %v", dropErr)
+	}
+	if dropErr := st.Project.Exec(`DROP TABLE run_attempts_probe`); dropErr != nil {
+		t.Fatalf("drop probe table: %v", dropErr)
+	}
+	if restoreErr := st.Project.Exec(`ALTER TABLE run_attempts_shadow RENAME TO run_attempts`); restoreErr != nil {
+		t.Fatalf("restore run_attempts: %v", restoreErr)
+	}
+	if err == nil {
+		t.Fatal("ClaimRun succeeded, want concurrency count error")
+	}
+	assertErrorContains(t, err, "malformed JSON")
+	assertIssueState(t, st, issue.ID, core.StateReady)
+	assertRunAttemptCount(t, st, issue.ID, 0)
+	assertNoClaimDispatchEvents(t, st, issue.ID)
+}
+
+func TestClaimRunPropagatesAttemptNumberError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "ClaimRun attempt number failure")
+	if err := st.Project.Exec(`ALTER TABLE run_attempts RENAME TO run_attempts_shadow`); err != nil {
+		t.Fatalf("rename run_attempts: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TABLE run_attempts(id TEXT, issue_id TEXT, status TEXT, created_at TEXT)`); err != nil {
+		t.Fatalf("create replacement run_attempts: %v", err)
+	}
+
+	_, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+
+	if dropErr := st.Project.Exec(`DROP TABLE run_attempts`); dropErr != nil {
+		t.Fatalf("drop replacement run_attempts: %v", dropErr)
+	}
+	if restoreErr := st.Project.Exec(`ALTER TABLE run_attempts_shadow RENAME TO run_attempts`); restoreErr != nil {
+		t.Fatalf("restore run_attempts: %v", restoreErr)
+	}
+	if err == nil {
+		t.Fatal("ClaimRun succeeded, want attempt number error")
+	}
+	assertErrorContains(t, err, "no such column: attempt_no")
+	assertIssueState(t, st, issue.ID, core.StateReady)
+	assertRunAttemptCount(t, st, issue.ID, 0)
+	assertNoClaimDispatchEvents(t, st, issue.ID)
+}
+
+func TestClaimRunRollsBackRunClaimedEventWhenStateChangedEventFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "ClaimRun state changed event failure")
+	if err := st.Project.Exec(`CREATE TRIGGER fail_claim_state_changed_event BEFORE INSERT ON run_events WHEN NEW.event_type='issue.state_changed' BEGIN SELECT RAISE(ABORT, 'claim state changed event failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err == nil {
+		t.Fatal("ClaimRun succeeded, want issue.state_changed event error")
+	}
+	assertIssueState(t, st, issue.ID, core.StateReady)
+	assertRunAttemptCount(t, st, issue.ID, 0)
+	assertNoClaimDispatchEvents(t, st, issue.ID)
+}
+
 func TestInsertReviewPacketRollsBackWhenIssuePointerUpdateFails(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareActiveRun(t, st, "Review packet pointer failure")
@@ -1025,7 +1240,7 @@ func prepareActiveRun(t *testing.T, st *Store, title string) (*core.Issue, *core
 	return prepareActiveRunWithMaxConcurrent(t, st, title, 1)
 }
 
-func prepareActiveRunWithMaxConcurrent(t *testing.T, st *Store, title string, maxConcurrent int) (*core.Issue, *core.RunAttempt) {
+func prepareReadyIssue(t *testing.T, st *Store, title string) *core.Issue {
 	t.Helper()
 	issue, err := st.CreateIssue(CreateIssueInput{
 		Title:              title,
@@ -1036,9 +1251,16 @@ func prepareActiveRunWithMaxConcurrent(t *testing.T, st *Store, title string, ma
 	if err != nil {
 		t.Fatalf("CreateIssue: %v", err)
 	}
-	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+	issue, err = st.TransitionIssue(issue.ID, core.StateReady, "", "")
+	if err != nil {
 		t.Fatalf("TransitionIssue: %v", err)
 	}
+	return issue
+}
+
+func prepareActiveRunWithMaxConcurrent(t *testing.T, st *Store, title string, maxConcurrent int) (*core.Issue, *core.RunAttempt) {
+	t.Helper()
+	issue := prepareReadyIssue(t, st, title)
 	run, err := st.ClaimRun(issue.ID, "manual", "fake", maxConcurrent)
 	if err != nil {
 		t.Fatalf("ClaimRun: %v", err)
@@ -1165,6 +1387,67 @@ func assertIssueState(t *testing.T, st *Store, issueID string, want core.IssueSt
 	}
 	if gotIssue.State != want {
 		t.Fatalf("issue state = %s, want %s", gotIssue.State, want)
+	}
+}
+
+func assertIssueLatestReviewPacketID(t *testing.T, st *Store, issueID string, want *string) {
+	t.Helper()
+	row, err := st.Project.QueryOne(`SELECT latest_review_packet_id FROM issues WHERE id=?`, issueID)
+	if err != nil {
+		t.Fatalf("get issue latest_review_packet_id: %v", err)
+	}
+	got := row["latest_review_packet_id"].String()
+	if want == nil {
+		if got != "" {
+			t.Fatalf("latest_review_packet_id = %q, want empty", got)
+		}
+		return
+	}
+	if got != *want {
+		t.Fatalf("latest_review_packet_id = %q, want %q", got, *want)
+	}
+}
+
+func assertRunAttemptCount(t *testing.T, st *Store, issueID string, want int) {
+	t.Helper()
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM run_attempts WHERE issue_id=?`, issueID)
+	if err != nil {
+		t.Fatalf("count run attempts: %v", err)
+	}
+	if got := row["c"].Int(); got != want {
+		t.Fatalf("run attempts = %d, want %d", got, want)
+	}
+}
+
+func assertNoClaimDispatchEvents(t *testing.T, st *Store, issueID string) {
+	t.Helper()
+	rows, err := st.Project.Query(`SELECT id FROM run_events WHERE issue_id=? AND event_type IN ('run.claimed','issue.state_changed')`, issueID)
+	if err != nil {
+		t.Fatalf("query claim dispatch events: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("claim dispatch events = %d, want 0 after rollback", len(rows))
+	}
+}
+
+func assertNoReviewGeneratedEvent(t *testing.T, st *Store, runID string) {
+	t.Helper()
+	rows, err := st.Project.Query(`SELECT id FROM run_events WHERE run_id=? AND event_type='review.packet_generated'`, runID)
+	if err != nil {
+		t.Fatalf("query review generated events: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("review generated events = %d, want 0 after rollback", len(rows))
+	}
+}
+
+func assertErrorContains(t *testing.T, err error, want string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("error is nil, want %q", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %q, want to contain %q", err.Error(), want)
 	}
 }
 

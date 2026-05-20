@@ -496,7 +496,7 @@ func (s *Store) issueFromRow(r map[string]db.Value) (*core.Issue, error) {
 		git = &core.GitSummary{}
 	}
 	latestRun, latestRunID := s.latestRunSummary(id)
-	activeRunID := s.activeRunID(id)
+	activeRunID, _ := s.activeRunID(id)
 	latestRP, latestRPID := s.latestReviewSummary(id)
 	return &core.Issue{
 		ID: id, Identifier: r["identifier"].String(), SequenceNo: r["sequence_no"].Int(), Title: r["title"].String(), Description: r["description"].String(), AcceptanceCriteria: decodeStringSlice(r["acceptance_criteria_json"].String()), Priority: r["priority"].Int(), State: core.IssueState(r["state"].String()), URL: nil, Labels: labels,
@@ -556,17 +556,20 @@ func (s *Store) latestRunSummary(issueID string) (*core.RunSummary, *string) {
 	id := sum.ID
 	return sum, &id
 }
-func (s *Store) activeRunID(issueID string) *string {
+func (s *Store) activeRunID(issueID string) (*string, error) {
 	return s.activeRunIDTx(s.Project, issueID)
 }
 
-func (s *Store) activeRunIDTx(q sqlRunner, issueID string) *string {
-	rows, _ := q.Query(`SELECT id FROM run_attempts WHERE issue_id=? AND status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running') ORDER BY created_at DESC LIMIT 1`, issueID)
+func (s *Store) activeRunIDTx(q sqlRunner, issueID string) (*string, error) {
+	rows, err := q.Query(`SELECT id FROM run_attempts WHERE issue_id=? AND status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running') ORDER BY created_at DESC LIMIT 1`, issueID)
+	if err != nil {
+		return nil, err
+	}
 	if len(rows) == 0 {
-		return nil
+		return nil, nil
 	}
 	id := rows[0]["id"].String()
-	return &id
+	return &id, nil
 }
 func (s *Store) latestReviewSummary(issueID string) (*core.ReviewPacketSummary, *string) {
 	row, err := s.Project.QueryOne(`SELECT * FROM review_packets WHERE issue_id=? ORDER BY packet_no DESC LIMIT 1`, issueID)
@@ -698,7 +701,10 @@ func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, dupl
 	}
 	now := core.Now()
 	if err := s.Project.WithTx(func(tx *db.Tx) error {
-		active := s.activeRunIDTx(tx, id)
+		active, err := s.activeRunIDTx(tx, id)
+		if err != nil {
+			return err
+		}
 		if active != nil {
 			if err := s.cancelRunInTx(tx, *active, core.FailureIssueStateChanged, "issue state changed", true); err != nil {
 				return err
@@ -823,7 +829,11 @@ func (s *Store) DispatchPause(ref, reason string) (*core.Issue, error) {
 	if core.IsTerminalIssueState(core.IssueState(row["state"].String())) {
 		return nil, core.NewError(core.ErrInvalidStateTransition, "terminal issue dispatch state cannot be changed", nil)
 	}
-	if s.activeRunID(id) != nil {
+	active, err := s.activeRunID(id)
+	if err != nil {
+		return nil, err
+	}
+	if active != nil {
 		return nil, core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
 	}
 	now := core.Now()
@@ -846,7 +856,11 @@ func (s *Store) DispatchResume(ref, reason string) (*core.Issue, error) {
 	if core.IsTerminalIssueState(core.IssueState(row["state"].String())) {
 		return nil, core.NewError(core.ErrInvalidStateTransition, "terminal issue dispatch state cannot be changed", nil)
 	}
-	if s.activeRunID(id) != nil {
+	active, err := s.activeRunID(id)
+	if err != nil {
+		return nil, err
+	}
+	if active != nil {
 		return nil, core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
 	}
 	now := core.Now()
@@ -891,14 +905,24 @@ func (s *Store) ClaimRun(issueRef, dispatchReason, runnerKind string, maxConcurr
 		if len(blockers) > 0 {
 			return core.NewError(core.ErrIssueBlocked, "issue has active blockers", nil)
 		}
-		if s.activeRunIDTx(tx, id) != nil {
+		active, err := s.activeRunIDTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if active != nil {
 			return core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
 		}
-		activeRows, _ := tx.Query(`SELECT count(*) AS c FROM run_attempts WHERE status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running')`)
+		activeRows, err := tx.Query(`SELECT count(*) AS c FROM run_attempts WHERE status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running')`)
+		if err != nil {
+			return err
+		}
 		if len(activeRows) > 0 && activeRows[0]["c"].Int() >= maxConcurrent {
 			return core.NewError(core.ErrConcurrencyLimitReached, "concurrency limit reached", nil)
 		}
-		ar, _ := tx.QueryOne(`SELECT COALESCE(MAX(attempt_no),0)+1 AS n FROM run_attempts WHERE issue_id=?`, id)
+		ar, err := tx.QueryOne(`SELECT COALESCE(MAX(attempt_no),0)+1 AS n FROM run_attempts WHERE issue_id=?`, id)
+		if err != nil {
+			return err
+		}
 		attempt := ar["n"].Int()
 		now := core.Now()
 		runID = core.NewID("run_")
@@ -908,9 +932,15 @@ func (s *Store) ClaimRun(issueRef, dispatchReason, runnerKind string, maxConcurr
 		if err := tx.Exec(`UPDATE issues SET state=?, latest_run_id=?, updated_at=? WHERE id=?`, string(core.StateWorking), runID, now, id); err != nil {
 			return err
 		}
-		_ = tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), id, string(st), string(core.StateWorking), "orchestrator", runID, "dispatch", now)
-		_ = s.appendEventInTx(tx, "run.claimed", "orchestrator", &id, &runID, map[string]any{"source_issue_state": st})
-		_ = s.appendEventInTx(tx, "issue.state_changed", "orchestrator", &id, &runID, map[string]any{"from_state": st, "to_state": core.StateWorking})
+		if err := tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), id, string(st), string(core.StateWorking), "orchestrator", runID, "dispatch", now); err != nil {
+			return err
+		}
+		if err := s.appendEventInTx(tx, "run.claimed", "orchestrator", &id, &runID, map[string]any{"source_issue_state": st}); err != nil {
+			return err
+		}
+		if err := s.appendEventInTx(tx, "issue.state_changed", "orchestrator", &id, &runID, map[string]any{"from_state": st, "to_state": core.StateWorking}); err != nil {
+			return err
+		}
 		return nil
 	}); err != nil {
 		return nil, err
@@ -999,8 +1029,12 @@ func (s *Store) CompleteRunWithReview(runID, reviewPacketID string) error {
 		if err := tx.Exec(`UPDATE issues SET state=?, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL, latest_review_packet_id=?, updated_at=? WHERE id=?`, string(core.StateHumanReview), reviewPacketID, now, run.IssueID); err != nil {
 			return err
 		}
-		_ = tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), run.IssueID, string(core.StateWorking), string(core.StateHumanReview), "orchestrator", runID, "review packet generated", now)
-		_ = s.appendEventInTx(tx, "review.packet_generated", "system", &run.IssueID, &runID, map[string]any{"review_packet_id": reviewPacketID})
+		if err := tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), run.IssueID, string(core.StateWorking), string(core.StateHumanReview), "orchestrator", runID, "review packet generated", now); err != nil {
+			return err
+		}
+		if err := s.appendEventInTx(tx, "review.packet_generated", "system", &run.IssueID, &runID, map[string]any{"review_packet_id": reviewPacketID}); err != nil {
+			return err
+		}
 		return nil
 	})
 }
@@ -1418,7 +1452,11 @@ func (s *Store) reviewAction(issueRef, reason string, target core.IssueState) (*
 	if issue.State != core.StateHumanReview {
 		return nil, core.NewError(core.ErrInvalidStateTransition, "issue is not in Human Review", nil)
 	}
-	if issue.ActiveRunID != nil {
+	active, err := s.activeRunID(issue.ID)
+	if err != nil {
+		return nil, err
+	}
+	if active != nil {
 		return nil, core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
 	}
 	rp, err := s.ReviewPacketRow(issue.ID)

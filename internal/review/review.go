@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"local-symphony/internal/core"
@@ -197,17 +199,17 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 	changed := []string{}
 	untracked := []UntrackedInfo{}
 	denied := map[string]bool{}
-	if lines, err := gitx.StatusPorcelain(root); err == nil && len(lines) > 0 {
-		for _, l := range lines {
-			if len(l) < 4 {
+	if records, err := statusPorcelainRecords(root); err == nil && len(records) > 0 {
+		for _, record := range records {
+			if len(record.paths) == 0 {
 				continue
 			}
-			paths := statusPorcelainPaths(l)
+			paths := record.paths
 			safePaths := make([]string, 0, len(paths))
 			for _, candidate := range paths {
 				path := reviewSafePath(candidate)
 				if path == "" {
-					if renamedOrCopied(l) && len(paths) > 1 {
+					if record.renamedOrCopied() && len(paths) > 1 {
 						if dst := reviewSafePath(paths[len(paths)-1]); dst != "" {
 							denied[dst] = true
 						}
@@ -225,7 +227,7 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 					changed = append(changed, path)
 				}
 			}
-			if strings.HasPrefix(l, "??") {
+			if record.code == "??" {
 				untracked = append(untracked, untrackedInfo(root, safePaths[0]))
 			}
 		}
@@ -255,17 +257,67 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 	})
 	return changed, untracked, denied
 }
+
+type statusPorcelainRecord struct {
+	code  string
+	paths []string
+}
+
+func (r statusPorcelainRecord) renamedOrCopied() bool {
+	return len(r.code) >= 2 && (r.code[0] == 'R' || r.code[1] == 'R' || r.code[0] == 'C' || r.code[1] == 'C')
+}
+
+func statusPorcelainRecords(root string) ([]statusPorcelainRecord, error) {
+	cmd := exec.Command("git", "status", "--porcelain=v1", "-z", "-uall")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseStatusPorcelainZ(string(out)), nil
+}
+
+func parseStatusPorcelainZ(out string) []statusPorcelainRecord {
+	fields := strings.Split(out, "\x00")
+	records := []statusPorcelainRecord{}
+	for i := 0; i < len(fields); i++ {
+		field := fields[i]
+		if field == "" || len(field) < 4 {
+			continue
+		}
+		record := statusPorcelainRecord{code: field[:2], paths: []string{field[3:]}}
+		if record.renamedOrCopied() {
+			if i+1 >= len(fields) || fields[i+1] == "" {
+				continue
+			}
+			record.paths = []string{fields[i+1], field[3:]}
+			i++
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
 func statusPorcelainPaths(line string) []string {
 	path := strings.TrimSpace(line[3:])
 	if renamedOrCopied(line) {
 		if idx := strings.LastIndex(path, " -> "); idx >= 0 {
-			return []string{strings.TrimSpace(path[:idx]), strings.TrimSpace(path[idx+4:])}
+			return []string{decodeStatusPath(path[:idx]), decodeStatusPath(path[idx+4:])}
 		}
 	}
-	return []string{path}
+	return []string{decodeStatusPath(path)}
 }
 func renamedOrCopied(line string) bool {
 	return len(line) >= 2 && (line[0] == 'R' || line[1] == 'R' || line[0] == 'C' || line[1] == 'C')
+}
+func decodeStatusPath(path string) string {
+	path = strings.TrimSpace(path)
+	if strings.HasPrefix(path, `"`) {
+		if unquoted, err := strconv.Unquote(path); err == nil {
+			return unquoted
+		}
+	}
+	return path
 }
 func untrackedInfo(root, path string) UntrackedInfo {
 	path = filepath.ToSlash(path)

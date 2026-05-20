@@ -76,6 +76,26 @@ func TestGenerateOmitsTrackedProtectedDiffFromPatch(t *testing.T) {
 	}
 }
 
+func TestGenerateIncludesTrackedPathWithSpacesInPatch(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "space name.txt", "old\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	writeFile(t, workspace, "space name.txt", "new\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, nil)
+
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/space name.txt b/space name.txt") || !strings.Contains(patch, "+new") {
+		t.Fatalf("changes.patch missing tracked file with spaces:\n%s", patch)
+	}
+}
+
 func TestGenerateTreatsChangedFilesAsLiteralPathspecs(t *testing.T) {
 	st := newReviewTestStore(t)
 	workspace := initGitWorkspace(t)
@@ -151,6 +171,31 @@ func TestGenerateIncludesRenamedPathDiff(t *testing.T) {
 	}
 }
 
+func TestGenerateIncludesRenamedPathWithSpacesDiff(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "old name.txt", "shared\nold\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	runGit(t, workspace, "mv", "old name.txt", "new name.txt")
+	writeFile(t, workspace, "new name.txt", "shared\nnew\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, nil)
+
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "rename from old name.txt") || !strings.Contains(patch, "rename to new name.txt") || !strings.Contains(patch, "+new") {
+		t.Fatalf("changes.patch missing rename with spaces:\n%s", patch)
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if !strings.Contains(changed, "new name.txt\n") {
+		t.Fatalf("changed-files.txt missing renamed destination with spaces:\n%s", changed)
+	}
+}
+
 func TestGenerateIncludesUntrackedFilesInsideDirectories(t *testing.T) {
 	st := newReviewTestStore(t)
 	workspace := initGitWorkspace(t)
@@ -168,6 +213,30 @@ func TestGenerateIncludesUntrackedFilesInsideDirectories(t *testing.T) {
 	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
 	if !strings.Contains(patch, "diff --git a/notes/todo.txt b/notes/todo.txt") || !strings.Contains(patch, "+nested untracked") {
 		t.Fatalf("changes.patch missing nested untracked file:\n%s", patch)
+	}
+}
+
+func TestGenerateIncludesUntrackedPathWithSpacesInArtifacts(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	writeFile(t, workspace, "notes/space name.txt", "untracked content\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, nil)
+
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/notes/space name.txt b/notes/space name.txt") || !strings.Contains(patch, "+untracked content") {
+		t.Fatalf("changes.patch missing untracked file with spaces:\n%s", patch)
+	}
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	if _, ok := untracked["notes/space name.txt"]; !ok {
+		t.Fatalf("untracked artifact missing path with spaces: %+v", untracked)
 	}
 }
 
