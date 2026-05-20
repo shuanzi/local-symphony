@@ -300,6 +300,66 @@ func TestExchangeRequiresValidOpenTokenAndCreatesSessionCookie(t *testing.T) {
 	}
 }
 
+func TestSessionExpiryUsesParsedTime(t *testing.T) {
+	if !expiredAtOrBefore("2026-05-20T00:00:05Z", "2026-05-20T00:00:05.1Z") {
+		t.Fatalf("expiry without fractional seconds should be expired after fractional current time")
+	}
+}
+
+func TestSessionExpiryAtCurrentTimeIsExpired(t *testing.T) {
+	if !expiredAtOrBefore("2026-05-20T00:00:05Z", "2026-05-20T00:00:05Z") {
+		t.Fatalf("expiry equal to current time should be expired")
+	}
+}
+
+func TestBrowserSessionMalformedExpiryIsUnauthorized(t *testing.T) {
+	srv := newTestServer(t)
+
+	expiresAt := "not-rfc3339"
+	token := insertLocalSessionWithExpiry(t, srv, "browser", expiresAt)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("state with malformed session expiry status = %d, want 401; expires_at = %q, body = %s", rec.Code, expiresAt, rec.Body.String())
+	}
+}
+
+func TestBrowserSessionMissingExpiryIsUnauthorized(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token func(t *testing.T, srv *Server) string
+	}{
+		{
+			name: "null",
+			token: func(t *testing.T, srv *Server) string {
+				return insertLocalSession(t, srv, "browser")
+			},
+		},
+		{
+			name: "empty",
+			token: func(t *testing.T, srv *Server) string {
+				return insertLocalSessionWithExpiry(t, srv, "browser", "")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			token := tc.token(t, srv)
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+			req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("state with %s browser expiry status = %d, want 401; body = %s", tc.name, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestOpenTokenRequiresBearerSession(t *testing.T) {
 	srv := newTestServer(t)
 

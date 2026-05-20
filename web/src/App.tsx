@@ -401,22 +401,37 @@ function useDashboardData() {
       const authenticated = await bootstrapSession();
       if (!authenticated) return;
       setDaemonUnavailable(false);
-      const [health, issuesPage, runs, approvals, workflow, diagnostics, events] = await Promise.all([
+      const loadIssues = async () => {
+        const issues: Issue[] = [];
+        let cursor: string | null | undefined;
+        for (;;) {
+          const query = new URLSearchParams();
+          query.set('limit', '200');
+          if (cursor) query.set('cursor', cursor);
+          const page = await api.issues(`?${query.toString()}`);
+          issues.push(...(page.items || []));
+          if (authEpochRef.current !== requestAuthEpoch || !authenticatedRef.current) return null;
+          cursor = page.page?.next_cursor;
+          if (!page.page?.has_more || !cursor) return issues;
+        }
+      };
+      const [health, issues, runs, approvals, workflow, diagnostics, events] = await Promise.all([
         api.health(),
-        api.issues('?limit=200'),
+        loadIssues(),
         api.runs(),
         api.approvals(),
         api.workflow(),
         api.diagnostics(),
         api.events(maxSeqRef.current)
       ]);
+      if (issues === null) return;
       if (authEpochRef.current !== requestAuthEpoch || !authenticatedRef.current) return;
       setData((current) => {
         const mergedEvents = mergeEvents(current.events, events);
         maxSeqRef.current = eventMaxSeq(mergedEvents);
         return {
           health,
-          issues: issuesPage.items || [],
+          issues,
           runs,
           approvals,
           workflow,

@@ -6,6 +6,34 @@ const app = fs.readFileSync(new URL('src/App.tsx', root), 'utf8');
 const api = fs.readFileSync(new URL('src/api.ts', root), 'utf8');
 const styles = fs.readFileSync(new URL('src/styles.css', root), 'utf8');
 
+function extractIssuePaginationBlock(source) {
+  const helperMatch = /const\s+loadIssues\s*=\s*async\s*\([^)]*\)\s*=>\s*\{/.exec(source);
+  if (helperMatch) {
+    let depth = 1;
+    let i = helperMatch.index + helperMatch[0].length;
+    for (; i < source.length && depth > 0; i += 1) {
+      if (source[i] === '{') depth += 1;
+      if (source[i] === '}') depth -= 1;
+    }
+    return source.slice(helperMatch.index, i);
+  }
+  const loopMatch = /(for\s*\([^)]*\)|while\s*\([^)]*\))\s*\{[\s\S]{0,2000}api\.issues\s*\([\s\S]{0,2000}page\.page\?\.has_more[\s\S]{0,2000}\}/.exec(source);
+  return loopMatch?.[0] || '';
+}
+
+function assertIssuePaginationLoadsAllPages(source) {
+  const block = extractIssuePaginationBlock(source);
+  if (!block) throw new Error('loadAll must use a loadIssues helper or issue pagination loop');
+  if (!/api\.issues\s*\(/s.test(block)) throw new Error('issue pagination must call api.issues');
+  if (!/query\.set\(\s*['"]cursor['"]\s*,\s*cursor\s*\)|api\.issues\s*\([^)]*cursor/s.test(block)) throw new Error('issue pagination must pass cursor to api.issues requests');
+  if (!/\bcursor\s*=\s*page\.page\?\.next_cursor/s.test(block)) throw new Error('issue pagination must advance cursor from page.page?.next_cursor');
+  if (!/page\.page\?\.has_more/s.test(block)) throw new Error('issue pagination must read page.page?.has_more');
+  const apiIndex = block.search(/api\.issues\s*\(/s);
+  const itemsIndex = block.search(/page\.items/s);
+  const hasMoreIndex = block.search(/page\.page\?\.has_more/s);
+  if (itemsIndex < 0 || itemsIndex < apiIndex || itemsIndex > hasMoreIndex) throw new Error('issue pagination must accumulate page.items before deciding pagination is complete');
+}
+
 for (const action of ['create issue','update issue','transition issue','dispatch eligible issue','send to rework','mark done','diagnostics export']) {
   if (!inv.required_actions.includes(action)) throw new Error(`missing ${action}`);
 }
@@ -45,6 +73,8 @@ if (!/setData\(emptyData\)/s.test(app)) throw new Error('dashboard must clear pr
 if (!/authEpochRef\s*=\s*useRef\(0\)/s.test(app)) throw new Error('dashboard must track auth epoch for protected data requests');
 if (!/authEpochRef\.current\s*\+=\s*1[\s\S]*setData\(emptyData\)/s.test(app)) throw new Error('markUnauthenticated must advance auth epoch before clearing protected data');
 if (!/const requestAuthEpoch\s*=\s*authEpochRef\.current[\s\S]*authEpochRef\.current\s*!==\s*requestAuthEpoch[\s\S]*setData/s.test(app)) throw new Error('loadAll must skip stale protected data commits after auth epoch changes');
+if (/api\.issues\('\?limit=200'\)/s.test(app)) throw new Error('loadAll must not fetch only the first issue page');
+assertIssuePaginationLoadsAllPages(app);
 if (!app.includes('Update issue')) throw new Error('missing issue update UI');
 if (/const issue = issueByIdOrRef\([^;]+?\)\s*\|\|\s*issues\[0\]/s.test(app)) throw new Error('issue deep link falls back to first issue');
 if (/const run = runs\.find\([^;]+?\)\s*\|\|\s*runs\[0\]/s.test(app)) throw new Error('run deep link falls back to first run');

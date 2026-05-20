@@ -1079,7 +1079,7 @@ func (s *Server) exchangeOpenToken(openToken string) (string, string, error) {
 		if err != nil {
 			return err
 		}
-		if row["expires_at"].String() < now {
+		if expiredAtOrBefore(row["expires_at"].String(), now) {
 			return core.NewError(core.ErrUnauthorized, "open token expired", nil)
 		}
 		if err := tx.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,csrf_hash,user_label,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("ses_"), s.Store.ProjectID, "browser", security.HashToken(sessionToken), security.HashToken(s.csrfToken), "local-dashboard", now, expiresAt); err != nil {
@@ -1136,7 +1136,7 @@ func (s *Server) rotateBearerSession(token string) (string, *string, error) {
 		if !row["revoked_at"].Null && row["revoked_at"].String() != "" {
 			return core.NewError(core.ErrUnauthorized, "bearer token revoked", nil)
 		}
-		if !row["expires_at"].Null && row["expires_at"].String() != "" && row["expires_at"].String() < now {
+		if !row["expires_at"].Null && row["expires_at"].String() != "" && expiredAtOrBefore(row["expires_at"].String(), now) {
 			return core.NewError(core.ErrUnauthorized, "bearer token expired", nil)
 		}
 		if !row["expires_at"].Null && row["expires_at"].String() != "" {
@@ -1197,18 +1197,36 @@ func (s *Server) validStoredSession(tokenHash string, kinds ...string) bool {
 		placeholders = append(placeholders, "?")
 		args = append(args, kind)
 	}
-	row, err := s.Store.App.QueryOne(`SELECT id,expires_at,revoked_at FROM local_sessions WHERE project_id=? AND token_hash=? AND kind IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	row, err := s.Store.App.QueryOne(`SELECT id,kind,expires_at,revoked_at FROM local_sessions WHERE project_id=? AND token_hash=? AND kind IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {
 		return false
 	}
 	if !row["revoked_at"].Null && row["revoked_at"].String() != "" {
 		return false
 	}
-	if !row["expires_at"].Null && row["expires_at"].String() != "" && row["expires_at"].String() < core.Now() {
+	expiresAt := row["expires_at"]
+	if row["kind"].String() == "browser" && (expiresAt.Null || expiresAt.String() == "") {
 		return false
+	}
+	if !expiresAt.Null && expiresAt.String() != "" {
+		if expiredAtOrBefore(expiresAt.String(), core.Now()) {
+			return false
+		}
 	}
 	_ = s.Store.App.Exec(`UPDATE local_sessions SET last_seen_at=? WHERE id=?`, core.Now(), row["id"].String())
 	return true
+}
+
+func expiredAtOrBefore(expiresAt, now string) bool {
+	expires, err := time.Parse(time.RFC3339Nano, expiresAt)
+	if err != nil {
+		return true
+	}
+	current, err := time.Parse(time.RFC3339Nano, now)
+	if err != nil {
+		return true
+	}
+	return !expires.After(current)
 }
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token, expiresAt string) {

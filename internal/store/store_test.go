@@ -453,6 +453,25 @@ func TestCancelRunRollsBackWhenCancelledEventAppendFails(t *testing.T) {
 	}
 }
 
+func TestValidateToolTokenRejectsMalformedExpiry(t *testing.T) {
+	st := newStoreTestStore(t)
+	_, run := prepareActiveRun(t, st, "Malformed tool token expiry")
+	if err := st.UpdateRunStatus(run.ID, core.RunRunning, nil); err != nil {
+		t.Fatalf("UpdateRunStatus: %v", err)
+	}
+	if _, err := st.CreateToolToken(run.ID, "token-hash-malformed-expiry", map[string]any{"workspace": "/tmp/workspace"}, "not-rfc3339"); err != nil {
+		t.Fatalf("CreateToolToken: %v", err)
+	}
+
+	_, _, err := st.ValidateToolToken("token-hash-malformed-expiry")
+	if err == nil {
+		t.Fatal("ValidateToolToken succeeded, want tool_token_invalid")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrToolTokenInvalid {
+		t.Fatalf("ValidateToolToken error code = %s, want %s", got, core.ErrToolTokenInvalid)
+	}
+}
+
 func TestCreateToolTokenRejectsCancelledRun(t *testing.T) {
 	st := newStoreTestStore(t)
 	_, run := prepareCancelledRun(t, st)

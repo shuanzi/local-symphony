@@ -1222,7 +1222,7 @@ func (s *Store) ValidateToolTokenWithScope(tokenHash string) (runID, issueID str
 	if !row["revoked_at"].Null && row["revoked_at"].String() != "" {
 		return "", "", nil, core.NewError(core.ErrToolTokenInvalid, "tool token revoked", nil)
 	}
-	if row["expires_at"].String() < time.Now().UTC().Format(time.RFC3339Nano) {
+	if toolTokenExpiredAtOrBefore(row["expires_at"].String(), time.Now().UTC()) {
 		return "", "", nil, core.NewError(core.ErrToolTokenInvalid, "tool token expired", nil)
 	}
 	if core.RunStatus(row["run_status"].String()) != core.RunRunning {
@@ -1237,6 +1237,15 @@ func (s *Store) ValidateToolTokenWithScope(tokenHash string) (runID, issueID str
 	_ = s.Project.Exec(`UPDATE run_tool_tokens SET last_used_at=? WHERE id=?`, core.Now(), row["id"].String())
 	return row["run_id"].String(), row["issue_id"].String(), scope, nil
 }
+
+func toolTokenExpiredAtOrBefore(expiresAt string, now time.Time) bool {
+	expires, err := time.Parse(time.RFC3339Nano, expiresAt)
+	if err != nil {
+		return true
+	}
+	return !expires.After(now)
+}
+
 func (s *Store) RecordToolCall(issueID, runID, tool, status string, input, output any, errCode, errMsg string) error {
 	now := core.Now()
 	ended := now
