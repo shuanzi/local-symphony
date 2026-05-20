@@ -148,6 +148,89 @@ Do the work.
 	}
 }
 
+func TestLoadPathHonorsAgentMaxTurnsAliasWhenMaxTurnsPerRunUnset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "WORKFLOW.md")
+	content := `---
+agent:
+  max_turns: 1
+  max_handoff_continuations: 0
+---
+Do the work.
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	w, err := LoadPath(path, dir)
+	if err != nil {
+		t.Fatalf("LoadPath returned error: %v", err)
+	}
+	if !w.Validation.Valid {
+		t.Fatalf("Validation.Valid = false, errors = %v", w.Validation.Errors)
+	}
+	if got := w.Config.Agent.MaxTurnsPerRun; got != 1 {
+		t.Fatalf("agent.max_turns_per_run = %d, want 1", got)
+	}
+}
+
+func TestLoadPathPrefersAgentMaxTurnsPerRunOverAlias(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "WORKFLOW.md")
+	content := `---
+agent:
+  max_turns_per_run: 1
+  max_turns: 2
+  max_handoff_continuations: 0
+---
+Do the work.
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	w, err := LoadPath(path, dir)
+	if err != nil {
+		t.Fatalf("LoadPath returned error: %v", err)
+	}
+	if !w.Validation.Valid {
+		t.Fatalf("Validation.Valid = false, errors = %v", w.Validation.Errors)
+	}
+	if got := w.Config.Agent.MaxTurnsPerRun; got != 1 {
+		t.Fatalf("agent.max_turns_per_run = %d, want 1", got)
+	}
+}
+
+func TestLoadPathInvalidAgentMaxTurnsPerRunIsNotMaskedByAlias(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "WORKFLOW.md")
+	content := `---
+agent:
+  max_turns_per_run: bad
+  max_turns: 1
+  max_handoff_continuations: 0
+---
+Do the work.
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	w, err := LoadPath(path, dir)
+	if err != nil {
+		t.Fatalf("LoadPath returned error: %v", err)
+	}
+	if w.Validation.Valid {
+		t.Fatalf("Validation.Valid = true, want false")
+	}
+	if !slices.Contains(w.Validation.Errors, "max_turns_per_run must be integer") {
+		t.Fatalf("Validation.Errors = %v, want max_turns_per_run integer error", w.Validation.Errors)
+	}
+	if got := w.Config.Agent.MaxTurnsPerRun; got != Defaults(dir).Agent.MaxTurnsPerRun {
+		t.Fatalf("agent.max_turns_per_run = %d, want default after invalid explicit field", got)
+	}
+}
+
 func TestLoadPathExpandsOnlyCurrentUserHome(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {

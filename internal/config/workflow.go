@@ -328,10 +328,11 @@ func applyMap(c *EffectiveConfig, m map[string]any, baseDir string, warnings, er
 		if v, ok := intv(a, "max_handoff_continuations", errors); ok {
 			c.Agent.MaxHandoffContinuations = v
 		}
+		_, hasMaxTurnsPerRun := a["max_turns_per_run"]
 		if v, ok := intv(a, "max_turns_per_run", errors); ok {
 			c.Agent.MaxTurnsPerRun = v
 		}
-		if v, ok := intv(a, "max_turns", errors); ok && c.Agent.MaxTurnsPerRun == 0 {
+		if v, ok := intv(a, "max_turns", errors); ok && !hasMaxTurnsPerRun {
 			c.Agent.MaxTurnsPerRun = v
 		}
 		if v, ok := boolv(a, "handoff_required", errors); ok {

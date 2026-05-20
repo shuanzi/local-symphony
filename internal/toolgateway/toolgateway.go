@@ -577,7 +577,10 @@ func HTTPClientCall(endpoint, token string, req Request) Response {
 		req.Input = map[string]any{}
 	}
 	b, _ := json.Marshal(req)
-	hreq, _ := http.NewRequest("POST", strings.TrimRight(endpoint, "/")+"/tool/v1/call", bytes.NewReader(b))
+	hreq, err := http.NewRequest("POST", strings.TrimRight(endpoint, "/")+"/tool/v1/call", bytes.NewReader(b))
+	if err != nil {
+		return errResp(string(core.ErrToolGatewayFailed), err.Error(), nil)
+	}
 	hreq.Header.Set("Authorization", "Bearer "+token)
 	hreq.Header.Set("Content-Type", "application/json")
 	if cwd, err := os.Getwd(); err == nil {

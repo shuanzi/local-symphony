@@ -2324,6 +2324,75 @@ func TestArtifactContentDoesNotServeSymlinkOutsideAllowedRoots(t *testing.T) {
 	}
 }
 
+func TestArtifactRoutesRejectNonGETMethods(t *testing.T) {
+	srv := newTestServer(t)
+	artifactsDir := filepath.Join(srv.Store.RepoRoot, ".symphony", "artifacts")
+	if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
+		t.Fatalf("mkdir artifacts: %v", err)
+	}
+	artifactPath := filepath.Join(artifactsDir, "method.txt")
+	if err := os.WriteFile(artifactPath, []byte("allowed artifact content"), 0o644); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_method", Kind: "diagnostic", Path: artifactPath, Redacted: true}); err != nil {
+		t.Fatalf("InsertArtifact: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+
+	for _, method := range []string{http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete} {
+		for _, path := range []string{"/api/v1/artifacts/art_method", "/api/v1/artifacts/art_method/content"} {
+			t.Run(method+" "+path, func(t *testing.T) {
+				req := httptest.NewRequest(method, path, nil)
+				applySessionAuth(req, auth)
+				rec := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusMethodNotAllowed {
+					t.Fatalf("artifact route status = %d, want 405; body = %s", rec.Code, rec.Body.String())
+				}
+				if strings.Contains(rec.Body.String(), "art_method") || strings.Contains(rec.Body.String(), "allowed artifact content") {
+					t.Fatalf("artifact route returned artifact body for %s %s: %s", method, path, rec.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestArtifactRawContentReturnsForbiddenWithoutLeakingContent(t *testing.T) {
+	srv := newTestServer(t)
+	artifactsDir := filepath.Join(srv.Store.RepoRoot, ".symphony", "artifacts")
+	if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
+		t.Fatalf("mkdir artifacts: %v", err)
+	}
+	rawPath := filepath.Join(artifactsDir, "raw.log")
+	if err := os.WriteFile(rawPath, []byte("raw secret log content"), 0o644); err != nil {
+		t.Fatalf("write raw artifact: %v", err)
+	}
+	if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_raw", Kind: "codex_log", Path: rawPath, Redacted: false}); err != nil {
+		t.Fatalf("InsertArtifact raw: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/art_raw/content", nil)
+	addCookies(req, sessionAuth(t, srv).cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("raw artifact status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "raw secret log content") {
+		t.Fatalf("raw artifact response leaked content: %s", rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	errData := payload["error"].(map[string]any)
+	if got := errData["code"]; got != string(core.ErrRawLogAccessUnsupported) {
+		t.Fatalf("error code = %v, want %s; body = %s", got, core.ErrRawLogAccessUnsupported, rec.Body.String())
+	}
+	if _, ok := payload["data"]; ok {
+		t.Fatalf("raw artifact returned success data: %#v", payload)
+	}
+}
+
 func TestArtifactContentMissingFileUnderAllowedRootReturnsNotFound(t *testing.T) {
 	srv := newTestServer(t)
 	artifactsDir := filepath.Join(srv.Store.RepoRoot, ".symphony", "artifacts")

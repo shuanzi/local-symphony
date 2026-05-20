@@ -86,6 +86,17 @@ func TestHTTPClientCallReturnsToolGatewayFailedOnTimeout(t *testing.T) {
 	}
 }
 
+func TestHTTPClientCallReturnsToolGatewayFailedOnMalformedEndpoint(t *testing.T) {
+	resp := HTTPClientCall("://bad", "token", Request{Tool: "issue.get"})
+
+	if resp.Success {
+		t.Fatal("HTTPClientCall success = true, want malformed endpoint failure")
+	}
+	if resp.Error == nil || resp.Error.Code != string(core.ErrToolGatewayFailed) {
+		t.Fatalf("HTTPClientCall error = %#v, want %s", resp.Error, core.ErrToolGatewayFailed)
+	}
+}
+
 func TestArtifactAttachReturnsFailureAndDoesNotInsertArtifactWhenWriteFails(t *testing.T) {
 	st := newGatewayTestStore(t)
 	issue, run, workspace := prepareGatewayRun(t, st)

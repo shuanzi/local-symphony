@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"local-symphony/internal/app"
 	"local-symphony/internal/core"
@@ -319,6 +320,28 @@ func TestOpenDescriptorMintsDashboardOpenToken(t *testing.T) {
 	dashboardURL, _ := desc["dashboard_url"].(string)
 	if !strings.HasPrefix(dashboardURL, server.URL+"/?open_token=open_test_token") {
 		t.Fatalf("dashboard_url = %q", dashboardURL)
+	}
+}
+
+func TestRequestOpenTokenReturnsErrorWithShortTimeoutClient(t *testing.T) {
+	oldClient := openTokenHTTPClient
+	openTokenHTTPClient = &http.Client{Timeout: 10 * time.Millisecond}
+	t.Cleanup(func() { openTokenHTTPClient = oldClient })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+
+	start := time.Now()
+	_, err := requestOpenToken(server.URL, "cli-token")
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Fatalf("requestOpenToken took %s, want bounded timeout", elapsed)
+	}
+	if err == nil {
+		t.Fatal("requestOpenToken succeeded, want timeout error")
 	}
 }
 

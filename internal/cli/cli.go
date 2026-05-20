@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"local-symphony/internal/app"
 	"local-symphony/internal/config"
@@ -21,6 +22,8 @@ import (
 	"local-symphony/internal/store"
 	"local-symphony/internal/toolgateway"
 )
+
+var openTokenHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 func Main(args []string) int {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "help" {
@@ -182,7 +185,7 @@ func requestOpenToken(apiURL, token string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := openTokenHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}

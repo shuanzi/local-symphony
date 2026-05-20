@@ -760,6 +760,10 @@ func (s *Server) reviewRoutes(w http.ResponseWriter, r *http.Request, rest strin
 }
 func (s *Server) artifactRoutes(w http.ResponseWriter, r *http.Request, rest string) {
 	parts := strings.Split(rest, "/")
+	if r.Method != http.MethodGet {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
+		return
+	}
 	art, err := s.Store.GetArtifact(parts[0])
 	if err != nil {
 		apiErr(w, err)
@@ -771,7 +775,7 @@ func (s *Server) artifactRoutes(w http.ResponseWriter, r *http.Request, rest str
 	}
 	if len(parts) == 2 && parts[1] == "content" {
 		if art.Kind == "codex_log" || art.Kind == "prompt_snapshot" {
-			apiErr(w, core.NewError(core.ErrRawLogAccessUnsupported, "raw prompt/log access is not supported", nil))
+			apiErrWithStatus(w, http.StatusForbidden, core.NewError(core.ErrRawLogAccessUnsupported, "raw prompt/log access is not supported", nil))
 			return
 		}
 		root1 := filepath.Join(s.Store.RepoRoot, ".symphony", "artifacts")
@@ -967,6 +971,10 @@ func apiErr(w http.ResponseWriter, err error) {
 	if ae.Code == core.ErrInternal {
 		status = 500
 	}
+	apiErrWithStatus(w, status, err)
+}
+func apiErrWithStatus(w http.ResponseWriter, status int, err error) {
+	ae := core.AsAPIError(err)
 	writeJSON(w, status, core.ErrorEnvelope{Error: map[string]any{"code": ae.Code, "message": ae.Message, "details": ae.Details, "request_id": core.NewID("req_")}})
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
