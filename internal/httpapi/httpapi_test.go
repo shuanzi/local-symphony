@@ -1916,6 +1916,58 @@ func TestRunEventStreamUnknownRunReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestScopedEventStreamsRejectNonGETMethods(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Scoped stream methods", Description: "desc"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.Identifier, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	auth := sessionAuth(t, srv)
+	tests := []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodHead, path: "/api/v1/issues/" + issue.Identifier + "/events/stream"},
+		{method: http.MethodPost, path: "/api/v1/issues/" + issue.Identifier + "/events/stream"},
+		{method: http.MethodHead, path: "/api/v1/runs/" + run.ID + "/events/stream"},
+		{method: http.MethodPost, path: "/api/v1/runs/" + run.ID + "/events/stream"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req := httptest.NewRequest(tt.method, tt.path, nil).WithContext(ctx)
+			applySessionAuth(req, auth)
+			rec := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				srv.Handler().ServeHTTP(rec, req)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(50 * time.Millisecond):
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(250 * time.Millisecond):
+					t.Fatal("stream route did not return after context cancellation")
+				}
+			}
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("stream status = %d, want 405; body = %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestEventStreamReturnsInternalErrorWhenInitialQueryFails(t *testing.T) {
 	srv := newTestServer(t)
 	auth := sessionAuth(t, srv)

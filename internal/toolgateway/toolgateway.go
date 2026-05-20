@@ -499,7 +499,7 @@ func canonicalHandoff(in map[string]any) (map[string]any, error) {
 	if target != "Human Review" {
 		return nil, core.NewError(core.ErrInvalidRequest, "target_state must be Human Review", nil)
 	}
-	changedFiles, err := requiredStringSlice(in, "changed_files")
+	changedFiles, err := requiredNonBlankStringSlice(in, "changed_files")
 	if err != nil {
 		return nil, err
 	}
@@ -600,7 +600,9 @@ func HTTPClientCall(endpoint, token string, req Request) Response {
 }
 
 type TokenOptions struct {
-	ArtifactMaxBytes int64
+	ArtifactMaxBytes  int64
+	DisableFollowups  bool
+	DisableIssueBlock bool
 }
 
 func NewTokenForRun(st *store.Store, run *core.RunAttempt, workspacePath string) (string, error) {
@@ -614,6 +616,20 @@ func NewTokenForRunWithOptions(st *store.Store, run *core.RunAttempt, workspaceP
 	if artifactMaxBytes <= 0 {
 		artifactMaxBytes = defaultArtifactMaxBytes
 	}
-	_, err := st.CreateToolToken(run.ID, security.HashToken(token), map[string]any{"run_id": run.ID, "issue_id": run.IssueID, "workspace_path": workspacePath, "tools": Registry, "artifact_max_bytes": artifactMaxBytes}, expires)
+	_, err := st.CreateToolToken(run.ID, security.HashToken(token), map[string]any{"run_id": run.ID, "issue_id": run.IssueID, "workspace_path": workspacePath, "tools": scopedRegistry(opts), "artifact_max_bytes": artifactMaxBytes}, expires)
 	return token, err
+}
+
+func scopedRegistry(opts TokenOptions) []string {
+	tools := make([]string, 0, len(Registry))
+	for _, tool := range Registry {
+		if opts.DisableIssueBlock && tool == "issue.block" {
+			continue
+		}
+		if opts.DisableFollowups && tool == "followup.create" {
+			continue
+		}
+		tools = append(tools, tool)
+	}
+	return tools
 }

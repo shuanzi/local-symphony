@@ -530,6 +530,10 @@ func (s *Server) issueRoutes(w http.ResponseWriter, r *http.Request, rest string
 			}
 		case "events":
 			if len(parts) == 3 && parts[2] == "stream" {
+				if r.Method != http.MethodGet {
+					http.Error(w, "method", http.StatusMethodNotAllowed)
+					return
+				}
 				iss, err := s.Store.GetIssue(ref)
 				if err != nil {
 					apiErr(w, err)
@@ -563,6 +567,10 @@ func (s *Server) runRoutes(w http.ResponseWriter, r *http.Request, rest string) 
 				return
 			}
 			if len(parts) == 3 && parts[2] == "stream" {
+				if r.Method != http.MethodGet {
+					http.Error(w, "method", http.StatusMethodNotAllowed)
+					return
+				}
 				if _, err := s.Store.GetRun(id); err != nil {
 					apiErr(w, err)
 					return

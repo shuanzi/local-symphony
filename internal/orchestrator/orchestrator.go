@@ -105,7 +105,11 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	if !o.advanceRun(runID, core.RunStartingAgent, map[string]any{}) {
 		return nil
 	}
-	token, err := toolgateway.NewTokenForRunWithOptions(o.Store, run, ws.Path, toolgateway.TokenOptions{ArtifactMaxBytes: wf.Config.Tools.ArtifactMaxBytes})
+	token, err := toolgateway.NewTokenForRunWithOptions(o.Store, run, ws.Path, toolgateway.TokenOptions{
+		ArtifactMaxBytes:  wf.Config.Tools.ArtifactMaxBytes,
+		DisableFollowups:  !wf.Config.Tools.AgentCanCreateFollowups,
+		DisableIssueBlock: !wf.Config.Tools.AgentCanSetBlocked,
+	})
 	if err != nil {
 		_ = o.Store.FailRun(runID, core.FailureToolGatewayFailed, err.Error(), core.RunFailed)
 		return nil

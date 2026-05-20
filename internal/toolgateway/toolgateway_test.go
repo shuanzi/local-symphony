@@ -400,6 +400,68 @@ func TestCallAllowsIssueGetButRejectsCommentOutsideTokenScope(t *testing.T) {
 	}
 }
 
+func TestNewTokenForRunWithOptionsFiltersDisabledTools(t *testing.T) {
+	tests := []struct {
+		name      string
+		opts      TokenOptions
+		req       Request
+		assertion func(t *testing.T, st *store.Store, run *core.RunAttempt)
+	}{
+		{
+			name: "issue.block disabled",
+			opts: TokenOptions{DisableIssueBlock: true},
+			req: Request{
+				Tool:  "issue.block",
+				Input: map[string]any{"reason": "must not block"},
+			},
+			assertion: func(t *testing.T, st *store.Store, run *core.RunAttempt) {
+				t.Helper()
+				issue, err := st.GetIssue(run.IssueID)
+				if err != nil {
+					t.Fatalf("GetIssue: %v", err)
+				}
+				if issue.State == core.StateBlocked {
+					t.Fatalf("issue state = %s, want not blocked", issue.State)
+				}
+			},
+		},
+		{
+			name: "followup.create disabled",
+			opts: TokenOptions{DisableFollowups: true},
+			req: Request{
+				Tool:  "followup.create",
+				Input: map[string]any{"title": "must not create followup"},
+			},
+			assertion: func(t *testing.T, st *store.Store, run *core.RunAttempt) {
+				t.Helper()
+				assertIssueCount(t, st, 1)
+				assertFollowupRelationCount(t, st, 0)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newGatewayTestStore(t)
+			_, run, workspace := prepareGatewayRun(t, st)
+			token, err := NewTokenForRunWithOptions(st, run, workspace, tt.opts)
+			if err != nil {
+				t.Fatalf("NewTokenForRunWithOptions: %v", err)
+			}
+
+			resp := (Gateway{Store: st}).Call(token, workspace, tt.req)
+
+			if resp.Success {
+				t.Fatalf("%s success = true, want scope failure", tt.req.Tool)
+			}
+			if resp.Error == nil || resp.Error.Code != string(core.ErrForbidden) {
+				t.Fatalf("%s error = %#v, want %s", tt.req.Tool, resp.Error, core.ErrForbidden)
+			}
+			tt.assertion(t, st, run)
+			assertToolCallCount(t, st, run.ID, 0)
+		})
+	}
+}
+
 func TestCallRejectsAdditionalInputPropertiesBeforeDispatch(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -596,6 +658,13 @@ func TestHandoffSubmitRejectsInvalidListFieldsWithoutCreatingHandoff(t *testing.
 			input: map[string]any{
 				"summary":       "completed work",
 				"changed_files": []any{"ok", 123},
+			},
+		},
+		{
+			name: "changed_files contains blank item",
+			input: map[string]any{
+				"summary":       "completed work",
+				"changed_files": []any{"ok", " "},
 			},
 		},
 		{

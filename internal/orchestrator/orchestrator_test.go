@@ -79,6 +79,8 @@ func TestRunWorkerStoresWorkflowArtifactMaxBytesInToolTokenScope(t *testing.T) {
 	}
 	cfg := config.Defaults(st.RepoRoot)
 	cfg.Tools.ArtifactMaxBytes = 1234
+	cfg.Tools.AgentCanCreateFollowups = false
+	cfg.Tools.AgentCanSetBlocked = false
 	wf := &config.Workflow{
 		Path:       filepath.Join(st.RepoRoot, "WORKFLOW.md"),
 		Config:     cfg,
@@ -100,6 +102,17 @@ func TestRunWorkerStoresWorkflowArtifactMaxBytesInToolTokenScope(t *testing.T) {
 	}
 	if got := int64(scope["artifact_max_bytes"].(float64)); got != cfg.Tools.ArtifactMaxBytes {
 		t.Fatalf("artifact_max_bytes = %d, want %d", got, cfg.Tools.ArtifactMaxBytes)
+	}
+	tools, ok := scope["tools"].([]any)
+	if !ok {
+		t.Fatalf("tools scope = %#v, want array", scope["tools"])
+	}
+	for _, denied := range []string{"issue.block", "followup.create"} {
+		for _, tool := range tools {
+			if tool == denied {
+				t.Fatalf("tools scope includes disabled tool %q: %#v", denied, tools)
+			}
+		}
 	}
 }
 
