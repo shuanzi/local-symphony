@@ -82,7 +82,9 @@ func WorktreeAdd(repoRoot, path, branch, startPoint string) error {
 
 func copyWorkspace(src, dst string) error {
 	if _, err := os.Stat(dst); err == nil {
-		return nil
+		return fmt.Errorf("workspace path already exists: %s", dst)
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
@@ -92,11 +94,11 @@ func copyWorkspace(src, dst string) error {
 			return err
 		}
 		rel, _ := filepath.Rel(src, p)
-		if rel == "." || strings.HasPrefix(rel, ".symphony") || strings.HasPrefix(rel, ".git") {
-			if d.IsDir() && (rel == ".git" || strings.HasPrefix(rel, ".symphony")) {
-				return filepath.SkipDir
-			}
+		if rel == "." {
 			return nil
+		}
+		if d.IsDir() && (rel == ".git" || rel == ".symphony") {
+			return filepath.SkipDir
 		}
 		target := filepath.Join(dst, rel)
 		if d.IsDir() {

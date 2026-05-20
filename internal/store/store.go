@@ -396,6 +396,14 @@ func (s *Store) appendEventInTx(q sqlRunner, eventType, actor string, issueID, r
 	return q.Exec(`INSERT INTO run_events(id,project_id,issue_id,run_id,event_type,actor_type,data_json,redacted,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, core.NewID("evt_"), s.ProjectID, issueID, runID, eventType, actor, encodeJSON(data), 1, core.Now())
 }
 
+func rowsChanged(q sqlRunner) (int, error) {
+	row, err := q.QueryOne(`SELECT changes() AS n`)
+	if err != nil {
+		return 0, err
+	}
+	return row["n"].Int(), nil
+}
+
 func (s *Store) issueRowByRef(ref string) (map[string]db.Value, error) {
 	return s.issueRowByRefTx(s.Project, ref)
 }
@@ -932,6 +940,9 @@ func (s *Store) DispatchPause(ref, reason string) (*core.Issue, error) {
 		if active != nil {
 			return core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
 		}
+		if err := tx.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), id, "operator", reason, now); err != nil {
+			return err
+		}
 		return s.appendEventInTx(tx, "issue.dispatch_paused", "operator", &id, nil, map[string]any{"reason": reason})
 	}); err != nil {
 		return nil, err
@@ -970,6 +981,9 @@ func (s *Store) DispatchResume(ref, reason string) (*core.Issue, error) {
 		}
 		if active != nil {
 			return core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
+		}
+		if err := tx.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), id, "operator", reason, now); err != nil {
+			return err
 		}
 		return s.appendEventInTx(tx, "issue.dispatch_resumed", "operator", &id, nil, map[string]any{"reason": reason})
 	}); err != nil {
@@ -1681,55 +1695,111 @@ func (s *Store) reviewAction(issueRef, reason string, target core.IssueState) (*
 	if reason == "" {
 		return nil, core.NewError(core.ErrInvalidRequest, "reason is required", nil)
 	}
-	issue, err := s.GetIssue(issueRef)
-	if err != nil {
-		return nil, err
-	}
-	if issue.State != core.StateHumanReview {
-		return nil, core.NewError(core.ErrInvalidStateTransition, "issue is not in Human Review", nil)
-	}
-	active, err := s.activeRunID(issue.ID)
-	if err != nil {
-		return nil, err
-	}
-	if active != nil {
-		return nil, core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
-	}
-	rp, err := s.ReviewPacketRow(issue.ID)
-	if err != nil {
-		return nil, err
-	}
-	if rp["status"].String() != "generated" {
-		return nil, core.NewError(core.ErrReviewPacketRequired, "latest review packet is not generated", nil)
-	}
-	run, err := s.GetRun(rp["run_id"].String())
-	if err != nil || run.Status != core.RunCompleted {
-		return nil, core.NewError(core.ErrReviewPacketRequired, "latest review packet does not belong to latest completed handoff run", nil)
-	}
 	now := core.Now()
+	var issueID string
 	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		issue, err := s.issueRowByRefTx(tx, issueRef)
+		if err != nil {
+			return err
+		}
+		issueID = issue["id"].String()
+		if core.IssueState(issue["state"].String()) != core.StateHumanReview {
+			return core.NewError(core.ErrInvalidStateTransition, "issue is not in Human Review", nil)
+		}
+		active, err := s.activeRunIDTx(tx, issueID)
+		if err != nil {
+			return err
+		}
+		if active != nil {
+			return core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
+		}
+		rp, err := tx.QueryOne(`SELECT * FROM review_packets WHERE issue_id=? ORDER BY packet_no DESC LIMIT 1`, issueID)
+		if errors.Is(err, os.ErrNotExist) {
+			return core.NewError(core.ErrReviewPacketRequired, "review packet required", nil)
+		}
+		if err != nil {
+			return err
+		}
+		reviewPacketID := rp["id"].String()
+		if issue["latest_review_packet_id"].String() != reviewPacketID {
+			return core.NewError(core.ErrReviewPacketRequired, "latest review packet does not match issue", nil)
+		}
+		if rp["status"].String() != "generated" {
+			return core.NewError(core.ErrReviewPacketRequired, "latest review packet is not generated", nil)
+		}
+		runID := rp["run_id"].String()
+		run, err := s.getRunTx(tx, runID)
+		if err != nil || run.Status != core.RunCompleted {
+			return core.NewError(core.ErrReviewPacketRequired, "latest review packet does not belong to latest completed handoff run", nil)
+		}
 		var completedAt any = nil
 		if target == core.StateDone {
 			completedAt = now
 		}
-		if err := tx.Exec(`UPDATE issues SET state=?, completed_at=?, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL, updated_at=? WHERE id=?`, string(target), completedAt, now, issue.ID); err != nil {
+		if err := tx.Exec(`UPDATE issues SET state=?, completed_at=?, dispatch_paused=0, dispatch_pause_reason=NULL, dispatch_paused_at=NULL, updated_at=?
+WHERE id=? AND state=? AND latest_review_packet_id=? AND NOT EXISTS (
+	SELECT 1 FROM run_attempts
+	WHERE issue_id=? AND status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running')
+)`, string(target), completedAt, now, issueID, string(core.StateHumanReview), reviewPacketID, issueID); err != nil {
 			return err
 		}
-		if err := tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), issue.ID, string(core.StateHumanReview), string(target), "operator", reason, now); err != nil {
+		changed, err := rowsChanged(tx)
+		if err != nil {
 			return err
 		}
-		if err := tx.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), issue.ID, "operator", reason, now); err != nil {
+		if changed != 1 {
+			active, err := s.activeRunIDTx(tx, issueID)
+			if err != nil {
+				return err
+			}
+			if active != nil {
+				return core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
+			}
+			cur, err := tx.QueryOne(`SELECT state, latest_review_packet_id FROM issues WHERE id=?`, issueID)
+			if err != nil {
+				return err
+			}
+			if core.IssueState(cur["state"].String()) != core.StateHumanReview {
+				return core.NewError(core.ErrInvalidStateTransition, "issue is not in Human Review", nil)
+			}
+			return core.NewError(core.ErrReviewPacketRequired, "latest review packet does not match issue", nil)
+		}
+		active, err = s.activeRunIDTx(tx, issueID)
+		if err != nil {
+			return err
+		}
+		if active != nil {
+			return core.NewError(core.ErrIssueAlreadyRunning, "issue has an active run", nil)
+		}
+		latest, err := tx.QueryOne(`SELECT * FROM review_packets WHERE issue_id=? ORDER BY packet_no DESC LIMIT 1`, issueID)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return core.NewError(core.ErrReviewPacketRequired, "review packet required", nil)
+			}
+			return err
+		}
+		if latest["id"].String() != reviewPacketID || latest["status"].String() != "generated" {
+			return core.NewError(core.ErrReviewPacketRequired, "latest review packet is not generated", nil)
+		}
+		run, err = s.getRunTx(tx, runID)
+		if err != nil || run.Status != core.RunCompleted {
+			return core.NewError(core.ErrReviewPacketRequired, "latest review packet does not belong to latest completed handoff run", nil)
+		}
+		if err := tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), issueID, string(core.StateHumanReview), string(target), "operator", reason, now); err != nil {
+			return err
+		}
+		if err := tx.Exec(`INSERT INTO issue_comments(id,issue_id,author_type,body,created_at) VALUES(?,?,?,?,?)`, core.NewID("com_"), issueID, "operator", reason, now); err != nil {
 			return err
 		}
 		event := "review.sent_to_rework"
 		if target == core.StateDone {
 			event = "review.marked_done"
 		}
-		if err := s.appendEventInTx(tx, event, "operator", &issue.ID, nil, map[string]any{"reason": reason}); err != nil {
+		if err := s.appendEventInTx(tx, event, "operator", &issueID, nil, map[string]any{"reason": reason}); err != nil {
 			return err
 		}
 		if target == core.StateDone {
-			if err := s.appendEventInTx(tx, "issue.completed", "operator", &issue.ID, nil, map[string]any{"reason": reason}); err != nil {
+			if err := s.appendEventInTx(tx, "issue.completed", "operator", &issueID, nil, map[string]any{"reason": reason}); err != nil {
 				return err
 			}
 		}
@@ -1737,7 +1807,7 @@ func (s *Store) reviewAction(issueRef, reason string, target core.IssueState) (*
 	}); err != nil {
 		return nil, err
 	}
-	return s.GetIssue(issue.ID)
+	return s.GetIssue(issueID)
 }
 
 func (s *Store) PendingApprovals() ([]map[string]any, error) {
@@ -1755,29 +1825,35 @@ func (s *Store) DecideApproval(id, status, reason string) error {
 	if status == "cancel_run" {
 		status = "cancelled"
 	}
-	row, err := s.Project.QueryOne(`SELECT * FROM approval_requests WHERE id=?`, id)
-	if errors.Is(err, os.ErrNotExist) {
-		return core.NewError(core.ErrNotFound, "approval not found", nil)
-	}
-	if err != nil {
-		return err
-	}
-	if row["status"].String() != "pending" {
-		return core.NewError(core.ErrApprovalNotPending, "approval is not pending", nil)
-	}
 	now := core.Now()
-	if status == "cancelled" {
-		return s.Project.WithTx(func(tx *db.Tx) error {
+	return s.Project.WithTx(func(tx *db.Tx) error {
+		row, err := tx.QueryOne(`SELECT * FROM approval_requests WHERE id=?`, id)
+		if errors.Is(err, os.ErrNotExist) {
+			return core.NewError(core.ErrNotFound, "approval not found", nil)
+		}
+		if err != nil {
+			return err
+		}
+		if row["status"].String() != "pending" {
+			return core.NewError(core.ErrApprovalNotPending, "approval is not pending", nil)
+		}
+		if status == "cancelled" {
 			if err := s.cancelRunInTx(tx, row["run_id"].String(), core.FailureOperatorCancelled, reason, true); err != nil {
 				return err
 			}
-			return tx.Exec(`UPDATE approval_requests SET status=?, reason=?, resolved_at=? WHERE id=?`, status, reason, now, id)
-		})
-	}
-	if err := s.Project.Exec(`UPDATE approval_requests SET status=?, reason=?, resolved_at=? WHERE id=?`, status, reason, now, id); err != nil {
-		return err
-	}
-	return nil
+		}
+		if err := tx.Exec(`UPDATE approval_requests SET status=?, reason=?, resolved_at=? WHERE id=? AND status='pending'`, status, reason, now, id); err != nil {
+			return err
+		}
+		changed, err := rowsChanged(tx)
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return core.NewError(core.ErrApprovalNotPending, "approval is not pending", nil)
+		}
+		return nil
+	})
 }
 
 func (s *Store) ReconcileStaleActiveRuns() error {

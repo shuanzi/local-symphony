@@ -514,6 +514,86 @@ func TestMarkDonePropagatesActiveRunLookupErrorWithoutChangingIssue(t *testing.T
 	}
 }
 
+func TestReviewActionRejectsActiveRunInsertedDuringUpdate(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareCompletedReviewRun(t, st)
+	if err := st.Project.Exec(`CREATE TRIGGER race_review_active_run BEFORE UPDATE OF state ON issues
+WHEN NEW.id='` + issue.ID + `' AND NEW.state='Done'
+BEGIN
+	INSERT INTO run_attempts(id,issue_id,attempt_no,status,dispatch_reason,source_issue_state,runner_kind,created_at,updated_at)
+	VALUES('run_review_race', NEW.id, 2, 'pending', 'manual', OLD.state, 'fake', NEW.updated_at, NEW.updated_at);
+END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.MarkDone(issue.ID, "done after race")
+	if err == nil {
+		t.Fatal("MarkDone succeeded, want active run error")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrIssueAlreadyRunning {
+		t.Fatalf("MarkDone error code = %s, want %s", got, core.ErrIssueAlreadyRunning)
+	}
+	assertIssueState(t, st, issue.ID, core.StateHumanReview)
+	assertRunStatus(t, st, run.ID, core.RunCompleted)
+	assertRunAttemptCount(t, st, issue.ID, 1)
+	rows, qerr := st.Project.Query(`SELECT id FROM run_events WHERE issue_id=? AND event_type IN ('review.marked_done','issue.completed')`, issue.ID)
+	if qerr != nil {
+		t.Fatalf("query review events: %v", qerr)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("review completion events = %d, want 0", len(rows))
+	}
+}
+
+func TestReviewActionRejectsReviewPacketChangedDuringUpdate(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareCompletedReviewRun(t, st)
+	reviewPacketID := latestReviewPacketID(t, st, run.ID)
+	if err := st.Project.Exec(`CREATE TRIGGER race_review_packet_status AFTER UPDATE OF state ON issues
+WHEN NEW.id='` + issue.ID + `' AND NEW.state='Rework'
+BEGIN
+	UPDATE review_packets SET status='failed' WHERE id='` + reviewPacketID + `';
+END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.SendToRework(issue.ID, "rework after packet race")
+	if err == nil {
+		t.Fatal("SendToRework succeeded, want review packet error")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrReviewPacketRequired {
+		t.Fatalf("SendToRework error code = %s, want %s", got, core.ErrReviewPacketRequired)
+	}
+	assertIssueState(t, st, issue.ID, core.StateHumanReview)
+	assertRunStatus(t, st, run.ID, core.RunCompleted)
+	row := getReviewPacketRow(t, st, reviewPacketID)
+	if row["status"].String() != "generated" {
+		t.Fatalf("review packet status = %s, want generated", row["status"].String())
+	}
+}
+
+func TestReviewActionRejectsCompletedRunChangedDuringUpdate(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareCompletedReviewRun(t, st)
+	if err := st.Project.Exec(`CREATE TRIGGER race_review_run_status AFTER UPDATE OF state ON issues
+WHEN NEW.id='` + issue.ID + `' AND NEW.state='Done'
+BEGIN
+	UPDATE run_attempts SET status='failed' WHERE id='` + run.ID + `';
+END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.MarkDone(issue.ID, "done after run race")
+	if err == nil {
+		t.Fatal("MarkDone succeeded, want review packet error")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrReviewPacketRequired {
+		t.Fatalf("MarkDone error code = %s, want %s", got, core.ErrReviewPacketRequired)
+	}
+	assertIssueState(t, st, issue.ID, core.StateHumanReview)
+	assertRunStatus(t, st, run.ID, core.RunCompleted)
+}
+
 func TestUpdateRunStatusRejectsCompletedRunWithoutChangingRunOrIssue(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareCompletedReviewRun(t, st)
@@ -1019,6 +1099,59 @@ func TestDecideApprovalCancelCancelsActiveRunAndApproval(t *testing.T) {
 	}
 }
 
+func TestDecideApprovalReturnsNotPendingWhenFinalUpdateMissesPending(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Approval final update race")
+	approvalID := insertPendingApproval(t, st, run.ID, issue.ID)
+	if err := st.Project.Exec(`CREATE TRIGGER race_approval_decision BEFORE UPDATE OF status ON approval_requests
+WHEN OLD.id='` + approvalID + `' AND NEW.status='approved'
+BEGIN
+	UPDATE approval_requests SET status='rejected', reason='other operator', resolved_at=NEW.resolved_at WHERE id=OLD.id;
+	SELECT RAISE(IGNORE);
+END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err := st.DecideApproval(approvalID, "approved", "operator approved stale request")
+	if err == nil {
+		t.Fatal("DecideApproval succeeded, want approval_not_pending")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrApprovalNotPending {
+		t.Fatalf("DecideApproval error code = %s, want %s", got, core.ErrApprovalNotPending)
+	}
+	gotApproval := getApprovalRow(t, st, approvalID)
+	if gotApproval["status"].String() != "pending" {
+		t.Fatalf("approval status = %s, want pending after rollback", gotApproval["status"].String())
+	}
+}
+
+func TestDecideApprovalCancelRunReturnsNotPendingWhenApprovalChangesBeforeFinalUpdate(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Approval cancel_run final update race")
+	approvalID := insertPendingApproval(t, st, run.ID, issue.ID)
+	if err := st.Project.Exec(`CREATE TRIGGER race_cancel_run_approval BEFORE UPDATE OF status ON run_attempts
+WHEN OLD.id='` + run.ID + `' AND NEW.status='cancelled'
+BEGIN
+	UPDATE approval_requests SET status='approved', reason='other operator', resolved_at=NEW.updated_at WHERE id='` + approvalID + `' AND status='pending';
+END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err := st.DecideApproval(approvalID, "cancel_run", "operator cancelled stale approval")
+	if err == nil {
+		t.Fatal("DecideApproval succeeded, want approval_not_pending")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrApprovalNotPending {
+		t.Fatalf("DecideApproval error code = %s, want %s", got, core.ErrApprovalNotPending)
+	}
+	gotApproval := getApprovalRow(t, st, approvalID)
+	if gotApproval["status"].String() != "pending" {
+		t.Fatalf("approval status = %s, want pending after rollback", gotApproval["status"].String())
+	}
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+}
+
 func TestUpdateIssuePropagatesDescriptionWriteError(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, err := st.CreateIssue(CreateIssueInput{
@@ -1381,6 +1514,7 @@ func TestDispatchPauseRollsBackWhenEventInsertFails(t *testing.T) {
 	}
 	assertErrorContains(t, err, "dispatch pause event failed")
 	assertDispatchPaused(t, st, issue.ID, false)
+	assertIssueCommentCount(t, st, issue.ID, "pause", 0)
 }
 
 func TestDispatchResumeRollsBackWhenEventInsertFails(t *testing.T) {
@@ -1403,6 +1537,7 @@ func TestDispatchResumeRollsBackWhenEventInsertFails(t *testing.T) {
 	}
 	assertErrorContains(t, err, "dispatch resume event failed")
 	assertDispatchPaused(t, st, issue.ID, true)
+	assertIssueCommentCount(t, st, issue.ID, "resume", 0)
 }
 
 func TestDispatchPauseResumeRejectActiveRunWithoutChangingDispatchFields(t *testing.T) {
@@ -1426,6 +1561,21 @@ func TestDispatchPauseResumeRejectActiveRunWithoutChangingDispatchFields(t *test
 			assertDispatchPaused(t, st, issue.ID, false)
 		})
 	}
+}
+
+func TestDispatchPauseResumeInsertOperatorComments(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "Dispatch pause resume comments")
+
+	if _, err := st.DispatchPause(issue.ID, "pause for operator"); err != nil {
+		t.Fatalf("DispatchPause: %v", err)
+	}
+	assertIssueCommentCount(t, st, issue.ID, "pause for operator", 1)
+
+	if _, err := st.DispatchResume(issue.ID, "resume for operator"); err != nil {
+		t.Fatalf("DispatchResume: %v", err)
+	}
+	assertIssueCommentCount(t, st, issue.ID, "resume for operator", 1)
 }
 
 func TestClaimRunPropagatesBlockerQueryError(t *testing.T) {
@@ -2054,6 +2204,15 @@ func latestReviewPacketID(t *testing.T, st *Store, runID string) string {
 	return row["id"].String()
 }
 
+func getReviewPacketRow(t *testing.T, st *Store, reviewPacketID string) map[string]db.Value {
+	t.Helper()
+	row, err := st.Project.QueryOne(`SELECT * FROM review_packets WHERE id=?`, reviewPacketID)
+	if err != nil {
+		t.Fatalf("get review packet: %v", err)
+	}
+	return row
+}
+
 func assertRunStatus(t *testing.T, st *Store, runID string, want core.RunStatus) {
 	t.Helper()
 	gotRun, err := st.GetRun(runID)
@@ -2163,6 +2322,17 @@ func assertNoRunFailureAudit(t *testing.T, st *Store, runID string) {
 	}
 	if len(eventRows) != 0 {
 		t.Fatalf("failure events = %d, want 0 after rollback", len(eventRows))
+	}
+}
+
+func assertIssueCommentCount(t *testing.T, st *Store, issueID, body string, want int) {
+	t.Helper()
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM issue_comments WHERE issue_id=? AND author_type='operator' AND body=?`, issueID, body)
+	if err != nil {
+		t.Fatalf("count issue comments: %v", err)
+	}
+	if got := row["c"].Int(); got != want {
+		t.Fatalf("operator comments with body %q = %d, want %d", body, got, want)
 	}
 }
 
