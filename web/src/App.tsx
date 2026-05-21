@@ -48,6 +48,8 @@ const approvalDecisions: Array<{ value: ApprovalDecision; label: string; helper:
   { value: 'deny', label: 'Deny current action', helper: 'Decline this approval request only.' },
   { value: 'cancel_run', label: 'Cancel run', helper: 'Cancel the whole run with operator_cancelled side effects.' }
 ];
+const dispatchPauseDefaultReason = 'operator paused dispatch';
+const dispatchResumeDefaultReason = 'operator resumed dispatch';
 
 type PageKey = 'overview' | 'board' | 'issue' | 'run' | 'approvals' | 'review' | 'workflow' | 'diagnostics';
 
@@ -201,6 +203,12 @@ function transitionValidationError(target: IssueState, reason: string): string |
     return 'Reason is required for Blocked, Cancelled, and Duplicate transitions.';
   }
   return null;
+}
+
+function dispatchPauseResumeReason(input: string, isResuming: boolean): string {
+  const manualReason = input.trim();
+  if (manualReason) return manualReason;
+  return isResuming ? dispatchResumeDefaultReason : dispatchPauseDefaultReason;
 }
 
 function compareIssuePriority(a: Issue, b: Issue): number {
@@ -1006,7 +1014,7 @@ function ActionRail({ issue, data, runMutation }: {
   }
 
   async function pauseResume() {
-    const reason = pauseReason || (selectedIssue.dispatch_paused ? 'operator resumed dispatch' : 'operator paused dispatch');
+    const reason = dispatchPauseResumeReason(pauseReason, selectedIssue.dispatch_paused);
     const label = selectedIssue.dispatch_paused ? 'Dispatch resumed.' : 'Dispatch paused.';
     const result = await perform(label, () => selectedIssue.dispatch_paused ? api.resumeDispatch(selectedIssue.identifier, reason) : api.pauseDispatch(selectedIssue.identifier, reason));
     if (result) setPauseReason('');
@@ -1061,7 +1069,7 @@ function ActionRail({ issue, data, runMutation }: {
         ) : null}
         <label>
           Pause/resume reason
-          <input value={pauseReason} onChange={(event) => setPauseReason(event.target.value)} placeholder={selectedIssue.dispatch_paused ? 'operator resumed dispatch' : 'operator paused dispatch'} />
+          <input value={pauseReason} onChange={(event) => setPauseReason(event.target.value)} placeholder={selectedIssue.dispatch_paused ? dispatchResumeDefaultReason : dispatchPauseDefaultReason} />
         </label>
         <button type="button" onClick={() => void pauseResume()} disabled={active && !selectedIssue.dispatch_paused}>
           {selectedIssue.dispatch_paused ? 'Dispatch resume issue' : 'Dispatch pause issue'}
@@ -1412,7 +1420,7 @@ function IssueDetailPage({ route, issues, runs, events, runMutation, markUnauthe
   }
 
   async function pauseResume(paused: boolean) {
-    const reason = pauseReason || (paused ? 'operator resumed dispatch' : 'operator paused dispatch');
+    const reason = dispatchPauseResumeReason(pauseReason, paused);
     const result = await runMutation(() => paused ? api.resumeDispatch(selectedIssue.identifier, reason) : api.pauseDispatch(selectedIssue.identifier, reason));
     if (result) setPauseReason('');
   }
