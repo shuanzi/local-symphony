@@ -119,16 +119,22 @@
     "response": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["data"],
+      "required": ["success"],
       "properties": {
-        "data": { "type": "object", "additionalProperties": true }
+        "success": { "const": true },
+        "tool": { "$ref": "#/$defs/toolName" },
+        "data": true,
+        "issue_identifier": { "type": "string" },
+        "handoff_status": { "type": "string" },
+        "handoff_id": { "type": "string" }
       }
     },
     "error": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["error"],
+      "required": ["success", "error"],
       "properties": {
+        "success": { "const": false },
         "error": {
           "type": "object",
           "required": ["code", "message"],

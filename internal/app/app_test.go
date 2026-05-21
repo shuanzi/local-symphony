@@ -1,0 +1,231 @@
+package app
+
+import (
+	"encoding/json"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"local-symphony/internal/core"
+	"local-symphony/internal/db"
+	"local-symphony/internal/store"
+)
+
+func TestWriteCLISessionPropagatesAppDBInsertError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.App.Close(); err != nil {
+		t.Fatalf("close app db: %v", err)
+	}
+
+	err = writeCLISession(st, "http://127.0.0.1:1", "test-token")
+	if err == nil {
+		t.Fatal("writeCLISession succeeded, want app DB insert error")
+	}
+}
+
+func TestWriteCLISessionWritesProjectScopedSession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+
+	if err := writeCLISession(st, "http://127.0.0.1:1", "test-token"); err != nil {
+		t.Fatalf("writeCLISession: %v", err)
+	}
+
+	path := filepath.Join(home, ".symphony", "cli-sessions", st.ProjectID+".json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read project cli session: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat project cli session: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("session mode = %o, want 600", got)
+	}
+	dirInfo, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("stat project cli session dir: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("session dir mode = %o, want 700", got)
+	}
+	var session struct {
+		ProjectID string `json:"project_id"`
+		Token     string `json:"token"`
+	}
+	if err := json.Unmarshal(b, &session); err != nil {
+		t.Fatalf("unmarshal project cli session: %v", err)
+	}
+	if session.ProjectID != st.ProjectID || session.Token != "test-token" {
+		t.Fatalf("session = %#v, want project %q token test-token", session, st.ProjectID)
+	}
+}
+
+func TestServeReturnsErrorWhenRuntimeDescriptorWriteFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	projectID := st.ProjectID
+	runtimePath := filepath.Join(home, ".symphony", "runtime")
+	if err := os.WriteFile(runtimePath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("create runtime path conflict: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	err = prepareServeRuntime(st, ln, "http://"+ln.Addr().String(), "test-token", 1234)
+	if err == nil {
+		t.Fatal("prepareServeRuntime succeeded, want runtime descriptor error")
+	}
+	if _, readErr := os.ReadFile(CLISessionPath(projectID)); readErr != nil {
+		t.Fatalf("CLI session was not written before runtime descriptor failure: %v", readErr)
+	}
+	if closeErr := ln.Close(); closeErr == nil {
+		t.Fatal("listener remained open after runtime descriptor failure")
+	}
+}
+
+func TestServeReturnsReconcileError(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Serve reconcile failure",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	if _, err := st.ClaimRun(issue.ID, "manual", "fake", 1); err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_serve_reconcile_comment BEFORE INSERT ON issue_comments WHEN NEW.author_type='system' AND NEW.body LIKE 'Run ended with %' BEGIN SELECT RAISE(ABORT, 'serve reconcile failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	repoRoot := st.RepoRoot
+	st.Close()
+
+	err = Serve(ServeOptions{Project: repoRoot, Host: "0.0.0.0", Port: 0, NoOpen: true})
+	if err == nil {
+		t.Fatal("Serve succeeded, want reconcile error")
+	}
+	if !strings.Contains(err.Error(), "serve reconcile failed") {
+		t.Fatalf("Serve error = %v, want reconcile failure", err)
+	}
+}
+
+func TestCLISessionPathDoesNotAllowProjectIDPathTraversal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	base := filepath.Join(home, ".symphony", "cli-sessions")
+
+	path := CLISessionPath("../../cli-session")
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		t.Fatalf("relative session path: %v", err)
+	}
+	if filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
+		t.Fatalf("session path escaped base: base=%q path=%q rel=%q", base, path, rel)
+	}
+	if got := filepath.Base(path); !strings.HasPrefix(got, "project_") || strings.Contains(got, "..") || strings.ContainsAny(got, `/\`) {
+		t.Fatalf("session filename is not sanitized: %q", got)
+	}
+}
+
+func TestRuntimeDescriptorPreservesSafeProjectIDFileName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	st.ProjectID = "prj_abc123"
+
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1", "http://127.0.0.1:2", 1234); err != nil {
+		t.Fatalf("CreateRuntimeDescriptor: %v", err)
+	}
+	path := filepath.Join(db.RuntimeDir(), "prj_abc123.json")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("safe runtime descriptor path not written: %v", err)
+	}
+	if _, err := RuntimeDescriptor(st.ProjectID); err != nil {
+		t.Fatalf("RuntimeDescriptor: %v", err)
+	}
+	st.RemoveRuntimeDescriptor()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("runtime descriptor still exists after remove: %v", err)
+	}
+}
+
+func TestRuntimeDescriptorDoesNotAllowProjectIDPathTraversal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	st.ProjectID = "../../outside-runtime"
+
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1", "http://127.0.0.1:2", 1234); err != nil {
+		t.Fatalf("CreateRuntimeDescriptor: %v", err)
+	}
+	base := db.RuntimeDir()
+	unsafePath := filepath.Join(base, st.ProjectID+".json")
+	if _, err := os.Stat(unsafePath); err == nil {
+		t.Fatalf("runtime descriptor escaped base: base=%q path=%q", base, unsafePath)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat escaped runtime descriptor: %v", err)
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatalf("read runtime dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("runtime dir entries = %d, want 1", len(entries))
+	}
+	name := entries[0].Name()
+	if !strings.HasPrefix(name, "project_") || !strings.HasSuffix(name, ".json") || strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
+		t.Fatalf("runtime descriptor filename is not sanitized: %q", name)
+	}
+	path := filepath.Join(base, name)
+	desc, err := RuntimeDescriptor(st.ProjectID)
+	if err != nil {
+		t.Fatalf("RuntimeDescriptor: %v", err)
+	}
+	if desc["project_id"] != st.ProjectID {
+		t.Fatalf("runtime descriptor project_id = %v, want %q", desc["project_id"], st.ProjectID)
+	}
+	st.RemoveRuntimeDescriptor()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("runtime descriptor still exists after remove: %v", err)
+	}
+}

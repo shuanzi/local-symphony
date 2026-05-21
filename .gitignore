@@ -1,2 +1,7 @@
 
 *.patch
+.symphony/
+.superpowers/
+bin/
+web/dist/
+web/node_modules/

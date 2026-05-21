@@ -143,7 +143,7 @@ OPENAPI_DIAGNOSTICS_REQUIRED_FIELDS = {
     "DiagnosticsFailureBucket": frozenset({"failure_code", "count"}),
     "DiagnosticsPauseSummary": frozenset({"paused_dispatch_count", "paused_issue_refs"}),
     "DiagnosticsCheck": frozenset({"name", "status"}),
-    "DiagnosticsExport": frozenset({"artifact_id"}),
+    "DiagnosticsExport": frozenset({"artifact_id", "path"}),
 }
 
 REQUIRED_FORBIDDEN_CONCEPTS = frozenset(
@@ -292,6 +292,18 @@ def fail(msg: str) -> None:
 
 def load_json(rel: str) -> Any:
     return json.loads((ROOT / rel).read_text(encoding="utf-8"))
+
+
+def require_jsonschema_validator() -> Any:
+    try:
+        from jsonschema import Draft202012Validator  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        fail(
+            "jsonschema is required for contract validation. "
+            "Install development dependencies with: python3 -m pip install -r requirements-dev.txt"
+        )
+        raise AssertionError("unreachable") from exc
+    return Draft202012Validator
 
 
 def require_dict(value: Any, label: str) -> dict[str, Any]:
@@ -578,17 +590,14 @@ def assert_required_and_props_match(
 def validate_json() -> None:
     schema_paths = sorted((ROOT / "schemas").rglob("*.json"))
     example_paths = sorted((ROOT / "examples").glob("*.json"))
-    try:
-        from jsonschema import Draft202012Validator  # type: ignore
-    except Exception:  # pragma: no cover - optional dependency for bootstrap environments
-        Draft202012Validator = None  # type: ignore[assignment]
+    Draft202012Validator = require_jsonschema_validator()
 
     for path in schema_paths + example_paths:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             fail(f"invalid JSON {path.relative_to(ROOT)}: {exc}")
-        if Draft202012Validator is not None and is_under(path, ROOT / "schemas"):
+        if is_under(path, ROOT / "schemas"):
             try:
                 Draft202012Validator.check_schema(data)
             except Exception as exc:  # noqa: BLE001
@@ -852,6 +861,18 @@ def validate_openapi_diagnostics_contract(data: dict[str, Any]) -> None:
     diagnostics_properties = require_dict(diagnostics.get("properties"), "OpenAPI Diagnostics.properties")
     assert_const(require_dict(diagnostics_properties.get("redacted"), "OpenAPI Diagnostics.properties.redacted"), "OpenAPI Diagnostics.properties.redacted", True)
 
+    diagnostics_export = require_dict(schemas.get("DiagnosticsExport"), "OpenAPI DiagnosticsExport")
+    diagnostics_export_properties = require_dict(diagnostics_export.get("properties"), "OpenAPI DiagnosticsExport.properties")
+    diagnostics_export_artifact_id = require_dict(
+        diagnostics_export_properties.get("artifact_id"),
+        "OpenAPI DiagnosticsExport.properties.artifact_id",
+    )
+    if diagnostics_export_artifact_id.get("type") != "string" or diagnostics_export_artifact_id.get("pattern") != "^art_":
+        fail("OpenAPI DiagnosticsExport.properties.artifact_id must be a string matching ^art_")
+    diagnostics_export_path = require_dict(diagnostics_export_properties.get("path"), "OpenAPI DiagnosticsExport.properties.path")
+    if diagnostics_export_path.get("type") != "string":
+        fail("OpenAPI DiagnosticsExport.properties.path must be a string")
+
     database = require_dict(schemas.get("DiagnosticsDatabase"), "OpenAPI DiagnosticsDatabase")
     assert_required_fields(database, "OpenAPI DiagnosticsDatabase", DIAGNOSTICS_DATABASE_FIELDS)
     assert_enum(
@@ -986,8 +1007,9 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
         or limit_schema.get("default") != 50
     ):
         fail("OpenAPI GET /issues limit parameter must be integer minimum=1 maximum=200 default=50")
-    if issue_list_query_params["cursor"].get("schema", {}).get("type") != "string":
-        fail("OpenAPI GET /issues cursor parameter must be a string")
+    cursor_schema = issue_list_query_params["cursor"].get("schema", {})
+    if cursor_schema.get("type") != "string" or cursor_schema.get("pattern") != "^[0-9]+$":
+        fail('OpenAPI GET /issues cursor parameter must be a string with pattern "^[0-9]+$"')
     sort_schema = issue_list_query_params["sort"].get("schema", {})
     if sort_schema.get("enum") != ["priority", "updated", "identifier"] or sort_schema.get("default") != "priority":
         fail("OpenAPI GET /issues sort parameter must use priority/updated/identifier enum with priority default")
@@ -1117,32 +1139,10 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
         fail("POST /workflow/render-preview 200 response must use WorkflowRenderPreviewEnvelope")
 
     workflow_render_request = data["components"]["schemas"]["WorkflowRenderPreviewRequest"]
-    render_source = workflow_render_request["properties"]["source"]
-    if render_source.get("enum") != ["effective", "candidate"] or render_source.get("default") != "effective":
-        fail("WorkflowRenderPreviewRequest.source must default to effective with effective/candidate enum")
-    candidate_condition_found = False
-    for condition in workflow_render_request.get("allOf", []):
-        condition_if = condition.get("if", {})
-        condition_then = condition.get("then", {})
-        required_source = "source" in condition_if.get("required", [])
-        source_is_candidate = condition_if.get("properties", {}).get("source", {}).get("const") == "candidate"
-        candidate_required = {
-            tuple(branch.get("required", []))
-            for branch in condition_then.get("anyOf", [])
-            if isinstance(branch, dict)
-        }
-        requires_candidate_input = {
-            ("candidate_workflow_md",),
-            ("candidate_config",),
-        }.issubset(candidate_required)
-        if required_source and source_is_candidate and requires_candidate_input:
-            candidate_condition_found = True
-            break
-    if not candidate_condition_found:
-        fail(
-            "WorkflowRenderPreviewRequest must require candidate_workflow_md or candidate_config "
-            "when source is candidate"
-        )
+    if workflow_render_request.get("type") != "object":
+        fail("WorkflowRenderPreviewRequest must be an object")
+    if workflow_render_request.get("additionalProperties") is not False or workflow_render_request.get("maxProperties") != 0:
+        fail("WorkflowRenderPreviewRequest must not declare ignored candidate/source fields")
 
     workflow_render_preview_required = set(data["components"]["schemas"]["WorkflowRenderPreview"].get("required", []))
     expected_render_preview_required = {"source", "rendered_prompt_preview", "validation", "redactions_applied"}
@@ -1381,11 +1381,7 @@ def validate_workflow_example() -> None:
         value = config.get(section, {}).get(key)
         if isinstance(value, str) and re.search(r"\{\{|\}\}", value):
             fail(f"{workflow_path.relative_to(ROOT)} {section}.{key} must not contain Liquid interpolation")
-    try:
-        from jsonschema import Draft202012Validator  # type: ignore
-    except Exception:
-        print("warn workflow schema validation skipped: jsonschema not installed")
-        return
+    Draft202012Validator = require_jsonschema_validator()
     schema = load_json("schemas/workflow_config.schema.json")
     errors = sorted(Draft202012Validator(schema).iter_errors(config), key=lambda e: e.path)
     if errors:
@@ -1395,11 +1391,7 @@ def validate_workflow_example() -> None:
 
 
 def validate_tool_examples() -> None:
-    try:
-        from jsonschema import Draft202012Validator  # type: ignore
-    except Exception:
-        print("warn tool example schema validation skipped: jsonschema not installed")
-        return
+    Draft202012Validator = require_jsonschema_validator()
 
     example_schema_pairs = [
         ("examples/handoff.json", "schemas/tools/handoff_submit.input.schema.json", "handoff.submit"),
@@ -1416,6 +1408,7 @@ def validate_tool_examples() -> None:
 
 def validate_tool_gateway_manifest(manifest: dict[str, Any]) -> None:
     gateway_schema = load_json("schemas/tool_gateway.schema.json")
+    Draft202012Validator = require_jsonschema_validator()
     manifest_tools = set(require_list(manifest, ("tool_gateway", "registry_tools")))
     schema_tools = set(gateway_schema["$defs"]["toolName"]["enum"])
     if schema_tools != manifest_tools:
@@ -1456,6 +1449,18 @@ def validate_tool_gateway_manifest(manifest: dict[str, Any]) -> None:
     assert_non_blank_string_schema(
         handoff_submit_schema["properties"].get("summary"),
         "schemas/tools/handoff_submit.input.schema.json summary",
+    )
+    required_handoff = {"summary", "changed_files", "tests", "risks", "verification", "followups"}
+    if set(gateway_defs["handoffSubmitInput"].get("required", [])) != required_handoff:
+        fail("schemas/tool_gateway.schema.json handoffSubmitInput required fields drifted")
+    gateway_validator = Draft202012Validator(gateway_schema)
+    gateway_validator.validate({"success": True, "tool": "issue.get", "data": {"issue": {"identifier": "LOC-1"}}})
+    gateway_validator.validate({"success": True, "tool": "issue.comment", "issue_identifier": "LOC-1"})
+    gateway_validator.validate(
+        {"success": True, "tool": "handoff.submit", "handoff_status": "submitted", "handoff_id": "handoff_1"}
+    )
+    gateway_validator.validate(
+        {"success": False, "error": {"code": "invalid_request", "message": "bad input", "details": {}}}
     )
     print("ok tool gateway registry schemas/tool_gateway.schema.json")
 
