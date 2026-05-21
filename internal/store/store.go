@@ -1082,10 +1082,10 @@ func (s *Store) ClaimRun(issueRef, dispatchReason, runnerKind string, maxConcurr
 		if err := tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,run_id,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`, core.NewID("hist_"), id, string(st), string(core.StateWorking), "orchestrator", runID, "dispatch", now); err != nil {
 			return err
 		}
-		if err := s.appendEventInTx(tx, "run.claimed", "orchestrator", &id, &runID, map[string]any{"source_issue_state": st}); err != nil {
+		if err := s.appendEventInTx(tx, "run.claimed", "system", &id, &runID, map[string]any{"source_issue_state": st}); err != nil {
 			return err
 		}
-		if err := s.appendEventInTx(tx, "issue.state_changed", "orchestrator", &id, &runID, map[string]any{"from_state": st, "to_state": core.StateWorking}); err != nil {
+		if err := s.appendEventInTx(tx, "issue.state_changed", "system", &id, &runID, map[string]any{"from_state": st, "to_state": core.StateWorking}); err != nil {
 			return err
 		}
 		return nil
