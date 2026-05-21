@@ -594,6 +594,41 @@ END`); err != nil {
 	assertRunStatus(t, st, run.ID, core.RunCompleted)
 }
 
+func TestReviewActionPropagatesCompletedRunLoadError(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareCompletedReviewRun(t, st)
+	if err := st.Project.Exec(`ALTER TABLE run_attempts RENAME TO run_attempts_shadow`); err != nil {
+		t.Fatalf("rename run_attempts: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE VIEW run_attempts AS
+SELECT id, issue_id,
+       CASE WHEN id='` + run.ID + `' THEN json_extract('bad json','$.x') ELSE attempt_no END AS attempt_no,
+       workspace_id, workflow_snapshot_id, status, dispatch_reason, source_issue_state, runner_kind,
+       base_ref_config, base_ref, base_sha, branch_name, failure_code, failure_message,
+       started_at, ended_at, created_at, updated_at
+FROM run_attempts_shadow`); err != nil {
+		t.Fatalf("create run_attempts error view: %v", err)
+	}
+
+	_, err := st.MarkDone(issue.ID, "run load should fail")
+
+	if dropErr := st.Project.Exec(`DROP VIEW run_attempts`); dropErr != nil {
+		t.Fatalf("drop run_attempts view: %v", dropErr)
+	}
+	if restoreErr := st.Project.Exec(`ALTER TABLE run_attempts_shadow RENAME TO run_attempts`); restoreErr != nil {
+		t.Fatalf("restore run_attempts: %v", restoreErr)
+	}
+	if err == nil {
+		t.Fatal("MarkDone succeeded, want run load error")
+	}
+	assertErrorContains(t, err, "malformed JSON")
+	if got := core.AsAPIError(err).Code; got == core.ErrReviewPacketRequired {
+		t.Fatalf("MarkDone error code = %s, want backend error", got)
+	}
+	assertIssueState(t, st, issue.ID, core.StateHumanReview)
+	assertRunStatus(t, st, run.ID, core.RunCompleted)
+}
+
 func TestUpdateRunStatusRejectsCompletedRunWithoutChangingRunOrIssue(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareCompletedReviewRun(t, st)
@@ -696,6 +731,36 @@ func TestTransitionIssueRejectsUnknownStateWithoutChangingIssue(t *testing.T) {
 		t.Fatalf("TransitionIssue error code = %s, want %s", got, core.ErrInvalidRequest)
 	}
 	assertIssueState(t, st, issue.ID, core.StateInbox)
+}
+
+func TestTransitionIssueRejectsStateChangedDuringUpdate(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "Transition state race")
+	if err := st.Project.Exec(`CREATE TRIGGER race_transition_state BEFORE UPDATE OF state ON issues
+WHEN OLD.id='` + issue.ID + `' AND NEW.state='Blocked'
+BEGIN
+	UPDATE issues SET state='Done', completed_at=NEW.updated_at WHERE id=OLD.id;
+	SELECT RAISE(IGNORE);
+END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err := st.TransitionIssue(issue.ID, core.StateBlocked, "blocked after race", "")
+
+	if err == nil {
+		t.Fatal("TransitionIssue succeeded, want invalid_state_transition")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrInvalidStateTransition {
+		t.Fatalf("TransitionIssue error code = %s, want %s", got, core.ErrInvalidStateTransition)
+	}
+	assertIssueState(t, st, issue.ID, core.StateReady)
+	rows, qerr := st.Project.Query(`SELECT id FROM issue_state_history WHERE issue_id=? AND to_state=?`, issue.ID, string(core.StateBlocked))
+	if qerr != nil {
+		t.Fatalf("query state history: %v", qerr)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("blocked history rows = %d, want 0", len(rows))
+	}
 }
 
 func TestTransitionIssueToReadyCancelsActiveRunAndRevokesToken(t *testing.T) {

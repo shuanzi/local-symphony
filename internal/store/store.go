@@ -753,12 +753,6 @@ func validIssueState(state core.IssueState) bool {
 
 func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, duplicateOf string) (*core.Issue, error) {
 	reason = strings.TrimSpace(reason)
-	row, err := s.issueRowByRef(ref)
-	if err != nil {
-		return nil, err
-	}
-	id := row["id"].String()
-	from := core.IssueState(row["state"].String())
 	if target == "" {
 		return nil, core.NewError(core.ErrInvalidRequest, "state is required", nil)
 	}
@@ -771,20 +765,28 @@ func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, dupl
 	if (target == core.StateBlocked || target == core.StateCancelled || target == core.StateDuplicate) && reason == "" {
 		return nil, core.NewError(core.ErrInvalidRequest, "reason is required", nil)
 	}
-	if from == target && target != core.StateDuplicate {
-		return nil, core.NewError(core.ErrInvalidStateTransition, "same-state transition is not allowed", nil)
-	}
-	if target == core.StateReady && !validRequired(row) {
-		return nil, core.NewError(core.ErrInvalidRequest, "issue required fields are incomplete", nil)
-	}
-	if from == core.StateBlocked && target != core.StateReady {
-		return nil, core.NewError(core.ErrInvalidStateTransition, "blocked issues may resolve to Ready", nil)
-	}
-	if core.IsTerminalIssueState(from) && !(target == core.StateInbox || target == core.StateReady) {
-		return nil, core.NewError(core.ErrInvalidStateTransition, "terminal issues can reopen only to Inbox or Ready", nil)
-	}
+	var id string
 	now := core.Now()
 	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		row, err := s.issueRowByRefTx(tx, ref)
+		if err != nil {
+			return err
+		}
+		id = row["id"].String()
+		from := core.IssueState(row["state"].String())
+		expectedState := from
+		if from == target && target != core.StateDuplicate {
+			return core.NewError(core.ErrInvalidStateTransition, "same-state transition is not allowed", nil)
+		}
+		if target == core.StateReady && !validRequired(row) {
+			return core.NewError(core.ErrInvalidRequest, "issue required fields are incomplete", nil)
+		}
+		if from == core.StateBlocked && target != core.StateReady {
+			return core.NewError(core.ErrInvalidStateTransition, "blocked issues may resolve to Ready", nil)
+		}
+		if core.IsTerminalIssueState(from) && !(target == core.StateInbox || target == core.StateReady) {
+			return core.NewError(core.ErrInvalidStateTransition, "terminal issues can reopen only to Inbox or Ready", nil)
+		}
 		active, err := s.activeRunIDTx(tx, id)
 		if err != nil {
 			return err
@@ -793,6 +795,11 @@ func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, dupl
 			if err := s.cancelRunInTx(tx, *active, core.FailureIssueStateChanged, "issue state changed", true); err != nil {
 				return err
 			}
+			current, err := s.issueRowByRefTx(tx, id)
+			if err != nil {
+				return err
+			}
+			expectedState = core.IssueState(current["state"].String())
 		}
 		if target == core.StateDuplicate && duplicateOf != "" {
 			can, err := s.issueRowByRefTx(tx, duplicateOf)
@@ -820,8 +827,15 @@ func (s *Store) TransitionIssue(ref string, target core.IssueState, reason, dupl
 				return err
 			}
 		}
-		if err := tx.Exec(`UPDATE issues SET state=?, updated_at=? WHERE id=?`, string(target), now, id); err != nil {
+		if err := tx.Exec(`UPDATE issues SET state=?, updated_at=? WHERE id=? AND state=?`, string(target), now, id, string(expectedState)); err != nil {
 			return err
+		}
+		changed, err := rowsChanged(tx)
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return core.NewError(core.ErrInvalidStateTransition, "issue state changed during transition", nil)
 		}
 		if err := tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), id, string(from), string(target), "operator", reason, now); err != nil {
 			return err
@@ -1729,7 +1743,10 @@ func (s *Store) reviewAction(issueRef, reason string, target core.IssueState) (*
 		}
 		runID := rp["run_id"].String()
 		run, err := s.getRunTx(tx, runID)
-		if err != nil || run.Status != core.RunCompleted {
+		if err != nil {
+			return err
+		}
+		if run.Status != core.RunCompleted {
 			return core.NewError(core.ErrReviewPacketRequired, "latest review packet does not belong to latest completed handoff run", nil)
 		}
 		var completedAt any = nil
@@ -1782,7 +1799,10 @@ WHERE id=? AND state=? AND latest_review_packet_id=? AND NOT EXISTS (
 			return core.NewError(core.ErrReviewPacketRequired, "latest review packet is not generated", nil)
 		}
 		run, err = s.getRunTx(tx, runID)
-		if err != nil || run.Status != core.RunCompleted {
+		if err != nil {
+			return err
+		}
+		if run.Status != core.RunCompleted {
 			return core.NewError(core.ErrReviewPacketRequired, "latest review packet does not belong to latest completed handoff run", nil)
 		}
 		if err := tx.Exec(`INSERT INTO issue_state_history(id,issue_id,from_state,to_state,actor_type,reason,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("hist_"), issueID, string(core.StateHumanReview), string(target), "operator", reason, now); err != nil {
