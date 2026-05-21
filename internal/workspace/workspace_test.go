@@ -206,6 +206,42 @@ func TestPrepareFailsWithInvalidBaseRefEvenWhenWorkspacePathExists(t *testing.T)
 	}
 }
 
+func TestPreparePropagatesRunWorkspaceBindingErrorForPreparedWorkspace(t *testing.T) {
+	repoRoot := t.TempDir()
+	st, err := store.InitProject(repoRoot, "LOC")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+
+	issue := prepareReadyWorkspaceIssue(t, st, "Prepared workspace binding failure")
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	if _, err := st.CreateOrUpdateWorkspace(issue.ID, filepath.Join(t.TempDir(), "workspace"), "branch", "auto", "main", "base-sha"); err != nil {
+		t.Fatalf("CreateOrUpdateWorkspace: %v", err)
+	}
+	issue, err = st.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if issue.Workspace == nil || issue.Workspace.Status != "prepared" {
+		t.Fatalf("issue workspace = %#v, want prepared workspace", issue.Workspace)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_run_workspace_bind BEFORE UPDATE OF workspace_id ON run_attempts BEGIN SELECT RAISE(ABORT, 'workspace bind failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	_, err = (Manager{Store: st, Config: config.Defaults(repoRoot)}).Prepare(run, issue)
+	if err == nil {
+		t.Fatal("Prepare succeeded, want workspace binding error")
+	}
+	if !strings.Contains(err.Error(), "workspace bind failed") {
+		t.Fatalf("Prepare error = %v, want workspace bind failed", err)
+	}
+}
+
 func TestProjectWorkspaceRootDoesNotAllowProjectIDPathTraversal(t *testing.T) {
 	root := t.TempDir()
 	path := projectWorkspaceRoot(root, "../../../outside")
@@ -219,6 +255,24 @@ func TestProjectWorkspaceRootDoesNotAllowProjectIDPathTraversal(t *testing.T) {
 	if got := filepath.Base(path); !strings.HasPrefix(got, "project_") || strings.Contains(got, "..") || strings.ContainsAny(got, `/\`) {
 		t.Fatalf("workspace root segment is not sanitized: %q", got)
 	}
+}
+
+func prepareReadyWorkspaceIssue(t *testing.T, st *store.Store, title string) *core.Issue {
+	t.Helper()
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              title,
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	issue, err = st.TransitionIssue(issue.ID, core.StateReady, "ready", "")
+	if err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	return issue
 }
 
 func git(t *testing.T, dir string, args ...string) string {

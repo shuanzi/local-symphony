@@ -3,6 +3,7 @@ package gitx
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -62,6 +63,25 @@ func TestCopyWorkspaceExistingDestinationReturnsErrorAndPreservesContents(t *tes
 	}
 	if string(got) != "old\n" {
 		t.Fatalf("existing destination file = %q, want preserved old content", got)
+	}
+}
+
+func TestCopyWorkspaceRejectsDestinationNestedUnderSource(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	dst := filepath.Join(src, "workspaces", "issue-1")
+
+	writeTestFile(t, src, "file.txt", "source\n")
+
+	err := copyWorkspace(src, dst)
+	if err == nil {
+		t.Fatal("copyWorkspace() error = nil, want nested destination error")
+	}
+	if !strings.Contains(err.Error(), "inside source workspace") {
+		t.Fatalf("copyWorkspace() error = %v, want nested destination message", err)
+	}
+	if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+		t.Fatalf("nested destination was created, stat error = %v", statErr)
 	}
 }
 

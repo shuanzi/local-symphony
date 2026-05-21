@@ -1907,7 +1907,7 @@ func TestDashboardDoesNotServeRepoWebDistWhenExecutableIsRepoRelative(t *testing
 	}
 }
 
-func TestEventStreamIncludesNamedEventAndDefaultMessageData(t *testing.T) {
+func TestEventStreamEmitsStoredEventOnceAsDefaultMessage(t *testing.T) {
 	srv := newTestServer(t)
 	if _, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "SSE issue", Description: "desc"}); err != nil {
 		t.Fatalf("CreateIssue: %v", err)
@@ -1928,11 +1928,11 @@ func TestEventStreamIncludesNamedEventAndDefaultMessageData(t *testing.T) {
 	<-done
 
 	body := rec.Body.String()
-	if !strings.Contains(body, "event: issue.created\n") {
-		t.Fatalf("stream body missing named event: %q", body)
+	if strings.Contains(body, "event: issue.created\n") {
+		t.Fatalf("stream body contains a typed issue.created frame: %q", body)
 	}
-	if !strings.Contains(body, "\ndata: ") {
-		t.Fatalf("stream body missing default message data: %q", body)
+	if got := strings.Count(body, "\ndata: "); got != 1 {
+		t.Fatalf("stream data frame count = %d, want 1; body = %q", got, body)
 	}
 }
 

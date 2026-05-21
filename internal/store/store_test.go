@@ -1842,6 +1842,51 @@ func TestClaimRunRollsBackRunClaimedEventWhenStateChangedEventFails(t *testing.T
 	assertNoClaimDispatchEvents(t, st, issue.ID)
 }
 
+func TestClaimRunReturnsClaimedRunWhenPostCommitReadFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "ClaimRun post-commit read failure")
+	quotedIssueID := "'" + strings.ReplaceAll(issue.ID, "'", "''") + "'"
+	if err := st.Project.Exec(`ALTER TABLE run_attempts RENAME TO run_attempts_shadow`); err != nil {
+		t.Fatalf("rename run_attempts: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE VIEW run_attempts AS
+SELECT id, issue_id, attempt_no, workspace_id, workflow_snapshot_id,
+       CASE WHEN issue_id=` + quotedIssueID + ` THEN json_extract('bad json','$.x') ELSE status END AS status,
+       dispatch_reason, source_issue_state, runner_kind, base_ref_config, base_ref, base_sha, branch_name,
+       failure_code, failure_message, started_at, ended_at, created_at, updated_at
+FROM run_attempts_shadow`); err != nil {
+		t.Fatalf("create failing run_attempts view: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER insert_run_attempts_view INSTEAD OF INSERT ON run_attempts BEGIN
+	INSERT INTO run_attempts_shadow(id,issue_id,attempt_no,workspace_id,workflow_snapshot_id,status,dispatch_reason,source_issue_state,runner_kind,base_ref_config,base_ref,base_sha,branch_name,failure_code,failure_message,started_at,ended_at,created_at,updated_at)
+	VALUES(NEW.id,NEW.issue_id,NEW.attempt_no,NEW.workspace_id,NEW.workflow_snapshot_id,NEW.status,NEW.dispatch_reason,NEW.source_issue_state,NEW.runner_kind,NEW.base_ref_config,NEW.base_ref,NEW.base_sha,NEW.branch_name,NEW.failure_code,NEW.failure_message,NEW.started_at,NEW.ended_at,NEW.created_at,NEW.updated_at);
+END`); err != nil {
+		t.Fatalf("create insert trigger: %v", err)
+	}
+
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun returned post-commit read error: %v", err)
+	}
+	if run.ID == "" || run.IssueID != issue.ID || run.IssueIdentifier != issue.Identifier || run.AttemptNo != 1 || run.Status != core.RunPending {
+		t.Fatalf("claimed run = %#v, want populated pending run for issue %s", run, issue.ID)
+	}
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM run_attempts_shadow WHERE issue_id=?`, issue.ID)
+	if err != nil {
+		t.Fatalf("count shadow run attempts: %v", err)
+	}
+	if got := row["c"].Int(); got != 1 {
+		t.Fatalf("shadow run attempts = %d, want 1", got)
+	}
+	row, err = st.Project.QueryOne(`SELECT state FROM issues WHERE id=?`, issue.ID)
+	if err != nil {
+		t.Fatalf("query issue state: %v", err)
+	}
+	if got := core.IssueState(row["state"].String()); got != core.StateWorking {
+		t.Fatalf("issue state = %s, want %s", got, core.StateWorking)
+	}
+}
+
 func TestInsertReviewPacketRollsBackWhenIssuePointerUpdateFails(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareActiveRun(t, st, "Review packet pointer failure")

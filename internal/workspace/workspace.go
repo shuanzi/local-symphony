@@ -21,7 +21,9 @@ type Manager struct {
 
 func (m Manager) Prepare(run *core.RunAttempt, issue *core.Issue) (*core.WorkspaceSummary, error) {
 	if issue.Workspace != nil && issue.Workspace.Status == "prepared" {
-		_ = m.Store.SetRunWorkspace(run.ID, issue.Workspace.ID, issue.Workspace.BranchName, issue.Workspace.BaseRefConfig, issue.Workspace.BaseRef, issue.Workspace.BaseSHA)
+		if err := m.Store.SetRunWorkspace(run.ID, issue.Workspace.ID, issue.Workspace.BranchName, issue.Workspace.BaseRefConfig, issue.Workspace.BaseRef, issue.Workspace.BaseSHA); err != nil {
+			return nil, err
+		}
 		return issue.Workspace, nil
 	}
 	root := m.Config.Workspace.Root

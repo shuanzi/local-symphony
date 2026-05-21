@@ -1,6 +1,7 @@
 package db
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -116,5 +117,32 @@ func TestBusyTimeoutWaitsForConcurrentWriter(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("concurrent writer did not complete after lock release")
+	}
+}
+
+func TestCloseKeepsConnectionUsableWhenSQLiteCloseFails(t *testing.T) {
+	d, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	originalCloseSQLite := closeSQLite
+	closeSQLite = func(*DB) int { return 5 }
+
+	err = d.Close()
+	closeSQLite = originalCloseSQLite
+	if err == nil {
+		t.Fatal("Close succeeded, want sqlite close error")
+	}
+	if !strings.Contains(err.Error(), "sqlite close rc=") {
+		t.Fatalf("Close error = %v, want sqlite close rc", err)
+	}
+
+	if err := d.Exec(`CREATE TABLE still_open(id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatalf("connection is not usable after failed Close: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close after finalizing statement: %v", err)
 	}
 }

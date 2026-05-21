@@ -653,7 +653,6 @@ func (s *Server) sse(w http.ResponseWriter, r *http.Request, runID, issueID stri
 		}
 		for _, e := range ev {
 			b, _ := json.Marshal(e)
-			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.Seq, e.EventType, b)
 			fmt.Fprintf(w, "id: %d\ndata: %s\n\n", e.Seq, b)
 			after = e.Seq
 		}

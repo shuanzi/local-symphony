@@ -28,6 +28,10 @@ type DB struct {
 	path string
 }
 
+var closeSQLite = func(d *DB) int {
+	return int(C.sqlite3_close(d.ptr))
+}
+
 type Tx struct {
 	db *DB
 }
@@ -87,11 +91,11 @@ func (d *DB) Close() error {
 	if d.ptr == nil {
 		return nil
 	}
-	rc := C.sqlite3_close(d.ptr)
-	d.ptr = nil
-	if rc != C.SQLITE_OK {
-		return fmt.Errorf("sqlite close rc=%d", int(rc))
+	rc := closeSQLite(d)
+	if rc != int(C.SQLITE_OK) {
+		return fmt.Errorf("sqlite close rc=%d", rc)
 	}
+	d.ptr = nil
 	return nil
 }
 

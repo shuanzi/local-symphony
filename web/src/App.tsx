@@ -526,7 +526,7 @@ function useDashboardData() {
     setSseState('connecting');
     const source = new EventSource(`/api/v1/events/stream?after_seq=${maxSeqRef.current}`);
     source.onopen = () => setSseState('connected');
-    source.onmessage = (message) => {
+    const handleMessage = (message: MessageEvent) => {
       setSseState('connected');
       const event = eventFromSseMessage(message);
       if (event) {
@@ -537,10 +537,7 @@ function useDashboardData() {
         scheduleSummaryRefresh();
       }
     };
-    source.addEventListener('run.claimed', () => {
-      setSseState('connected');
-      void loadAll();
-    });
+    source.onmessage = handleMessage;
     source.onerror = () => {
       setSseState('reconnecting');
     };

@@ -86,6 +86,13 @@ func copyWorkspace(src, dst string) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	nested, err := isPathWithin(src, dst)
+	if err != nil {
+		return err
+	}
+	if nested {
+		return fmt.Errorf("workspace destination is inside source workspace: %s", dst)
+	}
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}
@@ -117,6 +124,22 @@ func copyWorkspace(src, dst string) error {
 		}
 		return os.WriteFile(target, b, info.Mode().Perm())
 	})
+}
+
+func isPathWithin(parent, child string) (bool, error) {
+	parentAbs, err := filepath.Abs(parent)
+	if err != nil {
+		return false, err
+	}
+	childAbs, err := filepath.Abs(child)
+	if err != nil {
+		return false, err
+	}
+	rel, err := filepath.Rel(parentAbs, childAbs)
+	if err != nil {
+		return false, err
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel), nil
 }
 
 func StatusPorcelain(dir string) ([]string, error) {

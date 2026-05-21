@@ -1016,7 +1016,7 @@ func (s *Store) ClaimRun(issueRef, dispatchReason, runnerKind string, maxConcurr
 	if maxConcurrent <= 0 {
 		maxConcurrent = 3
 	}
-	var runID string
+	var claimed *core.RunAttempt
 	if err := s.Project.WithTx(func(tx *db.Tx) error {
 		row, err := s.issueRowByRefTx(tx, issueRef)
 		if err != nil {
@@ -1060,9 +1060,21 @@ func (s *Store) ClaimRun(issueRef, dispatchReason, runnerKind string, maxConcurr
 		}
 		attempt := ar["n"].Int()
 		now := core.Now()
-		runID = core.NewID("run_")
+		runID := core.NewID("run_")
 		if err := tx.Exec(`INSERT INTO run_attempts(id,issue_id,attempt_no,status,dispatch_reason,source_issue_state,runner_kind,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, runID, id, attempt, string(core.RunPending), dispatchReason, string(st), runnerKind, now, now); err != nil {
 			return err
+		}
+		claimed = &core.RunAttempt{
+			ID:               runID,
+			IssueID:          id,
+			IssueIdentifier:  row["identifier"].String(),
+			AttemptNo:        attempt,
+			Status:           core.RunPending,
+			DispatchReason:   dispatchReason,
+			SourceIssueState: st,
+			RunnerKind:       runnerKind,
+			CreatedAt:        now,
+			UpdatedAt:        now,
 		}
 		if err := tx.Exec(`UPDATE issues SET state=?, latest_run_id=?, updated_at=? WHERE id=?`, string(core.StateWorking), runID, now, id); err != nil {
 			return err
@@ -1080,7 +1092,7 @@ func (s *Store) ClaimRun(issueRef, dispatchReason, runnerKind string, maxConcurr
 	}); err != nil {
 		return nil, err
 	}
-	return s.GetRun(runID)
+	return claimed, nil
 }
 
 func (s *Store) GetRun(runID string) (*core.RunAttempt, error) {
