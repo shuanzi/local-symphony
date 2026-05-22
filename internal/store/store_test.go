@@ -1674,6 +1674,37 @@ func TestClaimRunPropagatesBlockerQueryError(t *testing.T) {
 	}
 }
 
+func TestClaimRunUsesSchemaAllowedActorTypesForDispatchEvents(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue := prepareReadyIssue(t, st, "ClaimRun dispatch event actor types")
+
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+
+	rows, err := st.Project.Query(`SELECT event_type, actor_type FROM run_events WHERE run_id=? AND event_type IN ('run.claimed','issue.state_changed') ORDER BY event_type`, run.ID)
+	if err != nil {
+		t.Fatalf("query dispatch events: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("dispatch event count = %d, want 2", len(rows))
+	}
+	for _, row := range rows {
+		if got := row["actor_type"].String(); got != "system" {
+			t.Fatalf("%s actor_type = %q, want system", row["event_type"].String(), got)
+		}
+	}
+
+	hist, err := st.Project.QueryOne(`SELECT actor_type FROM issue_state_history WHERE issue_id=? AND run_id=? AND reason='dispatch'`, issue.ID, run.ID)
+	if err != nil {
+		t.Fatalf("query dispatch history: %v", err)
+	}
+	if got := hist["actor_type"].String(); got != "orchestrator" {
+		t.Fatalf("dispatch history actor_type = %q, want orchestrator", got)
+	}
+}
+
 func TestClaimRunRollsBackWhenStateHistoryInsertFails(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue := prepareReadyIssue(t, st, "ClaimRun history failure")
