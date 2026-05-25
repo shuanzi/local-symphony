@@ -358,6 +358,30 @@ func TestHandleProtocolLineRejectsTurnCompletedBeforeHandshake(t *testing.T) {
 	}
 }
 
+func TestHandleProtocolLineRejectsTurnFailedBeforeHandshake(t *testing.T) {
+	req := agent.RunRequest{}
+	handshakeDone := false
+	var startupC <-chan time.Time
+	handoffReceived := false
+	threadID := ""
+
+	_, done, err := handleProtocolLine(req, nil, `{"type":"turn_failed","failure_code":"operator_cancelled"}`, &handshakeDone, &startupC, &handoffReceived, &threadID)
+	if err == nil || !strings.Contains(err.Error(), "turn failed before handshake") {
+		t.Fatalf("err = %v, want turn failed before handshake", err)
+	}
+	if done {
+		t.Fatal("done = true, want false")
+	}
+}
+
+func TestDefaultFixtureRootSupportsEnvOverride(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("SYMPHONY_CODEX_FIXTURE_ROOT", tmp)
+	if got := defaultFixtureRoot(); got != tmp {
+		t.Fatalf("defaultFixtureRoot() = %q, want %q", got, tmp)
+	}
+}
+
 func TestRunnerStallTimeoutFails(t *testing.T) {
 	_, run, issue, workspacePath, token := newCodexRunnerFixture(t)
 	script := writeFakeCodexBinary(t, `#!/bin/sh

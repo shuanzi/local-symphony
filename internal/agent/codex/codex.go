@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -190,14 +189,11 @@ func (r *Runner) startAppServer(req agent.RunRequest, selected *SelectedFixture)
 	emit(req, "agent.process_started", map[string]any{"command": "redacted", "cwd": cmd.Dir, "codex_version": selected.Version})
 	go func() { _, _ = io.Copy(stderrCounter, stderr) }()
 	lines := make(chan stdoutItem, 128)
-	scanDone := make(chan struct{})
 	go func() {
 		scanStdout(stdout, lines)
-		close(scanDone)
 	}()
 	waitCh := make(chan error, 1)
 	go func() {
-		<-scanDone
 		waitCh <- cmd.Wait()
 	}()
 
@@ -364,6 +360,9 @@ func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line st
 		}
 		return agent.RunResult{Kind: agent.RunResultSucceeded}, true, nil
 	case "turn_failed":
+		if !*handshakeDone {
+			return agent.RunResult{}, false, fmt.Errorf("turn failed before handshake")
+		}
 		code := core.FailureCodexProtocolError
 		if strings.TrimSpace(msg.FailureCode) != "" {
 			code = core.FailureCode(msg.FailureCode)
@@ -704,11 +703,26 @@ func validateCompatibilityMetadata(version string, metadata CompatibilityMetadat
 }
 
 func defaultFixtureRoot() string {
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		return filepath.Join("internal", "agent", "codex", "testdata")
+	if root := strings.TrimSpace(os.Getenv("SYMPHONY_CODEX_FIXTURE_ROOT")); root != "" {
+		return root
 	}
-	return filepath.Join(filepath.Dir(file), "testdata")
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		candidates := []string{
+			filepath.Join(exeDir, "fixtures", "codex"),
+			filepath.Join(exeDir, "..", "share", "local-symphony", "fixtures", "codex"),
+			filepath.Join(exeDir, "..", "fixtures", "codex"),
+		}
+		for _, candidate := range candidates {
+			if isDir(candidate) {
+				return candidate
+			}
+		}
+	}
+	if isDir("testdata") {
+		return "testdata"
+	}
+	return filepath.Join("internal", "agent", "codex", "testdata")
 }
 
 func isDir(path string) bool {
