@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex 0.0.0-test protocol fixture",
+  "type": "object",
+  "additionalProperties": true
+}

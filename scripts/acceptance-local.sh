@@ -4,6 +4,9 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 BIN="$TMP/symphony"
+export HOME="$TMP/home"
+export SYMPHONY_WORKSPACE_ROOT="$TMP/workspaces"
+mkdir -p "$HOME" "$SYMPHONY_WORKSPACE_ROOT"
 (cd "$ROOT" && go build -o "$BIN" ./cmd/symphony)
 cd "$TMP"
 git init -q

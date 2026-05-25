@@ -28,6 +28,13 @@ type Store struct {
 	App           *db.DB
 }
 
+const SupportedSchemaVersion = "1"
+
+type SchemaVersionStatus struct {
+	Version string
+	Status  string
+}
+
 type CreateIssueInput struct {
 	Title              string
 	Description        string
@@ -125,10 +132,22 @@ func InitProject(repoRoot, issuePrefix string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	s := &Store{RepoRoot: root, ProjectDBPath: filepath.Join(root, ".symphony", "project.db"), AppDBPath: db.AppDBPath(), ProjectID: ProjectIDForRoot(root), IssuePrefix: issuePrefix}
+	projectDBExists := fileExists(s.ProjectDBPath)
+	appDBExists := fileExists(s.AppDBPath)
+	if projectDBExists {
+		if err := validateExistingSchemaVersion(s.ProjectDBPath); err != nil {
+			return nil, err
+		}
+	}
+	if appDBExists {
+		if err := validateExistingSchemaVersion(s.AppDBPath); err != nil {
+			return nil, err
+		}
+	}
 	if err := os.MkdirAll(filepath.Join(root, ".symphony", "artifacts"), 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{RepoRoot: root, ProjectDBPath: filepath.Join(root, ".symphony", "project.db"), AppDBPath: db.AppDBPath(), ProjectID: ProjectIDForRoot(root), IssuePrefix: issuePrefix}
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -153,6 +172,12 @@ func InitProject(repoRoot, issuePrefix string) (*Store, error) {
 		return nil, err
 	}
 	if err := s.Project.ExecScript(projSchema); err != nil {
+		return nil, err
+	}
+	if err := validateSchemaVersion(s.App, s.AppDBPath); err != nil {
+		return nil, err
+	}
+	if err := validateSchemaVersion(s.Project, s.ProjectDBPath); err != nil {
 		return nil, err
 	}
 	now := core.Now()
@@ -189,11 +214,16 @@ func Open(repoRoot string) (*Store, error) {
 	if _, err := os.Stat(s.ProjectDBPath); err != nil {
 		return nil, core.NewError(core.ErrInvalidRequest, "project is not initialized; run symphony init", nil)
 	}
-	if s.Project, err = db.Open(s.ProjectDBPath); err != nil {
+	appDBExists := fileExists(s.AppDBPath)
+	if err := validateExistingSchemaVersion(s.ProjectDBPath); err != nil {
 		return nil, err
 	}
-	if s.App, err = db.Open(s.AppDBPath); err != nil {
-		_ = s.Project.Close()
+	if appDBExists {
+		if err := validateExistingSchemaVersion(s.AppDBPath); err != nil {
+			return nil, err
+		}
+	}
+	if s.Project, err = db.Open(s.ProjectDBPath); err != nil {
 		return nil, err
 	}
 	cleanup := true
@@ -202,6 +232,21 @@ func Open(repoRoot string) (*Store, error) {
 			s.Close()
 		}
 	}()
+	if s.App, err = db.Open(s.AppDBPath); err != nil {
+		return nil, err
+	}
+	if !appDBExists {
+		appSchema, err := db.ReadSchema(root, "db/schema/v1_app.sql")
+		if err != nil {
+			return nil, err
+		}
+		if err := s.App.ExecScript(appSchema); err != nil {
+			return nil, err
+		}
+	}
+	if err := validateSchemaVersion(s.App, s.AppDBPath); err != nil {
+		return nil, err
+	}
 	row, err := s.Project.QueryOne(`SELECT id, issue_prefix FROM project_info LIMIT 1`)
 	if err != nil {
 		return nil, fmt.Errorf("read project_info: %w", err)
@@ -219,6 +264,87 @@ func (s *Store) Close() {
 	if s.App != nil {
 		_ = s.App.Close()
 	}
+}
+
+func (s *Store) DatabaseSchemaVersions() (SchemaVersionStatus, SchemaVersionStatus) {
+	return schemaVersionStatus(s.App), schemaVersionStatus(s.Project)
+}
+
+func schemaVersionStatus(database *db.DB) SchemaVersionStatus {
+	version, detected, err := readSchemaVersion(database)
+	if err != nil {
+		status := "unknown"
+		if strings.HasPrefix(detected, "missing_") {
+			status = "missing"
+		}
+		return SchemaVersionStatus{Version: detected, Status: status}
+	}
+	status := "unsupported"
+	if isSupportedSchemaVersion(version) {
+		status = "supported"
+	}
+	return SchemaVersionStatus{Version: version, Status: status}
+}
+
+func validateExistingSchemaVersion(dbPath string) error {
+	database, err := db.OpenReadOnly(dbPath)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	return validateSchemaVersion(database, dbPath)
+}
+
+func validateSchemaVersion(database *db.DB, dbPath string) error {
+	version, detected, err := readSchemaVersion(database)
+	if err != nil {
+		return unsupportedDBVersionError(dbPath, detected)
+	}
+	if !isSupportedSchemaVersion(version) {
+		return unsupportedDBVersionError(dbPath, version)
+	}
+	return nil
+}
+
+func readSchemaVersion(database *db.DB) (string, string, error) {
+	if database == nil {
+		return "", "unknown", errors.New("sqlite database is unavailable")
+	}
+	if _, err := database.QueryOne(`SELECT name FROM sqlite_master WHERE type='table' AND name='schema_meta'`); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", "missing_schema_meta", err
+		}
+		return "", "unknown", err
+	}
+	row, err := database.QueryOne(`SELECT value FROM schema_meta WHERE key='schema_version'`)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", "missing_schema_version", err
+		}
+		return "", "unknown", err
+	}
+	return row["value"].String(), row["value"].String(), nil
+}
+
+func isSupportedSchemaVersion(version string) bool {
+	if _, err := strconv.Atoi(version); err != nil {
+		return false
+	}
+	return version == SupportedSchemaVersion
+}
+
+func unsupportedDBVersionError(dbPath, detected string) *core.APIError {
+	return core.NewError(core.ErrUnsupportedDBVersion, "unsupported database schema version", map[string]any{
+		"detected_version":  detected,
+		"expected_version":  SupportedSchemaVersion,
+		"db_path":           dbPath,
+		"operator_guidance": "This Local Symphony build only supports schema version 1. Use a compatible binary for this database, manually restore from an operator-maintained backup outside Symphony, or initialize a new project DB. This build will not modify unsupported databases and does not provide automatic migration, rollback, backup, or restore.",
+	})
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func defaultWorkflow() string {
