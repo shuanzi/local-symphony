@@ -160,7 +160,8 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		return nil
 	}
 	if result.Kind == agentrunner.RunResultMissingHandoff && wf.Config.Agent.MaxHandoffContinuations > 0 {
-		if !o.runIsActive(runID) {
+		active, activeErr := o.runIsActive(runID)
+		if activeErr != nil || !active {
 			return nil
 		}
 		_ = o.Store.AppendEvent("agent.handoff_continuation_requested", "system", &issue.ID, &runID, map[string]any{"continuation": 1, "prompt": "redacted"})
@@ -173,11 +174,13 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 			return nil
 		}
 	}
-	if !o.runIsActive(runID) {
+	active, activeErr := o.runIsActive(runID)
+	if activeErr != nil || !active {
 		return nil
 	}
 	_ = runAfterHook(o.Store, wf, ws.Path, runID, issue.ID)
-	if !o.runIsActive(runID) {
+	active, activeErr = o.runIsActive(runID)
+	if activeErr != nil || !active {
 		return nil
 	}
 	switch result.Kind {
@@ -192,7 +195,8 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		_ = o.Store.FailRun(runID, core.FailureMissingHandoff, "handoff missing", core.RunCompletedWithoutHandoff)
 		return nil
 	}
-	if !o.runIsActive(runID) {
+	active, activeErr = o.runIsActive(runID)
+	if activeErr != nil || !active {
 		return nil
 	}
 	rpID, err := review.Generator{Store: o.Store}.Generate(runID)
@@ -245,9 +249,12 @@ func failureMessageOrDefault(message, fallback string) string {
 	return message
 }
 
-func (o Orchestrator) runIsActive(runID string) bool {
+func (o Orchestrator) runIsActive(runID string) (bool, error) {
 	run, err := o.Store.GetRun(runID)
-	return err == nil && core.IsActiveRunStatus(run.Status)
+	if err != nil {
+		return false, err
+	}
+	return core.IsActiveRunStatus(run.Status), nil
 }
 
 func (o Orchestrator) runContext(runID string) (context.Context, context.CancelFunc) {
@@ -261,7 +268,11 @@ func (o Orchestrator) runContext(runID string) (context.Context, context.CancelF
 			case <-done:
 				return
 			case <-ticker.C:
-				if !o.runIsActive(runID) {
+				active, err := o.runIsActive(runID)
+				if err != nil {
+					continue
+				}
+				if !active {
 					cancel()
 					return
 				}
@@ -275,13 +286,15 @@ func (o Orchestrator) runContext(runID string) (context.Context, context.CancelF
 }
 
 func (o Orchestrator) advanceRun(runID string, status core.RunStatus, fields map[string]any) bool {
-	if !o.runIsActive(runID) {
+	active, err := o.runIsActive(runID)
+	if err != nil || !active {
 		return false
 	}
 	if err := o.Store.UpdateRunStatus(runID, status, fields); err != nil {
 		return false
 	}
-	return o.runIsActive(runID)
+	active, err = o.runIsActive(runID)
+	return err == nil && active
 }
 
 func runAfterHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID string) error {

@@ -337,6 +337,9 @@ func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line st
 		}
 		emit(req, "agent.turn_progress", map[string]any{"message": redactedMessage(msg.Message)})
 	case "handoff":
+		if !*handshakeDone {
+			return agent.RunResult{}, false, fmt.Errorf("handoff before handshake")
+		}
 		if len(msg.Payload) == 0 {
 			return agent.RunResult{}, false, fmt.Errorf("handoff payload is required")
 		}
@@ -352,6 +355,9 @@ func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line st
 	case "tool_call":
 		emit(req, "agent.tool_call_observed", map[string]any{"tool": "redacted"})
 	case "turn_completed":
+		if !*handshakeDone {
+			return agent.RunResult{}, false, fmt.Errorf("turn completed before handshake")
+		}
 		emit(req, "agent.turn_completed", map[string]any{})
 		if !*handoffReceived {
 			return agent.RunResult{Kind: agent.RunResultMissingHandoff, FailureCode: core.FailureMissingHandoff, FailureMessage: "handoff missing"}, true, nil

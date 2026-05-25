@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"local-symphony/internal/agent"
 	"local-symphony/internal/core"
@@ -317,6 +318,43 @@ sleep 2
 	}
 	if result.Kind != agent.RunResultFailed || result.FailureCode != core.FailureTurnTimeout {
 		t.Fatalf("result = %#v, want turn timeout", result)
+	}
+}
+
+func TestHandleProtocolLineRejectsHandoffBeforeHandshake(t *testing.T) {
+	req := agent.RunRequest{
+		Gateway: toolgateway.Gateway{Store: nil},
+	}
+	handshakeDone := false
+	var startupC <-chan time.Time
+	handoffReceived := false
+	threadID := ""
+
+	_, done, err := handleProtocolLine(req, nil, `{"type":"handoff","payload":{"summary":"x"}}`, &handshakeDone, &startupC, &handoffReceived, &threadID)
+	if err == nil || !strings.Contains(err.Error(), "handoff before handshake") {
+		t.Fatalf("err = %v, want handoff before handshake", err)
+	}
+	if done {
+		t.Fatal("done = true, want false")
+	}
+	if handoffReceived {
+		t.Fatal("handoffReceived = true, want false")
+	}
+}
+
+func TestHandleProtocolLineRejectsTurnCompletedBeforeHandshake(t *testing.T) {
+	req := agent.RunRequest{}
+	handshakeDone := false
+	var startupC <-chan time.Time
+	handoffReceived := true
+	threadID := ""
+
+	_, done, err := handleProtocolLine(req, nil, `{"type":"turn_completed"}`, &handshakeDone, &startupC, &handoffReceived, &threadID)
+	if err == nil || !strings.Contains(err.Error(), "turn completed before handshake") {
+		t.Fatalf("err = %v, want turn completed before handshake", err)
+	}
+	if done {
+		t.Fatal("done = true, want false")
 	}
 }
 
