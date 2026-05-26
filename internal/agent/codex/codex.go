@@ -24,8 +24,9 @@ import (
 const (
 	compatibilityMetadataFile = "compatibility.json"
 	maxProtocolLineBytes      = 16 * 1024 * 1024
-	versionProbeTimeout       = 2 * time.Second
 )
+
+var versionProbeTimeout = 10 * time.Second
 
 type Support struct {
 	Supported bool   `json:"supported"`
@@ -150,9 +151,6 @@ func versionProbeCandidates(parts []string) [][]string {
 }
 
 func versionProbeOutput(parts []string) ([]byte, error) {
-	if len(parts) == 2 && parts[1] == "--version" {
-		return exec.Command(parts[0], parts[1:]...).Output()
-	}
 	return commandOutputWithTimeout(parts, versionProbeTimeout)
 }
 
@@ -546,6 +544,7 @@ func ValidateTranscriptFixture(selected *SelectedFixture, name string) error {
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxProtocolLineBytes)
 	lineNo := 0
 	handshakeSeen := false
 	terminalSeen := false

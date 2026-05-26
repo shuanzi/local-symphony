@@ -357,7 +357,7 @@ if [ "$1" = "--version" ]; then
 fi
 read start_turn
 printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
-sleep 0.1
+sleep 0.5
 printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
 printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
 printf '%s\n' '{"type":"handoff","payload":{"summary":"Codex fixture completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
@@ -369,7 +369,7 @@ printf '%s\n' '{"type":"turn_completed"}'
 		Issue:     issue,
 		Workspace: &core.WorkspaceSummary{Path: workspacePath},
 		ToolToken: token,
-		Timeouts:  agent.TimeoutPolicy{StartupMS: 1000, TurnMS: 1000, StallMS: 1000, ReadMS: 25},
+		Timeouts:  agent.TimeoutPolicy{StartupMS: 1000, TurnMS: 1000, StallMS: 1000, ReadMS: 250},
 		Gateway:   toolgateway.Gateway{Store: st},
 	})
 	if err != nil {
@@ -645,6 +645,29 @@ exit 1
 	}
 }
 
+func TestDetectVersionForCommandTimesOutDirectProbe(t *testing.T) {
+	oldTimeout := versionProbeTimeout
+	versionProbeTimeout = 25 * time.Millisecond
+	t.Cleanup(func() {
+		versionProbeTimeout = oldTimeout
+	})
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  sleep 2
+  exit 0
+fi
+exit 1
+`)
+
+	start := time.Now()
+	if got := DetectVersionForCommand(script); got != "" {
+		t.Fatalf("DetectVersionForCommand() = %q, want empty version after timeout", got)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("DetectVersionForCommand took %s, want bounded by probe timeout", elapsed)
+	}
+}
+
 func TestRunnerStallTimeoutFails(t *testing.T) {
 	_, run, issue, workspacePath, token := newCodexRunnerFixture(t)
 	script := writeFakeCodexBinary(t, `#!/bin/sh
@@ -715,6 +738,43 @@ func TestScanStdoutAcceptsLargeProtocolLine(t *testing.T) {
 	item, ok = <-lines
 	if ok {
 		t.Fatalf("unexpected trailing stdout item: %#v", item)
+	}
+}
+
+func TestValidateTranscriptFixtureAcceptsLargeProtocolLine(t *testing.T) {
+	root := t.TempDir()
+	version := "1.2.3"
+	writeTestFixture(t, root, version, `{
+		"codex_version": "1.2.3",
+		"protocol_version": "protocol-test-v1",
+		"schema_version": "schema-test-v1",
+		"supported_notifications": ["codex.initialized"],
+		"supported_requests": ["initialize"],
+		"experimental_api": false
+	}`)
+	if err := os.WriteFile(filepath.Join(root, "schema", version, "schema.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write schema: %v", err)
+	}
+	transcript := strings.Join([]string{
+		`{"type":"handshake","codex_version":"1.2.3","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}`,
+		`{"type":"turn_progress","message":"` + strings.Repeat("x", 128*1024) + `"}`,
+		`{"type":"turn_completed"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(root, "transcripts", version, "happy-path.jsonl"), []byte(transcript), 0o644); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	selected := &SelectedFixture{
+		TranscriptDir: filepath.Join(root, "transcripts", version),
+		Metadata: CompatibilityMetadata{
+			CodexVersion:    version,
+			ProtocolVersion: "protocol-test-v1",
+			SchemaVersion:   "schema-test-v1",
+			ExperimentalAPI: false,
+		},
+	}
+
+	if err := ValidateTranscriptFixture(selected, "happy-path.jsonl"); err != nil {
+		t.Fatalf("ValidateTranscriptFixture: %v", err)
 	}
 }
 
