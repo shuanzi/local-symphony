@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -321,6 +322,64 @@ sleep 2
 	}
 }
 
+func TestRunnerReadTimeoutFails(t *testing.T) {
+	_, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+sleep 2
+`)
+
+	result, err := (&Runner{Command: script + " app-server"}).Run(context.Background(), agent.RunRequest{
+		Run:       run,
+		Issue:     issue,
+		Workspace: &core.WorkspaceSummary{Path: workspacePath},
+		ToolToken: token,
+		Timeouts:  agent.TimeoutPolicy{StartupMS: 1000, TurnMS: 1000, StallMS: 1000, ReadMS: 25},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Kind != agent.RunResultFailed || result.FailureCode != core.FailureCodexProtocolError || result.FailureMessage != "codex read timeout" {
+		t.Fatalf("result = %#v, want read timeout protocol failure", result)
+	}
+}
+
+func TestRunnerReadTimeoutOnlyAppliesBeforeFirstResponse(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+sleep 0.1
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"type":"handoff","payload":{"summary":"Codex fixture completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
+printf '%s\n' '{"type":"turn_completed"}'
+`)
+
+	result, err := (&Runner{Command: script + " app-server"}).Run(context.Background(), agent.RunRequest{
+		Run:       run,
+		Issue:     issue,
+		Workspace: &core.WorkspaceSummary{Path: workspacePath},
+		ToolToken: token,
+		Timeouts:  agent.TimeoutPolicy{StartupMS: 1000, TurnMS: 1000, StallMS: 1000, ReadMS: 25},
+		Gateway:   toolgateway.Gateway{Store: st},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Kind != agent.RunResultSucceeded {
+		t.Fatalf("result = %#v, want success", result)
+	}
+}
+
 func TestHandleProtocolLineRejectsHandoffBeforeHandshake(t *testing.T) {
 	req := agent.RunRequest{
 		Gateway: toolgateway.Gateway{Store: nil},
@@ -374,11 +433,195 @@ func TestHandleProtocolLineRejectsTurnFailedBeforeHandshake(t *testing.T) {
 	}
 }
 
+func TestHandleProtocolLineRejectsNotificationsBeforeHandshake(t *testing.T) {
+	cases := []struct {
+		name    string
+		line    string
+		wantErr string
+	}{
+		{name: "approval_requested", line: `{"type":"approval_requested"}`, wantErr: "approval requested before handshake"},
+		{name: "approval_resolved", line: `{"type":"approval_resolved"}`, wantErr: "approval resolved before handshake"},
+		{name: "tool_call", line: `{"type":"tool_call"}`, wantErr: "tool call before handshake"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := agent.RunRequest{}
+			handshakeDone := false
+			var startupC <-chan time.Time
+			handoffReceived := false
+			threadID := ""
+
+			_, done, err := handleProtocolLine(req, nil, tc.line, &handshakeDone, &startupC, &handoffReceived, &threadID)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want contains %q", err, tc.wantErr)
+			}
+			if done {
+				t.Fatal("done = true, want false")
+			}
+		})
+	}
+}
+
 func TestDefaultFixtureRootSupportsEnvOverride(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("SYMPHONY_CODEX_FIXTURE_ROOT", tmp)
 	if got := defaultFixtureRoot(); got != tmp {
 		t.Fatalf("defaultFixtureRoot() = %q, want %q", got, tmp)
+	}
+}
+
+func TestDefaultFixtureRootPrefersRepositoryFixturePathOverCWDTestdata(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(wd)
+	})
+
+	root := t.TempDir()
+	writeLocalSymphonyGoMod(t, root)
+	if err := os.MkdirAll(filepath.Join(root, "testdata"), 0o755); err != nil {
+		t.Fatalf("mkdir cwd testdata: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "internal", "agent", "codex", "testdata"), 0o755); err != nil {
+		t.Fatalf("mkdir repo fixture root: %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+
+	t.Setenv("SYMPHONY_CODEX_FIXTURE_ROOT", "")
+	want := filepath.Join("internal", "agent", "codex", "testdata")
+	assertSamePath(t, defaultFixtureRoot(), filepath.Join(root, want))
+}
+
+func TestDefaultFixtureRootFindsRepositoryFixturePathFromSubdirectory(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(wd)
+	})
+
+	root := t.TempDir()
+	writeLocalSymphonyGoMod(t, root)
+	subdir := filepath.Join(root, "internal", "orchestrator")
+	if err := os.MkdirAll(filepath.Join(subdir, "testdata"), 0o755); err != nil {
+		t.Fatalf("mkdir cwd testdata: %v", err)
+	}
+	repoFixtureRoot := filepath.Join(root, "internal", "agent", "codex", "testdata")
+	if err := os.MkdirAll(repoFixtureRoot, 0o755); err != nil {
+		t.Fatalf("mkdir repo fixture root: %v", err)
+	}
+	if err := os.Chdir(subdir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+
+	t.Setenv("SYMPHONY_CODEX_FIXTURE_ROOT", "")
+	assertSamePath(t, defaultFixtureRoot(), repoFixtureRoot)
+}
+
+func TestDefaultFixtureRootDoesNotUseUnrelatedRepositoryFixturePath(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(wd)
+	})
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module unrelated\n"), 0o644); err != nil {
+		t.Fatalf("write unrelated go.mod: %v", err)
+	}
+	unrelatedFixtureRoot := filepath.Join(root, "internal", "agent", "codex", "testdata")
+	if err := os.MkdirAll(unrelatedFixtureRoot, 0o755); err != nil {
+		t.Fatalf("mkdir unrelated fixture root: %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+
+	t.Setenv("SYMPHONY_CODEX_FIXTURE_ROOT", "")
+	if got := defaultFixtureRoot(); sameExistingPath(t, got, unrelatedFixtureRoot) {
+		t.Fatalf("defaultFixtureRoot() = unrelated fixture root %q", got)
+	}
+}
+
+func TestDefaultFixtureRootDoesNotUseArbitraryCWDTestdata(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(wd)
+	})
+
+	root := t.TempDir()
+	cwdTestdata := filepath.Join(root, "testdata")
+	if err := os.MkdirAll(cwdTestdata, 0o755); err != nil {
+		t.Fatalf("mkdir cwd testdata: %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+
+	t.Setenv("SYMPHONY_CODEX_FIXTURE_ROOT", "")
+	if got := defaultFixtureRoot(); sameExistingPath(t, got, cwdTestdata) {
+		t.Fatalf("defaultFixtureRoot() = arbitrary cwd testdata %q", got)
+	}
+}
+
+func TestCommandPartsPreservesQuotedArguments(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		want    []string
+	}{
+		{
+			name:    "quoted executable path",
+			command: `"/opt/tools/codex wrapper" app-server`,
+			want:    []string{"/opt/tools/codex wrapper", "app-server"},
+		},
+		{
+			name:    "quoted and empty argument",
+			command: `codex app-server --label "space value" --empty ""`,
+			want:    []string{"codex", "app-server", "--label", "space value", "--empty", ""},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := commandParts(tc.command); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("commandParts(%q) = %#v, want %#v", tc.command, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDetectVersionForCommandSupportsQuotedExecutablePath(t *testing.T) {
+	binDir := filepath.Join(t.TempDir(), "with spaces")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin dir: %v", err)
+	}
+	executable := filepath.Join(binDir, "codex wrapper")
+	body := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(executable, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fake codex executable: %v", err)
+	}
+
+	command := `"` + executable + `" app-server`
+	if got := DetectVersionForCommand(command); got != "codex 0.0.0-test" {
+		t.Fatalf("DetectVersionForCommand(%q) = %q, want %q", command, got, "codex 0.0.0-test")
 	}
 }
 
@@ -433,6 +676,28 @@ sleep 2
 	}
 }
 
+func TestScanStdoutAcceptsLargeProtocolLine(t *testing.T) {
+	largeLine := `{"type":"turn_progress","message":"` + strings.Repeat("x", 2*1024*1024) + `"}`
+	lines := make(chan stdoutItem, 2)
+
+	scanStdout(strings.NewReader(largeLine+"\n"), lines)
+
+	item, ok := <-lines
+	if !ok {
+		t.Fatal("stdout line channel closed before first line")
+	}
+	if item.err != nil {
+		t.Fatalf("scanStdout error = %v", item.err)
+	}
+	if item.line != largeLine {
+		t.Fatalf("line length = %d, want %d", len(item.line), len(largeLine))
+	}
+	item, ok = <-lines
+	if ok {
+		t.Fatalf("unexpected trailing stdout item: %#v", item)
+	}
+}
+
 func TestRunnerHandshakeMismatchFailsProtocolError(t *testing.T) {
 	_, run, issue, workspacePath, token := newCodexRunnerFixture(t)
 	script := writeFakeCodexBinary(t, `#!/bin/sh
@@ -475,6 +740,42 @@ func assertWorkspaceCWD(t *testing.T, workspacePath string) {
 	if actual != expected {
 		t.Fatalf("process cwd = %q, want %q", actual, expected)
 	}
+}
+
+func assertSamePath(t *testing.T, got, want string) {
+	t.Helper()
+	actual, err := realPath(got)
+	if err != nil {
+		t.Fatalf("EvalSymlinks got path %q: %v", got, err)
+	}
+	expected, err := realPath(want)
+	if err != nil {
+		t.Fatalf("EvalSymlinks want path %q: %v", want, err)
+	}
+	if actual != expected {
+		t.Fatalf("path = %q, want %q", actual, expected)
+	}
+}
+
+func sameExistingPath(t *testing.T, got, want string) bool {
+	t.Helper()
+	actual, err := realPath(got)
+	if err != nil {
+		return false
+	}
+	expected, err := realPath(want)
+	if err != nil {
+		return false
+	}
+	return actual == expected
+}
+
+func realPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
 }
 
 func assertStartTurn(t *testing.T, path, wantPrompt string, wantContinuation bool, wantThreadID string) {
@@ -620,5 +921,12 @@ func writeTestFixture(t *testing.T, root, version, metadata string) {
 	}
 	if err := os.WriteFile(filepath.Join(schemaDir, "compatibility.json"), []byte(metadata), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func writeLocalSymphonyGoMod(t *testing.T, root string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module local-symphony\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
 	}
 }

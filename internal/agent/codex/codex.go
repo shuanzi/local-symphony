@@ -13,13 +13,17 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"local-symphony/internal/agent"
 	"local-symphony/internal/core"
 	"local-symphony/internal/toolgateway"
 )
 
-const compatibilityMetadataFile = "compatibility.json"
+const (
+	compatibilityMetadataFile = "compatibility.json"
+	maxProtocolLineBytes      = 16 * 1024 * 1024
+)
 
 type Support struct {
 	Supported bool   `json:"supported"`
@@ -227,6 +231,13 @@ func (r *Runner) runTurn(ctx context.Context, req agent.RunRequest, session *pro
 	defer turn.Stop()
 	stall := time.NewTimer(timeoutDuration(req.Timeouts.StallMS, 5*time.Minute))
 	defer stall.Stop()
+	var read *time.Timer
+	var readC <-chan time.Time
+	if req.Timeouts.ReadMS > 0 {
+		read = time.NewTimer(time.Duration(req.Timeouts.ReadMS) * time.Millisecond)
+		defer read.Stop()
+		readC = read.C
+	}
 	startupC := startup.C
 	if session.handshakeDone {
 		startupC = nil
@@ -251,6 +262,9 @@ func (r *Runner) runTurn(ctx context.Context, req agent.RunRequest, session *pro
 		case <-stallC:
 			_ = r.closeSession(req)
 			return failed(core.FailureStallTimeout, "codex stall timeout"), nil
+		case <-readC:
+			_ = r.closeSession(req)
+			return failed(core.FailureCodexProtocolError, "codex read timeout"), nil
 		case item, ok := <-session.lines:
 			if !ok {
 				err := waitForProcess(session.waitCh, session.cmd.Process)
@@ -262,6 +276,11 @@ func (r *Runner) runTurn(ctx context.Context, req agent.RunRequest, session *pro
 					return failed(core.FailureCodexProtocolError, err.Error()), nil
 				}
 				return failed(core.FailureCodexProtocolError, "codex process exited before terminal turn result"), nil
+			}
+			if read != nil {
+				stopTimer(read)
+				read = nil
+				readC = nil
 			}
 			if item.err != nil {
 				_ = r.closeSession(req)
@@ -345,10 +364,19 @@ func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line st
 		}
 		*handoffReceived = true
 	case "approval_requested":
+		if !*handshakeDone {
+			return agent.RunResult{}, false, fmt.Errorf("approval requested before handshake")
+		}
 		emit(req, "approval.requested", map[string]any{"kind": "redacted"})
 	case "approval_resolved":
+		if !*handshakeDone {
+			return agent.RunResult{}, false, fmt.Errorf("approval resolved before handshake")
+		}
 		emit(req, "approval.resolved", map[string]any{"decision": "redacted"})
 	case "tool_call":
+		if !*handshakeDone {
+			return agent.RunResult{}, false, fmt.Errorf("tool call before handshake")
+		}
 		emit(req, "agent.tool_call_observed", map[string]any{"tool": "redacted"})
 	case "turn_completed":
 		if !*handshakeDone {
@@ -523,7 +551,7 @@ func validProtocolMessageType(messageType string) bool {
 func scanStdout(stdout io.Reader, lines chan<- stdoutItem) {
 	defer close(lines)
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxProtocolLineBytes)
 	for scanner.Scan() {
 		lines <- stdoutItem{line: scanner.Text()}
 	}
@@ -597,7 +625,77 @@ func failed(code core.FailureCode, message string) agent.RunResult {
 }
 
 func commandParts(command string) []string {
-	return strings.Fields(strings.TrimSpace(command))
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return nil
+	}
+
+	parts := []string{}
+	var current strings.Builder
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+	tokenStarted := false
+
+	flush := func() {
+		if !tokenStarted {
+			return
+		}
+		parts = append(parts, current.String())
+		current.Reset()
+		tokenStarted = false
+	}
+
+	for _, r := range command {
+		if escaped {
+			current.WriteRune(r)
+			tokenStarted = true
+			escaped = false
+			continue
+		}
+		if inSingleQuote {
+			if r == '\'' {
+				inSingleQuote = false
+				continue
+			}
+			current.WriteRune(r)
+			tokenStarted = true
+			continue
+		}
+		if inDoubleQuote {
+			switch r {
+			case '"':
+				inDoubleQuote = false
+			case '\\':
+				escaped = true
+			default:
+				current.WriteRune(r)
+				tokenStarted = true
+			}
+			continue
+		}
+		switch {
+		case unicode.IsSpace(r):
+			flush()
+		case r == '\'':
+			inSingleQuote = true
+			tokenStarted = true
+		case r == '"':
+			inDoubleQuote = true
+			tokenStarted = true
+		case r == '\\':
+			escaped = true
+			tokenStarted = true
+		default:
+			current.WriteRune(r)
+			tokenStarted = true
+		}
+	}
+	if escaped {
+		current.WriteRune('\\')
+	}
+	flush()
+	return parts
 }
 
 func codexEnv(req agent.RunRequest) []string {
@@ -656,6 +754,15 @@ func resetTimer(timer *time.Timer, d time.Duration) {
 	timer.Reset(d)
 }
 
+func stopTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
 func workspacePath(req agent.RunRequest) string {
 	if req.Workspace == nil {
 		return ""
@@ -706,23 +813,64 @@ func defaultFixtureRoot() string {
 	if root := strings.TrimSpace(os.Getenv("SYMPHONY_CODEX_FIXTURE_ROOT")); root != "" {
 		return root
 	}
-	if exePath, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exePath)
-		candidates := []string{
-			filepath.Join(exeDir, "fixtures", "codex"),
-			filepath.Join(exeDir, "..", "share", "local-symphony", "fixtures", "codex"),
-			filepath.Join(exeDir, "..", "fixtures", "codex"),
-		}
-		for _, candidate := range candidates {
-			if isDir(candidate) {
-				return candidate
-			}
+	candidates := deployableFixtureRootCandidates()
+	for _, candidate := range candidates {
+		if isDir(candidate) {
+			return candidate
 		}
 	}
-	if isDir("testdata") {
-		return "testdata"
+	if repoFixtureRoot := findRepoFixtureRoot(); repoFixtureRoot != "" {
+		return repoFixtureRoot
 	}
-	return filepath.Join("internal", "agent", "codex", "testdata")
+	if len(candidates) > 0 {
+		return candidates[0]
+	}
+	return filepath.Join(os.TempDir(), "local-symphony-missing-codex-fixtures")
+}
+
+func deployableFixtureRootCandidates() []string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+	exeDir := filepath.Dir(exePath)
+	return []string{
+		filepath.Join(exeDir, "fixtures", "codex"),
+		filepath.Join(exeDir, "..", "share", "local-symphony", "fixtures", "codex"),
+		filepath.Join(exeDir, "..", "fixtures", "codex"),
+	}
+}
+
+func findRepoFixtureRoot() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	for {
+		candidate := filepath.Join(wd, "internal", "agent", "codex", "testdata")
+		if isLocalSymphonyRepoRoot(wd) && isDir(candidate) {
+			return candidate
+		}
+		parent := filepath.Dir(wd)
+		if parent == wd {
+			return ""
+		}
+		wd = parent
+	}
+}
+
+func isLocalSymphonyRepoRoot(path string) bool {
+	data, err := os.ReadFile(filepath.Join(path, "go.mod"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "module" {
+			return fields[1] == "local-symphony"
+		}
+	}
+	return false
 }
 
 func isDir(path string) bool {

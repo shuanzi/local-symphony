@@ -138,7 +138,7 @@ func TestRunWorkerCancelsCodexProcessWhenRunCancelled(t *testing.T) {
 	go func() {
 		done <- (Orchestrator{Store: st}).runWorker(run.ID, wf)
 	}()
-	waitForRunEvent(t, st, run.ID, "agent.process_started")
+	waitForRunEvent(t, st, run.ID, "agent.handshake_completed")
 	if err := st.CancelRun(run.ID, "operator cancelled"); err != nil {
 		t.Fatalf("CancelRun: %v", err)
 	}
