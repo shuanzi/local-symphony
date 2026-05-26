@@ -1,0 +1,9 @@
+{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}
+{"type":"thread_started","thread_id":"thread_fixture"}
+{"type":"turn_started","turn_id":"turn_fixture"}
+{"type":"turn_progress","message":"redacted fixture progress"}
+{"type":"approval_requested","payload":{"kind":"command"}}
+{"type":"approval_resolved","payload":{"decision":"approve_once"}}
+{"type":"tool_call","payload":{"tool":"issue.get"}}
+{"type":"handoff","payload":{"summary":"Codex fixture completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}
+{"type":"turn_completed"}

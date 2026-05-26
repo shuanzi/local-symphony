@@ -14,6 +14,281 @@ import (
 	"local-symphony/internal/store"
 )
 
+func TestDispatchIssueDefaultsToFakeRunnerAndCompletesWithReview(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_RUNNER_KIND", "")
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, issue := newReadyDispatchIssue(t)
+
+	res, err := (Orchestrator{Store: st}).DispatchIssue(issue.Identifier, "manual")
+	if err != nil {
+		t.Fatalf("DispatchIssue: %v", err)
+	}
+
+	if res.Run.RunnerKind != "fake" {
+		t.Fatalf("runner_kind = %q, want fake", res.Run.RunnerKind)
+	}
+	if res.Run.Status != core.RunCompleted {
+		t.Fatalf("run status = %s, want %s", res.Run.Status, core.RunCompleted)
+	}
+	if res.Issue.State != core.StateHumanReview {
+		t.Fatalf("issue state = %s, want %s", res.Issue.State, core.StateHumanReview)
+	}
+	if res.Issue.LatestReviewPacketID == nil || *res.Issue.LatestReviewPacketID == "" {
+		t.Fatal("latest review packet id is empty")
+	}
+}
+
+func TestDispatchIssueCodexRunnerFailClosedUnsupportedVersion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_RUNNER_KIND", "codex")
+	st, issue := newReadyDispatchIssue(t)
+
+	res, err := (Orchestrator{Store: st}).DispatchIssue(issue.Identifier, "manual")
+	if err != nil {
+		t.Fatalf("DispatchIssue: %v", err)
+	}
+
+	if res.Run.RunnerKind != "codex" {
+		t.Fatalf("runner_kind = %q, want codex", res.Run.RunnerKind)
+	}
+	if res.Run.Status != core.RunFailed {
+		t.Fatalf("run status = %s, want %s", res.Run.Status, core.RunFailed)
+	}
+	if res.Run.FailureCode == nil || *res.Run.FailureCode != core.FailureUnsupportedCodexVersion {
+		t.Fatalf("failure code = %v, want %s", res.Run.FailureCode, core.FailureUnsupportedCodexVersion)
+	}
+	if !res.Issue.DispatchPaused {
+		t.Fatal("issue dispatch_paused = false, want true")
+	}
+	if res.Issue.DispatchPauseReason == nil || *res.Issue.DispatchPauseReason != string(core.FailureUnsupportedCodexVersion) {
+		t.Fatalf("dispatch pause reason = %v, want %s", res.Issue.DispatchPauseReason, core.FailureUnsupportedCodexVersion)
+	}
+}
+
+func TestDispatchIssueCodexFixtureProcessCompletesWithReview(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_RUNNER_KIND", "codex")
+	st, issue := newReadyDispatchIssue(t)
+	script := writeCodexFixtureCommand(t)
+	writeWorkflowWithCodexCommand(t, st.RepoRoot, script+" app-server")
+
+	res, err := (Orchestrator{Store: st}).DispatchIssue(issue.Identifier, "manual")
+	if err != nil {
+		t.Fatalf("DispatchIssue: %v", err)
+	}
+
+	if res.Run.RunnerKind != "codex" {
+		t.Fatalf("runner_kind = %q, want codex", res.Run.RunnerKind)
+	}
+	if res.Run.Status != core.RunCompleted {
+		t.Fatalf("run status = %s, want %s", res.Run.Status, core.RunCompleted)
+	}
+	if res.Issue.State != core.StateHumanReview {
+		t.Fatalf("issue state = %s, want %s", res.Issue.State, core.StateHumanReview)
+	}
+	assertRunEventCount(t, st, res.Run.ID, "agent.process_started", 1)
+	assertRunEventCount(t, st, res.Run.ID, "agent.handshake_completed", 1)
+	assertRunEventCount(t, st, res.Run.ID, "agent.turn_completed", 1)
+}
+
+func TestDispatchIssueCodexMissingHandoffContinuationUsesSameProcess(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_RUNNER_KIND", "codex")
+	st, issue := newReadyDispatchIssue(t)
+	script := writeCodexContinuationFixtureCommand(t)
+	writeWorkflowWithCodexCommand(t, st.RepoRoot, script+" app-server")
+
+	res, err := (Orchestrator{Store: st}).DispatchIssue(issue.Identifier, "manual")
+	if err != nil {
+		t.Fatalf("DispatchIssue: %v", err)
+	}
+	if res.Run.Status != core.RunCompleted {
+		t.Fatalf("run status = %s, want %s", res.Run.Status, core.RunCompleted)
+	}
+	gotIssue, err := st.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if gotIssue.Workspace == nil {
+		t.Fatal("workspace is nil")
+	}
+	assertRunEventCount(t, st, res.Run.ID, "agent.process_started", 1)
+	assertRunEventCount(t, st, res.Run.ID, "agent.handoff_continuation_requested", 1)
+	assertRecordedStartTurn(t, filepath.Join(gotIssue.Workspace.Path, "turn-1.json"), false, "")
+	assertRecordedStartTurn(t, filepath.Join(gotIssue.Workspace.Path, "turn-2.json"), true, "thread_fixture")
+}
+
+func TestRunWorkerCancelsCodexProcessWhenRunCancelled(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_RUNNER_KIND", "codex")
+	st, issue := newReadyDispatchIssue(t)
+	script := writeCancellableCodexFixtureCommand(t)
+	writeWorkflowWithCodexCommand(t, st.RepoRoot, script+" app-server")
+	run, err := st.ClaimRun(issue.ID, "manual", "codex", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	wf, err := config.Load(st.RepoRoot)
+	if err != nil {
+		t.Fatalf("Load workflow: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- (Orchestrator{Store: st}).runWorker(run.ID, wf)
+	}()
+	waitForRunEvent(t, st, run.ID, "agent.handshake_completed")
+	if err := st.CancelRun(run.ID, "operator cancelled"); err != nil {
+		t.Fatalf("CancelRun: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runWorker: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runWorker did not return after cancellation")
+	}
+
+	gotRun, err := st.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Status != core.RunCancelled {
+		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunCancelled)
+	}
+	gotIssue, err := st.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if gotIssue.Workspace == nil {
+		t.Fatal("workspace is nil")
+	}
+	if _, err := os.Stat(filepath.Join(gotIssue.Workspace.Path, "terminated")); err != nil {
+		t.Fatalf("codex process was not terminated: %v", err)
+	}
+}
+
+func TestRunWorkerMissingHandoffWithoutContinuationFailsImmediately(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "missing_handoff")
+	st, run := newRunWorkerTestFixture(t)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Agent.MaxHandoffContinuations = 0
+	wf.Config.Agent.MaxTurnsPerRun = 1
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	gotRun, err := st.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Status != core.RunCompletedWithoutHandoff {
+		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunCompletedWithoutHandoff)
+	}
+	if gotRun.FailureCode == nil || *gotRun.FailureCode != core.FailureMissingHandoff {
+		t.Fatalf("failure code = %v, want %s", gotRun.FailureCode, core.FailureMissingHandoff)
+	}
+	assertRunEventCount(t, st, run.ID, "agent.handoff_continuation_requested", 0)
+}
+
+func TestRunWorkerMissingHandoffContinuationFailsAfterOneRetry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOMES", "missing_handoff,missing_handoff")
+	st, run := newRunWorkerTestFixture(t)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Agent.MaxHandoffContinuations = 1
+	wf.Config.Agent.MaxTurnsPerRun = 2
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	gotRun, err := st.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Status != core.RunCompletedWithoutHandoff {
+		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunCompletedWithoutHandoff)
+	}
+	if gotRun.FailureCode == nil || *gotRun.FailureCode != core.FailureMissingHandoff {
+		t.Fatalf("failure code = %v, want %s", gotRun.FailureCode, core.FailureMissingHandoff)
+	}
+	assertRunEventCount(t, st, run.ID, "agent.handoff_continuation_requested", 1)
+}
+
+func TestRunWorkerMissingHandoffContinuationSuccessGeneratesReview(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOMES", "missing_handoff,success")
+	st, run := newRunWorkerTestFixture(t)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Agent.MaxHandoffContinuations = 1
+	wf.Config.Agent.MaxTurnsPerRun = 2
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	gotRun, err := st.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Status != core.RunCompleted {
+		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunCompleted)
+	}
+	issue, err := st.GetIssue(run.IssueID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if issue.State != core.StateHumanReview {
+		t.Fatalf("issue state = %s, want %s", issue.State, core.StateHumanReview)
+	}
+	if issue.LatestReviewPacketID == nil || *issue.LatestReviewPacketID == "" {
+		t.Fatal("latest review packet id is empty")
+	}
+	assertRunEventCount(t, st, run.ID, "agent.handoff_continuation_requested", 1)
+}
+
+func TestRunWorkerRunsAfterRunOnlyAfterFinalRunnerResult(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOMES", "missing_handoff,missing_handoff")
+	st, run := newRunWorkerTestFixture(t)
+	marker := filepath.Join(t.TempDir(), "after-run")
+	afterRun := fmt.Sprintf("printf x >> %q", marker)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Agent.MaxHandoffContinuations = 1
+	wf.Config.Agent.MaxTurnsPerRun = 2
+	wf.Config.Hooks.AfterRun = &afterRun
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read after_run marker: %v", err)
+	}
+	if got := string(data); got != "x" {
+		t.Fatalf("after_run executions wrote %q, want one execution", got)
+	}
+	rows, err := st.Project.Query(`SELECT event_type FROM run_events WHERE run_id=? AND event_type IN ('agent.handoff_continuation_requested','hook.after_run.started') ORDER BY seq ASC`, run.ID)
+	if err != nil {
+		t.Fatalf("query run events: %v", err)
+	}
+	want := []string{"agent.handoff_continuation_requested", "hook.after_run.started"}
+	if len(rows) != len(want) {
+		t.Fatalf("event count = %d, want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if got := rows[i]["event_type"].String(); got != w {
+			t.Fatalf("event %d = %s, want %s", i, got, w)
+		}
+	}
+}
+
 func TestRunWorkerFailsWhenWorkflowSnapshotInsertFails(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
@@ -456,12 +731,168 @@ func newRunWorkerTestFixture(t *testing.T) (*store.Store, *core.RunAttempt) {
 	return st, run
 }
 
+func newReadyDispatchIssue(t *testing.T) (*store.Store, *core.Issue) {
+	t.Helper()
+	st, err := store.InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Dispatch runner",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	return st, issue
+}
+
+func writeCodexFixtureCommand(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "codex-fixture")
+	body := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"type":"turn_progress","message":"working"}'
+printf '%s\n' '{"type":"handoff","payload":{"summary":"Codex fixture completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
+printf '%s\n' '{"type":"turn_completed"}'
+`
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatalf("write codex fixture command: %v", err)
+	}
+	return path
+}
+
+func writeCodexContinuationFixtureCommand(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "codex-continuation")
+	body := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read first_turn
+printf '%s\n' "$first_turn" > "$SYMPHONY_WORKSPACE_PATH/turn-1.json"
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_1"}'
+printf '%s\n' '{"type":"turn_completed"}'
+read second_turn
+printf '%s\n' "$second_turn" > "$SYMPHONY_WORKSPACE_PATH/turn-2.json"
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_2"}'
+printf '%s\n' '{"type":"handoff","payload":{"summary":"Continuation handoff.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
+printf '%s\n' '{"type":"turn_completed"}'
+while true; do sleep 1; done
+`
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatalf("write codex continuation fixture command: %v", err)
+	}
+	return path
+}
+
+func writeCancellableCodexFixtureCommand(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "codex-cancellable")
+	body := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+trap 'touch "$SYMPHONY_WORKSPACE_PATH/terminated"; exit 0' TERM
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+while true; do sleep 1; done
+`
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatalf("write cancellable codex fixture command: %v", err)
+	}
+	return path
+}
+
+func writeWorkflowWithCodexCommand(t *testing.T, repoRoot, command string) {
+	t.Helper()
+	body := fmt.Sprintf(`---
+agent:
+  max_turns_per_run: 2
+  max_handoff_continuations: 1
+codex:
+  command: %s
+---
+Do the work.
+`, command)
+	if err := os.WriteFile(filepath.Join(repoRoot, "WORKFLOW.md"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+}
+
 func newRunWorkerTestWorkflow(st *store.Store) *config.Workflow {
 	return &config.Workflow{
 		Path:       filepath.Join(st.RepoRoot, "WORKFLOW.md"),
 		Config:     config.Defaults(st.RepoRoot),
 		PromptBody: "Do the work.",
 		Validation: config.Validation{Valid: true},
+	}
+}
+
+func assertRecordedStartTurn(t *testing.T, path string, wantContinuation bool, wantThreadID string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read start turn %s: %v", path, err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode start turn %s: %v", path, err)
+	}
+	if got["continuation"] != wantContinuation {
+		t.Fatalf("continuation = %v, want %v", got["continuation"], wantContinuation)
+	}
+	if wantThreadID == "" {
+		if _, ok := got["thread_id"]; ok {
+			t.Fatalf("thread_id = %v, want absent", got["thread_id"])
+		}
+		return
+	}
+	if got["thread_id"] != wantThreadID {
+		t.Fatalf("thread_id = %v, want %s", got["thread_id"], wantThreadID)
+	}
+}
+
+func waitForRunEvent(t *testing.T, st *store.Store, runID, eventType string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, err := st.Project.Query(`SELECT id FROM run_events WHERE run_id=? AND event_type=?`, runID, eventType)
+		if err != nil {
+			t.Fatalf("query run events: %v", err)
+		}
+		if len(rows) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s event was not recorded before deadline", eventType)
+}
+
+func assertRunEventCount(t *testing.T, st *store.Store, runID, eventType string, want int) {
+	t.Helper()
+	rows, err := st.Project.Query(`SELECT id FROM run_events WHERE run_id=? AND event_type=?`, runID, eventType)
+	if err != nil {
+		t.Fatalf("query run events: %v", err)
+	}
+	if len(rows) != want {
+		t.Fatalf("%s event count = %d, want %d", eventType, len(rows), want)
 	}
 }
 

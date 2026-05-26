@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	agentrunner "local-symphony/internal/agent"
+	"local-symphony/internal/agent/codex"
 	"local-symphony/internal/agent/fake"
 	"local-symphony/internal/config"
 	"local-symphony/internal/core"
@@ -38,27 +41,14 @@ func (o Orchestrator) DispatchIssue(issueRef, reason string) (*DispatchResult, e
 	if !wf.Validation.Valid {
 		return nil, core.NewError(core.ErrWorkflowInvalid, "WORKFLOW.md is invalid", map[string]any{"errors": wf.Validation.Errors, "warnings": wf.Validation.Warnings})
 	}
-	run, err := o.Store.ClaimRun(issueRef, reasonOrDefault(reason, "manual"), "fake", wf.Config.Agent.MaxConcurrentAgents)
+	runnerKind := selectedRunnerKind()
+	run, err := o.Store.ClaimRun(issueRef, reasonOrDefault(reason, "manual"), runnerKind, wf.Config.Agent.MaxConcurrentAgents)
 	if err != nil {
 		return nil, err
 	}
 	issue, err := o.Store.GetIssue(run.IssueID)
 	if err != nil {
 		return nil, err
-	}
-	if fake.SelectedOutcome() == fake.OutcomeHold {
-		if err := o.Store.UpdateRunStatus(run.ID, core.RunRunning, map[string]any{"started_at": core.Now()}); err != nil {
-			return nil, err
-		}
-		run, err = o.Store.GetRun(run.ID)
-		if err != nil {
-			return nil, err
-		}
-		issue, err = o.Store.GetIssue(run.IssueID)
-		if err != nil {
-			return nil, err
-		}
-		return &DispatchResult{Run: run, Issue: issue, Workspace: issue.Workspace}, nil
 	}
 	if err := o.runWorker(run.ID, wf); err != nil {
 		return nil, err
@@ -72,6 +62,13 @@ func (o Orchestrator) DispatchIssue(issueRef, reason string) (*DispatchResult, e
 		return nil, err
 	}
 	return &DispatchResult{Run: run, Issue: issue, Workspace: issue.Workspace}, nil
+}
+
+func selectedRunnerKind() string {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("SYMPHONY_RUNNER_KIND")), "codex") {
+		return "codex"
+	}
+	return "fake"
 }
 
 func reasonOrDefault(s, d string) string {
@@ -135,43 +132,71 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		return nil
 	}
 	gw := toolgateway.Gateway{Store: o.Store}
-	switch fake.SelectedOutcome() {
-	case fake.OutcomeFailure:
-		code := core.FailureCodexProtocolError
-		if v := os.Getenv("SYMPHONY_FAKE_FAILURE_CODE"); v != "" {
-			code = core.FailureCode(v)
-		}
-		_ = runAfterHook(o.Store, wf, ws.Path, runID, issue.ID)
-		if !o.runIsActive(runID) {
+	runner := runnerForRun(run, wf)
+	runCtx, stopRunContext := o.runContext(runID)
+	defer stopRunContext()
+	runReq := agentrunner.RunRequest{
+		Run:                run,
+		Issue:              issue,
+		Workspace:          ws,
+		ProjectID:          o.Store.ProjectID,
+		WorkflowSnapshotID: wfID,
+		Prompt:             prompt,
+		ToolEndpoint:       wf.Config.Tools.Gateway,
+		ToolToken:          token,
+		Timeouts:           runnerTimeoutPolicy(wf),
+		Gateway:            gw,
+		EmitEvent: func(eventType string, data map[string]any) error {
+			return o.Store.AppendEvent(eventType, "codex", &issue.ID, &runID, data)
+		},
+	}
+	defer closeRunner(runCtx, runner, runReq)
+	result, err := runner.Run(runCtx, runReq)
+	if err != nil {
+		_ = o.Store.FailRun(runID, core.FailureToolGatewayFailed, err.Error(), core.RunFailed)
+		return nil
+	}
+	if result.Kind == agentrunner.RunResultHeld {
+		return nil
+	}
+	if result.Kind == agentrunner.RunResultMissingHandoff && wf.Config.Agent.MaxHandoffContinuations > 0 {
+		active, activeErr := o.runIsActive(runID)
+		if activeErr != nil || !active {
 			return nil
 		}
-		_ = o.Store.FailRun(runID, code, "fake runner failure", core.RunFailed)
-		return nil
-	case fake.OutcomeMissingHandoff:
-		_ = runAfterHook(o.Store, wf, ws.Path, runID, issue.ID)
-		if !o.runIsActive(runID) {
-			return nil
-		}
-		_ = o.Store.FailRun(runID, core.FailureMissingHandoff, "fake runner completed without handoff", core.RunCompletedWithoutHandoff)
-		return nil
-	default:
-		if err := fake.Run(ws.Path, issue.Identifier, token, gw); err != nil {
+		_ = o.Store.AppendEvent("agent.handoff_continuation_requested", "system", &issue.ID, &runID, map[string]any{"continuation": 1, "prompt": "redacted"})
+		continuationReq := runReq
+		continuationReq.Prompt = handoffContinuationPrompt()
+		continuationReq.IsContinuation = true
+		result, err = runner.Run(runCtx, continuationReq)
+		if err != nil {
 			_ = o.Store.FailRun(runID, core.FailureToolGatewayFailed, err.Error(), core.RunFailed)
 			return nil
 		}
 	}
-	if !o.runIsActive(runID) {
+	active, activeErr := o.runIsActive(runID)
+	if activeErr != nil || !active {
 		return nil
 	}
 	_ = runAfterHook(o.Store, wf, ws.Path, runID, issue.ID)
-	if !o.runIsActive(runID) {
+	active, activeErr = o.runIsActive(runID)
+	if activeErr != nil || !active {
+		return nil
+	}
+	switch result.Kind {
+	case agentrunner.RunResultFailed:
+		_ = o.Store.FailRun(runID, failureCodeOrDefault(result.FailureCode, core.FailureCodexProtocolError), failureMessageOrDefault(result.FailureMessage, "runner failed"), core.RunFailed)
+		return nil
+	case agentrunner.RunResultMissingHandoff:
+		_ = o.Store.FailRun(runID, core.FailureMissingHandoff, failureMessageOrDefault(result.FailureMessage, "handoff missing"), core.RunCompletedWithoutHandoff)
 		return nil
 	}
 	if _, err := o.Store.GetHandoffByRun(runID); err != nil {
 		_ = o.Store.FailRun(runID, core.FailureMissingHandoff, "handoff missing", core.RunCompletedWithoutHandoff)
 		return nil
 	}
-	if !o.runIsActive(runID) {
+	active, activeErr = o.runIsActive(runID)
+	if activeErr != nil || !active {
 		return nil
 	}
 	rpID, err := review.Generator{Store: o.Store}.Generate(runID)
@@ -182,19 +207,94 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	return o.Store.CompleteRunWithReview(runID, rpID)
 }
 
-func (o Orchestrator) runIsActive(runID string) bool {
+func runnerForRun(run *core.RunAttempt, wf *config.Workflow) agentrunner.Runner {
+	if run.RunnerKind == "codex" {
+		return &codex.Runner{Command: wf.Config.Codex.Command, ExperimentalAPI: wf.Config.Codex.ExperimentalAPI}
+	}
+	return fake.Runner{}
+}
+
+func closeRunner(ctx context.Context, runner agentrunner.Runner, req agentrunner.RunRequest) {
+	closer, ok := runner.(agentrunner.ClosableRunner)
+	if !ok {
+		return
+	}
+	_ = closer.Close(ctx, req)
+}
+
+func handoffContinuationPrompt() string {
+	return "Submit the required handoff only. Do not continue implementation work or repeat the original task prompt."
+}
+
+func runnerTimeoutPolicy(wf *config.Workflow) agentrunner.TimeoutPolicy {
+	return agentrunner.TimeoutPolicy{
+		StartupMS: wf.Config.Codex.StartupTimeoutMS,
+		TurnMS:    wf.Config.Codex.TurnTimeoutMS,
+		StallMS:   wf.Config.Codex.StallTimeoutMS,
+		ReadMS:    wf.Config.Codex.ReadTimeoutMS,
+	}
+}
+
+func failureCodeOrDefault(code core.FailureCode, fallback core.FailureCode) core.FailureCode {
+	if code == "" {
+		return fallback
+	}
+	return code
+}
+
+func failureMessageOrDefault(message, fallback string) string {
+	if strings.TrimSpace(message) == "" {
+		return fallback
+	}
+	return message
+}
+
+func (o Orchestrator) runIsActive(runID string) (bool, error) {
 	run, err := o.Store.GetRun(runID)
-	return err == nil && core.IsActiveRunStatus(run.Status)
+	if err != nil {
+		return false, err
+	}
+	return core.IsActiveRunStatus(run.Status), nil
+}
+
+func (o Orchestrator) runContext(runID string) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				active, err := o.runIsActive(runID)
+				if err != nil {
+					continue
+				}
+				if !active {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() {
+		close(done)
+		cancel()
+	}
 }
 
 func (o Orchestrator) advanceRun(runID string, status core.RunStatus, fields map[string]any) bool {
-	if !o.runIsActive(runID) {
+	active, err := o.runIsActive(runID)
+	if err != nil || !active {
 		return false
 	}
 	if err := o.Store.UpdateRunStatus(runID, status, fields); err != nil {
 		return false
 	}
-	return o.runIsActive(runID)
+	active, err = o.runIsActive(runID)
+	return err == nil && active
 }
 
 func runAfterHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID string) error {

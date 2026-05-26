@@ -14,6 +14,7 @@ import (
 
 func Diagnostics(st *store.Store) map[string]any {
 	wf, _ := config.Load(st.RepoRoot)
+	appVersion, projectVersion := st.DatabaseSchemaVersions()
 	gitStatus := "unknown"
 	if gitx.IsRepo(st.RepoRoot) {
 		gitStatus = "clean"
@@ -30,7 +31,7 @@ func Diagnostics(st *store.Store) map[string]any {
 	}
 	return map[string]any{
 		"project_id": st.ProjectID, "generated_at": core.Now(), "redacted": true, "repo_root": st.RepoRoot,
-		"database":  map[string]any{"app_db_path": st.AppDBPath, "project_db_path": st.ProjectDBPath, "app_schema_version": "1", "project_schema_version": "1", "app_version_status": "supported", "project_version_status": "supported"},
+		"database":  map[string]any{"app_db_path": st.AppDBPath, "project_db_path": st.ProjectDBPath, "app_schema_version": appVersion.Version, "project_schema_version": projectVersion.Version, "app_version_status": appVersion.Status, "project_version_status": projectVersion.Status},
 		"workflow":  map[string]any{"config_path": filepath.Join(st.RepoRoot, "WORKFLOW.md"), "validation": wf.Validation, "last_valid_config": map[string]any{"available": wf.Validation.Valid, "path": wf.Path, "validated_at": core.Now(), "content_hash": wf.PromptHash}},
 		"daemon":    map[string]any{"pid": os.Getpid(), "uptime_ms": 0, "runtime_descriptor": map[string]any{"api_url": "", "tool_gateway_endpoint": "", "daemon_pid": os.Getpid()}},
 		"codex":     map[string]any{"available": false, "version": nil, "support": map[string]any{"cli": "unknown", "model": "unknown", "sandbox": "unknown"}},

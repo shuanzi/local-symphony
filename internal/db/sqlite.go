@@ -83,6 +83,29 @@ func Open(path string) (*DB, error) {
 	return db, nil
 }
 
+func OpenReadOnly(path string) (*DB, error) {
+	if path == "" {
+		return nil, errors.New("sqlite path is empty")
+	}
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	var p *C.sqlite3
+	if rc := C.sqlite3_open_v2(cpath, &p, C.SQLITE_OPEN_READONLY, nil); rc != C.SQLITE_OK {
+		msg := "sqlite open failed"
+		if p != nil {
+			msg = C.GoString(C.sqlite3_errmsg(p))
+			C.sqlite3_close(p)
+		}
+		return nil, errors.New(msg)
+	}
+	db := &DB{ptr: p, path: path}
+	if err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
 func (d *DB) Path() string { return d.path }
 
 func (d *DB) Close() error {

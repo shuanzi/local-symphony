@@ -81,6 +81,54 @@ func TestStatusReturnsErrorWhenQueriesFail(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsReturnsUnsupportedDBVersionDetails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectDBPath := st.ProjectDBPath
+	if err := st.Project.Exec(`UPDATE schema_meta SET value='2' WHERE key='schema_version'`); err != nil {
+		t.Fatalf("update project schema version: %v", err)
+	}
+	st.Close()
+
+	code, stdout, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"diagnostics", "--project", dir})
+	})
+	if code != core.ExitCodeForError(core.ErrUnsupportedDBVersion) {
+		t.Fatalf("diagnostics exit code = %d, want %d; stderr = %s", code, core.ExitCodeForError(core.ErrUnsupportedDBVersion), stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("diagnostics wrote stdout on unsupported DB: %s", stdout)
+	}
+	var envelope core.ErrorEnvelope
+	if err := json.Unmarshal([]byte(stderr), &envelope); err != nil {
+		t.Fatalf("decode diagnostics stderr: %v; stderr = %s", err, stderr)
+	}
+	if got := envelope.Error["code"]; got != string(core.ErrUnsupportedDBVersion) {
+		t.Fatalf("error code = %v, want %s", got, core.ErrUnsupportedDBVersion)
+	}
+	details, ok := envelope.Error["details"].(map[string]any)
+	if !ok {
+		t.Fatalf("error details has type %T, want map[string]any", envelope.Error["details"])
+	}
+	if got := details["db_path"]; got != projectDBPath {
+		t.Fatalf("db_path detail = %v, want %s", got, projectDBPath)
+	}
+	if got := details["detected_version"]; got != "2" {
+		t.Fatalf("detected_version detail = %v, want 2", got)
+	}
+	if got := details["expected_version"]; got != "1" {
+		t.Fatalf("expected_version detail = %v, want 1", got)
+	}
+	guidance, ok := details["operator_guidance"].(string)
+	if !ok || !strings.Contains(strings.ToLower(guidance), "compatible binary") {
+		t.Fatalf("operator_guidance detail missing compatible binary guidance: %#v", details["operator_guidance"])
+	}
+}
+
 func TestReviewReturnsErrorWhenArtifactMetadataQueryFails(t *testing.T) {
 	dir := t.TempDir()
 	st, err := store.InitProject(dir, "APP")

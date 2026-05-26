@@ -13,15 +13,60 @@ internal/agent/codex/testdata/transcripts/<codex-version>/
 
 ```text
 schema.json or generated TypeScript types
-fixture metadata with installed Codex version and generated protocol/schema version
+schema/<codex-version>/compatibility.json
 happy-path transcript
 missing-handoff transcript
+protocol-error transcript
 command approval transcript
 file-change approval transcript
 network approval transcript
-protocol-error transcript
 static compatibility metadata when generated protocol/schema version differs from installed Codex version
 ```
+
+阶段 A 的 prelaunch gate 至少校验并消费 `happy-path.jsonl`。为真实 Codex version 宣布生产可用前，必须随着对应能力落地补齐上面列出的场景 transcript；未提交 fixture 的版本仍必须 fail-closed。
+
+## Compatibility metadata
+
+每个 supported Codex version 必须提交：
+
+```text
+internal/agent/codex/testdata/schema/<codex-version>/compatibility.json
+```
+
+`compatibility.json` 是 prelaunch gate 的静态事实来源，字段如下：
+
+```json
+{
+  "codex_version": "0.0.0-test",
+  "protocol_version": "protocol-test-v1",
+  "schema_version": "schema-test-v1",
+  "supported_notifications": ["handshake", "thread_started", "turn_started", "turn_progress", "handoff", "approval_requested", "approval_resolved", "tool_call", "turn_completed", "turn_failed"],
+  "supported_requests": ["initialize", "thread.start", "turn.start"],
+  "experimental_api": false
+}
+```
+
+- `codex_version` 必须与 `codex --version` 解析出的 version 完全一致。
+- `protocol_version` 和 `schema_version` 是 committed schema/transcript 对应的协议版本，不允许从真实 `codex app-server` handshake 动态发现。
+- `supported_notifications` 和 `supported_requests` 声明 adapter 已经用 fixture 覆盖的 protocol message/request。
+- `experimental_api=false` 时，任何请求 experimental API 的真实 Codex dispatch 都必须在启动 app-server 前以 `unsupported_codex_version` 失败。
+
+## Fixture layout
+
+测试用 fixture 版本使用 `0.0.0-test`，目录布局如下：
+
+```text
+internal/agent/codex/testdata/
+  schema/
+    0.0.0-test/
+      compatibility.json
+      schema.json
+  transcripts/
+    0.0.0-test/
+      happy-path.jsonl
+```
+
+新增真实 Codex version 时必须新增对应的 `schema/<codex-version>/` 与 `transcripts/<codex-version>/`，并提交完整 transcript 覆盖当前 policy 中列出的场景。
 
 ## Dispatch behavior
 

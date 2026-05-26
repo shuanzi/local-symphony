@@ -36,3 +36,32 @@ func TestExportDoesNotAllowProjectIDPathTraversal(t *testing.T) {
 		t.Fatalf("stat diagnostics export: %v", err)
 	}
 }
+
+func TestDiagnosticsReadsSchemaVersionsFromStore(t *testing.T) {
+	st, err := store.InitProject(t.TempDir(), "LOC")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.Project.Exec(`UPDATE schema_meta SET value='2' WHERE key='schema_version'`); err != nil {
+		t.Fatalf("update project schema version: %v", err)
+	}
+
+	diag := Diagnostics(st)
+	database, ok := diag["database"].(map[string]any)
+	if !ok {
+		t.Fatalf("database diagnostics has type %T, want map[string]any", diag["database"])
+	}
+	if got := database["app_schema_version"]; got != "1" {
+		t.Fatalf("app_schema_version = %v, want 1", got)
+	}
+	if got := database["app_version_status"]; got != "supported" {
+		t.Fatalf("app_version_status = %v, want supported", got)
+	}
+	if got := database["project_schema_version"]; got != "2" {
+		t.Fatalf("project_schema_version = %v, want 2", got)
+	}
+	if got := database["project_version_status"]; got != "unsupported" {
+		t.Fatalf("project_version_status = %v, want unsupported", got)
+	}
+}

@@ -101,6 +101,210 @@ func TestOpenReturnsProjectInfoQueryError(t *testing.T) {
 	}
 }
 
+func TestOpenRepopulatesProjectMetadataAfterAppDBRebuild(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	st, err := InitProject(repoRoot, "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	appDBPath := st.AppDBPath
+	st.Close()
+
+	removeSQLiteFiles(t, appDBPath)
+	opened, err := Open(repoRoot)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer opened.Close()
+
+	rows, err := opened.App.Query(`SELECT id, repo_root, issue_prefix FROM projects WHERE id=?`, opened.ProjectID)
+	if err != nil {
+		t.Fatalf("query projects: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("project rows = %d, want 1", len(rows))
+	}
+	if got := rows[0]["repo_root"].String(); got != opened.RepoRoot {
+		t.Fatalf("repo_root = %q, want %q", got, opened.RepoRoot)
+	}
+	if got := rows[0]["issue_prefix"].String(); got != "TST" {
+		t.Fatalf("issue_prefix = %q, want TST", got)
+	}
+	if err := opened.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("ses_"), opened.ProjectID, "cli", "token_hash", "test-session", core.Now()); err != nil {
+		t.Fatalf("insert local session after app DB rebuild: %v", err)
+	}
+}
+
+func TestOpenRejectsUnsupportedProjectSchemaVersion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	st, err := InitProject(repoRoot, "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	if err := st.Project.Exec(`UPDATE schema_meta SET value='2' WHERE key='schema_version'`); err != nil {
+		t.Fatalf("update project schema version: %v", err)
+	}
+	projectDBPath := st.ProjectDBPath
+	appDBPath := st.AppDBPath
+	st.Close()
+
+	opened, err := Open(repoRoot)
+	if err == nil {
+		opened.Close()
+		t.Fatal("Open succeeded, want unsupported project schema version")
+	}
+	apiErr := core.AsAPIError(err)
+	if apiErr.Code != core.ErrUnsupportedDBVersion {
+		t.Fatalf("Open error code = %s, want %s", apiErr.Code, core.ErrUnsupportedDBVersion)
+	}
+	assertUnsupportedDBVersionDetails(t, apiErr, projectDBPath, "2")
+	assertNoOpenSQLiteFile(t, projectDBPath)
+	assertNoOpenSQLiteFile(t, appDBPath)
+}
+
+func TestOpenRejectsUnsupportedAppSchemaVersion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	st, err := InitProject(repoRoot, "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	if err := st.App.Exec(`UPDATE schema_meta SET value='0' WHERE key='schema_version'`); err != nil {
+		t.Fatalf("update app schema version: %v", err)
+	}
+	projectDBPath := st.ProjectDBPath
+	appDBPath := st.AppDBPath
+	st.Close()
+
+	opened, err := Open(repoRoot)
+	if err == nil {
+		opened.Close()
+		t.Fatal("Open succeeded, want unsupported app schema version")
+	}
+	apiErr := core.AsAPIError(err)
+	if apiErr.Code != core.ErrUnsupportedDBVersion {
+		t.Fatalf("Open error code = %s, want %s", apiErr.Code, core.ErrUnsupportedDBVersion)
+	}
+	assertUnsupportedDBVersionDetails(t, apiErr, appDBPath, "0")
+	assertNoOpenSQLiteFile(t, projectDBPath)
+	assertNoOpenSQLiteFile(t, appDBPath)
+}
+
+func TestOpenRejectsMissingAndUnparseableProjectSchemaVersion(t *testing.T) {
+	tests := []struct {
+		name     string
+		mutate   func(t *testing.T, st *Store)
+		detected string
+	}{
+		{
+			name: "missing schema_version",
+			mutate: func(t *testing.T, st *Store) {
+				t.Helper()
+				if err := st.Project.Exec(`DELETE FROM schema_meta WHERE key='schema_version'`); err != nil {
+					t.Fatalf("delete schema version: %v", err)
+				}
+			},
+			detected: "missing_schema_version",
+		},
+		{
+			name: "unparseable schema_version",
+			mutate: func(t *testing.T, st *Store) {
+				t.Helper()
+				if err := st.Project.Exec(`UPDATE schema_meta SET value='v1' WHERE key='schema_version'`); err != nil {
+					t.Fatalf("update schema version: %v", err)
+				}
+			},
+			detected: "v1",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			repoRoot := filepath.Join(t.TempDir(), "repo")
+			st, err := InitProject(repoRoot, "TST")
+			if err != nil {
+				t.Fatalf("InitProject: %v", err)
+			}
+			tt.mutate(t, st)
+			projectDBPath := st.ProjectDBPath
+			st.Close()
+
+			opened, err := Open(repoRoot)
+			if err == nil {
+				opened.Close()
+				t.Fatal("Open succeeded, want unsupported project schema version")
+			}
+			apiErr := core.AsAPIError(err)
+			if apiErr.Code != core.ErrUnsupportedDBVersion {
+				t.Fatalf("Open error code = %s, want %s", apiErr.Code, core.ErrUnsupportedDBVersion)
+			}
+			assertUnsupportedDBVersionDetails(t, apiErr, projectDBPath, tt.detected)
+			assertNoOpenSQLiteFile(t, projectDBPath)
+		})
+	}
+}
+
+func TestInitProjectDoesNotRepairExistingProjectDBWithoutSchemaMeta(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	st, err := InitProject(repoRoot, "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectDBPath := st.ProjectDBPath
+	if err := st.Project.Exec(`DROP TABLE schema_meta`); err != nil {
+		t.Fatalf("drop schema_meta: %v", err)
+	}
+	st.Close()
+
+	opened, err := InitProject(repoRoot, "TST")
+	if err == nil {
+		opened.Close()
+		t.Fatal("InitProject succeeded, want unsupported DB version")
+	}
+	apiErr := core.AsAPIError(err)
+	if apiErr.Code != core.ErrUnsupportedDBVersion {
+		t.Fatalf("InitProject error code = %s, want %s", apiErr.Code, core.ErrUnsupportedDBVersion)
+	}
+	assertUnsupportedDBVersionDetails(t, apiErr, projectDBPath, "missing_schema_meta")
+
+	raw, err := db.Open(projectDBPath)
+	if err != nil {
+		t.Fatalf("open raw project db: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.QueryOne(`SELECT value FROM schema_meta WHERE key='schema_version'`); err == nil {
+		t.Fatal("schema_meta was repaired, want existing DB left unchanged")
+	}
+}
+
+func TestOpenInitializesMissingAppDB(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	st, err := InitProject(repoRoot, "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	appDBPath := st.AppDBPath
+	st.Close()
+	removeSQLiteFiles(t, appDBPath)
+
+	opened, err := Open(repoRoot)
+	if err != nil {
+		t.Fatalf("Open with missing app DB: %v", err)
+	}
+	defer opened.Close()
+	row, err := opened.App.QueryOne(`SELECT value FROM schema_meta WHERE key='schema_version'`)
+	if err != nil {
+		t.Fatalf("read app schema version: %v", err)
+	}
+	if got := row["value"].String(); got != "1" {
+		t.Fatalf("app schema version = %q, want 1", got)
+	}
+}
+
 func TestGetAndListIssuesPropagateLabelQueryError(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, err := st.CreateIssue(CreateIssueInput{
@@ -2151,6 +2355,29 @@ func assertNoOpenSQLiteFile(t *testing.T, path string) {
 	}
 	if count != 0 {
 		t.Fatalf("%s has %d open file descriptors, want 0", path, count)
+	}
+}
+
+func assertUnsupportedDBVersionDetails(t *testing.T, apiErr *core.APIError, dbPath, detected string) {
+	t.Helper()
+	if got := apiErr.Details["db_path"]; got != dbPath {
+		t.Fatalf("db_path detail = %v, want %s", got, dbPath)
+	}
+	if got := apiErr.Details["detected_version"]; got != detected {
+		t.Fatalf("detected_version detail = %v, want %s", got, detected)
+	}
+	if got := apiErr.Details["expected_version"]; got != "1" {
+		t.Fatalf("expected_version detail = %v, want 1", got)
+	}
+	guidance, ok := apiErr.Details["operator_guidance"].(string)
+	if !ok || guidance == "" {
+		t.Fatalf("operator_guidance detail missing: %#v", apiErr.Details["operator_guidance"])
+	}
+	lower := strings.ToLower(guidance)
+	for _, want := range []string{"compatible binary", "operator-maintained backup", "new project db", "does not provide automatic"} {
+		if !strings.Contains(lower, want) {
+			t.Fatalf("operator guidance %q missing %q", guidance, want)
+		}
 	}
 }
 
