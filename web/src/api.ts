@@ -169,7 +169,7 @@ export const api = {
     apiRequest<RunAttempt>(`/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST', body: JSON.stringify({ reason }) }),
   approvals: () => apiRequest<Approval[]>('/approvals'),
   decideApproval: (approvalId: string, decision: ApprovalDecision, reason: string) =>
-    apiRequest<{ id: string; status: string }>(`/approvals/${encodeURIComponent(approvalId)}/decide`, {
+    apiRequest<Approval>(`/approvals/${encodeURIComponent(approvalId)}/decide`, {
       method: 'POST',
       body: JSON.stringify({ decision, reason })
     }),

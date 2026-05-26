@@ -103,6 +103,36 @@ DIAGNOSTICS_DATABASE_VERSION_STATUS_ENUM = ("supported", "unsupported", "unknown
 DIAGNOSTICS_SUPPORT_STATUS_ENUM = ("supported", "unsupported", "unknown")
 DIAGNOSTICS_GIT_STATUS_ENUM = ("clean", "dirty", "unavailable", "unknown")
 DIAGNOSTICS_CHECK_STATUS_ENUM = ("ok", "warning", "error")
+APPROVAL_REQUIRED_FIELDS = frozenset(
+    {
+        "id",
+        "run_id",
+        "issue_id",
+        "kind",
+        "status",
+        "action_summary",
+        "risk_level",
+        "policy_match",
+        "requested_at",
+        "created_at",
+        "timeout_ms",
+        "expires_at",
+        "resolved_at",
+        "reason",
+    }
+)
+APPROVAL_KIND_ENUM = ("command", "file_change", "network")
+APPROVAL_STATUS_ENUM = (
+    "pending",
+    "approved_once",
+    "approved_for_run",
+    "approved_for_session",
+    "denied",
+    "auto_denied",
+    "cancelled",
+    "timeout",
+)
+APPROVAL_FORBIDDEN_API_FIELDS = ("request", "request_json", "decision", "decision_json")
 DIAGNOSTICS_DEFINITION_REQUIRED_FIELDS = {
     "database": DIAGNOSTICS_DATABASE_FIELDS,
     "workflow": frozenset({"config_path", "validation", "last_valid_config"}),
@@ -325,6 +355,13 @@ def assert_required_fields(schema: dict[str, Any], label: str, required_fields: 
         missing_properties = required_fields - set(properties)
         if missing_properties:
             fail(f"{label}.properties missing required fields: {sorted(missing_properties)}")
+
+
+def assert_exact_required_fields(schema: dict[str, Any], label: str, required_fields: set[str] | frozenset[str]) -> None:
+    assert_required_fields(schema, label, required_fields)
+    actual_required = set(schema.get("required", []))
+    if actual_required != required_fields:
+        fail(f"{label}.required drifted: {sorted(actual_required ^ required_fields)}")
 
 
 def assert_required_field_map_covers_schema(
@@ -697,6 +734,20 @@ def validate_workflow_config_schema_contract() -> None:
     print("ok workflow config schema contract schemas/workflow_config.schema.json")
 
 
+def validate_approval_schema_contract() -> None:
+    schema = require_dict(load_json("schemas/approval_request.schema.json"), "schemas/approval_request.schema.json")
+    assert_additional_properties_false(schema, "schemas/approval_request.schema.json")
+    assert_exact_required_fields(schema, "schemas/approval_request.schema.json", APPROVAL_REQUIRED_FIELDS)
+
+    properties = require_dict(schema.get("properties"), "schemas/approval_request.schema.json.properties")
+    for forbidden in APPROVAL_FORBIDDEN_API_FIELDS:
+        if forbidden in properties:
+            fail(f"schemas/approval_request.schema.json must not expose {forbidden}")
+    assert_enum(require_dict(properties.get("kind"), "schemas/approval_request.schema.json.properties.kind"), "schemas/approval_request.schema.json.properties.kind", APPROVAL_KIND_ENUM)
+    assert_enum(require_dict(properties.get("status"), "schemas/approval_request.schema.json.properties.status"), "schemas/approval_request.schema.json.properties.status", APPROVAL_STATUS_ENUM)
+    print("ok approval schema contract schemas/approval_request.schema.json")
+
+
 def validate_diagnostics_schema_contract() -> None:
     schema = load_json("schemas/diagnostics.schema.json")
     schema = require_dict(schema, "schemas/diagnostics.schema.json")
@@ -829,12 +880,39 @@ def validate_sql() -> None:
                 missing = expected_cols - actual_cols
                 if missing:
                     fail(f"{rel} table {table} missing columns: {sorted(missing)}")
+            if rel == "db/schema/v1_project.sql":
+                approval_sql_row = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_requests'").fetchone()
+                approval_sql = normalize_sql(approval_sql_row[0] if approval_sql_row else "")
+                assert_sql_contains(
+                    approval_sql,
+                    "db/schema/v1_project.sql approval_requests.kind",
+                    "kind TEXT NOT NULL CHECK (kind IN ('command','file_change','network'))",
+                )
+                assert_sql_contains(
+                    approval_sql,
+                    "db/schema/v1_project.sql approval_requests.status",
+                    "status TEXT NOT NULL CHECK (status IN ('pending','approved_once','approved_for_run','approved_for_session','denied','auto_denied','cancelled','timeout'))",
+                )
+                assert_sql_contains(
+                    approval_sql,
+                    "db/schema/v1_project.sql approval_requests.timeout_ms",
+                    "timeout_ms INTEGER CHECK (timeout_ms IS NULL OR timeout_ms > 0)",
+                )
             con.close()
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001
             fail(f"invalid SQLite DDL {rel}: {exc}")
         print(f"ok sql {rel}")
+
+
+def normalize_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql)
+
+
+def assert_sql_contains(sql: str, label: str, expected: str) -> None:
+    if expected not in sql:
+        fail(f"{label} constraint drifted")
 
 
 def validate_openapi_diagnostics_contract(data: dict[str, Any]) -> None:
@@ -936,6 +1014,76 @@ def validate_openapi_diagnostics_contract(data: dict[str, Any]) -> None:
         "OpenAPI DiagnosticsCheck.properties.status",
         DIAGNOSTICS_CHECK_STATUS_ENUM,
     )
+
+
+def validate_openapi_approval_contract(data: dict[str, Any]) -> None:
+    components = require_dict(data.get("components"), "OpenAPI components")
+    schemas = require_dict(components.get("schemas"), "OpenAPI components.schemas")
+    paths = require_dict(data.get("paths"), "OpenAPI paths")
+    approval = require_dict(schemas.get("ApprovalRequest"), "OpenAPI ApprovalRequest")
+    approval_schema = require_dict(load_json("schemas/approval_request.schema.json"), "schemas/approval_request.schema.json")
+    approval_schema_props = require_dict(approval_schema.get("properties"), "schemas/approval_request.schema.json.properties")
+
+    assert_additional_properties_false(approval, "OpenAPI ApprovalRequest")
+    assert_exact_required_fields(approval, "OpenAPI ApprovalRequest", APPROVAL_REQUIRED_FIELDS)
+    if set(approval_schema.get("required", [])) != set(approval.get("required", [])):
+        fail("OpenAPI ApprovalRequest.required must match schemas/approval_request.schema.json")
+
+    approval_props = require_dict(approval.get("properties"), "OpenAPI ApprovalRequest.properties")
+    for forbidden in APPROVAL_FORBIDDEN_API_FIELDS:
+        if forbidden in approval_props:
+            fail(f"OpenAPI ApprovalRequest must not expose {forbidden}")
+    for field in APPROVAL_REQUIRED_FIELDS - {"status"}:
+        if approval_props.get(field) != approval_schema_props.get(field):
+            fail(f"OpenAPI ApprovalRequest.{field} must match schemas/approval_request.schema.json")
+    if require_dict(approval_props.get("status"), "OpenAPI ApprovalRequest.properties.status").get("$ref") != "#/components/schemas/ApprovalStatus":
+        fail("OpenAPI ApprovalRequest.status must reference ApprovalStatus")
+    assert_enum(require_dict(schemas.get("ApprovalStatus"), "OpenAPI ApprovalStatus"), "OpenAPI ApprovalStatus", APPROVAL_STATUS_ENUM)
+
+    for envelope_name in ("ApprovalEnvelope", "ApprovalDecisionEnvelope"):
+        data_schema = openapi_envelope_data_schema(
+            require_dict(schemas.get(envelope_name), f"OpenAPI {envelope_name}"),
+            f"OpenAPI {envelope_name}",
+        )
+        if data_schema.get("$ref") != "#/components/schemas/ApprovalRequest":
+            fail(f"OpenAPI {envelope_name}.data must reference ApprovalRequest")
+    list_data_schema = openapi_envelope_data_schema(
+        require_dict(schemas.get("ApprovalListEnvelope"), "OpenAPI ApprovalListEnvelope"),
+        "OpenAPI ApprovalListEnvelope",
+    )
+    if list_data_schema.get("type") != "array":
+        fail("OpenAPI ApprovalListEnvelope.data must be an array")
+    if require_dict(list_data_schema.get("items"), "OpenAPI ApprovalListEnvelope.data.items").get("$ref") != "#/components/schemas/ApprovalRequest":
+        fail("OpenAPI ApprovalListEnvelope.data.items must reference ApprovalRequest")
+    if openapi_json_response_schema_ref(paths, "/approvals", "get", "200") != "#/components/schemas/ApprovalListEnvelope":
+        fail("OpenAPI GET /approvals 200 response must reference ApprovalListEnvelope")
+    if openapi_json_response_schema_ref(paths, "/approvals/{approval_id}/decide", "post", "200") != "#/components/schemas/ApprovalDecisionEnvelope":
+        fail("OpenAPI POST /approvals/{approval_id}/decide 200 response must reference ApprovalDecisionEnvelope")
+
+
+def openapi_envelope_data_schema(envelope: dict[str, Any], label: str) -> dict[str, Any]:
+    for part in envelope.get("allOf", []):
+        if not isinstance(part, dict):
+            continue
+        properties = part.get("properties")
+        if isinstance(properties, dict):
+            return require_dict(properties.get("data"), f"{label}.data")
+    fail(f"{label}.data must be declared")
+    raise AssertionError("unreachable")
+
+
+def openapi_json_response_schema_ref(paths: dict[str, Any], route: str, method: str, status: str) -> str:
+    route_def = require_dict(paths.get(route), f"OpenAPI {route}")
+    operation = require_dict(route_def.get(method), f"OpenAPI {method.upper()} {route}")
+    responses = require_dict(operation.get("responses"), f"OpenAPI {method.upper()} {route}.responses")
+    response = require_dict(responses.get(status), f"OpenAPI {method.upper()} {route} {status} response")
+    content = require_dict(response.get("content"), f"OpenAPI {method.upper()} {route} {status}.content")
+    media_type = require_dict(content.get("application/json"), f"OpenAPI {method.upper()} {route} {status}.application/json")
+    schema = require_dict(media_type.get("schema"), f"OpenAPI {method.upper()} {route} {status}.schema")
+    ref = schema.get("$ref")
+    if not isinstance(ref, str):
+        fail(f"OpenAPI {method.upper()} {route} {status}.schema must use a $ref")
+    return ref
 
 
 def validate_openapi(manifest: dict[str, Any]) -> None:
@@ -1174,6 +1322,7 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
     decision_enum = data["components"]["schemas"]["ApprovalDecisionRequest"]["properties"]["decision"]["enum"]
     if decision_enum != ["approve_once", "approve_for_run", "approve_for_session", "deny", "cancel_run"]:
         fail("ApprovalDecisionRequest enum drifted from TECH_SPEC")
+    validate_openapi_approval_contract(data)
 
     failure_schema = load_json("schemas/failure_codes.schema.json")
     expected_failure_codes = set(failure_schema["$defs"]["failureCode"]["enum"])
@@ -1499,6 +1648,7 @@ def main() -> None:
     validate_json()
     validate_review_packet_schema_contract()
     validate_workflow_config_schema_contract()
+    validate_approval_schema_contract()
     validate_diagnostics_schema_contract()
     validate_sql()
     validate_openapi(manifest)

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1368,20 +1369,96 @@ func TestDecideApprovalCancelCancelsActiveRunAndApproval(t *testing.T) {
 	}
 }
 
+func TestPendingApprovalsProjectsStructuredFieldsWithoutOpaqueJSON(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Approval projection")
+	pendingID := core.NewID("apr_")
+	resolvedID := core.NewID("apr_")
+	timeoutID := core.NewID("apr_")
+	if err := st.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,timeout_ms,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		pendingID, run.ID, issue.ID, "command", "pending", `{"action_summary":"Run go test","risk_level":"medium","policy_match":"command.review","command":"secret command","path":"/tmp/secret"}`, 30000, "2026-05-26T10:01:00Z", "2026-05-26T10:00:00Z"); err != nil {
+		t.Fatalf("insert pending approval: %v", err)
+	}
+	if err := st.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at,resolved_at,reason,decision_json) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		resolvedID, run.ID, issue.ID, "network", "denied", `{"url":"https://example.invalid/private"}`, "2026-05-26T09:00:00Z", "2026-05-26T09:02:00Z", "too broad", `{"decision":"deny"}`); err != nil {
+		t.Fatalf("insert resolved approval: %v", err)
+	}
+	if err := st.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,timeout_ms,expires_at,created_at,resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		timeoutID, run.ID, issue.ID, "file_change", "timeout", `{"raw_request":"do not expose"}`, 1000, "2026-05-26T08:00:01Z", "2026-05-26T08:00:00Z", "2026-05-26T08:00:01Z"); err != nil {
+		t.Fatalf("insert timeout approval: %v", err)
+	}
+
+	approvals, err := st.PendingApprovals()
+	if err != nil {
+		t.Fatalf("PendingApprovals: %v", err)
+	}
+	if len(approvals) != 3 {
+		t.Fatalf("approvals len = %d, want 3", len(approvals))
+	}
+	gotPending := approvals[0]
+	if gotPending.ID != pendingID || gotPending.RunID != run.ID || gotPending.IssueID != issue.ID || gotPending.Kind != "command" || gotPending.Status != "pending" {
+		t.Fatalf("pending approval identity/status = %#v", gotPending)
+	}
+	if gotPending.ActionSummary != "Run go test" || gotPending.RiskLevel != "medium" || gotPending.PolicyMatch != "command.review" {
+		t.Fatalf("pending structured fields = %#v", gotPending)
+	}
+	if gotPending.RequestedAt != "2026-05-26T10:00:00Z" || gotPending.CreatedAt != "2026-05-26T10:00:00Z" {
+		t.Fatalf("pending timestamps = requested %q created %q", gotPending.RequestedAt, gotPending.CreatedAt)
+	}
+	if gotPending.TimeoutMS == nil || *gotPending.TimeoutMS != 30000 {
+		t.Fatalf("pending timeout_ms = %#v, want 30000", gotPending.TimeoutMS)
+	}
+	if gotPending.ExpiresAt == nil || *gotPending.ExpiresAt != "2026-05-26T10:01:00Z" {
+		t.Fatalf("pending expires_at = %#v", gotPending.ExpiresAt)
+	}
+	if gotPending.ResolvedAt != nil || gotPending.Reason != nil {
+		t.Fatalf("pending nullable fields = resolved_at %#v reason %#v, want nil", gotPending.ResolvedAt, gotPending.Reason)
+	}
+	gotResolved := approvals[1]
+	if gotResolved.ID != resolvedID {
+		t.Fatalf("resolved approval id = %s, want %s", gotResolved.ID, resolvedID)
+	}
+	if gotResolved.ActionSummary != "network approval "+resolvedID || gotResolved.RiskLevel != "unknown" || gotResolved.PolicyMatch != "unclassified" {
+		t.Fatalf("resolved defaults = %#v", gotResolved)
+	}
+	if gotResolved.TimeoutMS != nil || gotResolved.ExpiresAt != nil {
+		t.Fatalf("resolved timeout fields = %#v %#v, want nil", gotResolved.TimeoutMS, gotResolved.ExpiresAt)
+	}
+	if gotResolved.ResolvedAt == nil || *gotResolved.ResolvedAt != "2026-05-26T09:02:00Z" || gotResolved.Reason == nil || *gotResolved.Reason != "too broad" {
+		t.Fatalf("resolved nullable fields = resolved_at %#v reason %#v", gotResolved.ResolvedAt, gotResolved.Reason)
+	}
+	gotTimeout := approvals[2]
+	if gotTimeout.ID != timeoutID || gotTimeout.Status != "timeout" {
+		t.Fatalf("timeout approval = %#v", gotTimeout)
+	}
+	if gotTimeout.ActionSummary != "file_change approval "+timeoutID || gotTimeout.RiskLevel != "unknown" || gotTimeout.PolicyMatch != "unclassified" {
+		t.Fatalf("timeout defaults = %#v", gotTimeout)
+	}
+	b, err := json.Marshal(approvals)
+	if err != nil {
+		t.Fatalf("marshal approvals: %v", err)
+	}
+	for _, forbidden := range []string{"request_json", "decision_json", `"request"`, `"decision"`, "secret command", "/tmp/secret", "example.invalid", "raw_request"} {
+		if strings.Contains(string(b), forbidden) {
+			t.Fatalf("approval projection leaked %q in JSON %s", forbidden, string(b))
+		}
+	}
+}
+
 func TestDecideApprovalReturnsNotPendingWhenFinalUpdateMissesPending(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareActiveRun(t, st, "Approval final update race")
 	approvalID := insertPendingApproval(t, st, run.ID, issue.ID)
 	if err := st.Project.Exec(`CREATE TRIGGER race_approval_decision BEFORE UPDATE OF status ON approval_requests
-WHEN OLD.id='` + approvalID + `' AND NEW.status='approved'
+WHEN OLD.id='` + approvalID + `' AND NEW.status='approved_once'
 BEGIN
-	UPDATE approval_requests SET status='rejected', reason='other operator', resolved_at=NEW.resolved_at WHERE id=OLD.id;
+	UPDATE approval_requests SET status='denied', reason='other operator', resolved_at=NEW.resolved_at WHERE id=OLD.id;
 	SELECT RAISE(IGNORE);
 END`); err != nil {
 		t.Fatalf("create trigger: %v", err)
 	}
 
-	err := st.DecideApproval(approvalID, "approved", "operator approved stale request")
+	err := st.DecideApproval(approvalID, "approved_once", "operator approved stale request")
 	if err == nil {
 		t.Fatal("DecideApproval succeeded, want approval_not_pending")
 	}
@@ -1401,7 +1478,7 @@ func TestDecideApprovalCancelRunReturnsNotPendingWhenApprovalChangesBeforeFinalU
 	if err := st.Project.Exec(`CREATE TRIGGER race_cancel_run_approval BEFORE UPDATE OF status ON run_attempts
 WHEN OLD.id='` + run.ID + `' AND NEW.status='cancelled'
 BEGIN
-	UPDATE approval_requests SET status='approved', reason='other operator', resolved_at=NEW.updated_at WHERE id='` + approvalID + `' AND status='pending';
+	UPDATE approval_requests SET status='approved_once', reason='other operator', resolved_at=NEW.updated_at WHERE id='` + approvalID + `' AND status='pending';
 END`); err != nil {
 		t.Fatalf("create trigger: %v", err)
 	}

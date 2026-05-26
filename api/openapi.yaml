@@ -783,20 +783,23 @@ components:
       enum: [pending, approved_once, approved_for_run, approved_for_session, denied, auto_denied, cancelled, timeout]
     ApprovalRequest:
       type: object
-      required: [id, run_id, issue_id, kind, status, created_at]
+      required: [id, run_id, issue_id, kind, status, action_summary, risk_level, policy_match, requested_at, created_at, timeout_ms, expires_at, resolved_at, reason]
+      additionalProperties: false
       properties:
         id: { type: string, pattern: "^apr_" }
         run_id: { type: string }
         issue_id: { type: string }
         kind: { type: string, enum: [command, file_change, network] }
         status: { $ref: '#/components/schemas/ApprovalStatus' }
-        request: { type: object, additionalProperties: true }
-        decision: { type: [object, 'null'], additionalProperties: true }
-        reason: { type: [string, 'null'] }
+        action_summary: { type: string }
+        risk_level: { type: string }
+        policy_match: { type: string }
+        requested_at: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
         timeout_ms: { type: [integer, 'null'] }
         expires_at: { type: [string, 'null'], format: date-time }
         resolved_at: { type: [string, 'null'], format: date-time }
+        reason: { type: [string, 'null'] }
     ApprovalDecisionRequest:
       type: object
       required: [decision]
@@ -804,15 +807,8 @@ components:
       properties:
         decision: { type: string, enum: [approve_once, approve_for_run, approve_for_session, deny, cancel_run] }
         reason: { type: string }
-    ApprovalDecisionResult:
-      type: object
-      required: [id, status]
-      additionalProperties: false
-      properties:
-        id: { type: string, pattern: "^apr_" }
-        status: { $ref: '#/components/schemas/ApprovalStatus' }
     ApprovalDecisionEnvelope:
-      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ApprovalDecisionResult' } } } ]
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ApprovalRequest' } } } ]
     ApprovalEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ApprovalRequest' } } } ]
     ApprovalListEnvelope:

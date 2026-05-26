@@ -454,6 +454,157 @@ class ManifestContractTests(unittest.TestCase):
                     finally:
                         validator.ROOT = old_root
 
+    def test_approval_schema_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        schema = validator.load_json("schemas/approval_request.schema.json")
+
+        cases = (
+            ("additionalProperties", lambda drifted: drifted.__setitem__("additionalProperties", True)),
+            ("required action_summary", lambda drifted: drifted["required"].remove("action_summary")),
+            ("kind enum", lambda drifted: drifted["properties"]["kind"]["enum"].remove("file_change")),
+            ("status enum", lambda drifted: drifted["properties"]["status"]["enum"].append("expired")),
+            ("opaque request", lambda drifted: drifted["properties"].__setitem__("request", {"type": "object"})),
+        )
+
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                drifted_schema = copy.deepcopy(schema)
+                mutate(drifted_schema)
+
+                original_load_json = validator.load_json
+                validator.load_json = lambda rel, drifted_schema=drifted_schema: (
+                    drifted_schema if rel == "schemas/approval_request.schema.json" else original_load_json(rel)
+                )
+                try:
+                    with self.assertRaises(SystemExit):
+                        validator.validate_approval_schema_contract()
+                finally:
+                    validator.load_json = original_load_json
+
+    def test_sql_approval_contract_fails_when_enum_checks_drift(self) -> None:
+        validator = load_validator()
+
+        cases = (
+            (
+                "kind check",
+                lambda text: text.replace(
+                    "kind TEXT NOT NULL CHECK (kind IN ('command','file_change','network'))",
+                    "kind TEXT NOT NULL",
+                ),
+            ),
+            (
+                "status check",
+                lambda text: text.replace(
+                    "status TEXT NOT NULL CHECK (status IN ('pending','approved_once','approved_for_run','approved_for_session','denied','auto_denied','cancelled','timeout'))",
+                    "status TEXT NOT NULL",
+                ),
+            ),
+            (
+                "timeout check",
+                lambda text: text.replace(
+                    "timeout_ms INTEGER CHECK (timeout_ms IS NULL OR timeout_ms > 0)",
+                    "timeout_ms INTEGER",
+                ),
+            ),
+        )
+
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    shutil.copytree(ROOT / "db", temp_root / "db")
+                    schema_path = temp_root / "db/schema/v1_project.sql"
+                    schema_text = schema_path.read_text(encoding="utf-8")
+                    drifted_text = mutate(schema_text)
+                    self.assertNotEqual(schema_text, drifted_text)
+                    schema_path.write_text(drifted_text, encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_sql()
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_approval_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            ("required action_summary", lambda schemas: schemas["ApprovalRequest"]["required"].remove("action_summary")),
+            ("additionalProperties", lambda schemas: schemas["ApprovalRequest"].__setitem__("additionalProperties", True)),
+            ("kind enum", lambda schemas: schemas["ApprovalRequest"]["properties"]["kind"]["enum"].remove("file_change")),
+            ("opaque request", lambda schemas: schemas["ApprovalRequest"]["properties"].__setitem__("request", {"type": "object"})),
+            (
+                "decision response",
+                lambda schemas: schemas["ApprovalDecisionEnvelope"]["allOf"][1]["properties"]["data"].__setitem__(
+                    "$ref", "#/components/schemas/ApprovalDecisionResult"
+                ),
+            ),
+            (
+                "list envelope items",
+                lambda schemas: schemas["ApprovalListEnvelope"]["allOf"][1]["properties"]["data"]["items"].__setitem__(
+                    "$ref", "#/components/schemas/ApprovalDecisionResult"
+                ),
+            ),
+        )
+
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    mutate(openapi["components"]["schemas"])
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
+    def test_openapi_approval_route_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        cases = (
+            (
+                "list route envelope",
+                lambda openapi: openapi["paths"]["/approvals"]["get"]["responses"]["200"]["content"]["application/json"][
+                    "schema"
+                ].__setitem__("$ref", "#/components/schemas/ApprovalEnvelope"),
+            ),
+            (
+                "decision route envelope",
+                lambda openapi: openapi["paths"]["/approvals/{approval_id}/decide"]["post"]["responses"]["200"]["content"][
+                    "application/json"
+                ]["schema"].__setitem__("$ref", "#/components/schemas/ApprovalEnvelope"),
+            ),
+        )
+
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    openapi_path = temp_root / "api/openapi.yaml"
+                    openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+                    mutate(openapi)
+                    openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_openapi(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
     def test_openapi_review_packet_summary_failure_metadata_contract_fails_when_drifted(self) -> None:
         validator = load_validator()
         manifest = load_manifest()

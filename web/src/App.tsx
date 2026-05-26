@@ -1826,17 +1826,19 @@ function ApprovalInboxPage({ approvals, runMutation }: { approvals: Approval[]; 
           </Section>
         </div>
         <aside className="page-aside">
-          <Section title="Resolved / expired approvals">
+          <Section title="Resolved / timed out approvals">
             {resolved.length === 0 ? (
-              <EmptyState title="No resolved approvals" body="Expired, denied, approved, and cancelled approvals are listed after they leave pending state." />
+              <EmptyState title="No resolved approvals" body="Timed out, denied, approved, and cancelled approvals are listed after they leave pending state." />
             ) : (
               <table className="data-table compact-table">
-                <thead><tr><th>ID</th><th>Status</th><th>Run</th></tr></thead>
+                <thead><tr><th>ID</th><th>Status</th><th>Run</th><th>Resolved</th><th>Reason</th></tr></thead>
                 <tbody>{resolved.map((approval) => (
                   <tr key={approval.id}>
                     <td>{approval.id}</td>
                     <td><StatusPill value={approval.status} /></td>
                     <td><button type="button" className="link-button" onClick={() => navigate({ page: 'run', runId: approval.run_id })}>{approval.run_id}</button></td>
+                    <td>{approval.resolved_at ? formatDate(approval.resolved_at) : '—'}</td>
+                    <td>{approval.reason || '—'}</td>
                   </tr>
                 ))}</tbody>
               </table>
@@ -1850,20 +1852,22 @@ function ApprovalInboxPage({ approvals, runMutation }: { approvals: Approval[]; 
 
 function ApprovalCard({ approval, runMutation }: { approval: Approval; runMutation: <T>(operation: () => Promise<T>) => Promise<T | null> }) {
   const [reason, setReason] = useState('operator decision');
-  const actionSummary = approval.action_summary || `${approval.kind} approval ${approval.id}`;
 
   return (
     <article className="approval-card">
       <div className="issue-card-header">
-        <strong>{actionSummary}</strong>
+        <strong>{approval.action_summary}</strong>
         <StatusPill value={approval.kind} />
       </div>
       <KeyValue rows={[
         ['ID', approval.id],
         ['Run', <button type="button" className="link-button" onClick={() => navigate({ page: 'run', runId: approval.run_id })}>{approval.run_id}</button>],
-        ['Risk level', approval.risk_level || '—'],
-        ['Policy match', approval.policy_match || '—'],
-        ['Created', formatDate(approval.created_at)]
+        ['Risk level', approval.risk_level],
+        ['Policy match', approval.policy_match],
+        ['Requested', formatDate(approval.requested_at)],
+        ['Created', formatDate(approval.created_at)],
+        ['Timeout', approval.timeout_ms === null ? '—' : `${approval.timeout_ms} ms`],
+        ['Expires', approval.expires_at ? formatDate(approval.expires_at) : '—']
       ]} />
       <label>
         Decision reason
