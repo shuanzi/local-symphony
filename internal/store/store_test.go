@@ -101,6 +101,41 @@ func TestOpenReturnsProjectInfoQueryError(t *testing.T) {
 	}
 }
 
+func TestOpenRepopulatesProjectMetadataAfterAppDBRebuild(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	st, err := InitProject(repoRoot, "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	appDBPath := st.AppDBPath
+	st.Close()
+
+	removeSQLiteFiles(t, appDBPath)
+	opened, err := Open(repoRoot)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer opened.Close()
+
+	rows, err := opened.App.Query(`SELECT id, repo_root, issue_prefix FROM projects WHERE id=?`, opened.ProjectID)
+	if err != nil {
+		t.Fatalf("query projects: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("project rows = %d, want 1", len(rows))
+	}
+	if got := rows[0]["repo_root"].String(); got != opened.RepoRoot {
+		t.Fatalf("repo_root = %q, want %q", got, opened.RepoRoot)
+	}
+	if got := rows[0]["issue_prefix"].String(); got != "TST" {
+		t.Fatalf("issue_prefix = %q, want TST", got)
+	}
+	if err := opened.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("ses_"), opened.ProjectID, "cli", "token_hash", "test-session", core.Now()); err != nil {
+		t.Fatalf("insert local session after app DB rebuild: %v", err)
+	}
+}
+
 func TestOpenRejectsUnsupportedProjectSchemaVersion(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	repoRoot := filepath.Join(t.TempDir(), "repo")

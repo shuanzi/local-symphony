@@ -2,6 +2,7 @@ package codex
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 const (
 	compatibilityMetadataFile = "compatibility.json"
 	maxProtocolLineBytes      = 16 * 1024 * 1024
+	versionProbeTimeout       = 2 * time.Second
 )
 
 type Support struct {
@@ -122,12 +124,60 @@ func DetectVersionForCommand(command string) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	cmd := exec.Command(parts[0], "--version")
-	out, err := cmd.Output()
-	if err != nil {
-		return ""
+	for _, candidate := range versionProbeCandidates(parts) {
+		out, err := versionProbeOutput(candidate)
+		if err != nil {
+			continue
+		}
+		output := strings.TrimSpace(string(out))
+		if _, err := ParseCodexVersionOutput(output); err == nil {
+			return output
+		}
 	}
-	return strings.TrimSpace(string(out))
+	return ""
+}
+
+func versionProbeCandidates(parts []string) [][]string {
+	direct := []string{parts[0], "--version"}
+	if len(parts) == 1 {
+		return [][]string{direct}
+	}
+	full := append(append([]string{}, parts...), "--version")
+	if len(parts) == 2 && parts[1] == "app-server" {
+		return [][]string{direct}
+	}
+	return [][]string{full, direct}
+}
+
+func versionProbeOutput(parts []string) ([]byte, error) {
+	if len(parts) == 2 && parts[1] == "--version" {
+		return exec.Command(parts[0], parts[1:]...).Output()
+	}
+	return commandOutputWithTimeout(parts, versionProbeTimeout)
+}
+
+func commandOutputWithTimeout(parts []string, timeout time.Duration) ([]byte, error) {
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("command is empty")
+	}
+	cmd := exec.Command(parts[0], parts[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+	select {
+	case err := <-waitCh:
+		return stdout.Bytes(), err
+	case <-time.After(timeout):
+		terminateProcessGroup(cmd.Process)
+		return nil, waitForProcess(waitCh, cmd.Process)
+	}
 }
 
 type protocolMessage struct {

@@ -625,6 +625,26 @@ exit 1
 	}
 }
 
+func TestDetectVersionForCommandPreservesWrapperArguments(t *testing.T) {
+	wrapper := filepath.Join(t.TempDir(), "codex-wrapper")
+	body := `#!/bin/sh
+if [ "$1" = "app-server" ] && [ "$2" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+echo "unexpected args: $*" >&2
+exit 1
+`
+	if err := os.WriteFile(wrapper, []byte(body), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+
+	command := `/bin/sh "` + wrapper + `" app-server`
+	if got := DetectVersionForCommand(command); got != "codex 0.0.0-test" {
+		t.Fatalf("DetectVersionForCommand(%q) = %q, want %q", command, got, "codex 0.0.0-test")
+	}
+}
+
 func TestRunnerStallTimeoutFails(t *testing.T) {
 	_, run, issue, workspacePath, token := newCodexRunnerFixture(t)
 	script := writeFakeCodexBinary(t, `#!/bin/sh

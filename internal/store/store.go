@@ -188,10 +188,9 @@ func InitProject(repoRoot, issuePrefix string) (*Store, error) {
 	if err := s.Project.Exec(`UPDATE project_info SET issue_prefix=?, updated_at=? WHERE id=?`, issuePrefix, now, s.ProjectID); err != nil {
 		return nil, err
 	}
-	if err := s.App.Exec(`INSERT OR IGNORE INTO projects(id,name,repo_root,project_db_path,workflow_path,issue_prefix,created_at,updated_at,last_opened_at) VALUES(?,?,?,?,?,?,?,?,?)`, s.ProjectID, name, root, s.ProjectDBPath, filepath.Join(root, "WORKFLOW.md"), issuePrefix, now, now, now); err != nil {
+	if err := s.upsertAppProjectMetadata(name, issuePrefix, now); err != nil {
 		return nil, err
 	}
-	_ = s.App.Exec(`UPDATE projects SET project_db_path=?, workflow_path=?, issue_prefix=?, updated_at=?, last_opened_at=? WHERE id=?`, s.ProjectDBPath, filepath.Join(root, "WORKFLOW.md"), issuePrefix, now, now, s.ProjectID)
 	if _, err := os.Stat(filepath.Join(root, "WORKFLOW.md")); errors.Is(err, fs.ErrNotExist) {
 		body, readErr := os.ReadFile(filepath.Join(root, "examples", "WORKFLOW.default.md"))
 		if readErr != nil {
@@ -253,8 +252,21 @@ func Open(repoRoot string) (*Store, error) {
 	}
 	s.ProjectID = row["id"].String()
 	s.IssuePrefix = row["issue_prefix"].String()
+	if !appDBExists {
+		if err := s.upsertAppProjectMetadata(filepath.Base(root), s.IssuePrefix, core.Now()); err != nil {
+			return nil, err
+		}
+	}
 	cleanup = false
 	return s, nil
+}
+
+func (s *Store) upsertAppProjectMetadata(name, issuePrefix, now string) error {
+	workflowPath := filepath.Join(s.RepoRoot, "WORKFLOW.md")
+	if err := s.App.Exec(`INSERT OR IGNORE INTO projects(id,name,repo_root,project_db_path,workflow_path,issue_prefix,created_at,updated_at,last_opened_at) VALUES(?,?,?,?,?,?,?,?,?)`, s.ProjectID, name, s.RepoRoot, s.ProjectDBPath, workflowPath, issuePrefix, now, now, now); err != nil {
+		return err
+	}
+	return s.App.Exec(`UPDATE projects SET project_db_path=?, workflow_path=?, issue_prefix=?, updated_at=?, last_opened_at=? WHERE id=?`, s.ProjectDBPath, workflowPath, issuePrefix, now, now, s.ProjectID)
 }
 
 func (s *Store) Close() {
