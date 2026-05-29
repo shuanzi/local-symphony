@@ -103,6 +103,17 @@ type Approval struct {
 	Reason        *string `json:"reason"`
 }
 
+type CreateApprovalRequestInput struct {
+	RunID         string
+	IssueID       string
+	Kind          string
+	ActionSummary string
+	RiskLevel     string
+	PolicyMatch   string
+	RequestID     string
+	TimeoutMS     int64
+}
+
 func ResolveProjectRoot(project string) (string, error) {
 	if project == "" {
 		project = "."
@@ -2028,6 +2039,60 @@ func (s *Store) ApprovalByID(id string) (*Approval, error) {
 	return &approval, nil
 }
 
+func (s *Store) CreatePendingApprovalRequest(in CreateApprovalRequestInput) (*Approval, error) {
+	id := core.NewID("apr_")
+	createdAt := core.Now()
+	switch in.Kind {
+	case "command", "file_change", "network":
+	default:
+		return nil, core.NewError(core.ErrInvalidRequest, "unsupported approval kind", map[string]any{"kind": in.Kind})
+	}
+	request := map[string]string{}
+	if value := strings.TrimSpace(in.ActionSummary); value != "" {
+		request["action_summary"] = value
+	}
+	if value := strings.TrimSpace(in.RiskLevel); value != "" {
+		request["risk_level"] = value
+	}
+	if value := strings.TrimSpace(in.PolicyMatch); value != "" {
+		request["policy_match"] = value
+	}
+	if value := strings.TrimSpace(in.RequestID); value != "" {
+		request["request_id"] = value
+	}
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	var timeoutMS any
+	var expiresAt any
+	if in.TimeoutMS > 0 {
+		timeoutMS = in.TimeoutMS
+		created, err := time.Parse(time.RFC3339Nano, createdAt)
+		if err != nil {
+			return nil, err
+		}
+		expiresAt = created.Add(time.Duration(in.TimeoutMS) * time.Millisecond).UTC().Format(time.RFC3339Nano)
+	}
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		run, err := s.getRunTx(tx, in.RunID)
+		if err != nil {
+			return err
+		}
+		if run.IssueID != in.IssueID {
+			return core.NewError(core.ErrInvalidRequest, "approval issue does not match run", map[string]any{"run_id": in.RunID, "issue_id": in.IssueID})
+		}
+		if !core.IsActiveRunStatus(run.Status) {
+			return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": in.RunID, "status": run.Status})
+		}
+		return tx.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,timeout_ms,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+			id, in.RunID, in.IssueID, in.Kind, "pending", string(requestJSON), timeoutMS, expiresAt, createdAt)
+	}); err != nil {
+		return nil, err
+	}
+	return s.ApprovalByID(id)
+}
+
 func approvalFromRow(r map[string]db.Value) Approval {
 	id := r["id"].String()
 	kind := r["kind"].String()
@@ -2121,6 +2186,27 @@ func (s *Store) DecideApproval(id, status, reason string) error {
 			}
 		}
 		if err := tx.Exec(`UPDATE approval_requests SET status=?, reason=?, decision_json=?, resolved_at=? WHERE id=? AND status='pending'`, status, reason, decisionJSON, now, id); err != nil {
+			return err
+		}
+		changed, err := rowsChanged(tx)
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return core.NewError(core.ErrApprovalNotPending, "approval is not pending", nil)
+		}
+		return nil
+	})
+}
+
+func (s *Store) MarkApprovalTimeout(id, reason string) error {
+	now := core.Now()
+	decisionJSON, err := approvalDecisionJSON("timeout", reason, now)
+	if err != nil {
+		return err
+	}
+	return s.Project.WithTx(func(tx *db.Tx) error {
+		if err := tx.Exec(`UPDATE approval_requests SET status='timeout', reason=?, decision_json=?, resolved_at=? WHERE id=? AND status='pending'`, reason, decisionJSON, now, id); err != nil {
 			return err
 		}
 		changed, err := rowsChanged(tx)

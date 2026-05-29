@@ -1445,6 +1445,82 @@ func TestPendingApprovalsProjectsStructuredFieldsWithoutOpaqueJSON(t *testing.T)
 	}
 }
 
+func TestCreatePendingApprovalRequestStoresStructuredFieldsAndTimeout(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Approval helper")
+
+	approval, err := st.CreatePendingApprovalRequest(CreateApprovalRequestInput{
+		RunID:         run.ID,
+		IssueID:       issue.ID,
+		Kind:          "command",
+		ActionSummary: "Run go test ./internal/store",
+		RiskLevel:     "medium",
+		PolicyMatch:   "command.review",
+		RequestID:     "codex_req_123",
+		TimeoutMS:     5000,
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingApprovalRequest: %v", err)
+	}
+
+	if approval.ID == "" || approval.RunID != run.ID || approval.IssueID != issue.ID || approval.Kind != "command" || approval.Status != "pending" {
+		t.Fatalf("approval identity/status = %#v", approval)
+	}
+	if approval.ActionSummary != "Run go test ./internal/store" || approval.RiskLevel != "medium" || approval.PolicyMatch != "command.review" {
+		t.Fatalf("approval structured fields = %#v", approval)
+	}
+	if approval.TimeoutMS == nil || *approval.TimeoutMS != 5000 || approval.ExpiresAt == nil {
+		t.Fatalf("approval timeout fields = timeout_ms %#v expires_at %#v", approval.TimeoutMS, approval.ExpiresAt)
+	}
+
+	row := getApprovalRow(t, st, approval.ID)
+	var request map[string]any
+	if err := json.Unmarshal([]byte(row["request_json"].String()), &request); err != nil {
+		t.Fatalf("decode request_json: %v", err)
+	}
+	for _, key := range []string{"action_summary", "risk_level", "policy_match", "request_id"} {
+		if _, ok := request[key]; !ok {
+			t.Fatalf("request_json missing %s: %s", key, row["request_json"].String())
+		}
+	}
+
+	if err := st.MarkApprovalTimeout(approval.ID, "approval timed out"); err != nil {
+		t.Fatalf("MarkApprovalTimeout: %v", err)
+	}
+	got := getApprovalRow(t, st, approval.ID)
+	if got["status"].String() != "timeout" {
+		t.Fatalf("approval status = %s, want timeout", got["status"].String())
+	}
+	if got["resolved_at"].String() == "" {
+		t.Fatal("resolved_at is empty after timeout")
+	}
+	err = st.DecideApproval(approval.ID, "approved_once", "too late")
+	if err == nil {
+		t.Fatal("DecideApproval after timeout succeeded, want approval_not_pending")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrApprovalNotPending {
+		t.Fatalf("DecideApproval error code = %s, want %s", got, core.ErrApprovalNotPending)
+	}
+}
+
+func TestCreatePendingApprovalRequestRejectsInactiveRun(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareCompletedReviewRun(t, st)
+
+	_, err := st.CreatePendingApprovalRequest(CreateApprovalRequestInput{
+		RunID:         run.ID,
+		IssueID:       issue.ID,
+		Kind:          "command",
+		ActionSummary: "Run stale command",
+	})
+	if err == nil {
+		t.Fatal("CreatePendingApprovalRequest succeeded, want invalid_state_transition")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrInvalidStateTransition {
+		t.Fatalf("CreatePendingApprovalRequest error code = %s, want %s", got, core.ErrInvalidStateTransition)
+	}
+}
+
 func TestDecideApprovalReturnsNotPendingWhenFinalUpdateMissesPending(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareActiveRun(t, st, "Approval final update race")

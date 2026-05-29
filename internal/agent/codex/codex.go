@@ -18,6 +18,7 @@ import (
 
 	"local-symphony/internal/agent"
 	"local-symphony/internal/core"
+	"local-symphony/internal/store"
 	"local-symphony/internal/toolgateway"
 )
 
@@ -335,6 +336,20 @@ func (r *Runner) runTurn(ctx context.Context, req agent.RunRequest, session *pro
 				return failed(core.FailureCodexProtocolError, "codex stdout read failed"), nil
 			}
 			resetTimer(stall, timeoutDuration(req.Timeouts.StallMS, 5*time.Minute))
+			if isPostHandshakeApprovalRequest(item.line, session.handshakeDone) {
+				result, terminal, err := r.handleApprovalRequest(ctx, req, session, item.line)
+				if err != nil {
+					emit(req, "agent.protocol_error", map[string]any{"message": "redacted"})
+					_ = r.closeSession(req)
+					return failed(core.FailureCodexProtocolError, "codex protocol error"), nil
+				}
+				if terminal {
+					_ = r.closeSession(req)
+					return result, nil
+				}
+				resetTimer(stall, timeoutDuration(req.Timeouts.StallMS, 5*time.Minute))
+				continue
+			}
 			result, terminal, err := handleProtocolLine(req, session.selected, item.line, &session.handshakeDone, &startupC, &handoffReceived, &session.threadID)
 			if err != nil {
 				emit(req, "agent.protocol_error", map[string]any{"message": "redacted"})
@@ -350,6 +365,165 @@ func (r *Runner) runTurn(ctx context.Context, req agent.RunRequest, session *pro
 			}
 		}
 	}
+}
+
+func isPostHandshakeApprovalRequest(line string, handshakeDone bool) bool {
+	if !handshakeDone {
+		return false
+	}
+	var msg protocolMessage
+	if err := json.Unmarshal([]byte(line), &msg); err != nil {
+		return false
+	}
+	return msg.Type == "approval_requested"
+}
+
+func (r *Runner) handleApprovalRequest(ctx context.Context, req agent.RunRequest, session *processSession, line string) (agent.RunResult, bool, error) {
+	if req.Gateway.Store == nil {
+		return agent.RunResult{}, false, fmt.Errorf("approval store is required")
+	}
+	var msg protocolMessage
+	if err := json.Unmarshal([]byte(line), &msg); err != nil {
+		return agent.RunResult{}, false, err
+	}
+	approvalInput, codexRequestID, err := approvalInputFromMessage(req, msg)
+	if err != nil {
+		return agent.RunResult{}, false, err
+	}
+	approval, err := req.Gateway.Store.CreatePendingApprovalRequest(approvalInput)
+	if err != nil {
+		return agent.RunResult{}, false, err
+	}
+	emit(req, "approval.requested", map[string]any{"kind": "redacted", "approval_id": approval.ID})
+	result, terminal, err := r.waitForApprovalDecision(ctx, req, session, approval.ID, codexRequestID, approvalInput.TimeoutMS)
+	if err != nil || terminal {
+		return result, terminal, err
+	}
+	return agent.RunResult{}, false, nil
+}
+
+func approvalInputFromMessage(req agent.RunRequest, msg protocolMessage) (store.CreateApprovalRequestInput, string, error) {
+	kind := strings.TrimSpace(payloadString(msg.Payload, "kind"))
+	switch kind {
+	case "command", "file_change", "network":
+	default:
+		return store.CreateApprovalRequestInput{}, "", fmt.Errorf("unsupported approval kind %q", kind)
+	}
+	requestID := strings.TrimSpace(payloadString(msg.Payload, "request_id"))
+	return store.CreateApprovalRequestInput{
+		RunID:         req.Run.ID,
+		IssueID:       req.Issue.ID,
+		Kind:          kind,
+		ActionSummary: payloadString(msg.Payload, "action_summary"),
+		RiskLevel:     payloadString(msg.Payload, "risk_level"),
+		PolicyMatch:   payloadString(msg.Payload, "policy_match"),
+		RequestID:     requestID,
+		TimeoutMS:     payloadInt64(msg.Payload, "timeout_ms"),
+	}, requestID, nil
+}
+
+func (r *Runner) waitForApprovalDecision(ctx context.Context, req agent.RunRequest, session *processSession, approvalID, codexRequestID string, timeoutMS int64) (agent.RunResult, bool, error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var timeoutC <-chan time.Time
+	var timeout *time.Timer
+	if timeoutMS > 0 {
+		timeout = time.NewTimer(time.Duration(timeoutMS) * time.Millisecond)
+		defer timeout.Stop()
+		timeoutC = timeout.C
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return failed(core.FailureOperatorCancelled, "operator cancelled"), true, nil
+		case <-timeoutC:
+			if err := req.Gateway.Store.MarkApprovalTimeout(approvalID, "approval timed out"); err != nil {
+				if core.AsAPIError(err).Code != core.ErrApprovalNotPending {
+					return agent.RunResult{}, false, err
+				}
+				continue
+			}
+			return failed(core.FailureApprovalTimeout, "approval timed out"), true, nil
+		case <-ticker.C:
+			approval, err := req.Gateway.Store.ApprovalByID(approvalID)
+			if err != nil {
+				return agent.RunResult{}, false, err
+			}
+			if approval.Status == "timeout" {
+				return failed(core.FailureApprovalTimeout, "approval timed out"), true, nil
+			}
+			decision, ok := approvalDecisionForStatus(approval.Status)
+			if !ok {
+				continue
+			}
+			if decision == "cancel_run" {
+				return failed(core.FailureOperatorCancelled, "operator cancelled"), true, nil
+			}
+			if err := writeApprovalDecision(session.stdin, approvalIDForCodex(approvalID, codexRequestID), decision); err != nil {
+				return failed(core.FailureCodexProtocolError, "codex stdin write failed"), true, nil
+			}
+			emit(req, "approval.resolved", map[string]any{"decision": "redacted"})
+			return agent.RunResult{}, false, nil
+		}
+	}
+}
+
+func payloadString(payload map[string]any, key string) string {
+	value, ok := payload[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func payloadInt64(payload map[string]any, key string) int64 {
+	switch value := payload[key].(type) {
+	case float64:
+		if value > 0 {
+			return int64(value)
+		}
+	case int64:
+		if value > 0 {
+			return value
+		}
+	case int:
+		if value > 0 {
+			return int64(value)
+		}
+	}
+	return 0
+}
+
+func approvalDecisionForStatus(status string) (string, bool) {
+	switch status {
+	case "approved_once":
+		return "approve_once", true
+	case "approved_for_run":
+		return "approve_for_run", true
+	case "approved_for_session":
+		return "approve_for_session", true
+	case "denied":
+		return "deny", true
+	case "cancelled":
+		return "cancel_run", true
+	default:
+		return "", false
+	}
+}
+
+func approvalIDForCodex(approvalID, requestID string) string {
+	if strings.TrimSpace(requestID) != "" {
+		return strings.TrimSpace(requestID)
+	}
+	return approvalID
+}
+
+func writeApprovalDecision(w io.Writer, approvalID, decision string) error {
+	return json.NewEncoder(w).Encode(map[string]string{
+		"type":        "approval_decision",
+		"approval_id": approvalID,
+		"decision":    decision,
+	})
 }
 
 func (r *Runner) closeSession(req agent.RunRequest) error {
