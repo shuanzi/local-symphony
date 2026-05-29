@@ -337,7 +337,7 @@ func (r *Runner) runTurn(ctx context.Context, req agent.RunRequest, session *pro
 			}
 			resetTimer(stall, timeoutDuration(req.Timeouts.StallMS, 5*time.Minute))
 			if isPostHandshakeApprovalRequest(item.line, session.handshakeDone) {
-				result, terminal, err := r.handleApprovalRequest(ctx, req, session, item.line)
+				result, terminal, err := r.handleApprovalRequest(ctx, req, session, item.line, turnC)
 				if err != nil {
 					emit(req, "agent.protocol_error", map[string]any{"message": "redacted"})
 					_ = r.closeSession(req)
@@ -375,10 +375,10 @@ func isPostHandshakeApprovalRequest(line string, handshakeDone bool) bool {
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
 		return false
 	}
-	return msg.Type == "approval_requested"
+	return msg.Type == "approval_requested" && strings.TrimSpace(payloadString(msg.Payload, "request_id")) != ""
 }
 
-func (r *Runner) handleApprovalRequest(ctx context.Context, req agent.RunRequest, session *processSession, line string) (agent.RunResult, bool, error) {
+func (r *Runner) handleApprovalRequest(ctx context.Context, req agent.RunRequest, session *processSession, line string, turnC <-chan time.Time) (agent.RunResult, bool, error) {
 	if req.Gateway.Store == nil {
 		return agent.RunResult{}, false, fmt.Errorf("approval store is required")
 	}
@@ -395,7 +395,7 @@ func (r *Runner) handleApprovalRequest(ctx context.Context, req agent.RunRequest
 		return agent.RunResult{}, false, err
 	}
 	emit(req, "approval.requested", map[string]any{"kind": "redacted", "approval_id": approval.ID})
-	result, terminal, err := r.waitForApprovalDecision(ctx, req, session, approval.ID, codexRequestID, approvalInput.TimeoutMS)
+	result, terminal, err := r.waitForApprovalDecision(ctx, req, session, approval.ID, codexRequestID, approvalInput.TimeoutMS, turnC)
 	if err != nil || terminal {
 		return result, terminal, err
 	}
@@ -422,7 +422,7 @@ func approvalInputFromMessage(req agent.RunRequest, msg protocolMessage) (store.
 	}, requestID, nil
 }
 
-func (r *Runner) waitForApprovalDecision(ctx context.Context, req agent.RunRequest, session *processSession, approvalID, codexRequestID string, timeoutMS int64) (agent.RunResult, bool, error) {
+func (r *Runner) waitForApprovalDecision(ctx context.Context, req agent.RunRequest, session *processSession, approvalID, codexRequestID string, timeoutMS int64, turnC <-chan time.Time) (agent.RunResult, bool, error) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	var timeoutC <-chan time.Time
@@ -435,13 +435,30 @@ func (r *Runner) waitForApprovalDecision(ctx context.Context, req agent.RunReque
 	for {
 		select {
 		case <-ctx.Done():
+			if err := markApprovalCancelledIfPending(req.Gateway.Store, approvalID, "operator cancelled"); err != nil {
+				return agent.RunResult{}, false, err
+			}
 			return failed(core.FailureOperatorCancelled, "operator cancelled"), true, nil
+		case <-turnC:
+			if err := markApprovalTimeoutIfPending(req.Gateway.Store, approvalID, "codex turn timeout"); err != nil {
+				return agent.RunResult{}, false, err
+			}
+			return failed(core.FailureTurnTimeout, "codex turn timeout"), true, nil
+		case err := <-session.waitCh:
+			session.closed = true
+			session.processExited = true
+			emitProcessExited(req, err, session.stderrCounter)
+			r.session = nil
+			if cancelErr := markApprovalCancelledIfPending(req.Gateway.Store, approvalID, "codex process exited"); cancelErr != nil {
+				return agent.RunResult{}, false, cancelErr
+			}
+			if err != nil {
+				return failed(core.FailureCodexProtocolError, err.Error()), true, nil
+			}
+			return failed(core.FailureCodexProtocolError, "codex process exited before approval decision"), true, nil
 		case <-timeoutC:
-			if err := req.Gateway.Store.MarkApprovalTimeout(approvalID, "approval timed out"); err != nil {
-				if core.AsAPIError(err).Code != core.ErrApprovalNotPending {
-					return agent.RunResult{}, false, err
-				}
-				continue
+			if err := markApprovalTimeoutIfPending(req.Gateway.Store, approvalID, "approval timed out"); err != nil {
+				return agent.RunResult{}, false, err
 			}
 			return failed(core.FailureApprovalTimeout, "approval timed out"), true, nil
 		case <-ticker.C:
@@ -466,6 +483,26 @@ func (r *Runner) waitForApprovalDecision(ctx context.Context, req agent.RunReque
 			return agent.RunResult{}, false, nil
 		}
 	}
+}
+
+func markApprovalTimeoutIfPending(st *store.Store, approvalID, reason string) error {
+	if err := st.MarkApprovalTimeout(approvalID, reason); err != nil {
+		if core.AsAPIError(err).Code == core.ErrApprovalNotPending {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func markApprovalCancelledIfPending(st *store.Store, approvalID, reason string) error {
+	if err := st.MarkApprovalCancelled(approvalID, reason); err != nil {
+		if core.AsAPIError(err).Code == core.ErrApprovalNotPending {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func payloadString(payload map[string]any, key string) string {

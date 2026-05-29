@@ -325,6 +325,139 @@ sleep 2
 	}
 }
 
+func TestRunnerApprovalNotificationWithoutRequestIDDoesNotBlock(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"type":"approval_requested","payload":{"kind":"command","timeout_ms":25}}'
+printf '%s\n' '{"type":"approval_resolved","payload":{"decision":"approve_once"}}'
+printf '%s\n' '{"type":"handoff","payload":{"summary":"Notification approval completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
+printf '%s\n' '{"type":"turn_completed"}'
+`)
+
+	result, err := (&Runner{Command: script + " app-server"}).Run(context.Background(), codexTestRunRequest(st, run, issue, workspacePath, token))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Kind != agent.RunResultSucceeded {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	approvals, err := st.PendingApprovals()
+	if err != nil {
+		t.Fatalf("PendingApprovals: %v", err)
+	}
+	if len(approvals) != 0 {
+		t.Fatalf("pending approvals = %#v, want none", approvals)
+	}
+	assertRunEventCount(t, st, run.ID, "approval.requested", 1)
+	assertRunEventCount(t, st, run.ID, "approval.resolved", 1)
+}
+
+func TestRunnerApprovalContextCancelMarksRowCancelled(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"type":"approval_requested","payload":{"kind":"command","action_summary":"Run cancellable command","risk_level":"high","policy_match":"command.review","request_id":"codex_req_ctx_cancel","timeout_ms":5000}}'
+sleep 2
+`)
+	runner := &Runner{Command: script + " app-server"}
+	ctx, cancel := context.WithCancel(context.Background())
+	resultC := make(chan agent.RunResult, 1)
+	errC := make(chan error, 1)
+	go func() {
+		result, err := runner.Run(ctx, codexTestRunRequest(st, run, issue, workspacePath, token))
+		resultC <- result
+		errC <- err
+	}()
+
+	approval := waitForApprovalByRequestID(t, st, "codex_req_ctx_cancel")
+	cancel()
+	result := waitCodexResult(t, resultC, errC)
+	if result.Kind != agent.RunResultFailed || result.FailureCode != core.FailureOperatorCancelled {
+		t.Fatalf("result = %#v, want operator_cancelled", result)
+	}
+	approval, err := st.ApprovalByID(approval.ID)
+	if err != nil {
+		t.Fatalf("ApprovalByID: %v", err)
+	}
+	if approval.Status != "cancelled" || approval.ResolvedAt == nil {
+		t.Fatalf("approval after context cancel = %#v", approval)
+	}
+}
+
+func TestRunnerApprovalWaitObeysTurnTimeout(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"type":"approval_requested","payload":{"kind":"command","action_summary":"Run slow approval","risk_level":"medium","policy_match":"command.review","request_id":"codex_req_turn_timeout","timeout_ms":5000}}'
+sleep 6
+`)
+	req := codexTestRunRequest(st, run, issue, workspacePath, token)
+	req.Timeouts.TurnMS = 50
+
+	result, err := (&Runner{Command: script + " app-server"}).Run(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Kind != agent.RunResultFailed || result.FailureCode != core.FailureTurnTimeout {
+		t.Fatalf("result = %#v, want turn_timeout", result)
+	}
+	approval := approvalByRequestID(t, st, "codex_req_turn_timeout")
+	if approval.Status != "timeout" || approval.ResolvedAt == nil {
+		t.Fatalf("approval after turn timeout = %#v", approval)
+	}
+}
+
+func TestRunnerApprovalWaitFailsWhenCodexProcessExits(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"type":"approval_requested","payload":{"kind":"command","action_summary":"Run crashing command","risk_level":"high","policy_match":"command.review","request_id":"codex_req_process_exit","timeout_ms":5000}}'
+exit 7
+`)
+
+	result, err := (&Runner{Command: script + " app-server"}).Run(context.Background(), codexTestRunRequest(st, run, issue, workspacePath, token))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Kind != agent.RunResultFailed || result.FailureCode != core.FailureCodexProtocolError {
+		t.Fatalf("result = %#v, want codex_protocol_error", result)
+	}
+	approval := approvalByRequestID(t, st, "codex_req_process_exit")
+	if approval.Status != "cancelled" || approval.ResolvedAt == nil {
+		t.Fatalf("approval after process exit = %#v", approval)
+	}
+	assertRunEventCount(t, st, run.ID, "agent.process_exited", 1)
+}
+
 func TestRunnerApprovalCancelRunReturnsOperatorCancelledAndTerminatesProcess(t *testing.T) {
 	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
 	script := writeFakeCodexBinary(t, `#!/bin/sh
@@ -1223,6 +1356,30 @@ func waitForApprovalByRequestID(t *testing.T, st *store.Store, requestID string)
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("approval with request_id %q was not created", requestID)
+	return nil
+}
+
+func approvalByRequestID(t *testing.T, st *store.Store, requestID string) *store.Approval {
+	t.Helper()
+	rows, err := st.Project.Query(`SELECT id, request_json FROM approval_requests ORDER BY created_at ASC`)
+	if err != nil {
+		t.Fatalf("query approvals: %v", err)
+	}
+	for _, row := range rows {
+		var request map[string]any
+		if err := json.Unmarshal([]byte(row["request_json"].String()), &request); err != nil {
+			t.Fatalf("decode request_json: %v", err)
+		}
+		if request["request_id"] != requestID {
+			continue
+		}
+		approval, err := st.ApprovalByID(row["id"].String())
+		if err != nil {
+			t.Fatalf("ApprovalByID: %v", err)
+		}
+		return approval
+	}
+	t.Fatalf("approval with request_id %q was not found", requestID)
 	return nil
 }
 

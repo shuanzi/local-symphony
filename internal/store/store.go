@@ -2220,6 +2220,27 @@ func (s *Store) MarkApprovalTimeout(id, reason string) error {
 	})
 }
 
+func (s *Store) MarkApprovalCancelled(id, reason string) error {
+	now := core.Now()
+	decisionJSON, err := approvalDecisionJSON("cancelled", reason, now)
+	if err != nil {
+		return err
+	}
+	return s.Project.WithTx(func(tx *db.Tx) error {
+		if err := tx.Exec(`UPDATE approval_requests SET status='cancelled', reason=?, decision_json=?, resolved_at=? WHERE id=? AND status='pending'`, reason, decisionJSON, now, id); err != nil {
+			return err
+		}
+		changed, err := rowsChanged(tx)
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return core.NewError(core.ErrApprovalNotPending, "approval is not pending", nil)
+		}
+		return nil
+	})
+}
+
 func (s *Store) ReconcileStaleActiveRuns() error {
 	rows, err := s.Project.Query(`SELECT id FROM run_attempts WHERE status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running')`)
 	if err != nil {
