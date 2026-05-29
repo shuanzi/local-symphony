@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-symphony.dev/schemas/approval_request.schema.json",
+  "title": "ApprovalRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "run_id",
+    "issue_id",
+    "kind",
+    "status",
+    "action_summary",
+    "risk_level",
+    "policy_match",
+    "requested_at",
+    "created_at",
+    "timeout_ms",
+    "expires_at",
+    "resolved_at",
+    "reason"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^apr_"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "issue_id": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "command",
+        "file_change",
+        "network"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "approved_once",
+        "approved_for_run",
+        "approved_for_session",
+        "denied",
+        "auto_denied",
+        "cancelled",
+        "timeout"
+      ]
+    },
+    "action_summary": {
+      "type": "string"
+    },
+    "risk_level": {
+      "type": "string"
+    },
+    "policy_match": {
+      "type": "string"
+    },
+    "requested_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "timeout_ms": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "resolved_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

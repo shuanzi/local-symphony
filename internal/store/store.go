@@ -86,6 +86,23 @@ type ArtifactRecord struct {
 	CreatedAt      string  `json:"created_at"`
 }
 
+type Approval struct {
+	ID            string  `json:"id"`
+	RunID         string  `json:"run_id"`
+	IssueID       string  `json:"issue_id"`
+	Kind          string  `json:"kind"`
+	Status        string  `json:"status"`
+	ActionSummary string  `json:"action_summary"`
+	RiskLevel     string  `json:"risk_level"`
+	PolicyMatch   string  `json:"policy_match"`
+	RequestedAt   string  `json:"requested_at"`
+	CreatedAt     string  `json:"created_at"`
+	TimeoutMS     *int64  `json:"timeout_ms"`
+	ExpiresAt     *string `json:"expires_at"`
+	ResolvedAt    *string `json:"resolved_at"`
+	Reason        *string `json:"reason"`
+}
+
 func ResolveProjectRoot(project string) (string, error) {
 	if project == "" {
 		project = "."
@@ -436,6 +453,13 @@ func ptrFromVal(v db.Value) *string {
 	}
 	s := v.String()
 	return &s
+}
+func int64PtrFromVal(v db.Value) *int64 {
+	if v.Null || v.String() == "" {
+		return nil
+	}
+	n := v.Int64()
+	return &n
 }
 func failPtrFromVal(v db.Value) *core.FailureCode {
 	if v.Null || v.String() == "" {
@@ -1980,22 +2004,106 @@ WHERE id=? AND state=? AND latest_review_packet_id=? AND NOT EXISTS (
 	return s.GetIssue(issueID)
 }
 
-func (s *Store) PendingApprovals() ([]map[string]any, error) {
+func (s *Store) PendingApprovals() ([]Approval, error) {
 	rows, err := s.Project.Query(`SELECT * FROM approval_requests ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
-	out := []map[string]any{}
+	out := []Approval{}
 	for _, r := range rows {
-		out = append(out, map[string]any{"id": r["id"].String(), "run_id": r["run_id"].String(), "issue_id": r["issue_id"].String(), "kind": r["kind"].String(), "status": r["status"].String(), "created_at": r["created_at"].String()})
+		out = append(out, approvalFromRow(r))
 	}
 	return out, nil
 }
+
+func (s *Store) ApprovalByID(id string) (*Approval, error) {
+	row, err := s.Project.QueryOne(`SELECT * FROM approval_requests WHERE id=?`, id)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, core.NewError(core.ErrNotFound, "approval not found", nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+	approval := approvalFromRow(row)
+	return &approval, nil
+}
+
+func approvalFromRow(r map[string]db.Value) Approval {
+	id := r["id"].String()
+	kind := r["kind"].String()
+	actionSummary, riskLevel, policyMatch := approvalRequestFields(r["request_json"].String(), kind, id)
+	createdAt := r["created_at"].String()
+	return Approval{
+		ID:            id,
+		RunID:         r["run_id"].String(),
+		IssueID:       r["issue_id"].String(),
+		Kind:          kind,
+		Status:        r["status"].String(),
+		ActionSummary: actionSummary,
+		RiskLevel:     riskLevel,
+		PolicyMatch:   policyMatch,
+		RequestedAt:   createdAt,
+		CreatedAt:     createdAt,
+		TimeoutMS:     int64PtrFromVal(r["timeout_ms"]),
+		ExpiresAt:     ptrFromVal(r["expires_at"]),
+		ResolvedAt:    ptrFromVal(r["resolved_at"]),
+		Reason:        ptrFromVal(r["reason"]),
+	}
+}
+
+func approvalRequestFields(raw, kind, id string) (string, string, string) {
+	actionSummary := kind + " approval " + id
+	riskLevel := "unknown"
+	policyMatch := "unclassified"
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		return actionSummary, riskLevel, policyMatch
+	}
+	if value, ok := nonBlankJSONString(fields["action_summary"]); ok {
+		actionSummary = value
+	}
+	if value, ok := nonBlankJSONString(fields["risk_level"]); ok {
+		riskLevel = value
+	}
+	if value, ok := nonBlankJSONString(fields["policy_match"]); ok {
+		policyMatch = value
+	}
+	return actionSummary, riskLevel, policyMatch
+}
+
+func nonBlankJSONString(v any) (string, bool) {
+	s, ok := v.(string)
+	if !ok {
+		return "", false
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	return s, true
+}
+
+func approvalDecisionJSON(status, reason, resolvedAt string) (string, error) {
+	b, err := json.Marshal(map[string]string{
+		"status":      status,
+		"reason":      reason,
+		"resolved_at": resolvedAt,
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
 func (s *Store) DecideApproval(id, status, reason string) error {
 	if status == "cancel_run" {
 		status = "cancelled"
 	}
 	now := core.Now()
+	decisionJSON, err := approvalDecisionJSON(status, reason, now)
+	if err != nil {
+		return err
+	}
 	return s.Project.WithTx(func(tx *db.Tx) error {
 		row, err := tx.QueryOne(`SELECT * FROM approval_requests WHERE id=?`, id)
 		if errors.Is(err, os.ErrNotExist) {
@@ -2012,7 +2120,7 @@ func (s *Store) DecideApproval(id, status, reason string) error {
 				return err
 			}
 		}
-		if err := tx.Exec(`UPDATE approval_requests SET status=?, reason=?, resolved_at=? WHERE id=? AND status='pending'`, status, reason, now, id); err != nil {
+		if err := tx.Exec(`UPDATE approval_requests SET status=?, reason=?, decision_json=?, resolved_at=? WHERE id=? AND status='pending'`, status, reason, decisionJSON, now, id); err != nil {
 			return err
 		}
 		changed, err := rowsChanged(tx)

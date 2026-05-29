@@ -707,7 +707,12 @@ func (s *Server) approvalRoutes(w http.ResponseWriter, r *http.Request, rest str
 			apiErr(w, err)
 			return
 		}
-		ok(w, map[string]any{"id": parts[0], "status": status})
+		approval, err := s.Store.ApprovalByID(parts[0])
+		if err != nil {
+			apiErr(w, err)
+			return
+		}
+		ok(w, approval)
 		return
 	}
 	apiErr(w, core.NewError(core.ErrNotFound, "approval route not found", nil))

@@ -1042,6 +1042,84 @@ func TestListApprovalsReturnsInternalErrorWhenStoreQueryFails(t *testing.T) {
 	}
 }
 
+func TestListApprovalsReturnsStructuredProjection(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{
+		Title:              "Approval HTTP list",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	pendingID := core.NewID("apr_")
+	resolvedID := core.NewID("apr_")
+	timeoutID := core.NewID("apr_")
+	if err := srv.Store.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,timeout_ms,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		pendingID, run.ID, issue.ID, "command", "pending", `{"action_summary":"Run backend tests","risk_level":"medium","policy_match":"command.review","command":"secret command"}`, 30000, "2026-05-26T10:01:00Z", "2026-05-26T10:00:00Z"); err != nil {
+		t.Fatalf("insert pending approval: %v", err)
+	}
+	if err := srv.Store.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at,resolved_at,reason,decision_json) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		resolvedID, run.ID, issue.ID, "network", "denied", `{"url":"https://example.invalid/private"}`, "2026-05-26T09:00:00Z", "2026-05-26T09:02:00Z", "too broad", `{"decision":"deny"}`); err != nil {
+		t.Fatalf("insert resolved approval: %v", err)
+	}
+	if err := srv.Store.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,timeout_ms,expires_at,created_at,resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		timeoutID, run.ID, issue.ID, "file_change", "timeout", `{"raw_request":"do not expose"}`, 1000, "2026-05-26T08:00:01Z", "2026-05-26T08:00:00Z", "2026-05-26T08:00:01Z"); err != nil {
+		t.Fatalf("insert timeout approval: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/approvals", nil)
+	addCookies(req, sessionAuth(t, srv).cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list approvals status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	items := payload["data"].([]any)
+	if len(items) != 3 {
+		t.Fatalf("approvals len = %d, want 3", len(items))
+	}
+	pending := items[0].(map[string]any)
+	if pending["id"] != pendingID || pending["run_id"] != run.ID || pending["issue_id"] != issue.ID || pending["kind"] != "command" || pending["status"] != "pending" {
+		t.Fatalf("pending approval identity/status = %#v", pending)
+	}
+	if pending["action_summary"] != "Run backend tests" || pending["risk_level"] != "medium" || pending["policy_match"] != "command.review" {
+		t.Fatalf("pending structured fields = %#v", pending)
+	}
+	if pending["requested_at"] != "2026-05-26T10:00:00Z" || pending["created_at"] != "2026-05-26T10:00:00Z" || pending["timeout_ms"] != float64(30000) || pending["expires_at"] != "2026-05-26T10:01:00Z" {
+		t.Fatalf("pending timing fields = %#v", pending)
+	}
+	if pending["resolved_at"] != nil || pending["reason"] != nil {
+		t.Fatalf("pending null fields = %#v", pending)
+	}
+	resolved := items[1].(map[string]any)
+	if resolved["id"] != resolvedID || resolved["action_summary"] != "network approval "+resolvedID || resolved["risk_level"] != "unknown" || resolved["policy_match"] != "unclassified" {
+		t.Fatalf("resolved defaults = %#v", resolved)
+	}
+	if resolved["timeout_ms"] != nil || resolved["expires_at"] != nil || resolved["resolved_at"] != "2026-05-26T09:02:00Z" || resolved["reason"] != "too broad" {
+		t.Fatalf("resolved null/timing fields = %#v", resolved)
+	}
+	timeout := items[2].(map[string]any)
+	if timeout["id"] != timeoutID || timeout["status"] != "timeout" || timeout["action_summary"] != "file_change approval "+timeoutID {
+		t.Fatalf("timeout approval = %#v", timeout)
+	}
+	forbiddenBody := rec.Body.String()
+	for _, forbidden := range []string{"request_json", "decision_json", `"request"`, `"decision"`, "secret command", "example.invalid", "raw_request"} {
+		if strings.Contains(forbiddenBody, forbidden) {
+			t.Fatalf("approval response leaked %q in body %s", forbidden, forbiddenBody)
+		}
+	}
+}
+
 func TestIssueControlRoutesReturnIssueEnvelope(t *testing.T) {
 	srv := newTestServer(t)
 	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "Control shape", Description: "desc"})
@@ -2669,6 +2747,71 @@ func TestApprovalRejectsUnsupportedDecision(t *testing.T) {
 	}
 	if row["status"].String() != "pending" {
 		t.Fatalf("approval status = %s, want pending", row["status"].String())
+	}
+}
+
+func TestApprovalDecisionReturnsStructuredProjection(t *testing.T) {
+	srv := newTestServer(t)
+	issue, err := srv.Store.CreateIssue(store.CreateIssueInput{
+		Title:              "Approval HTTP decide",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := srv.Store.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := srv.Store.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	approvalID := core.NewID("apr_")
+	if err := srv.Store.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,timeout_ms,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		approvalID, run.ID, issue.ID, "command", "pending", `{"action_summary":"Run risky command","risk_level":"high","policy_match":"command.deny","command":"rm -rf secret"}`, 5000, "2026-05-26T10:00:05Z", "2026-05-26T10:00:00Z"); err != nil {
+		t.Fatalf("insert approval: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/"+approvalID+"/decide", strings.NewReader(`{"decision":"deny","reason":"too risky"}`))
+	req.Header.Set("Content-Type", "application/json")
+	applySessionAuth(req, sessionAuth(t, srv))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("approval decide status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	data := payload["data"].(map[string]any)
+	if data["id"] != approvalID || data["run_id"] != run.ID || data["issue_id"] != issue.ID || data["kind"] != "command" || data["status"] != "denied" {
+		t.Fatalf("approval decision identity/status = %#v", data)
+	}
+	if data["action_summary"] != "Run risky command" || data["risk_level"] != "high" || data["policy_match"] != "command.deny" {
+		t.Fatalf("approval decision structured fields = %#v", data)
+	}
+	if data["requested_at"] != "2026-05-26T10:00:00Z" || data["created_at"] != "2026-05-26T10:00:00Z" || data["timeout_ms"] != float64(5000) || data["expires_at"] != "2026-05-26T10:00:05Z" {
+		t.Fatalf("approval decision timing fields = %#v", data)
+	}
+	if data["resolved_at"] == nil || data["reason"] != "too risky" {
+		t.Fatalf("approval decision resolution fields = %#v", data)
+	}
+	row, err := srv.Store.Project.QueryOne(`SELECT decision_json FROM approval_requests WHERE id=?`, approvalID)
+	if err != nil {
+		t.Fatalf("get approval decision json: %v", err)
+	}
+	var decision map[string]any
+	if err := json.Unmarshal([]byte(row["decision_json"].String()), &decision); err != nil {
+		t.Fatalf("decode decision_json: %v", err)
+	}
+	if decision["status"] != "denied" || decision["reason"] != "too risky" || decision["resolved_at"] == "" {
+		t.Fatalf("decision_json = %#v, want internal status/reason/resolved_at", decision)
+	}
+	body := rec.Body.String()
+	for _, forbidden := range []string{"request_json", "decision_json", `"request"`, `"decision"`, "rm -rf secret"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("approval decision leaked %q in body %s", forbidden, body)
+		}
 	}
 }
 

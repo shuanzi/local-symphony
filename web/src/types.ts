@@ -142,12 +142,17 @@ export interface Approval {
   id: string;
   run_id: string;
   issue_id: string;
-  kind: 'command' | 'file' | 'network' | string;
-  status: 'pending' | 'expired' | 'denied' | 'auto_denied' | 'approved_once' | 'approved_for_run' | 'approved_for_session' | 'cancelled' | string;
-  action_summary?: string;
-  risk_level?: string;
-  policy_match?: string;
+  kind: 'command' | 'file_change' | 'network';
+  status: 'pending' | 'approved_once' | 'approved_for_run' | 'approved_for_session' | 'denied' | 'auto_denied' | 'cancelled' | 'timeout';
+  action_summary: string;
+  risk_level: string;
+  policy_match: string;
+  requested_at: string;
   created_at: string;
+  timeout_ms: number | null;
+  expires_at: string | null;
+  resolved_at: string | null;
+  reason: string | null;
 }
 
 export interface Artifact {

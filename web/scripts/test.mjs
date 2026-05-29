@@ -4,6 +4,7 @@ const root = new URL('..', import.meta.url);
 const inv = JSON.parse(fs.readFileSync(new URL('action-inventory.json', root), 'utf8'));
 const app = fs.readFileSync(new URL('src/App.tsx', root), 'utf8');
 const api = fs.readFileSync(new URL('src/api.ts', root), 'utf8');
+const types = fs.readFileSync(new URL('src/types.ts', root), 'utf8');
 const styles = fs.readFileSync(new URL('src/styles.css', root), 'utf8');
 const validateContracts = fs.readFileSync(new URL('../scripts/validate_contracts.py', root), 'utf8');
 
@@ -41,6 +42,20 @@ function exactSet(name, actual, expected) {
   if (missing.length || extra.length) {
     throw new Error(`${name} drift: missing=${missing.join(', ') || 'none'} extra=${extra.join(', ') || 'none'}`);
   }
+}
+
+function extractBlock(source, startPattern) {
+  const start = source.search(startPattern);
+  if (start < 0) return '';
+  const openBrace = source.indexOf('{', start);
+  if (openBrace < 0) return '';
+  let depth = 1;
+  let i = openBrace + 1;
+  for (; i < source.length && depth > 0; i += 1) {
+    if (source[i] === '{') depth += 1;
+    if (source[i] === '}') depth -= 1;
+  }
+  return source.slice(start, i);
 }
 
 const requiredActionEvidence = {
@@ -96,6 +111,38 @@ const requiredApiPaths = [
 for (const path of requiredApiPaths) {
   if (!api.includes(path)) throw new Error(`missing API client path ${path}`);
 }
+
+const approvalInterface = extractBlock(types, /export\s+interface\s+Approval\s*\{/);
+if (!approvalInterface) throw new Error('missing Approval interface');
+for (const forbidden of ['request', 'request_json', 'decision', 'decision_json']) {
+  if (new RegExp(`\\b${forbidden}\\??:`).test(approvalInterface)) throw new Error(`Approval type must not expose ${forbidden}`);
+}
+const approvalTypeFields = {
+  id: /id:\s*string;/,
+  run_id: /run_id:\s*string;/,
+  issue_id: /issue_id:\s*string;/,
+  kind: /kind:\s*'command'\s*\|\s*'file_change'\s*\|\s*'network';/,
+  status: /status:\s*'pending'\s*\|\s*'approved_once'\s*\|\s*'approved_for_run'\s*\|\s*'approved_for_session'\s*\|\s*'denied'\s*\|\s*'auto_denied'\s*\|\s*'cancelled'\s*\|\s*'timeout';/,
+  action_summary: /action_summary:\s*string;/,
+  risk_level: /risk_level:\s*string;/,
+  policy_match: /policy_match:\s*string;/,
+  requested_at: /requested_at:\s*string;/,
+  created_at: /created_at:\s*string;/,
+  timeout_ms: /timeout_ms:\s*number\s*\|\s*null;/,
+  expires_at: /expires_at:\s*string\s*\|\s*null;/,
+  resolved_at: /resolved_at:\s*string\s*\|\s*null;/,
+  reason: /reason:\s*string\s*\|\s*null;/
+};
+for (const [field, pattern] of Object.entries(approvalTypeFields)) {
+  if (!pattern.test(approvalInterface)) throw new Error(`Approval type field mismatch: ${field}`);
+}
+if (/\bexpired\b/.test(approvalInterface) || /\|\s*string\b/.test(approvalInterface)) throw new Error('Approval type must use the B1 finite status/kind unions');
+if (!/decideApproval:[\s\S]*apiRequest<Approval>\(`/s.test(api)) throw new Error('approval decision API must return full Approval');
+
+for (const field of ['action_summary', 'risk_level', 'policy_match', 'requested_at', 'timeout_ms', 'expires_at']) {
+  if (!app.includes(`approval.${field}`)) throw new Error(`Approval Inbox must render structured field ${field}`);
+}
+if (/approval\.request\b|request_json|decision_json/.test(app)) throw new Error('Approval Inbox must not parse opaque approval request/decision payloads');
 
 const sharedStates = [
   'Loading dashboard state', 'No issues', 'Session expired', 'Daemon unavailable',
