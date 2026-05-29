@@ -180,17 +180,26 @@ func commandOutputWithTimeout(parts []string, timeout time.Duration) ([]byte, er
 }
 
 type protocolMessage struct {
-	Type            string         `json:"type"`
-	CodexVersion    string         `json:"codex_version"`
-	ProtocolVersion string         `json:"protocol_version"`
-	SchemaVersion   string         `json:"schema_version"`
-	ExperimentalAPI bool           `json:"experimental_api"`
-	ThreadID        string         `json:"thread_id"`
-	TurnID          string         `json:"turn_id"`
-	Message         string         `json:"message"`
-	FailureCode     string         `json:"failure_code"`
-	Error           string         `json:"error"`
-	Payload         map[string]any `json:"payload"`
+	JSONRPC         string          `json:"jsonrpc"`
+	ID              json.RawMessage `json:"id"`
+	Method          string          `json:"method"`
+	Type            string          `json:"type"`
+	CodexVersion    string          `json:"codex_version"`
+	ProtocolVersion string          `json:"protocol_version"`
+	SchemaVersion   string          `json:"schema_version"`
+	ExperimentalAPI bool            `json:"experimental_api"`
+	ThreadID        string          `json:"thread_id"`
+	TurnID          string          `json:"turn_id"`
+	Message         string          `json:"message"`
+	FailureCode     string          `json:"failure_code"`
+	Error           string          `json:"error"`
+	Payload         map[string]any  `json:"payload"`
+	Params          map[string]any  `json:"params"`
+}
+
+type approvalResponseTarget struct {
+	requestID string
+	jsonrpcID json.RawMessage
 }
 
 type stdoutItem struct {
@@ -375,7 +384,10 @@ func isPostHandshakeApprovalRequest(line string, handshakeDone bool) bool {
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
 		return false
 	}
-	return msg.Type == "approval_requested" && strings.TrimSpace(payloadString(msg.Payload, "request_id")) != ""
+	if msg.Type == "approval_requested" && strings.TrimSpace(payloadString(msg.Payload, "request_id")) != "" {
+		return true
+	}
+	return isJSONRPCApprovalMethod(msg.Method) && len(bytes.TrimSpace(msg.ID)) != 0
 }
 
 func (r *Runner) handleApprovalRequest(ctx context.Context, req agent.RunRequest, session *processSession, line string, turnC <-chan time.Time) (agent.RunResult, bool, error) {
@@ -386,28 +398,48 @@ func (r *Runner) handleApprovalRequest(ctx context.Context, req agent.RunRequest
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
 		return agent.RunResult{}, false, err
 	}
-	approvalInput, codexRequestID, err := approvalInputFromMessage(req, msg)
+	approvalInput, responseTarget, err := approvalInputFromMessage(req, msg)
 	if err != nil {
 		return agent.RunResult{}, false, err
+	}
+	if handled, err := r.tryApprovedForRunDecision(req, session, approvalInput, responseTarget); err != nil {
+		return failed(core.FailureCodexProtocolError, "codex stdin write failed"), true, nil
+	} else if handled {
+		return agent.RunResult{}, false, nil
 	}
 	approval, err := req.Gateway.Store.CreatePendingApprovalRequest(approvalInput)
 	if err != nil {
 		return agent.RunResult{}, false, err
 	}
 	emit(req, "approval.requested", map[string]any{"kind": "redacted", "approval_id": approval.ID})
-	result, terminal, err := r.waitForApprovalDecision(ctx, req, session, approval.ID, codexRequestID, approvalInput.TimeoutMS, turnC)
+	result, terminal, err := r.waitForApprovalDecision(ctx, req, session, approval.ID, responseTarget, approvalInput.TimeoutMS, turnC)
 	if err != nil || terminal {
 		return result, terminal, err
 	}
 	return agent.RunResult{}, false, nil
 }
 
-func approvalInputFromMessage(req agent.RunRequest, msg protocolMessage) (store.CreateApprovalRequestInput, string, error) {
+func (r *Runner) tryApprovedForRunDecision(req agent.RunRequest, session *processSession, approvalInput store.CreateApprovalRequestInput, target approvalResponseTarget) (bool, error) {
+	ok, err := req.Gateway.Store.HasApprovedForRunApproval(approvalInput)
+	if err != nil || !ok {
+		return false, err
+	}
+	if err := writeApprovalDecision(session.stdin, approvalIDForCodex("", target.requestID), target, "approve_for_run"); err != nil {
+		return false, err
+	}
+	emit(req, "approval.resolved", map[string]any{"decision": "redacted"})
+	return true, nil
+}
+
+func approvalInputFromMessage(req agent.RunRequest, msg protocolMessage) (store.CreateApprovalRequestInput, approvalResponseTarget, error) {
+	if isJSONRPCApprovalMethod(msg.Method) {
+		return approvalInputFromJSONRPCRequest(req, msg)
+	}
 	kind := strings.TrimSpace(payloadString(msg.Payload, "kind"))
 	switch kind {
 	case "command", "file_change", "network":
 	default:
-		return store.CreateApprovalRequestInput{}, "", fmt.Errorf("unsupported approval kind %q", kind)
+		return store.CreateApprovalRequestInput{}, approvalResponseTarget{}, fmt.Errorf("unsupported approval kind %q", kind)
 	}
 	requestID := strings.TrimSpace(payloadString(msg.Payload, "request_id"))
 	return store.CreateApprovalRequestInput{
@@ -419,10 +451,125 @@ func approvalInputFromMessage(req agent.RunRequest, msg protocolMessage) (store.
 		PolicyMatch:   payloadString(msg.Payload, "policy_match"),
 		RequestID:     requestID,
 		TimeoutMS:     payloadInt64(msg.Payload, "timeout_ms"),
-	}, requestID, nil
+	}, approvalResponseTarget{requestID: requestID}, nil
 }
 
-func (r *Runner) waitForApprovalDecision(ctx context.Context, req agent.RunRequest, session *processSession, approvalID, codexRequestID string, timeoutMS int64, turnC <-chan time.Time) (agent.RunResult, bool, error) {
+func approvalInputFromJSONRPCRequest(req agent.RunRequest, msg protocolMessage) (store.CreateApprovalRequestInput, approvalResponseTarget, error) {
+	requestID := jsonRPCIDString(msg.ID)
+	if requestID == "" {
+		return store.CreateApprovalRequestInput{}, approvalResponseTarget{}, fmt.Errorf("json-rpc approval id is required")
+	}
+	kind := jsonRPCApprovalKind(msg)
+	return store.CreateApprovalRequestInput{
+		RunID:         req.Run.ID,
+		IssueID:       req.Issue.ID,
+		Kind:          kind,
+		ActionSummary: jsonRPCApprovalActionSummary(kind, msg.Params),
+		RiskLevel:     payloadString(msg.Params, "risk_level"),
+		PolicyMatch:   payloadString(msg.Params, "policy_match"),
+		RequestID:     requestID,
+		TimeoutMS:     payloadInt64(msg.Params, "timeout_ms"),
+	}, approvalResponseTarget{requestID: requestID, jsonrpcID: append(json.RawMessage(nil), msg.ID...)}, nil
+}
+
+func jsonRPCApprovalKind(msg protocolMessage) string {
+	if strings.TrimSpace(msg.Method) == "item/fileChange/requestApproval" {
+		return "file_change"
+	}
+	if hasNetworkApprovalContext(msg.Params) {
+		return "network"
+	}
+	return "command"
+}
+
+func hasNetworkApprovalContext(params map[string]any) bool {
+	if hasJSONRPCCommand(params) {
+		return false
+	}
+	if _, ok := params["networkApprovalContext"]; ok {
+		return true
+	}
+	additional, ok := params["additionalPermissions"].(map[string]any)
+	if !ok {
+		return false
+	}
+	network, ok := additional["network"].(map[string]any)
+	if !ok {
+		return false
+	}
+	enabled, _ := network["enabled"].(bool)
+	return enabled
+}
+
+func hasJSONRPCCommand(params map[string]any) bool {
+	command, ok := params["command"]
+	if !ok || command == nil {
+		return false
+	}
+	switch value := command.(type) {
+	case string:
+		return strings.TrimSpace(value) != ""
+	case []any:
+		return len(value) > 0
+	default:
+		return true
+	}
+}
+
+func isJSONRPCApprovalMethod(method string) bool {
+	switch strings.TrimSpace(method) {
+	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
+		return true
+	default:
+		return false
+	}
+}
+
+func jsonRPCApprovalActionSummary(kind string, params map[string]any) string {
+	if value := payloadString(params, "action_summary"); value != "" {
+		return value
+	}
+	if value := payloadString(params, "reason"); value != "" {
+		return value
+	}
+	if kind == "command" {
+		return jsonRPCCommandSummary(params["command"])
+	}
+	return payloadString(params, "summary")
+}
+
+func jsonRPCCommandSummary(value any) string {
+	switch command := value.(type) {
+	case string:
+		return strings.TrimSpace(command)
+	case []any:
+		parts := make([]string, 0, len(command))
+		for _, part := range command {
+			text, ok := part.(string)
+			if !ok {
+				return ""
+			}
+			parts = append(parts, text)
+		}
+		return strings.TrimSpace(strings.Join(parts, " "))
+	default:
+		return ""
+	}
+}
+
+func jsonRPCIDString(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+func (r *Runner) waitForApprovalDecision(ctx context.Context, req agent.RunRequest, session *processSession, approvalID string, target approvalResponseTarget, timeoutMS int64, turnC <-chan time.Time) (agent.RunResult, bool, error) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	var timeoutC <-chan time.Time
@@ -476,7 +623,7 @@ func (r *Runner) waitForApprovalDecision(ctx context.Context, req agent.RunReque
 			if decision == "cancel_run" {
 				return failed(core.FailureOperatorCancelled, "operator cancelled"), true, nil
 			}
-			if err := writeApprovalDecision(session.stdin, approvalIDForCodex(approvalID, codexRequestID), decision); err != nil {
+			if err := writeApprovalDecision(session.stdin, approvalIDForCodex(approvalID, target.requestID), target, decision); err != nil {
 				return failed(core.FailureCodexProtocolError, "codex stdin write failed"), true, nil
 			}
 			emit(req, "approval.resolved", map[string]any{"decision": "redacted"})
@@ -555,12 +702,45 @@ func approvalIDForCodex(approvalID, requestID string) string {
 	return approvalID
 }
 
-func writeApprovalDecision(w io.Writer, approvalID, decision string) error {
+func writeApprovalDecision(w io.Writer, approvalID string, target approvalResponseTarget, decision string) error {
+	if len(bytes.TrimSpace(target.jsonrpcID)) != 0 {
+		return writeJSONRPCApprovalDecision(w, target.jsonrpcID, jsonRPCApprovalDecision(decision))
+	}
 	return json.NewEncoder(w).Encode(map[string]string{
 		"type":        "approval_decision",
 		"approval_id": approvalID,
 		"decision":    decision,
 	})
+}
+
+func jsonRPCApprovalDecision(decision string) string {
+	switch decision {
+	case "approve_once", "approve_for_run":
+		return "accept"
+	case "approve_for_session":
+		return "acceptForSession"
+	case "deny":
+		return "decline"
+	case "cancel_run":
+		return "cancel"
+	default:
+		return decision
+	}
+}
+
+func writeJSONRPCApprovalDecision(w io.Writer, id json.RawMessage, decision string) error {
+	var buf bytes.Buffer
+	buf.WriteString(`{"id":`)
+	buf.Write(bytes.TrimSpace(id))
+	buf.WriteString(`,"result":{"decision":`)
+	decisionJSON, err := json.Marshal(decision)
+	if err != nil {
+		return err
+	}
+	buf.Write(decisionJSON)
+	buf.WriteString("}}\n")
+	_, err = w.Write(buf.Bytes())
+	return err
 }
 
 func (r *Runner) closeSession(req agent.RunRequest) error {

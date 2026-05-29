@@ -256,6 +256,166 @@ printf '%s\n' '{"type":"turn_completed"}'
 	assertRunEventCount(t, st, run.ID, "approval.requested", 1)
 }
 
+func TestRunnerHandlesJSONRPCCommandApprovalRequest(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"id":"approval-command-1","method":"item/commandExecution/requestApproval","params":{"command":["go","test","./internal/agent/codex"],"cwd":"/workspace","timeout_ms":5000}}'
+read approval_decision
+printf '%s\n' "$approval_decision" > "$SYMPHONY_WORKSPACE_PATH/jsonrpc-approval-decision.json"
+printf '%s\n' '{"type":"handoff","payload":{"summary":"JSON-RPC approval completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
+printf '%s\n' '{"type":"turn_completed"}'
+`)
+	runner := &Runner{Command: script + " app-server"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultC := make(chan agent.RunResult, 1)
+	errC := make(chan error, 1)
+	go func() {
+		result, err := runner.Run(ctx, codexTestRunRequest(st, run, issue, workspacePath, token))
+		resultC <- result
+		errC <- err
+	}()
+
+	approval := waitForApprovalByRequestID(t, st, "approval-command-1")
+	if approval.Kind != "command" || approval.ActionSummary != "go test ./internal/agent/codex" {
+		t.Fatalf("approval = %#v", approval)
+	}
+	if err := st.DecideApproval(approval.ID, "approved_once", "jsonrpc approved"); err != nil {
+		t.Fatalf("DecideApproval: %v", err)
+	}
+	result := waitCodexResult(t, resultC, errC)
+	if result.Kind != agent.RunResultSucceeded {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "jsonrpc-approval-decision.json"), "approval-command-1", "accept")
+	assertRunEventCount(t, st, run.ID, "approval.requested", 1)
+	assertRunEventCount(t, st, run.ID, "approval.resolved", 1)
+}
+
+func TestRunnerReusesApprovedForRunJSONRPCCommandApproval(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"id":"approval-command-1","method":"item/commandExecution/requestApproval","params":{"command":["go","test","./internal/agent/codex"],"cwd":"/workspace","timeout_ms":5000}}'
+read first_decision
+printf '%s\n' "$first_decision" > "$SYMPHONY_WORKSPACE_PATH/jsonrpc-run-approval-1.json"
+printf '%s\n' '{"id":"approval-command-2","method":"item/commandExecution/requestApproval","params":{"command":["go","test","./internal/agent/codex"],"cwd":"/workspace","timeout_ms":5000}}'
+read second_decision
+printf '%s\n' "$second_decision" > "$SYMPHONY_WORKSPACE_PATH/jsonrpc-run-approval-2.json"
+printf '%s\n' '{"type":"handoff","payload":{"summary":"JSON-RPC run approval completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
+printf '%s\n' '{"type":"turn_completed"}'
+`)
+	runner := &Runner{Command: script + " app-server"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultC := make(chan agent.RunResult, 1)
+	errC := make(chan error, 1)
+	go func() {
+		result, err := runner.Run(ctx, codexTestRunRequest(st, run, issue, workspacePath, token))
+		resultC <- result
+		errC <- err
+	}()
+
+	approval := waitForApprovalByRequestID(t, st, "approval-command-1")
+	if err := st.DecideApproval(approval.ID, "approved_for_run", "jsonrpc approved for run"); err != nil {
+		t.Fatalf("DecideApproval: %v", err)
+	}
+	result := waitCodexResult(t, resultC, errC)
+	if result.Kind != agent.RunResultSucceeded {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "jsonrpc-run-approval-1.json"), "approval-command-1", "accept")
+	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "jsonrpc-run-approval-2.json"), "approval-command-2", "accept")
+	assertRunEventCount(t, st, run.ID, "approval.requested", 1)
+	assertRunEventCount(t, st, run.ID, "approval.resolved", 2)
+	rows, err := st.Project.Query(`SELECT id FROM approval_requests WHERE run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("query approvals: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("approval rows = %d, want 1", len(rows))
+	}
+}
+
+func TestApprovalInputFromJSONRPCFileChangeRequest(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	req := codexTestRunRequest(st, run, issue, workspacePath, token)
+
+	input, target, err := approvalInputFromMessage(req, protocolMessage{
+		ID:     json.RawMessage(`42`),
+		Method: "item/fileChange/requestApproval",
+		Params: map[string]any{
+			"reason":     "Review proposed patch",
+			"timeout_ms": float64(2500),
+		},
+	})
+	if err != nil {
+		t.Fatalf("approvalInputFromMessage: %v", err)
+	}
+	if input.RunID != run.ID || input.IssueID != issue.ID || input.Kind != "file_change" || input.ActionSummary != "Review proposed patch" || input.RequestID != "42" || input.TimeoutMS != 2500 {
+		t.Fatalf("approval input = %#v", input)
+	}
+	if string(target.jsonrpcID) != "42" || target.requestID != "42" {
+		t.Fatalf("target = %#v", target)
+	}
+}
+
+func TestApprovalInputFromJSONRPCNetworkRequest(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	req := codexTestRunRequest(st, run, issue, workspacePath, token)
+
+	input, _, err := approvalInputFromMessage(req, protocolMessage{
+		ID:     json.RawMessage(`"network-1"`),
+		Method: "item/commandExecution/requestApproval",
+		Params: map[string]any{
+			"command":                nil,
+			"reason":                 "Allow network access",
+			"networkApprovalContext": map[string]any{"host": "example.invalid"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("approvalInputFromMessage: %v", err)
+	}
+	if input.Kind != "network" || input.ActionSummary != "Allow network access" || input.RequestID != "network-1" {
+		t.Fatalf("approval input = %#v", input)
+	}
+}
+
+func TestApprovalInputFromJSONRPCCommandRequestKeepsCommandWhenNetworkContextPresent(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	req := codexTestRunRequest(st, run, issue, workspacePath, token)
+
+	input, _, err := approvalInputFromMessage(req, protocolMessage{
+		ID:     json.RawMessage(`"command-with-network-1"`),
+		Method: "item/commandExecution/requestApproval",
+		Params: map[string]any{
+			"command":                "curl https://example.invalid",
+			"networkApprovalContext": map[string]any{"host": "example.invalid"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("approvalInputFromMessage: %v", err)
+	}
+	if input.Kind != "command" || input.ActionSummary != "curl https://example.invalid" {
+		t.Fatalf("approval input = %#v", input)
+	}
+}
+
 func TestRunnerWritesDenyAndUsesCodexFailureCode(t *testing.T) {
 	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
 	script := writeFakeCodexBinary(t, `#!/bin/sh
@@ -340,6 +500,7 @@ printf '%s\n' '{"type":"approval_requested","payload":{"kind":"command","timeout
 printf '%s\n' '{"type":"approval_resolved","payload":{"decision":"approve_once"}}'
 printf '%s\n' '{"type":"handoff","payload":{"summary":"Notification approval completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
 printf '%s\n' '{"type":"turn_completed"}'
+while true; do sleep 1; done
 `)
 
 	result, err := (&Runner{Command: script + " app-server"}).Run(context.Background(), codexTestRunRequest(st, run, issue, workspacePath, token))
@@ -1420,6 +1581,27 @@ func assertApprovalDecisionFile(t *testing.T, path, wantApprovalID, wantDecision
 	}
 	if got["type"] != "approval_decision" || got["approval_id"] != wantApprovalID || got["decision"] != wantDecision {
 		t.Fatalf("approval decision = %#v, want id %q decision %q", got, wantApprovalID, wantDecision)
+	}
+}
+
+func assertJSONRPCApprovalDecisionFile(t *testing.T, path, wantID, wantDecision string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read JSON-RPC approval decision: %v", err)
+	}
+	var got struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      string `json:"id"`
+		Result  struct {
+			Decision string `json:"decision"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode JSON-RPC approval decision %s: %v", string(data), err)
+	}
+	if got.JSONRPC != "" || got.ID != wantID || got.Result.Decision != wantDecision {
+		t.Fatalf("JSON-RPC approval decision = %#v, want id %q decision %q", got, wantID, wantDecision)
 	}
 }
 

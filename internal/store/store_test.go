@@ -1299,6 +1299,69 @@ func TestReconcileStaleActiveRunsContinuesAfterFailRunError(t *testing.T) {
 	assertIssueState(t, st, issue2.ID, core.StateReady)
 }
 
+func TestReconcileStaleActiveRunsCancelsPendingApproval(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Reconcile approval")
+	approval, err := st.CreatePendingApprovalRequest(CreateApprovalRequestInput{
+		RunID:         run.ID,
+		IssueID:       issue.ID,
+		Kind:          "command",
+		ActionSummary: "Run command after restart",
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingApprovalRequest: %v", err)
+	}
+
+	if err := st.ReconcileStaleActiveRuns(); err != nil {
+		t.Fatalf("ReconcileStaleActiveRuns: %v", err)
+	}
+
+	assertRunStatus(t, st, run.ID, core.RunFailed)
+	gotApproval := getApprovalRow(t, st, approval.ID)
+	if gotApproval["status"].String() != "cancelled" {
+		t.Fatalf("approval status = %s, want cancelled", gotApproval["status"].String())
+	}
+	if gotApproval["resolved_at"].String() == "" {
+		t.Fatal("approval resolved_at is empty after reconcile")
+	}
+	err = st.DecideApproval(approval.ID, "approved_once", "operator approved stale request")
+	if err == nil {
+		t.Fatal("DecideApproval succeeded, want approval_not_pending")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrApprovalNotPending {
+		t.Fatalf("DecideApproval error code = %s, want %s", got, core.ErrApprovalNotPending)
+	}
+}
+
+func TestReconcileStaleActiveRunsRollsBackWhenApprovalCancelFails(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Reconcile approval rollback")
+	approval, err := st.CreatePendingApprovalRequest(CreateApprovalRequestInput{
+		RunID:         run.ID,
+		IssueID:       issue.ID,
+		Kind:          "command",
+		ActionSummary: "Run command after restart",
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingApprovalRequest: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_reconcile_approval_cancel BEFORE UPDATE OF status ON approval_requests WHEN OLD.id='` + approval.ID + `' AND NEW.status='cancelled' BEGIN SELECT RAISE(ABORT, 'approval cancel failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err = st.ReconcileStaleActiveRuns()
+	if err == nil {
+		t.Fatal("ReconcileStaleActiveRuns succeeded, want approval cancel error")
+	}
+	assertErrorContains(t, err, "approval cancel failed")
+	assertRunStatus(t, st, run.ID, core.RunPending)
+	assertIssueState(t, st, issue.ID, core.StateWorking)
+	gotApproval := getApprovalRow(t, st, approval.ID)
+	if gotApproval["status"].String() != "pending" {
+		t.Fatalf("approval status = %s, want pending after rollback", gotApproval["status"].String())
+	}
+}
+
 func TestDecideApprovalCancelRejectsCompletedRunWithoutChangingApproval(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareCompletedReviewRun(t, st)
@@ -1329,6 +1392,24 @@ func TestDecideApprovalCancelRejectsCompletedRunWithoutChangingApproval(t *testi
 	}
 	if gotRun.Status != core.RunCompleted {
 		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunCompleted)
+	}
+}
+
+func TestDecideApprovalRejectsInactiveRunForNonCancelDecision(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareCompletedReviewRun(t, st)
+	approvalID := insertPendingApproval(t, st, run.ID, issue.ID)
+
+	err := st.DecideApproval(approvalID, "approved_once", "operator approved stale approval")
+	if err == nil {
+		t.Fatal("DecideApproval succeeded, want invalid_state_transition")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrInvalidStateTransition {
+		t.Fatalf("DecideApproval error code = %s, want %s", got, core.ErrInvalidStateTransition)
+	}
+	gotApproval := getApprovalRow(t, st, approvalID)
+	if gotApproval["status"].String() != "pending" {
+		t.Fatalf("approval status = %s, want pending", gotApproval["status"].String())
 	}
 }
 
@@ -1500,6 +1581,44 @@ func TestCreatePendingApprovalRequestStoresStructuredFieldsAndTimeout(t *testing
 	}
 	if got := core.AsAPIError(err).Code; got != core.ErrApprovalNotPending {
 		t.Fatalf("DecideApproval error code = %s, want %s", got, core.ErrApprovalNotPending)
+	}
+}
+
+func TestHasApprovedForRunApprovalRequiresPolicyOrActionMatch(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Approval run scope match")
+	if err := st.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at) VALUES(?,?,?,?,?,?,?)`,
+		core.NewID("apr_"), run.ID, issue.ID, "network", "approved_for_run", `{}`, core.Now()); err != nil {
+		t.Fatalf("insert approved approval: %v", err)
+	}
+
+	ok, err := st.HasApprovedForRunApproval(CreateApprovalRequestInput{
+		RunID:   run.ID,
+		IssueID: issue.ID,
+		Kind:    "network",
+	})
+	if err != nil {
+		t.Fatalf("HasApprovedForRunApproval: %v", err)
+	}
+	if ok {
+		t.Fatal("HasApprovedForRunApproval returned true without policy/action match keys")
+	}
+
+	if err := st.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at) VALUES(?,?,?,?,?,?,?)`,
+		core.NewID("apr_"), run.ID, issue.ID, "network", "approved_for_run", `{"policy_match":"network.example"}`, core.Now()); err != nil {
+		t.Fatalf("insert policy approval: %v", err)
+	}
+	ok, err = st.HasApprovedForRunApproval(CreateApprovalRequestInput{
+		RunID:       run.ID,
+		IssueID:     issue.ID,
+		Kind:        "network",
+		PolicyMatch: "network.example",
+	})
+	if err != nil {
+		t.Fatalf("HasApprovedForRunApproval: %v", err)
+	}
+	if !ok {
+		t.Fatal("HasApprovedForRunApproval returned false for matching policy")
 	}
 }
 

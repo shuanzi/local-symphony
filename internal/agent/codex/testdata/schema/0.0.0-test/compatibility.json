@@ -17,7 +17,9 @@
   "supported_requests": [
     "initialize",
     "thread.start",
-    "turn.start"
+    "turn.start",
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval"
   ],
   "experimental_api": false
 }

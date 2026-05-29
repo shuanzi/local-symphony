@@ -1421,45 +1421,45 @@ func (s *Store) CompleteRunWithReview(runID, reviewPacketID string) error {
 	})
 }
 func (s *Store) FailRun(runID string, code core.FailureCode, message string, status core.RunStatus) error {
-	run, err := s.GetRun(runID)
-	if err != nil {
-		return err
-	}
 	if status == "" {
 		status = core.RunFailed
 	}
-	now := core.Now()
 	return s.Project.WithTx(func(tx *db.Tx) error {
-		run, err = s.getRunTx(tx, runID)
-		if err != nil {
-			return err
-		}
-		if !core.IsActiveRunStatus(run.Status) {
-			return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
-		}
-		if err := tx.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(status), string(code), message, now, now, runID); err != nil {
-			return err
-		}
-		row, err := tx.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
-		if err != nil {
-			return err
-		}
-		cur := core.IssueState(row["state"].String())
-		target := cur
-		if !core.IsTerminalIssueState(cur) && cur != core.StateBlocked {
-			target = run.SourceIssueState
-		}
-		if err := tx.Exec(`UPDATE issues SET state=?, dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, string(target), string(code), now, now, run.IssueID); err != nil {
-			return err
-		}
-		if err := tx.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "system", fmt.Sprintf("Run ended with %s: %s", code, message), now); err != nil {
-			return err
-		}
-		if err := s.appendEventInTx(tx, "run.failed", "system", &run.IssueID, &runID, map[string]any{"failure_code": code, "message": message}); err != nil {
-			return err
-		}
-		return s.appendEventInTx(tx, "scheduler.paused", "system", &run.IssueID, &runID, map[string]any{"reason": code})
+		return s.failRunInTx(tx, runID, code, message, status)
 	})
+}
+
+func (s *Store) failRunInTx(q sqlRunner, runID string, code core.FailureCode, message string, status core.RunStatus) error {
+	now := core.Now()
+	run, err := s.getRunTx(q, runID)
+	if err != nil {
+		return err
+	}
+	if !core.IsActiveRunStatus(run.Status) {
+		return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": runID, "status": run.Status})
+	}
+	if err := q.Exec(`UPDATE run_attempts SET status=?, failure_code=?, failure_message=?, ended_at=?, updated_at=? WHERE id=?`, string(status), string(code), message, now, now, runID); err != nil {
+		return err
+	}
+	row, err := q.QueryOne(`SELECT state FROM issues WHERE id=?`, run.IssueID)
+	if err != nil {
+		return err
+	}
+	cur := core.IssueState(row["state"].String())
+	target := cur
+	if !core.IsTerminalIssueState(cur) && cur != core.StateBlocked {
+		target = run.SourceIssueState
+	}
+	if err := q.Exec(`UPDATE issues SET state=?, dispatch_paused=1, dispatch_pause_reason=?, dispatch_paused_at=?, updated_at=? WHERE id=?`, string(target), string(code), now, now, run.IssueID); err != nil {
+		return err
+	}
+	if err := q.Exec(`INSERT INTO issue_comments(id,issue_id,run_id,author_type,body,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("com_"), run.IssueID, runID, "system", fmt.Sprintf("Run ended with %s: %s", code, message), now); err != nil {
+		return err
+	}
+	if err := s.appendEventInTx(q, "run.failed", "system", &run.IssueID, &runID, map[string]any{"failure_code": code, "message": message}); err != nil {
+		return err
+	}
+	return s.appendEventInTx(q, "scheduler.paused", "system", &run.IssueID, &runID, map[string]any{"reason": code})
 }
 
 func (s *Store) BlockRunByAgent(runID, reason string) error {
@@ -2093,6 +2093,61 @@ func (s *Store) CreatePendingApprovalRequest(in CreateApprovalRequestInput) (*Ap
 	return s.ApprovalByID(id)
 }
 
+func (s *Store) HasApprovedForRunApproval(in CreateApprovalRequestInput) (bool, error) {
+	var matched bool
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		run, err := s.getRunTx(tx, in.RunID)
+		if err != nil {
+			return err
+		}
+		if run.IssueID != in.IssueID {
+			return core.NewError(core.ErrInvalidRequest, "approval issue does not match run", map[string]any{"run_id": in.RunID, "issue_id": in.IssueID})
+		}
+		if !core.IsActiveRunStatus(run.Status) {
+			return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": in.RunID, "status": run.Status})
+		}
+		rows, err := tx.Query(`SELECT request_json FROM approval_requests WHERE run_id=? AND issue_id=? AND kind=? AND status='approved_for_run'`, in.RunID, in.IssueID, in.Kind)
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			if approvalRequestMatchesInput(r["request_json"].String(), in) {
+				matched = true
+				return nil
+			}
+		}
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	return matched, nil
+}
+
+func approvalRequestMatchesInput(raw string, in CreateApprovalRequestInput) bool {
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		return false
+	}
+	gotPolicy := approvalRequestStringField(fields, "policy_match")
+	wantPolicy := strings.TrimSpace(in.PolicyMatch)
+	if gotPolicy != "" || wantPolicy != "" {
+		return gotPolicy == wantPolicy
+	}
+	gotAction := approvalRequestStringField(fields, "action_summary")
+	wantAction := strings.TrimSpace(in.ActionSummary)
+	if gotAction != "" || wantAction != "" {
+		return gotAction == wantAction
+	}
+	return false
+}
+
+func approvalRequestStringField(fields map[string]any, key string) string {
+	if value, ok := nonBlankJSONString(fields[key]); ok {
+		return value
+	}
+	return ""
+}
+
 func approvalFromRow(r map[string]db.Value) Approval {
 	id := r["id"].String()
 	kind := r["kind"].String()
@@ -2184,6 +2239,14 @@ func (s *Store) DecideApproval(id, status, reason string) error {
 			if err := s.cancelRunInTx(tx, row["run_id"].String(), core.FailureOperatorCancelled, reason, true); err != nil {
 				return err
 			}
+		} else {
+			run, err := s.getRunTx(tx, row["run_id"].String())
+			if err != nil {
+				return err
+			}
+			if !core.IsActiveRunStatus(run.Status) {
+				return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": run.ID, "status": run.Status})
+			}
 		}
 		if err := tx.Exec(`UPDATE approval_requests SET status=?, reason=?, decision_json=?, resolved_at=? WHERE id=? AND status='pending'`, status, reason, decisionJSON, now, id); err != nil {
 			return err
@@ -2241,6 +2304,15 @@ func (s *Store) MarkApprovalCancelled(id, reason string) error {
 	})
 }
 
+func (s *Store) cancelPendingApprovalsForRunInTx(q sqlRunner, runID, reason string) error {
+	now := core.Now()
+	decisionJSON, err := approvalDecisionJSON("cancelled", reason, now)
+	if err != nil {
+		return err
+	}
+	return q.Exec(`UPDATE approval_requests SET status='cancelled', reason=?, decision_json=?, resolved_at=? WHERE run_id=? AND status='pending'`, reason, decisionJSON, now, runID)
+}
+
 func (s *Store) ReconcileStaleActiveRuns() error {
 	rows, err := s.Project.Query(`SELECT id FROM run_attempts WHERE status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running')`)
 	if err != nil {
@@ -2249,7 +2321,13 @@ func (s *Store) ReconcileStaleActiveRuns() error {
 	var errs []error
 	for _, r := range rows {
 		runID := r["id"].String()
-		if err := s.FailRun(runID, core.FailureDaemonRestartedInterrupted, "daemon restarted while run was active", core.RunFailed); err != nil {
+		reason := "daemon restarted while run was active"
+		if err := s.Project.WithTx(func(tx *db.Tx) error {
+			if err := s.failRunInTx(tx, runID, core.FailureDaemonRestartedInterrupted, reason, core.RunFailed); err != nil {
+				return err
+			}
+			return s.cancelPendingApprovalsForRunInTx(tx, runID, reason)
+		}); err != nil {
 			errs = append(errs, fmt.Errorf("reconcile stale run %s: %w", runID, err))
 		}
 	}
