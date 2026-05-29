@@ -1,8 +1,8 @@
 # v1 真实产品化执行计划
 
-**状态**：执行计划  
-**更新日期**：2026-05-25  
-**需求来源**：`docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md`  
+**状态**：执行中，阶段 A 与 B1 已完成
+**更新日期**：2026-05-29
+**需求来源**：`docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md`
 **目标**：把 R1-R17 的产品化缺口拆成可落地、可审查、可验收的实施批次，推进 Local Symphony 从本地 fake runner MVP 进入真实 Codex 可运行的本地产品化版本。
 
 ## 1. 执行原则
@@ -29,6 +29,16 @@
 
 R15 是横切要求，不作为单独最后阶段处理。每完成一个需求，都必须同步相关合同、文档和验收清单。
 
+### 2.1 当前进度 checklist
+
+- [x] 阶段 A / 真实 Codex 最小闭环：A0-A5 已完成，合并记录为 PR #11；验收记录见 `docs/productization/V1_PHASE_A_ACCEPTANCE.md`。
+- [x] B1 / Approval API contract 补齐：已完成并合并 PR #12，Approval DTO、OpenAPI、JSON Schema、DB/fallback schema、store/httpapi、dashboard 类型与测试已对齐。
+- [ ] B2 / Codex approval producer 与 writeback：未完成；下一步应接入 Codex command/file_change/network approval request 到 `approval_requests`，并实现 operator 决策写回 Codex。
+- [ ] B3 / 安全策略执行与回归套件：未完成；依赖 B2 的 approval bridge 形成可执行策略闭环。
+- [ ] 阶段 B 收口：未完成；需在 B1-B3 全部完成后运行阶段 B 门禁并生成阶段 B 验收记录。
+- [ ] 阶段 C / Daemon 产品行为补齐：未开始。
+- [ ] 阶段 D / Operator 体验与发布：未开始。
+
 ## 3. 全局 Definition of Done
 
 每个工作包完成前必须满足：
@@ -45,6 +55,8 @@ R15 是横切要求，不作为单独最后阶段处理。每完成一个需求�
 ## 4. 阶段 A：真实 Codex 最小可运行闭环
 
 阶段目标：先建立不可绕过的 DB 和 Codex compatibility gate，再引入 runner abstraction、Codex process lifecycle、normalized timeline 和 missing handoff continuation。阶段结束时，fake runner 仍是默认验收路径；真实 Codex 只在 fixture gate 通过时可 opt-in 运行一个无需 approval 的任务。
+
+**进度**：已完成并合并 PR #11。阶段 A 已覆盖 A0-A5 的最小闭环要求；真实 Codex 仍受 committed fixture gate 限制，完整 approval row/writeback 属于阶段 B。
 
 ### A0. DB schema version guard
 
@@ -298,6 +310,8 @@ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
 
 覆盖 R5 的 API/model 部分。
 
+**进度**：已完成并合并 PR #12。当前 API、OpenAPI、`schemas/approval_request.schema.json`、store/httpapi projection、dashboard 类型和 Approval Inbox 已统一使用结构化 Approval DTO；`request_json` 和 `decision_json` 保持内部字段，不在 API/dashboard 暴露。
+
 目标：
 
 - Approval API 返回 `action_summary`、`risk_level`、`policy_match`、`requested_at`、`timeout_ms`、`expires_at`、`resolved_at`。
@@ -313,15 +327,18 @@ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
 
 任务拆分：
 
-1. 扩展 approval response DTO，不暴露 opaque raw request。
-2. DB 现有 `request_json` 保持内部记录，API projection 输出结构化字段。
-3. 更新 OpenAPI 和 dashboard client/type tests。
-4. 增加 pending/resolved/expired approval API tests。
+1. [x] 扩展 approval response DTO，不暴露 opaque raw request。
+2. [x] DB 现有 `request_json` 保持内部记录，API projection 输出结构化字段。
+3. [x] 更新 OpenAPI 和 dashboard client/type tests。
+4. [x] 增加 pending/resolved/timeout approval API tests。
+5. [x] 增加 Approval response JSON Schema 与 OpenAPI/DB/fallback schema 漂移门禁。
 
 验收：
 
-- Dashboard Approval Inbox 不解析 opaque `request_json`。
-- API 字段与 TECH 对齐。
+- [x] Dashboard Approval Inbox 不解析 opaque `request_json`。
+- [x] API 字段与 TECH 对齐。
+- [x] decision 成功后 `decision_json` 内部落库，但 API/OpenAPI/dashboard 不暴露。
+- [x] `approval_requests.kind/status/timeout_ms` 约束在主 DB schema、fallback schema 和 contract validation 中一致。
 
 ### B2. Codex approval producer 与 writeback
 
@@ -808,12 +825,12 @@ R15
 
 为了降低风险，建议从以下顺序开始：
 
-1. **A0 / R17**：DB schema version guard 与 diagnostics 真实版本读取。
-2. **A1 / R2**：Codex fixture metadata 和 `codex --version` gate。
-3. **A2 / R1**：Runner interface 与 fake runner 迁移。
-4. **A3 / R3**：Codex process launcher + startup timeout + redacted stderr。
-5. **A4 / R4**：最小 normalized timeline。
-6. **A5 / R6**：missing handoff continuation。
-7. **B1 / R5**：Approval API contract 字段补齐。
+1. [x] **A0 / R17**：DB schema version guard 与 diagnostics 真实版本读取。
+2. [x] **A1 / R2**：Codex fixture metadata 和 `codex --version` gate。
+3. [x] **A2 / R1**：Runner interface 与 fake runner 迁移。
+4. [x] **A3 / R3**：Codex process launcher + startup timeout + redacted stderr。
+5. [x] **A4 / R4**：最小 normalized timeline。
+6. [x] **A5 / R6**：missing handoff continuation。
+7. [x] **B1 / R5**：Approval API contract 字段补齐。
 
-第一批完成后再决定是否先深化 Codex approval writeback，或转向 daemon ownership/tick loop。判断标准是：真实 Codex 最小闭环是否已经能稳定通过 opt-in integration，且 fake acceptance 没有回退。
+第一批已完成。下一步建议优先推进 **B2 / Codex approval producer 与 writeback**，因为 B1 已把 operator API/dashboard/schema 合同补齐，B2 可以在该合同上接入真实 Codex approval request 与 writeback；若真实 Codex opt-in integration 出现阻塞，再切换到 C 阶段 daemon ownership/tick loop。
