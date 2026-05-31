@@ -111,6 +111,7 @@ type CreateApprovalRequestInput struct {
 	RiskLevel     string
 	PolicyMatch   string
 	RequestID     string
+	CWD           string
 	TimeoutMS     int64
 }
 
@@ -2060,6 +2061,9 @@ func (s *Store) CreatePendingApprovalRequest(in CreateApprovalRequestInput) (*Ap
 	if value := strings.TrimSpace(in.RequestID); value != "" {
 		request["request_id"] = value
 	}
+	if value := strings.TrimSpace(in.CWD); value != "" {
+		request["cwd"] = value
+	}
 	requestJSON, err := json.Marshal(request)
 	if err != nil {
 		return nil, err
@@ -2094,6 +2098,9 @@ func (s *Store) CreatePendingApprovalRequest(in CreateApprovalRequestInput) (*Ap
 }
 
 func (s *Store) HasApprovedForRunApproval(in CreateApprovalRequestInput) (bool, error) {
+	if in.Kind == "command" && strings.TrimSpace(in.CWD) == "" {
+		return false, nil
+	}
 	var matched bool
 	if err := s.Project.WithTx(func(tx *db.Tx) error {
 		run, err := s.getRunTx(tx, in.RunID)
@@ -2127,6 +2134,18 @@ func approvalRequestMatchesInput(raw string, in CreateApprovalRequestInput) bool
 	var fields map[string]any
 	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
 		return false
+	}
+	gotCWD := approvalRequestStringField(fields, "cwd")
+	wantCWD := strings.TrimSpace(in.CWD)
+	if gotCWD != "" || wantCWD != "" {
+		if gotCWD == "" || wantCWD == "" || gotCWD != wantCWD {
+			return false
+		}
+	}
+	if in.Kind == "command" {
+		gotAction := approvalRequestStringField(fields, "action_summary")
+		wantAction := strings.TrimSpace(in.ActionSummary)
+		return gotAction != "" && wantAction != "" && gotAction == wantAction
 	}
 	gotPolicy := approvalRequestStringField(fields, "policy_match")
 	wantPolicy := strings.TrimSpace(in.PolicyMatch)

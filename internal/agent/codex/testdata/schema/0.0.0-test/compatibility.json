@@ -10,6 +10,7 @@
     "handoff",
     "approval_requested",
     "approval_resolved",
+    "serverRequest/resolved",
     "tool_call",
     "turn_completed",
     "turn_failed"
@@ -19,7 +20,8 @@
     "thread.start",
     "turn.start",
     "item/commandExecution/requestApproval",
-    "item/fileChange/requestApproval"
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval"
   ],
   "experimental_api": false
 }

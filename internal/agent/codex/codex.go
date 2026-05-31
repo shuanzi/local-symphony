@@ -198,8 +198,10 @@ type protocolMessage struct {
 }
 
 type approvalResponseTarget struct {
-	requestID string
-	jsonrpcID json.RawMessage
+	requestID            string
+	jsonrpcID            json.RawMessage
+	permissionsResponse  bool
+	requestedPermissions map[string]any
 }
 
 type stdoutItem struct {
@@ -420,6 +422,9 @@ func (r *Runner) handleApprovalRequest(ctx context.Context, req agent.RunRequest
 }
 
 func (r *Runner) tryApprovedForRunDecision(req agent.RunRequest, session *processSession, approvalInput store.CreateApprovalRequestInput, target approvalResponseTarget) (bool, error) {
+	if target.permissionsResponse {
+		return false, nil
+	}
 	ok, err := req.Gateway.Store.HasApprovedForRunApproval(approvalInput)
 	if err != nil || !ok {
 		return false, err
@@ -450,6 +455,7 @@ func approvalInputFromMessage(req agent.RunRequest, msg protocolMessage) (store.
 		RiskLevel:     payloadString(msg.Payload, "risk_level"),
 		PolicyMatch:   payloadString(msg.Payload, "policy_match"),
 		RequestID:     requestID,
+		CWD:           payloadString(msg.Payload, "cwd"),
 		TimeoutMS:     payloadInt64(msg.Payload, "timeout_ms"),
 	}, approvalResponseTarget{requestID: requestID}, nil
 }
@@ -460,6 +466,11 @@ func approvalInputFromJSONRPCRequest(req agent.RunRequest, msg protocolMessage) 
 		return store.CreateApprovalRequestInput{}, approvalResponseTarget{}, fmt.Errorf("json-rpc approval id is required")
 	}
 	kind := jsonRPCApprovalKind(msg)
+	target := approvalResponseTarget{requestID: requestID, jsonrpcID: append(json.RawMessage(nil), msg.ID...)}
+	if strings.TrimSpace(msg.Method) == "item/permissions/requestApproval" {
+		target.permissionsResponse = true
+		target.requestedPermissions = jsonRPCRequestedPermissions(msg.Params)
+	}
 	return store.CreateApprovalRequestInput{
 		RunID:         req.Run.ID,
 		IssueID:       req.Issue.ID,
@@ -468,18 +479,44 @@ func approvalInputFromJSONRPCRequest(req agent.RunRequest, msg protocolMessage) 
 		RiskLevel:     payloadString(msg.Params, "risk_level"),
 		PolicyMatch:   payloadString(msg.Params, "policy_match"),
 		RequestID:     requestID,
+		CWD:           payloadString(msg.Params, "cwd"),
 		TimeoutMS:     payloadInt64(msg.Params, "timeout_ms"),
-	}, approvalResponseTarget{requestID: requestID, jsonrpcID: append(json.RawMessage(nil), msg.ID...)}, nil
+	}, target, nil
 }
 
 func jsonRPCApprovalKind(msg protocolMessage) string {
-	if strings.TrimSpace(msg.Method) == "item/fileChange/requestApproval" {
+	switch strings.TrimSpace(msg.Method) {
+	case "item/fileChange/requestApproval":
 		return "file_change"
+	case "item/permissions/requestApproval":
+		return jsonRPCPermissionApprovalKind(msg.Params)
 	}
 	if hasNetworkApprovalContext(msg.Params) {
 		return "network"
 	}
 	return "command"
+}
+
+func jsonRPCPermissionApprovalKind(params map[string]any) string {
+	permissions, _ := params["permissions"].(map[string]any)
+	if _, ok := permissions["network"]; ok {
+		return "network"
+	}
+	if _, ok := permissions["fileSystem"]; ok {
+		return "file_change"
+	}
+	if _, ok := permissions["filesystem"]; ok {
+		return "file_change"
+	}
+	return "file_change"
+}
+
+func jsonRPCRequestedPermissions(params map[string]any) map[string]any {
+	permissions, ok := params["permissions"].(map[string]any)
+	if !ok || permissions == nil {
+		return map[string]any{}
+	}
+	return permissions
 }
 
 func hasNetworkApprovalContext(params map[string]any) bool {
@@ -518,7 +555,7 @@ func hasJSONRPCCommand(params map[string]any) bool {
 
 func isJSONRPCApprovalMethod(method string) bool {
 	switch strings.TrimSpace(method) {
-	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
+	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval":
 		return true
 	default:
 		return false
@@ -704,6 +741,9 @@ func approvalIDForCodex(approvalID, requestID string) string {
 
 func writeApprovalDecision(w io.Writer, approvalID string, target approvalResponseTarget, decision string) error {
 	if len(bytes.TrimSpace(target.jsonrpcID)) != 0 {
+		if target.permissionsResponse {
+			return writeJSONRPCPermissionApprovalDecision(w, target.jsonrpcID, decision, target.requestedPermissions)
+		}
 		return writeJSONRPCApprovalDecision(w, target.jsonrpcID, jsonRPCApprovalDecision(decision))
 	}
 	return json.NewEncoder(w).Encode(map[string]string{
@@ -726,6 +766,23 @@ func jsonRPCApprovalDecision(decision string) string {
 	default:
 		return decision
 	}
+}
+
+func writeJSONRPCPermissionApprovalDecision(w io.Writer, id json.RawMessage, decision string, permissions map[string]any) error {
+	result := map[string]any{"permissions": map[string]any{}}
+	switch decision {
+	case "approve_once", "approve_for_run", "approve_for_session":
+		if permissions != nil {
+			result["permissions"] = permissions
+		}
+		if decision == "approve_for_session" {
+			result["scope"] = "session"
+		}
+	}
+	return json.NewEncoder(w).Encode(map[string]any{
+		"id":     json.RawMessage(bytes.TrimSpace(id)),
+		"result": result,
+	})
 }
 
 func writeJSONRPCApprovalDecision(w io.Writer, id json.RawMessage, decision string) error {
@@ -762,6 +819,15 @@ func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line st
 	var msg protocolMessage
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
 		return agent.RunResult{}, false, err
+	}
+	if msg.Type == "" && strings.TrimSpace(msg.Method) != "" {
+		if !*handshakeDone {
+			return agent.RunResult{}, false, fmt.Errorf("json-rpc notification before handshake")
+		}
+		if isExpectedJSONRPCNotification(msg.Method) {
+			return agent.RunResult{}, false, nil
+		}
+		return agent.RunResult{}, false, fmt.Errorf("unsupported json-rpc notification %q", msg.Method)
 	}
 	switch msg.Type {
 	case "handshake":
@@ -840,6 +906,15 @@ func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line st
 		return agent.RunResult{}, false, fmt.Errorf("unsupported codex message type %q", msg.Type)
 	}
 	return agent.RunResult{}, false, nil
+}
+
+func isExpectedJSONRPCNotification(method string) bool {
+	switch strings.TrimSpace(method) {
+	case "serverRequest/resolved":
+		return true
+	default:
+		return false
+	}
 }
 
 func ParseCodexVersionOutput(output string) (string, error) {

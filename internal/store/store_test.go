@@ -1622,6 +1622,58 @@ func TestHasApprovedForRunApprovalRequiresPolicyOrActionMatch(t *testing.T) {
 	}
 }
 
+func TestApprovedForRunApprovalDoesNotMatchWhenStoredCWDIsUnknown(t *testing.T) {
+	if approvalRequestMatchesInput(`{"action_summary":"go test","cwd":"/workspace/a"}`, CreateApprovalRequestInput{ActionSummary: "go test"}) {
+		t.Fatal("approvalRequestMatchesInput returned true without matching cwd")
+	}
+}
+
+func TestHasApprovedForRunApprovalRequiresCWDForCommandReuse(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Approval run scope command cwd")
+	if err := st.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at) VALUES(?,?,?,?,?,?,?)`,
+		core.NewID("apr_"), run.ID, issue.ID, "command", "approved_for_run", `{"action_summary":"go test"}`, core.Now()); err != nil {
+		t.Fatalf("insert command approval: %v", err)
+	}
+
+	ok, err := st.HasApprovedForRunApproval(CreateApprovalRequestInput{
+		RunID:         run.ID,
+		IssueID:       issue.ID,
+		Kind:          "command",
+		ActionSummary: "go test",
+	})
+	if err != nil {
+		t.Fatalf("HasApprovedForRunApproval: %v", err)
+	}
+	if ok {
+		t.Fatal("HasApprovedForRunApproval returned true for command approval without cwd")
+	}
+}
+
+func TestHasApprovedForRunApprovalRequiresCommandActionMatch(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Approval run scope command fingerprint")
+	if err := st.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at) VALUES(?,?,?,?,?,?,?)`,
+		core.NewID("apr_"), run.ID, issue.ID, "command", "approved_for_run", `{"cwd":"/workspace","policy_match":"command.review","action_summary":"go test"}`, core.Now()); err != nil {
+		t.Fatalf("insert command approval: %v", err)
+	}
+
+	ok, err := st.HasApprovedForRunApproval(CreateApprovalRequestInput{
+		RunID:         run.ID,
+		IssueID:       issue.ID,
+		Kind:          "command",
+		CWD:           "/workspace",
+		PolicyMatch:   "command.review",
+		ActionSummary: "go test ./other",
+	})
+	if err != nil {
+		t.Fatalf("HasApprovedForRunApproval: %v", err)
+	}
+	if ok {
+		t.Fatal("HasApprovedForRunApproval returned true for different command with same cwd and policy")
+	}
+}
+
 func TestCreatePendingApprovalRequestRejectsInactiveRun(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareCompletedReviewRun(t, st)
