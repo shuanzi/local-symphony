@@ -267,10 +267,12 @@ read start_turn
 printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
 printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
 printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"method":"item/started","params":{"itemId":"item_command_1"}}'
 printf '%s\n' '{"id":"approval-command-1","method":"item/commandExecution/requestApproval","params":{"command":["go","test","./internal/agent/codex"],"cwd":"/workspace","timeout_ms":5000}}'
 read approval_decision
 printf '%s\n' "$approval_decision" > "$SYMPHONY_WORKSPACE_PATH/jsonrpc-approval-decision.json"
 printf '%s\n' '{"method":"serverRequest/resolved","params":{"threadId":"thread_fixture","requestId":"approval-command-1"}}'
+printf '%s\n' '{"method":"item/completed","params":{"itemId":"item_command_1"}}'
 printf '%s\n' '{"type":"handoff","payload":{"summary":"JSON-RPC approval completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
 printf '%s\n' '{"type":"turn_completed"}'
 `)
@@ -329,18 +331,11 @@ printf '%s\n' '{"type":"turn_completed"}'
 		resultC <- result
 		errC <- err
 	}()
-	go func() {
-		deadline := time.Now().Add(time.Second)
-		for time.Now().Before(deadline) {
-			approval := approvalByRequestIDOrNil(t, st, "approval-permission-1")
-			if approval != nil {
-				_ = st.DecideApproval(approval.ID, "approved_once", "jsonrpc permissions approved")
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}()
 
+	approval := waitForApprovalByRequestID(t, st, "approval-permission-1")
+	if err := st.DecideApproval(approval.ID, "approved_once", "jsonrpc permissions approved"); err != nil {
+		t.Fatalf("DecideApproval: %v", err)
+	}
 	result := waitCodexResult(t, resultC, errC)
 	if result.Kind != agent.RunResultSucceeded {
 		t.Fatalf("result = %#v, want success", result)
@@ -502,6 +497,114 @@ printf '%s\n' '{"type":"turn_completed"}'
 	}
 	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "jsonrpc-cwd-approval-1.json"), "approval-command-1", "accept")
 	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "jsonrpc-cwd-approval-2.json"), "approval-command-2", "accept")
+	rows, err := st.Project.Query(`SELECT id FROM approval_requests WHERE run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("query approvals: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("approval rows = %d, want 2", len(rows))
+	}
+}
+
+func TestRunnerDoesNotReuseApprovedForRunJSONRPCCommandApprovalAcrossArgv(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"id":"approval-command-1","method":"item/commandExecution/requestApproval","params":{"command":["echo","a b"],"cwd":"/workspace","timeout_ms":5000}}'
+read first_decision
+printf '%s\n' "$first_decision" > "$SYMPHONY_WORKSPACE_PATH/jsonrpc-argv-approval-1.json"
+printf '%s\n' '{"id":"approval-command-2","method":"item/commandExecution/requestApproval","params":{"command":["echo a","b"],"cwd":"/workspace","timeout_ms":5000}}'
+read second_decision
+printf '%s\n' "$second_decision" > "$SYMPHONY_WORKSPACE_PATH/jsonrpc-argv-approval-2.json"
+printf '%s\n' '{"type":"handoff","payload":{"summary":"JSON-RPC argv approval completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
+printf '%s\n' '{"type":"turn_completed"}'
+`)
+	runner := &Runner{Command: script + " app-server"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultC := make(chan agent.RunResult, 1)
+	errC := make(chan error, 1)
+	go func() {
+		result, err := runner.Run(ctx, codexTestRunRequest(st, run, issue, workspacePath, token))
+		resultC <- result
+		errC <- err
+	}()
+
+	first := waitForApprovalByRequestID(t, st, "approval-command-1")
+	if err := st.DecideApproval(first.ID, "approved_for_run", "jsonrpc approved for run"); err != nil {
+		t.Fatalf("DecideApproval first: %v", err)
+	}
+	second := waitForApprovalByRequestID(t, st, "approval-command-2")
+	if err := st.DecideApproval(second.ID, "approved_once", "jsonrpc approved once"); err != nil {
+		t.Fatalf("DecideApproval second: %v", err)
+	}
+	result := waitCodexResult(t, resultC, errC)
+	if result.Kind != agent.RunResultSucceeded {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "jsonrpc-argv-approval-1.json"), "approval-command-1", "accept")
+	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "jsonrpc-argv-approval-2.json"), "approval-command-2", "accept")
+	rows, err := st.Project.Query(`SELECT id FROM approval_requests WHERE run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("query approvals: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("approval rows = %d, want 2", len(rows))
+	}
+}
+
+func TestRunnerDoesNotReuseApprovedForRunJSONRPCFileChangeApprovalAcrossGrantRoot(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"id":"approval-file-1","method":"item/fileChange/requestApproval","params":{"reason":"Allow write access","grantRoot":"/workspace/a","timeout_ms":5000}}'
+read first_decision
+printf '%s\n' "$first_decision" > "$SYMPHONY_WORKSPACE_PATH/jsonrpc-file-approval-1.json"
+printf '%s\n' '{"id":"approval-file-2","method":"item/fileChange/requestApproval","params":{"reason":"Allow write access","grantRoot":"/workspace/b","timeout_ms":5000}}'
+read second_decision
+printf '%s\n' "$second_decision" > "$SYMPHONY_WORKSPACE_PATH/jsonrpc-file-approval-2.json"
+printf '%s\n' '{"type":"handoff","payload":{"summary":"JSON-RPC file approval completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
+printf '%s\n' '{"type":"turn_completed"}'
+`)
+	runner := &Runner{Command: script + " app-server"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultC := make(chan agent.RunResult, 1)
+	errC := make(chan error, 1)
+	go func() {
+		result, err := runner.Run(ctx, codexTestRunRequest(st, run, issue, workspacePath, token))
+		resultC <- result
+		errC <- err
+	}()
+
+	first := waitForApprovalByRequestID(t, st, "approval-file-1")
+	if err := st.DecideApproval(first.ID, "approved_for_run", "jsonrpc file approved for run"); err != nil {
+		t.Fatalf("DecideApproval first: %v", err)
+	}
+	second := waitForApprovalByRequestID(t, st, "approval-file-2")
+	if err := st.DecideApproval(second.ID, "approved_once", "jsonrpc file approved once"); err != nil {
+		t.Fatalf("DecideApproval second: %v", err)
+	}
+	result := waitCodexResult(t, resultC, errC)
+	if result.Kind != agent.RunResultSucceeded {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "jsonrpc-file-approval-1.json"), "approval-file-1", "accept")
+	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "jsonrpc-file-approval-2.json"), "approval-file-2", "accept")
 	rows, err := st.Project.Query(`SELECT id FROM approval_requests WHERE run_id=?`, run.ID)
 	if err != nil {
 		t.Fatalf("query approvals: %v", err)
@@ -1724,29 +1827,6 @@ func approvalByRequestID(t *testing.T, st *store.Store, requestID string) *store
 		return approval
 	}
 	t.Fatalf("approval with request_id %q was not found", requestID)
-	return nil
-}
-
-func approvalByRequestIDOrNil(t *testing.T, st *store.Store, requestID string) *store.Approval {
-	t.Helper()
-	rows, err := st.Project.Query(`SELECT id, request_json FROM approval_requests ORDER BY created_at ASC`)
-	if err != nil {
-		t.Fatalf("query approvals: %v", err)
-	}
-	for _, row := range rows {
-		var request map[string]any
-		if err := json.Unmarshal([]byte(row["request_json"].String()), &request); err != nil {
-			t.Fatalf("decode request_json: %v", err)
-		}
-		if request["request_id"] != requestID {
-			continue
-		}
-		approval, err := st.ApprovalByID(row["id"].String())
-		if err != nil {
-			t.Fatalf("ApprovalByID: %v", err)
-		}
-		return approval
-	}
 	return nil
 }
 

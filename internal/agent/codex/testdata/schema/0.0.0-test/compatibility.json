@@ -11,6 +11,8 @@
     "approval_requested",
     "approval_resolved",
     "serverRequest/resolved",
+    "item/started",
+    "item/completed",
     "tool_call",
     "turn_completed",
     "turn_failed"

@@ -112,6 +112,7 @@ type CreateApprovalRequestInput struct {
 	PolicyMatch   string
 	RequestID     string
 	CWD           string
+	Fingerprint   string
 	TimeoutMS     int64
 }
 
@@ -2064,6 +2065,9 @@ func (s *Store) CreatePendingApprovalRequest(in CreateApprovalRequestInput) (*Ap
 	if value := strings.TrimSpace(in.CWD); value != "" {
 		request["cwd"] = value
 	}
+	if value := strings.TrimSpace(in.Fingerprint); value != "" {
+		request["fingerprint"] = value
+	}
 	requestJSON, err := json.Marshal(request)
 	if err != nil {
 		return nil, err
@@ -2142,10 +2146,15 @@ func approvalRequestMatchesInput(raw string, in CreateApprovalRequestInput) bool
 			return false
 		}
 	}
-	if in.Kind == "command" {
-		gotAction := approvalRequestStringField(fields, "action_summary")
-		wantAction := strings.TrimSpace(in.ActionSummary)
-		return gotAction != "" && wantAction != "" && gotAction == wantAction
+	gotFingerprint := approvalRequestStringField(fields, "fingerprint")
+	wantFingerprint := strings.TrimSpace(in.Fingerprint)
+	if in.Kind == "command" || in.Kind == "file_change" {
+		return gotFingerprint != "" && wantFingerprint != "" && gotFingerprint == wantFingerprint
+	}
+	if gotFingerprint != "" || wantFingerprint != "" {
+		if gotFingerprint == "" || wantFingerprint == "" || gotFingerprint != wantFingerprint {
+			return false
+		}
 	}
 	gotPolicy := approvalRequestStringField(fields, "policy_match")
 	wantPolicy := strings.TrimSpace(in.PolicyMatch)

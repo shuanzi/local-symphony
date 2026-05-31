@@ -456,6 +456,7 @@ func approvalInputFromMessage(req agent.RunRequest, msg protocolMessage) (store.
 		PolicyMatch:   payloadString(msg.Payload, "policy_match"),
 		RequestID:     requestID,
 		CWD:           payloadString(msg.Payload, "cwd"),
+		Fingerprint:   payloadString(msg.Payload, "fingerprint"),
 		TimeoutMS:     payloadInt64(msg.Payload, "timeout_ms"),
 	}, approvalResponseTarget{requestID: requestID}, nil
 }
@@ -480,6 +481,7 @@ func approvalInputFromJSONRPCRequest(req agent.RunRequest, msg protocolMessage) 
 		PolicyMatch:   payloadString(msg.Params, "policy_match"),
 		RequestID:     requestID,
 		CWD:           payloadString(msg.Params, "cwd"),
+		Fingerprint:   jsonRPCApprovalFingerprint(kind, msg.Params),
 		TimeoutMS:     payloadInt64(msg.Params, "timeout_ms"),
 	}, target, nil
 }
@@ -517,6 +519,34 @@ func jsonRPCRequestedPermissions(params map[string]any) map[string]any {
 		return map[string]any{}
 	}
 	return permissions
+}
+
+func jsonRPCApprovalFingerprint(kind string, params map[string]any) string {
+	switch kind {
+	case "command":
+		return jsonRPCValueFingerprint("command", params["command"])
+	case "file_change":
+		if value := payloadString(params, "grantRoot"); value != "" {
+			return "grantRoot:" + value
+		}
+		if value := payloadString(params, "path"); value != "" {
+			return "path:" + value
+		}
+		return jsonRPCValueFingerprint("changes", params["changes"])
+	default:
+		return ""
+	}
+}
+
+func jsonRPCValueFingerprint(key string, value any) string {
+	if value == nil {
+		return ""
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return key + ":" + string(b)
 }
 
 func hasNetworkApprovalContext(params map[string]any) bool {
@@ -910,7 +940,7 @@ func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line st
 
 func isExpectedJSONRPCNotification(method string) bool {
 	switch strings.TrimSpace(method) {
-	case "serverRequest/resolved":
+	case "serverRequest/resolved", "item/started", "item/completed":
 		return true
 	default:
 		return false
