@@ -1566,6 +1566,44 @@ func TestHandleProtocolLineAcceptsAppServerLifecycleJSONRPCNotifications(t *test
 	}
 }
 
+func TestHandleProtocolLineFailsJSONRPCTurnCompletedWithFailedStatus(t *testing.T) {
+	req := agent.RunRequest{}
+	handshakeDone := true
+	var startupC <-chan time.Time
+	handoffReceived := true
+	threadID := ""
+
+	result, done, err := handleProtocolLine(req, nil, `{"method":"turn/completed","params":{"turn":{"id":"turn_jsonrpc","status":"failed","error":{"message":"quota exceeded"}}}}`, &handshakeDone, &startupC, &handoffReceived, &threadID, nil)
+	if err != nil {
+		t.Fatalf("turn/completed failed status: %v", err)
+	}
+	if !done {
+		t.Fatal("done = false, want true")
+	}
+	if result.Kind != agent.RunResultFailed || result.FailureCode != core.FailureCodexProtocolError {
+		t.Fatalf("result = %#v, want codex protocol failure", result)
+	}
+}
+
+func TestHandleProtocolLineJSONRPCFailedStatusTakesPrecedenceOverMissingHandoff(t *testing.T) {
+	req := agent.RunRequest{}
+	handshakeDone := true
+	var startupC <-chan time.Time
+	handoffReceived := false
+	threadID := ""
+
+	result, done, err := handleProtocolLine(req, nil, `{"method":"turn/completed","params":{"turn":{"id":"turn_jsonrpc","status":"interrupted"}}}`, &handshakeDone, &startupC, &handoffReceived, &threadID, nil)
+	if err != nil {
+		t.Fatalf("turn/completed interrupted status: %v", err)
+	}
+	if !done {
+		t.Fatal("done = false, want true")
+	}
+	if result.Kind != agent.RunResultFailed || result.FailureCode != core.FailureCodexProtocolError {
+		t.Fatalf("result = %#v, want codex protocol failure", result)
+	}
+}
+
 func TestDefaultFixtureRootSupportsEnvOverride(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("SYMPHONY_CODEX_FIXTURE_ROOT", tmp)

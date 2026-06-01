@@ -1169,6 +1169,27 @@ func copyStringAnyMap(in map[string]any) map[string]any {
 	return out
 }
 
+func jsonRPCTurnCompletionStatus(params map[string]any) string {
+	if turn, ok := params["turn"].(map[string]any); ok {
+		if status := payloadString(turn, "status"); status != "" {
+			return strings.ToLower(status)
+		}
+	}
+	if status := payloadString(params, "status"); status != "" {
+		return strings.ToLower(status)
+	}
+	return ""
+}
+
+func isFailedJSONRPCTurnStatus(status string) bool {
+	switch strings.TrimSpace(strings.ToLower(status)) {
+	case "", "completed", "success", "succeeded":
+		return false
+	default:
+		return true
+	}
+}
+
 func handleExpectedJSONRPCNotification(req agent.RunRequest, msg protocolMessage, handoffReceived *bool, threadID *string, jsonrpcItems map[string]map[string]any) (agent.RunResult, bool, error) {
 	switch strings.TrimSpace(msg.Method) {
 	case "thread/started":
@@ -1179,6 +1200,11 @@ func handleExpectedJSONRPCNotification(req agent.RunRequest, msg protocolMessage
 	case "turn/started":
 		emit(req, "agent.turn_started", map[string]any{"turn_id": payloadString(msg.Params, "turnId")})
 	case "turn/completed":
+		status := jsonRPCTurnCompletionStatus(msg.Params)
+		if isFailedJSONRPCTurnStatus(status) {
+			emit(req, "agent.turn_failed", map[string]any{"failure_code": core.FailureCodexProtocolError, "status": status, "message": "redacted"})
+			return failed(core.FailureCodexProtocolError, "codex turn failed"), true, nil
+		}
 		emit(req, "agent.turn_completed", map[string]any{})
 		if !*handoffReceived {
 			return agent.RunResult{Kind: agent.RunResultMissingHandoff, FailureCode: core.FailureMissingHandoff, FailureMessage: "handoff missing"}, true, nil
