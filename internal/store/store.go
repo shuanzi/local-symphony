@@ -2044,31 +2044,7 @@ func (s *Store) ApprovalByID(id string) (*Approval, error) {
 func (s *Store) CreatePendingApprovalRequest(in CreateApprovalRequestInput) (*Approval, error) {
 	id := core.NewID("apr_")
 	createdAt := core.Now()
-	switch in.Kind {
-	case "command", "file_change", "network":
-	default:
-		return nil, core.NewError(core.ErrInvalidRequest, "unsupported approval kind", map[string]any{"kind": in.Kind})
-	}
-	request := map[string]string{}
-	if value := strings.TrimSpace(in.ActionSummary); value != "" {
-		request["action_summary"] = value
-	}
-	if value := strings.TrimSpace(in.RiskLevel); value != "" {
-		request["risk_level"] = value
-	}
-	if value := strings.TrimSpace(in.PolicyMatch); value != "" {
-		request["policy_match"] = value
-	}
-	if value := strings.TrimSpace(in.RequestID); value != "" {
-		request["request_id"] = value
-	}
-	if value := strings.TrimSpace(in.CWD); value != "" {
-		request["cwd"] = value
-	}
-	if value := strings.TrimSpace(in.Fingerprint); value != "" {
-		request["fingerprint"] = value
-	}
-	requestJSON, err := json.Marshal(request)
+	requestJSON, err := approvalRequestJSON(in)
 	if err != nil {
 		return nil, err
 	}
@@ -2099,6 +2075,64 @@ func (s *Store) CreatePendingApprovalRequest(in CreateApprovalRequestInput) (*Ap
 		return nil, err
 	}
 	return s.ApprovalByID(id)
+}
+
+func (s *Store) CreateAutoDeniedApprovalRequest(in CreateApprovalRequestInput, reason string) (*Approval, error) {
+	id := core.NewID("apr_")
+	now := core.Now()
+	requestJSON, err := approvalRequestJSON(in)
+	if err != nil {
+		return nil, err
+	}
+	decisionJSON, err := approvalDecisionJSON("auto_denied", reason, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Project.WithTx(func(tx *db.Tx) error {
+		run, err := s.getRunTx(tx, in.RunID)
+		if err != nil {
+			return err
+		}
+		if run.IssueID != in.IssueID {
+			return core.NewError(core.ErrInvalidRequest, "approval issue does not match run", map[string]any{"run_id": in.RunID, "issue_id": in.IssueID})
+		}
+		if !core.IsActiveRunStatus(run.Status) {
+			return core.NewError(core.ErrInvalidStateTransition, "run is not active", map[string]any{"run_id": in.RunID, "status": run.Status})
+		}
+		return tx.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at,resolved_at,reason,decision_json) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			id, in.RunID, in.IssueID, in.Kind, "auto_denied", string(requestJSON), now, now, reason, decisionJSON)
+	}); err != nil {
+		return nil, err
+	}
+	return s.ApprovalByID(id)
+}
+
+func approvalRequestJSON(in CreateApprovalRequestInput) ([]byte, error) {
+	switch in.Kind {
+	case "command", "file_change", "network":
+	default:
+		return nil, core.NewError(core.ErrInvalidRequest, "unsupported approval kind", map[string]any{"kind": in.Kind})
+	}
+	request := map[string]string{}
+	if value := strings.TrimSpace(in.ActionSummary); value != "" {
+		request["action_summary"] = value
+	}
+	if value := strings.TrimSpace(in.RiskLevel); value != "" {
+		request["risk_level"] = value
+	}
+	if value := strings.TrimSpace(in.PolicyMatch); value != "" {
+		request["policy_match"] = value
+	}
+	if value := strings.TrimSpace(in.RequestID); value != "" {
+		request["request_id"] = value
+	}
+	if value := strings.TrimSpace(in.CWD); value != "" {
+		request["cwd"] = value
+	}
+	if value := strings.TrimSpace(in.Fingerprint); value != "" {
+		request["fingerprint"] = value
+	}
+	return json.Marshal(request)
 }
 
 func (s *Store) HasApprovedForRunApproval(in CreateApprovalRequestInput) (bool, error) {

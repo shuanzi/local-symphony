@@ -20,6 +20,7 @@ import (
 	"local-symphony/internal/config"
 	"local-symphony/internal/core"
 	"local-symphony/internal/review"
+	"local-symphony/internal/security"
 	"local-symphony/internal/store"
 	"local-symphony/internal/toolgateway"
 	"local-symphony/internal/workspace"
@@ -209,9 +210,22 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 
 func runnerForRun(run *core.RunAttempt, wf *config.Workflow) agentrunner.Runner {
 	if run.RunnerKind == "codex" {
-		return &codex.Runner{Command: wf.Config.Codex.Command, ExperimentalAPI: wf.Config.Codex.ExperimentalAPI}
+		return &codex.Runner{Command: wf.Config.Codex.Command, ExperimentalAPI: wf.Config.Codex.ExperimentalAPI, Policy: securityPolicyFromConfig(wf.Config)}
 	}
 	return fake.Runner{}
+}
+
+func securityPolicyFromConfig(cfg config.EffectiveConfig) security.Policy {
+	policy := security.DefaultPolicy()
+	switch cfg.Approvals.Network.Default {
+	case string(security.PolicyReview):
+		policy.NetworkDefault = security.PolicyReview
+	case string(security.PolicyDeny):
+		policy.NetworkDefault = security.PolicyDeny
+	}
+	policy.NetworkAllowlist = append([]string{}, cfg.Approvals.Network.Allowlist...)
+	policy.ProtectedPaths = append([]string{}, cfg.Approvals.ProtectedPaths...)
+	return policy
 }
 
 func closeRunner(ctx context.Context, runner agentrunner.Runner, req agentrunner.RunRequest) {
