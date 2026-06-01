@@ -2151,6 +2151,9 @@ func approvalRequestMatchesInput(raw string, in CreateApprovalRequestInput) bool
 	if in.Kind == "command" || in.Kind == "file_change" {
 		return gotFingerprint != "" && wantFingerprint != "" && gotFingerprint == wantFingerprint
 	}
+	if in.Kind == "network" {
+		return gotFingerprint != "" && wantFingerprint != "" && gotFingerprint == wantFingerprint
+	}
 	if gotFingerprint != "" || wantFingerprint != "" {
 		if gotFingerprint == "" || wantFingerprint == "" || gotFingerprint != wantFingerprint {
 			return false

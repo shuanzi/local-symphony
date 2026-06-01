@@ -1584,31 +1584,15 @@ func TestCreatePendingApprovalRequestStoresStructuredFieldsAndTimeout(t *testing
 	}
 }
 
-func TestHasApprovedForRunApprovalRequiresPolicyOrActionMatch(t *testing.T) {
+func TestHasApprovedForRunApprovalRequiresNetworkFingerprint(t *testing.T) {
 	st := newStoreTestStore(t)
-	issue, run := prepareActiveRun(t, st, "Approval run scope match")
-	if err := st.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at) VALUES(?,?,?,?,?,?,?)`,
-		core.NewID("apr_"), run.ID, issue.ID, "network", "approved_for_run", `{}`, core.Now()); err != nil {
-		t.Fatalf("insert approved approval: %v", err)
-	}
-
-	ok, err := st.HasApprovedForRunApproval(CreateApprovalRequestInput{
-		RunID:   run.ID,
-		IssueID: issue.ID,
-		Kind:    "network",
-	})
-	if err != nil {
-		t.Fatalf("HasApprovedForRunApproval: %v", err)
-	}
-	if ok {
-		t.Fatal("HasApprovedForRunApproval returned true without policy/action match keys")
-	}
-
+	issue, run := prepareActiveRun(t, st, "Approval run scope network fingerprint")
 	if err := st.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at) VALUES(?,?,?,?,?,?,?)`,
 		core.NewID("apr_"), run.ID, issue.ID, "network", "approved_for_run", `{"policy_match":"network.example"}`, core.Now()); err != nil {
 		t.Fatalf("insert policy approval: %v", err)
 	}
-	ok, err = st.HasApprovedForRunApproval(CreateApprovalRequestInput{
+
+	ok, err := st.HasApprovedForRunApproval(CreateApprovalRequestInput{
 		RunID:       run.ID,
 		IssueID:     issue.ID,
 		Kind:        "network",
@@ -1617,8 +1601,48 @@ func TestHasApprovedForRunApprovalRequiresPolicyOrActionMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HasApprovedForRunApproval: %v", err)
 	}
+	if ok {
+		t.Fatal("HasApprovedForRunApproval returned true for network approval without fingerprint")
+	}
+
+	if err := st.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at) VALUES(?,?,?,?,?,?,?)`,
+		core.NewID("apr_"), run.ID, issue.ID, "network", "approved_for_run", `{"policy_match":"network.example","fingerprint":"networkApprovalContext:{\"host\":\"example.invalid\"}"}`, core.Now()); err != nil {
+		t.Fatalf("insert fingerprint approval: %v", err)
+	}
+	ok, err = st.HasApprovedForRunApproval(CreateApprovalRequestInput{
+		RunID:       run.ID,
+		IssueID:     issue.ID,
+		Kind:        "network",
+		PolicyMatch: "network.example",
+		Fingerprint: "networkApprovalContext:{\"host\":\"example.invalid\"}",
+	})
+	if err != nil {
+		t.Fatalf("HasApprovedForRunApproval: %v", err)
+	}
 	if !ok {
-		t.Fatal("HasApprovedForRunApproval returned false for matching policy")
+		t.Fatal("HasApprovedForRunApproval returned false for matching network fingerprint")
+	}
+}
+
+func TestHasApprovedForRunApprovalDoesNotReuseNetworkActionWithoutFingerprint(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Approval run scope network fingerprint")
+	if err := st.Project.Exec(`INSERT INTO approval_requests(id,run_id,issue_id,kind,status,request_json,created_at) VALUES(?,?,?,?,?,?,?)`,
+		core.NewID("apr_"), run.ID, issue.ID, "network", "approved_for_run", `{"action_summary":"Allow network access"}`, core.Now()); err != nil {
+		t.Fatalf("insert network approval: %v", err)
+	}
+
+	ok, err := st.HasApprovedForRunApproval(CreateApprovalRequestInput{
+		RunID:         run.ID,
+		IssueID:       issue.ID,
+		Kind:          "network",
+		ActionSummary: "Allow network access",
+	})
+	if err != nil {
+		t.Fatalf("HasApprovedForRunApproval: %v", err)
+	}
+	if ok {
+		t.Fatal("HasApprovedForRunApproval returned true for network approval without fingerprint")
 	}
 }
 

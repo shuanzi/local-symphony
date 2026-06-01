@@ -221,6 +221,7 @@ type processSession struct {
 	processExited  bool
 	closed         bool
 	processStarted bool
+	jsonrpcItems   map[string]map[string]any
 }
 
 func (r *Runner) startAppServer(req agent.RunRequest, selected *SelectedFixture) (*processSession, agent.RunResult, error) {
@@ -269,6 +270,7 @@ func (r *Runner) startAppServer(req agent.RunRequest, selected *SelectedFixture)
 		stderrCounter:  stderrCounter,
 		selected:       selected,
 		processStarted: true,
+		jsonrpcItems:   map[string]map[string]any{},
 	}, agent.RunResult{}, nil
 }
 
@@ -361,7 +363,7 @@ func (r *Runner) runTurn(ctx context.Context, req agent.RunRequest, session *pro
 				resetTimer(stall, timeoutDuration(req.Timeouts.StallMS, 5*time.Minute))
 				continue
 			}
-			result, terminal, err := handleProtocolLine(req, session.selected, item.line, &session.handshakeDone, &startupC, &handoffReceived, &session.threadID)
+			result, terminal, err := handleProtocolLine(req, session.selected, item.line, &session.handshakeDone, &startupC, &handoffReceived, &session.threadID, session.jsonrpcItems)
 			if err != nil {
 				emit(req, "agent.protocol_error", map[string]any{"message": "redacted"})
 				_ = r.closeSession(req)
@@ -400,6 +402,7 @@ func (r *Runner) handleApprovalRequest(ctx context.Context, req agent.RunRequest
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
 		return agent.RunResult{}, false, err
 	}
+	msg = mergeJSONRPCApprovalItemDetails(msg, session.jsonrpcItems)
 	approvalInput, responseTarget, err := approvalInputFromMessage(req, msg)
 	if err != nil {
 		return agent.RunResult{}, false, err
@@ -533,6 +536,24 @@ func jsonRPCApprovalFingerprint(kind string, params map[string]any) string {
 			return "path:" + value
 		}
 		return jsonRPCValueFingerprint("changes", params["changes"])
+	case "network":
+		if value := jsonRPCValueFingerprint("networkApprovalContext", params["networkApprovalContext"]); value != "" {
+			return value
+		}
+		if additional, ok := params["additionalPermissions"].(map[string]any); ok {
+			if value := jsonRPCValueFingerprint("additionalPermissions.network", additional["network"]); value != "" {
+				return value
+			}
+		}
+		if permissions, ok := params["permissions"].(map[string]any); ok {
+			if value := jsonRPCValueFingerprint("permissions.network", permissions["network"]); value != "" {
+				return value
+			}
+		}
+		if value := jsonRPCValueFingerprint("policyAmendment", params["policyAmendment"]); value != "" {
+			return value
+		}
+		return jsonRPCValueFingerprint("policy_amendment", params["policy_amendment"])
 	default:
 		return ""
 	}
@@ -593,6 +614,21 @@ func isJSONRPCApprovalMethod(method string) bool {
 }
 
 func jsonRPCApprovalActionSummary(kind string, params map[string]any) string {
+	if kind != "command" {
+		if summary := jsonRPCPermissionActionSummary(params); summary != "" {
+			return summary
+		}
+	}
+	if kind == "command" {
+		if summary := jsonRPCCommandActionSummary(params); summary != "" {
+			return summary
+		}
+	}
+	if kind == "file_change" {
+		if summary := jsonRPCFileChangeActionSummary(params); summary != "" {
+			return summary
+		}
+	}
 	if value := payloadString(params, "action_summary"); value != "" {
 		return value
 	}
@@ -603,6 +639,138 @@ func jsonRPCApprovalActionSummary(kind string, params map[string]any) string {
 		return jsonRPCCommandSummary(params["command"])
 	}
 	return payloadString(params, "summary")
+}
+
+func jsonRPCPermissionActionSummary(params map[string]any) string {
+	permissions, ok := params["permissions"].(map[string]any)
+	if !ok || !jsonRPCPermissionsIncludeMixedGrants(permissions) {
+		return ""
+	}
+	summary := payloadString(params, "reason")
+	if summary == "" {
+		summary = payloadString(params, "action_summary")
+	}
+	if summary == "" {
+		summary = payloadString(params, "summary")
+	}
+	permissionsJSON, err := json.Marshal(permissions)
+	if err != nil {
+		return summary
+	}
+	if summary == "" {
+		return "permissions: " + string(permissionsJSON)
+	}
+	return summary + " | permissions: " + string(permissionsJSON)
+}
+
+func jsonRPCPermissionsIncludeMixedGrants(permissions map[string]any) bool {
+	hasNetwork := false
+	if _, ok := permissions["network"]; ok {
+		hasNetwork = true
+	}
+	return hasNetwork && jsonRPCPermissionsIncludeFilesystemGrant(permissions)
+}
+
+func jsonRPCPermissionsIncludeFilesystemGrant(permissions map[string]any) bool {
+	if _, ok := permissions["fileSystem"]; ok {
+		return true
+	}
+	if _, ok := permissions["filesystem"]; ok {
+		return true
+	}
+	return false
+}
+
+func jsonRPCCommandActionSummary(params map[string]any) string {
+	command := jsonRPCCommandDisplay(params["command"])
+	if command == "" {
+		return ""
+	}
+	cwd := payloadString(params, "cwd")
+	reason := payloadString(params, "reason")
+	actionSummary := payloadString(params, "action_summary")
+	if cwd == "" && reason == "" && actionSummary == "" {
+		return command
+	}
+	parts := []string{command}
+	if cwd != "" {
+		parts = append(parts, "cwd: "+cwd)
+	}
+	if reason != "" {
+		parts = append(parts, "reason: "+reason)
+	}
+	if actionSummary != "" {
+		parts = append(parts, "summary: "+actionSummary)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func jsonRPCCommandDisplay(value any) string {
+	switch command := value.(type) {
+	case string:
+		return strings.TrimSpace(command)
+	case []any:
+		parts := make([]string, 0, len(command))
+		for _, part := range command {
+			text, ok := part.(string)
+			if !ok {
+				return ""
+			}
+			parts = append(parts, text)
+		}
+		b, err := json.Marshal(parts)
+		if err != nil {
+			return ""
+		}
+		return "argv: " + string(b)
+	default:
+		return ""
+	}
+}
+
+func jsonRPCFileChangeActionSummary(params map[string]any) string {
+	parts := make([]string, 0, 5)
+	if reason := payloadString(params, "reason"); reason != "" {
+		parts = append(parts, reason)
+	} else if summary := payloadString(params, "action_summary"); summary != "" {
+		parts = append(parts, summary)
+	} else if summary := payloadString(params, "summary"); summary != "" {
+		parts = append(parts, summary)
+	}
+	if value := payloadString(params, "grantRoot"); value != "" {
+		parts = append(parts, "grantRoot: "+value)
+	}
+	if value := payloadString(params, "path"); value != "" {
+		parts = append(parts, "path: "+value)
+	}
+	if value := jsonRPCSummaryValue("paths", params["paths"]); value != "" {
+		parts = append(parts, value)
+	}
+	if value := payloadString(params, "diff"); value != "" {
+		parts = append(parts, "diff: "+value)
+	}
+	if value := jsonRPCSummaryValue("changes", params["changes"]); value != "" {
+		parts = append(parts, value)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func jsonRPCSummaryValue(label string, value any) string {
+	if value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return ""
+		}
+		return label + ": " + text
+	}
+	b, err := json.Marshal(value)
+	if err != nil || len(b) == 0 || string(b) == "null" {
+		return ""
+	}
+	return label + ": " + string(b)
 }
 
 func jsonRPCCommandSummary(value any) string {
@@ -845,7 +1013,7 @@ func (r *Runner) closeSession(req agent.RunRequest) error {
 	return waitErr
 }
 
-func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line string, handshakeDone *bool, startupC *<-chan time.Time, handoffReceived *bool, threadID *string) (agent.RunResult, bool, error) {
+func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line string, handshakeDone *bool, startupC *<-chan time.Time, handoffReceived *bool, threadID *string, jsonrpcItems map[string]map[string]any) (agent.RunResult, bool, error) {
 	var msg protocolMessage
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
 		return agent.RunResult{}, false, err
@@ -855,6 +1023,9 @@ func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line st
 			return agent.RunResult{}, false, fmt.Errorf("json-rpc notification before handshake")
 		}
 		if isExpectedJSONRPCNotification(msg.Method) {
+			if strings.TrimSpace(msg.Method) == "item/started" {
+				rememberJSONRPCStartedItem(msg.Params, jsonrpcItems)
+			}
 			return agent.RunResult{}, false, nil
 		}
 		return agent.RunResult{}, false, fmt.Errorf("unsupported json-rpc notification %q", msg.Method)
@@ -936,6 +1107,72 @@ func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line st
 		return agent.RunResult{}, false, fmt.Errorf("unsupported codex message type %q", msg.Type)
 	}
 	return agent.RunResult{}, false, nil
+}
+
+func rememberJSONRPCStartedItem(params map[string]any, items map[string]map[string]any) {
+	if len(params) == 0 || items == nil {
+		return
+	}
+	details := copyStringAnyMap(params)
+	if item, ok := params["item"].(map[string]any); ok {
+		details = copyStringAnyMap(item)
+		for key, value := range params {
+			if key == "item" {
+				continue
+			}
+			if _, exists := details[key]; !exists {
+				details[key] = value
+			}
+		}
+	}
+	itemID := jsonRPCItemID(details)
+	if itemID == "" {
+		itemID = jsonRPCItemID(params)
+	}
+	if itemID == "" {
+		return
+	}
+	items[itemID] = details
+}
+
+func mergeJSONRPCApprovalItemDetails(msg protocolMessage, items map[string]map[string]any) protocolMessage {
+	if strings.TrimSpace(msg.Method) != "item/fileChange/requestApproval" || len(items) == 0 {
+		return msg
+	}
+	itemID := jsonRPCItemID(msg.Params)
+	if itemID == "" {
+		return msg
+	}
+	details, ok := items[itemID]
+	if !ok || len(details) == 0 {
+		return msg
+	}
+	merged := copyStringAnyMap(details)
+	for key, value := range msg.Params {
+		merged[key] = value
+	}
+	msg.Params = merged
+	return msg
+}
+
+func jsonRPCItemID(params map[string]any) string {
+	for _, key := range []string{"itemId", "item_id", "id"} {
+		if value := payloadString(params, key); value != "" {
+			return value
+		}
+	}
+	if item, ok := params["item"].(map[string]any); ok {
+		return jsonRPCItemID(item)
+	}
+	return ""
+}
+
+func copyStringAnyMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func isExpectedJSONRPCNotification(method string) bool {
