@@ -643,7 +643,7 @@ func jsonRPCApprovalActionSummary(kind string, params map[string]any) string {
 
 func jsonRPCPermissionActionSummary(params map[string]any) string {
 	permissions, ok := params["permissions"].(map[string]any)
-	if !ok || !jsonRPCPermissionsIncludeMixedGrants(permissions) {
+	if !ok || permissions == nil {
 		return ""
 	}
 	summary := payloadString(params, "reason")
@@ -661,24 +661,6 @@ func jsonRPCPermissionActionSummary(params map[string]any) string {
 		return "permissions: " + string(permissionsJSON)
 	}
 	return summary + " | permissions: " + string(permissionsJSON)
-}
-
-func jsonRPCPermissionsIncludeMixedGrants(permissions map[string]any) bool {
-	hasNetwork := false
-	if _, ok := permissions["network"]; ok {
-		hasNetwork = true
-	}
-	return hasNetwork && jsonRPCPermissionsIncludeFilesystemGrant(permissions)
-}
-
-func jsonRPCPermissionsIncludeFilesystemGrant(permissions map[string]any) bool {
-	if _, ok := permissions["fileSystem"]; ok {
-		return true
-	}
-	if _, ok := permissions["filesystem"]; ok {
-		return true
-	}
-	return false
 }
 
 func jsonRPCCommandActionSummary(params map[string]any) string {

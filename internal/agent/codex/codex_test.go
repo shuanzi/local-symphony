@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -838,11 +839,68 @@ func TestApprovalInputFromJSONRPCPermissionRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("approvalInputFromMessage: %v", err)
 	}
-	if input.Kind != "file_change" || input.ActionSummary != "Allow selected permissions" || input.RequestID != "permission-1" {
+	if input.Kind != "file_change" || input.RequestID != "permission-1" {
 		t.Fatalf("approval input = %#v", input)
+	}
+	for _, want := range []string{"Allow selected permissions", "fileSystem", "/workspace"} {
+		if !strings.Contains(input.ActionSummary, want) {
+			t.Fatalf("approval action summary %q missing %q", input.ActionSummary, want)
+		}
 	}
 	if string(target.jsonrpcID) != `"permission-1"` || target.requestID != "permission-1" {
 		t.Fatalf("target = %#v", target)
+	}
+}
+
+func TestApprovalInputFromJSONRPCPermissionRequestShowsSingleGrantTypes(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	req := codexTestRunRequest(st, run, issue, workspacePath, token)
+
+	tests := []struct {
+		name        string
+		id          string
+		permissions map[string]any
+		wantKind    string
+		wantParts   []string
+	}{
+		{
+			name:        "filesystem only",
+			id:          "permission-filesystem",
+			permissions: map[string]any{"fileSystem": map[string]any{"write": []any{"/Users/me/shared"}}},
+			wantKind:    "file_change",
+			wantParts:   []string{"Allow selected permissions", "fileSystem", "write", "/Users/me/shared"},
+		},
+		{
+			name:        "network only",
+			id:          "permission-network",
+			permissions: map[string]any{"network": map[string]any{"enabled": true, "host": "example.invalid"}},
+			wantKind:    "network",
+			wantParts:   []string{"Allow selected permissions", "network", "enabled", "example.invalid"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input, _, err := approvalInputFromMessage(req, protocolMessage{
+				ID:     json.RawMessage(strconv.Quote(tt.id)),
+				Method: "item/permissions/requestApproval",
+				Params: map[string]any{
+					"cwd":         "/workspace",
+					"reason":      "Allow selected permissions",
+					"permissions": tt.permissions,
+				},
+			})
+			if err != nil {
+				t.Fatalf("approvalInputFromMessage: %v", err)
+			}
+			if input.Kind != tt.wantKind || input.RequestID != tt.id {
+				t.Fatalf("approval input = %#v", input)
+			}
+			for _, want := range tt.wantParts {
+				if !strings.Contains(input.ActionSummary, want) {
+					t.Fatalf("approval action summary %q missing %q", input.ActionSummary, want)
+				}
+			}
+		})
 	}
 }
 
