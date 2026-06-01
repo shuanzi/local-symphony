@@ -1459,6 +1459,103 @@ func TestHandleProtocolLineRejectsNotificationsBeforeHandshake(t *testing.T) {
 	}
 }
 
+func TestJSONRPCCommandActionSummaryIncludesAdditionalPermissions(t *testing.T) {
+	params := map[string]any{
+		"command": []any{"go", "test", "./..."},
+		"cwd":     "/workspace",
+		"additionalPermissions": map[string]any{
+			"network": map[string]any{"enabled": true},
+			"fileSystem": map[string]any{
+				"write": []any{"/workspace", "/tmp/build-cache"},
+			},
+		},
+	}
+
+	summary := jsonRPCCommandActionSummary(params)
+	for _, want := range []string{
+		`argv: ["go","test","./..."]`,
+		"cwd: /workspace",
+		`additionalPermissions: {"fileSystem":{"write":["/workspace","/tmp/build-cache"]},"network":{"enabled":true}}`,
+	} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary %q missing %q", summary, want)
+		}
+	}
+}
+
+func TestJSONRPCCommandApprovalFingerprintIncludesAdditionalPermissions(t *testing.T) {
+	base := map[string]any{"command": []any{"go", "test", "./..."}}
+	withNetwork := map[string]any{
+		"command": []any{"go", "test", "./..."},
+		"additionalPermissions": map[string]any{
+			"network": map[string]any{"enabled": true},
+		},
+	}
+
+	baseFingerprint := jsonRPCApprovalFingerprint("command", base)
+	networkFingerprint := jsonRPCApprovalFingerprint("command", withNetwork)
+	if baseFingerprint == "" || networkFingerprint == "" {
+		t.Fatalf("fingerprints must be populated: base=%q network=%q", baseFingerprint, networkFingerprint)
+	}
+	if baseFingerprint == networkFingerprint {
+		t.Fatalf("fingerprints should differ when additionalPermissions differ: %q", baseFingerprint)
+	}
+	if !strings.Contains(networkFingerprint, "additionalPermissions") {
+		t.Fatalf("fingerprint %q missing additionalPermissions", networkFingerprint)
+	}
+}
+
+func TestHandleProtocolLineAcceptsAppServerLifecycleJSONRPCNotifications(t *testing.T) {
+	req := agent.RunRequest{}
+	handshakeDone := true
+	var startupC <-chan time.Time
+	handoffReceived := false
+	threadID := ""
+	items := map[string]map[string]any{}
+
+	_, done, err := handleProtocolLine(req, nil, `{"method":"thread/started","params":{"threadId":"thread_jsonrpc"}}`, &handshakeDone, &startupC, &handoffReceived, &threadID, items)
+	if err != nil {
+		t.Fatalf("thread/started: %v", err)
+	}
+	if done {
+		t.Fatal("thread/started done = true, want false")
+	}
+	if threadID != "thread_jsonrpc" {
+		t.Fatalf("threadID = %q, want thread_jsonrpc", threadID)
+	}
+
+	_, done, err = handleProtocolLine(req, nil, `{"method":"turn/started","params":{"turnId":"turn_jsonrpc"}}`, &handshakeDone, &startupC, &handoffReceived, &threadID, items)
+	if err != nil {
+		t.Fatalf("turn/started: %v", err)
+	}
+	if done {
+		t.Fatal("turn/started done = true, want false")
+	}
+
+	_, done, err = handleProtocolLine(req, nil, `{"method":"item/started","params":{"itemId":"item_jsonrpc"}}`, &handshakeDone, &startupC, &handoffReceived, &threadID, items)
+	if err != nil {
+		t.Fatalf("item/started: %v", err)
+	}
+	if done {
+		t.Fatal("item/started done = true, want false")
+	}
+	if _, ok := items["item_jsonrpc"]; !ok {
+		t.Fatalf("item_jsonrpc was not remembered: %#v", items)
+	}
+
+	handoffReceived = true
+	result, done, err := handleProtocolLine(req, nil, `{"method":"turn/completed","params":{"turnId":"turn_jsonrpc"}}`, &handshakeDone, &startupC, &handoffReceived, &threadID, items)
+	if err != nil {
+		t.Fatalf("turn/completed: %v", err)
+	}
+	if !done {
+		t.Fatal("turn/completed done = false, want true")
+	}
+	if result.Kind != agent.RunResultSucceeded {
+		t.Fatalf("result = %#v, want success", result)
+	}
+}
+
 func TestDefaultFixtureRootSupportsEnvOverride(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("SYMPHONY_CODEX_FIXTURE_ROOT", tmp)

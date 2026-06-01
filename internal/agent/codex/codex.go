@@ -527,7 +527,7 @@ func jsonRPCRequestedPermissions(params map[string]any) map[string]any {
 func jsonRPCApprovalFingerprint(kind string, params map[string]any) string {
 	switch kind {
 	case "command":
-		return jsonRPCValueFingerprint("command", params["command"])
+		return jsonRPCCommandApprovalFingerprint(params)
 	case "file_change":
 		if value := payloadString(params, "grantRoot"); value != "" {
 			return "grantRoot:" + value
@@ -557,6 +557,17 @@ func jsonRPCApprovalFingerprint(kind string, params map[string]any) string {
 	default:
 		return ""
 	}
+}
+
+func jsonRPCCommandApprovalFingerprint(params map[string]any) string {
+	parts := make([]string, 0, 2)
+	if value := jsonRPCValueFingerprint("command", params["command"]); value != "" {
+		parts = append(parts, value)
+	}
+	if value := jsonRPCValueFingerprint("additionalPermissions", params["additionalPermissions"]); value != "" {
+		parts = append(parts, value)
+	}
+	return strings.Join(parts, "|")
 }
 
 func jsonRPCValueFingerprint(key string, value any) string {
@@ -671,7 +682,8 @@ func jsonRPCCommandActionSummary(params map[string]any) string {
 	cwd := payloadString(params, "cwd")
 	reason := payloadString(params, "reason")
 	actionSummary := payloadString(params, "action_summary")
-	if cwd == "" && reason == "" && actionSummary == "" {
+	additionalPermissions := jsonRPCSummaryValue("additionalPermissions", params["additionalPermissions"])
+	if cwd == "" && reason == "" && actionSummary == "" && additionalPermissions == "" {
 		return command
 	}
 	parts := []string{command}
@@ -683,6 +695,9 @@ func jsonRPCCommandActionSummary(params map[string]any) string {
 	}
 	if actionSummary != "" {
 		parts = append(parts, "summary: "+actionSummary)
+	}
+	if additionalPermissions != "" {
+		parts = append(parts, additionalPermissions)
 	}
 	return strings.Join(parts, " | ")
 }
@@ -1005,10 +1020,7 @@ func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line st
 			return agent.RunResult{}, false, fmt.Errorf("json-rpc notification before handshake")
 		}
 		if isExpectedJSONRPCNotification(msg.Method) {
-			if strings.TrimSpace(msg.Method) == "item/started" {
-				rememberJSONRPCStartedItem(msg.Params, jsonrpcItems)
-			}
-			return agent.RunResult{}, false, nil
+			return handleExpectedJSONRPCNotification(req, msg, handoffReceived, threadID, jsonrpcItems)
 		}
 		return agent.RunResult{}, false, fmt.Errorf("unsupported json-rpc notification %q", msg.Method)
 	}
@@ -1157,9 +1169,30 @@ func copyStringAnyMap(in map[string]any) map[string]any {
 	return out
 }
 
+func handleExpectedJSONRPCNotification(req agent.RunRequest, msg protocolMessage, handoffReceived *bool, threadID *string, jsonrpcItems map[string]map[string]any) (agent.RunResult, bool, error) {
+	switch strings.TrimSpace(msg.Method) {
+	case "thread/started":
+		if id := payloadString(msg.Params, "threadId"); id != "" {
+			*threadID = id
+		}
+		emit(req, "agent.thread_started", map[string]any{"thread_id": *threadID})
+	case "turn/started":
+		emit(req, "agent.turn_started", map[string]any{"turn_id": payloadString(msg.Params, "turnId")})
+	case "turn/completed":
+		emit(req, "agent.turn_completed", map[string]any{})
+		if !*handoffReceived {
+			return agent.RunResult{Kind: agent.RunResultMissingHandoff, FailureCode: core.FailureMissingHandoff, FailureMessage: "handoff missing"}, true, nil
+		}
+		return agent.RunResult{Kind: agent.RunResultSucceeded}, true, nil
+	case "item/started":
+		rememberJSONRPCStartedItem(msg.Params, jsonrpcItems)
+	}
+	return agent.RunResult{}, false, nil
+}
+
 func isExpectedJSONRPCNotification(method string) bool {
 	switch strings.TrimSpace(method) {
-	case "serverRequest/resolved", "item/started", "item/completed":
+	case "thread/started", "turn/started", "turn/completed", "serverRequest/resolved", "item/started", "item/completed":
 		return true
 	default:
 		return false
