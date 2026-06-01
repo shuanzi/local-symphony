@@ -607,6 +607,56 @@ printf '%s\n' '{"type":"turn_completed"}'
 	assertJSONRPCPermissionApprovalFile(t, filepath.Join(workspacePath, "jsonrpc-permission-approval.json"), "approval-permission-1")
 }
 
+func TestRunnerNetworkAllowlistDoesNotAutoApproveMixedJSONRPCPermissionApproval(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"id":"mixed-permission-1","method":"item/permissions/requestApproval","params":{"cwd":"/workspace","reason":"Allow mixed permissions","permissions":{"fileSystem":{"write":["/workspace"]},"network":{"enabled":true,"host":"example.invalid"}},"timeout_ms":5000}}'
+read approval_decision
+printf '%s\n' "$approval_decision" > "$SYMPHONY_WORKSPACE_PATH/jsonrpc-mixed-permission-approval.json"
+printf '%s\n' '{"type":"handoff","payload":{"summary":"JSON-RPC mixed permission approval completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
+printf '%s\n' '{"type":"turn_completed"}'
+`)
+	runner := &Runner{
+		Command: script + " app-server",
+		Policy: security.Policy{
+			NetworkDefault:   security.PolicyDeny,
+			NetworkAllowlist: []string{"example.invalid"},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultC := make(chan agent.RunResult, 1)
+	errC := make(chan error, 1)
+	go func() {
+		result, err := runner.Run(ctx, codexTestRunRequest(st, run, issue, workspacePath, token))
+		resultC <- result
+		errC <- err
+	}()
+
+	approval := waitForApprovalOrFailOnResultByRequestID(t, st, resultC, errC, "mixed-permission-1")
+	if approval.Kind != "file_change" {
+		t.Fatalf("mixed permission approval kind = %q, want file_change", approval.Kind)
+	}
+	if err := st.DecideApproval(approval.ID, "approved_once", "jsonrpc mixed permissions approved"); err != nil {
+		t.Fatalf("DecideApproval: %v", err)
+	}
+	result := waitCodexResult(t, resultC, errC)
+	if result.Kind != agent.RunResultSucceeded {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	assertJSONRPCPermissionApprovalFile(t, filepath.Join(workspacePath, "jsonrpc-mixed-permission-approval.json"), "mixed-permission-1")
+	assertRunEventCount(t, st, run.ID, "approval.requested", 1)
+	assertRunEventCount(t, st, run.ID, "approval.resolved", 1)
+}
+
 func TestRunnerDoesNotReuseApprovedForRunJSONRPCPermissionApproval(t *testing.T) {
 	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
 	script := writeFakeCodexBinary(t, `#!/bin/sh
@@ -2404,6 +2454,40 @@ func waitForApprovalByRequestID(t *testing.T, st *store.Store, requestID string)
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("approval with request_id %q was not created", requestID)
+	return nil
+}
+
+func waitForApprovalOrFailOnResultByRequestID(t *testing.T, st *store.Store, resultC <-chan agent.RunResult, errC <-chan error, requestID string) *store.Approval {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		approvals, err := st.PendingApprovals()
+		if err != nil {
+			t.Fatalf("PendingApprovals: %v", err)
+		}
+		for i := range approvals {
+			row, err := st.Project.QueryOne(`SELECT request_json FROM approval_requests WHERE id=?`, approvals[i].ID)
+			if err != nil {
+				t.Fatalf("query approval request_json: %v", err)
+			}
+			var request map[string]any
+			if err := json.Unmarshal([]byte(row["request_json"].String()), &request); err != nil {
+				t.Fatalf("decode request_json: %v", err)
+			}
+			if request["request_id"] == requestID {
+				return &approvals[i]
+			}
+		}
+		select {
+		case result := <-resultC:
+			if err := <-errC; err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			t.Fatalf("approval request %q completed before operator approval row: %#v", requestID, result)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatalf("approval with request_id %q was not created before runner completed", requestID)
 	return nil
 }
 

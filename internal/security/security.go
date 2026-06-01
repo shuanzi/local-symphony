@@ -72,6 +72,9 @@ func (p Policy) EvaluateCommand(req CommandRequest) PolicyDecision {
 	if len(argv) == 0 {
 		return PolicyDecision{Outcome: PolicyReview, Reason: "command_unclassified", PolicyMatch: "command.review.unclassified"}
 	}
+	if shellPipeToShell(argv, "curl") || shellPipeToShell(argv, "wget") {
+		return PolicyDecision{Outcome: PolicyDeny, Reason: "command_deny", PolicyMatch: "command.deny.default"}
+	}
 	if hasShellControlOperator(argv) {
 		return PolicyDecision{Outcome: PolicyReview, Reason: "command_compound", PolicyMatch: "command.review.compound"}
 	}
@@ -85,9 +88,7 @@ func (p Policy) EvaluateCommand(req CommandRequest) PolicyDecision {
 		commandMatches(argv, "scp"),
 		commandMatches(argv, "docker", "run", "--privileged"),
 		commandMatches(argv, "rm", "-rf", "/"),
-		commandMatches(argv, "rm", "-rf", "~"),
-		shellPipeToShell(argv, "curl"),
-		shellPipeToShell(argv, "wget"):
+		commandMatches(argv, "rm", "-rf", "~"):
 		return PolicyDecision{Outcome: PolicyDeny, Reason: "command_deny", PolicyMatch: "command.deny.default"}
 	case commandMatches(argv, "git", "status"),
 		commandMatches(argv, "git", "diff"),
