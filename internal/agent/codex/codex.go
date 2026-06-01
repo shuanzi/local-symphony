@@ -652,7 +652,7 @@ func collectPathCandidates(value any, paths *[]string) {
 	case map[string]any:
 		for key, child := range v {
 			lower := strings.ToLower(key)
-			if lower == "path" || lower == "paths" || lower == "grantroot" || lower == "read" || lower == "write" {
+			if lower == "path" || lower == "paths" || lower == "grantroot" || lower == "read" || lower == "write" || lower == "cwd" {
 				collectStringValues(child, paths)
 				continue
 			}
@@ -720,16 +720,18 @@ func jsonRPCApprovalKind(msg protocolMessage) string {
 
 func jsonRPCPermissionApprovalKind(params map[string]any) string {
 	permissions, _ := params["permissions"].(map[string]any)
-	if _, ok := permissions["network"]; ok {
+	if permissionRequestIsNetworkOnly(permissions) {
 		return "network"
 	}
-	if _, ok := permissions["fileSystem"]; ok {
-		return "file_change"
-	}
-	if _, ok := permissions["filesystem"]; ok {
-		return "file_change"
-	}
 	return "file_change"
+}
+
+func permissionRequestIsNetworkOnly(permissions map[string]any) bool {
+	if len(permissions) != 1 {
+		return false
+	}
+	_, ok := permissions["network"]
+	return ok
 }
 
 func jsonRPCRequestedPermissions(params map[string]any) map[string]any {

@@ -373,6 +373,60 @@ printf '%s\n' '{"type":"turn_completed"}'
 	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "command-allow-decision.json"), "command-allow-1", "accept")
 }
 
+func TestRunnerCommandPolicyDeniesProtectedCWD(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	req := codexTestRunRequest(st, run, issue, workspacePath, token)
+	msg := protocolMessage{
+		ID:     json.RawMessage(`"protected-cwd-1"`),
+		Method: "item/commandExecution/requestApproval",
+		Params: map[string]any{
+			"command": []any{"rg", "secret"},
+			"cwd":     "/workspace/.ssh",
+		},
+	}
+	input, _, err := approvalInputFromMessage(req, msg)
+	if err != nil {
+		t.Fatalf("approvalInputFromMessage: %v", err)
+	}
+
+	decision := (&Runner{}).evaluateApprovalPolicy(msg, input)
+
+	if decision.decision.Outcome != security.PolicyDeny || decision.failureCode != core.FailureProtectedPathDenied {
+		t.Fatalf("decision = %#v, want protected path denial", decision)
+	}
+}
+
+func TestRunnerMixedPermissionApprovalWithAllowlistedNetworkStaysUnderReview(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	req := codexTestRunRequest(st, run, issue, workspacePath, token)
+	msg := protocolMessage{
+		ID:     json.RawMessage(`"mixed-permission-1"`),
+		Method: "item/permissions/requestApproval",
+		Params: map[string]any{
+			"cwd":    "/workspace",
+			"reason": "Allow test permissions",
+			"permissions": map[string]any{
+				"fileSystem": map[string]any{"write": []any{"/workspace"}},
+				"network":    map[string]any{"enabled": true, "host": "example.invalid"},
+			},
+		},
+	}
+	input, _, err := approvalInputFromMessage(req, msg)
+	if err != nil {
+		t.Fatalf("approvalInputFromMessage: %v", err)
+	}
+	if input.Kind != "file_change" {
+		t.Fatalf("input kind = %q, want file_change for mixed permissions", input.Kind)
+	}
+	runner := &Runner{Policy: security.Policy{NetworkDefault: security.PolicyDeny, NetworkAllowlist: []string{"example.invalid"}}}
+
+	decision := runner.evaluateApprovalPolicy(msg, input)
+
+	if decision.decision.Outcome != security.PolicyReview {
+		t.Fatalf("decision = %#v, want review instead of allow", decision)
+	}
+}
+
 func TestRunnerCommandPolicyReviewKeepsPendingApprovalBehavior(t *testing.T) {
 	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
 	script := writeFakeCodexBinary(t, `#!/bin/sh
