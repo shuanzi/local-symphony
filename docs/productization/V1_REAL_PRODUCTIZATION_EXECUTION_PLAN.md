@@ -33,7 +33,7 @@ R15 是横切要求，不作为单独最后阶段处理。每完成一个需求�
 
 - [x] 阶段 A / 真实 Codex 最小闭环：A0-A5 已完成，合并记录为 PR #11；验收记录见 `docs/productization/V1_PHASE_A_ACCEPTANCE.md`。
 - [x] B1 / Approval API contract 补齐：已完成并合并 PR #12，Approval DTO、OpenAPI、JSON Schema、DB/fallback schema、store/httpapi、dashboard 类型与测试已对齐。
-- [ ] B2 / Codex approval producer 与 writeback：未完成；下一步应接入 Codex command/file_change/network approval request 到 `approval_requests`，并实现 operator 决策写回 Codex。
+- [x] B2 / Codex approval producer 与 writeback：已完成；Codex command/file_change/network approval request 会写入 `approval_requests`，operator 决策可写回 Codex，并覆盖 deny、cancel_run 与 timeout 语义。
 - [ ] B3 / 安全策略执行与回归套件：未完成；依赖 B2 的 approval bridge 形成可执行策略闭环。
 - [ ] 阶段 B 收口：未完成；需在 B1-B3 全部完成后运行阶段 B 门禁并生成阶段 B 验收记录。
 - [ ] 阶段 C / Daemon 产品行为补齐：未开始。
@@ -342,6 +342,8 @@ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
 
 ### B2. Codex approval producer 与 writeback
 
+**进度**：已完成。Codex adapter 在 handshake 后接收 `command`、`file_change`、`network` approval request，写入结构化 `approval_requests`，等待 operator 决策或 timeout，并通过 stdin 向 Codex 写回 `approval_decision`。`deny` 只写回拒绝并继续读取 Codex；`cancel_run` 走 `operator_cancelled` 终止路径；approval timeout 标记 row 为 `timeout` 并返回 `approval_timeout`。
+
 覆盖 R5 的 Codex bridge 部分。
 
 目标：
@@ -359,18 +361,18 @@ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
 
 任务拆分：
 
-1. Codex adapter 将 approval request normalizes 成 store row。
-2. orchestrator 等待 approval resolution 或 timeout。
-3. 实现 deny 只拒绝当前动作，不取消 run。
-4. 实现 cancel_run 立即终止 run，失败码 `operator_cancelled`，并 pause dispatch。
-5. 实现 approval timeout 后不可再决策。
-6. 增加 Codex transcript fixture 测试覆盖 writeback。
+1. [x] Codex adapter 将 approval request normalizes 成 store row。
+2. [x] orchestrator 等待 approval resolution 或 timeout。
+3. [x] 实现 deny 只拒绝当前动作，不取消 run。
+4. [x] 实现 cancel_run 立即终止 run，失败码 `operator_cancelled`，并 pause dispatch。
+5. [x] 实现 approval timeout 后不可再决策。
+6. [x] 增加 Codex fixture 测试覆盖 writeback。
 
 验收：
 
-- approval timeout -> `approval_timeout`。
-- deny 不直接设置 `operator_cancelled`。
-- cancel_run 使用 `operator_cancelled`，走终止 pause 路径。
+- [x] approval timeout -> `approval_timeout`。
+- [x] deny 不直接设置 `operator_cancelled`。
+- [x] cancel_run 使用 `operator_cancelled`，走终止 pause 路径。
 
 ### B3. 安全策略执行与回归套件
 

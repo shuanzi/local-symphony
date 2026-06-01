@@ -18,6 +18,7 @@ import (
 
 	"local-symphony/internal/agent"
 	"local-symphony/internal/core"
+	"local-symphony/internal/store"
 	"local-symphony/internal/toolgateway"
 )
 
@@ -179,17 +180,28 @@ func commandOutputWithTimeout(parts []string, timeout time.Duration) ([]byte, er
 }
 
 type protocolMessage struct {
-	Type            string         `json:"type"`
-	CodexVersion    string         `json:"codex_version"`
-	ProtocolVersion string         `json:"protocol_version"`
-	SchemaVersion   string         `json:"schema_version"`
-	ExperimentalAPI bool           `json:"experimental_api"`
-	ThreadID        string         `json:"thread_id"`
-	TurnID          string         `json:"turn_id"`
-	Message         string         `json:"message"`
-	FailureCode     string         `json:"failure_code"`
-	Error           string         `json:"error"`
-	Payload         map[string]any `json:"payload"`
+	JSONRPC         string          `json:"jsonrpc"`
+	ID              json.RawMessage `json:"id"`
+	Method          string          `json:"method"`
+	Type            string          `json:"type"`
+	CodexVersion    string          `json:"codex_version"`
+	ProtocolVersion string          `json:"protocol_version"`
+	SchemaVersion   string          `json:"schema_version"`
+	ExperimentalAPI bool            `json:"experimental_api"`
+	ThreadID        string          `json:"thread_id"`
+	TurnID          string          `json:"turn_id"`
+	Message         string          `json:"message"`
+	FailureCode     string          `json:"failure_code"`
+	Error           string          `json:"error"`
+	Payload         map[string]any  `json:"payload"`
+	Params          map[string]any  `json:"params"`
+}
+
+type approvalResponseTarget struct {
+	requestID            string
+	jsonrpcID            json.RawMessage
+	permissionsResponse  bool
+	requestedPermissions map[string]any
 }
 
 type stdoutItem struct {
@@ -209,6 +221,7 @@ type processSession struct {
 	processExited  bool
 	closed         bool
 	processStarted bool
+	jsonrpcItems   map[string]map[string]any
 }
 
 func (r *Runner) startAppServer(req agent.RunRequest, selected *SelectedFixture) (*processSession, agent.RunResult, error) {
@@ -257,6 +270,7 @@ func (r *Runner) startAppServer(req agent.RunRequest, selected *SelectedFixture)
 		stderrCounter:  stderrCounter,
 		selected:       selected,
 		processStarted: true,
+		jsonrpcItems:   map[string]map[string]any{},
 	}, agent.RunResult{}, nil
 }
 
@@ -335,7 +349,21 @@ func (r *Runner) runTurn(ctx context.Context, req agent.RunRequest, session *pro
 				return failed(core.FailureCodexProtocolError, "codex stdout read failed"), nil
 			}
 			resetTimer(stall, timeoutDuration(req.Timeouts.StallMS, 5*time.Minute))
-			result, terminal, err := handleProtocolLine(req, session.selected, item.line, &session.handshakeDone, &startupC, &handoffReceived, &session.threadID)
+			if isPostHandshakeApprovalRequest(item.line, session.handshakeDone) {
+				result, terminal, err := r.handleApprovalRequest(ctx, req, session, item.line, turnC)
+				if err != nil {
+					emit(req, "agent.protocol_error", map[string]any{"message": "redacted"})
+					_ = r.closeSession(req)
+					return failed(core.FailureCodexProtocolError, "codex protocol error"), nil
+				}
+				if terminal {
+					_ = r.closeSession(req)
+					return result, nil
+				}
+				resetTimer(stall, timeoutDuration(req.Timeouts.StallMS, 5*time.Minute))
+				continue
+			}
+			result, terminal, err := handleProtocolLine(req, session.selected, item.line, &session.handshakeDone, &startupC, &handoffReceived, &session.threadID, session.jsonrpcItems)
 			if err != nil {
 				emit(req, "agent.protocol_error", map[string]any{"message": "redacted"})
 				_ = r.closeSession(req)
@@ -350,6 +378,621 @@ func (r *Runner) runTurn(ctx context.Context, req agent.RunRequest, session *pro
 			}
 		}
 	}
+}
+
+func isPostHandshakeApprovalRequest(line string, handshakeDone bool) bool {
+	if !handshakeDone {
+		return false
+	}
+	var msg protocolMessage
+	if err := json.Unmarshal([]byte(line), &msg); err != nil {
+		return false
+	}
+	if msg.Type == "approval_requested" && strings.TrimSpace(payloadString(msg.Payload, "request_id")) != "" {
+		return true
+	}
+	return isJSONRPCApprovalMethod(msg.Method) && len(bytes.TrimSpace(msg.ID)) != 0
+}
+
+func (r *Runner) handleApprovalRequest(ctx context.Context, req agent.RunRequest, session *processSession, line string, turnC <-chan time.Time) (agent.RunResult, bool, error) {
+	if req.Gateway.Store == nil {
+		return agent.RunResult{}, false, fmt.Errorf("approval store is required")
+	}
+	var msg protocolMessage
+	if err := json.Unmarshal([]byte(line), &msg); err != nil {
+		return agent.RunResult{}, false, err
+	}
+	msg = mergeJSONRPCApprovalItemDetails(msg, session.jsonrpcItems)
+	approvalInput, responseTarget, err := approvalInputFromMessage(req, msg)
+	if err != nil {
+		return agent.RunResult{}, false, err
+	}
+	if handled, err := r.tryApprovedForRunDecision(req, session, approvalInput, responseTarget); err != nil {
+		return failed(core.FailureCodexProtocolError, "codex stdin write failed"), true, nil
+	} else if handled {
+		return agent.RunResult{}, false, nil
+	}
+	approval, err := req.Gateway.Store.CreatePendingApprovalRequest(approvalInput)
+	if err != nil {
+		return agent.RunResult{}, false, err
+	}
+	emit(req, "approval.requested", map[string]any{"kind": "redacted", "approval_id": approval.ID})
+	result, terminal, err := r.waitForApprovalDecision(ctx, req, session, approval.ID, responseTarget, approvalInput.TimeoutMS, turnC)
+	if err != nil || terminal {
+		return result, terminal, err
+	}
+	return agent.RunResult{}, false, nil
+}
+
+func (r *Runner) tryApprovedForRunDecision(req agent.RunRequest, session *processSession, approvalInput store.CreateApprovalRequestInput, target approvalResponseTarget) (bool, error) {
+	if target.permissionsResponse {
+		return false, nil
+	}
+	ok, err := req.Gateway.Store.HasApprovedForRunApproval(approvalInput)
+	if err != nil || !ok {
+		return false, err
+	}
+	if err := writeApprovalDecision(session.stdin, approvalIDForCodex("", target.requestID), target, "approve_for_run"); err != nil {
+		return false, err
+	}
+	emit(req, "approval.resolved", map[string]any{"decision": "redacted"})
+	return true, nil
+}
+
+func approvalInputFromMessage(req agent.RunRequest, msg protocolMessage) (store.CreateApprovalRequestInput, approvalResponseTarget, error) {
+	if isJSONRPCApprovalMethod(msg.Method) {
+		return approvalInputFromJSONRPCRequest(req, msg)
+	}
+	kind := strings.TrimSpace(payloadString(msg.Payload, "kind"))
+	switch kind {
+	case "command", "file_change", "network":
+	default:
+		return store.CreateApprovalRequestInput{}, approvalResponseTarget{}, fmt.Errorf("unsupported approval kind %q", kind)
+	}
+	requestID := strings.TrimSpace(payloadString(msg.Payload, "request_id"))
+	return store.CreateApprovalRequestInput{
+		RunID:         req.Run.ID,
+		IssueID:       req.Issue.ID,
+		Kind:          kind,
+		ActionSummary: payloadString(msg.Payload, "action_summary"),
+		RiskLevel:     payloadString(msg.Payload, "risk_level"),
+		PolicyMatch:   payloadString(msg.Payload, "policy_match"),
+		RequestID:     requestID,
+		CWD:           payloadString(msg.Payload, "cwd"),
+		Fingerprint:   payloadString(msg.Payload, "fingerprint"),
+		TimeoutMS:     payloadInt64(msg.Payload, "timeout_ms"),
+	}, approvalResponseTarget{requestID: requestID}, nil
+}
+
+func approvalInputFromJSONRPCRequest(req agent.RunRequest, msg protocolMessage) (store.CreateApprovalRequestInput, approvalResponseTarget, error) {
+	requestID := jsonRPCIDString(msg.ID)
+	if requestID == "" {
+		return store.CreateApprovalRequestInput{}, approvalResponseTarget{}, fmt.Errorf("json-rpc approval id is required")
+	}
+	kind := jsonRPCApprovalKind(msg)
+	target := approvalResponseTarget{requestID: requestID, jsonrpcID: append(json.RawMessage(nil), msg.ID...)}
+	if strings.TrimSpace(msg.Method) == "item/permissions/requestApproval" {
+		target.permissionsResponse = true
+		target.requestedPermissions = jsonRPCRequestedPermissions(msg.Params)
+	}
+	return store.CreateApprovalRequestInput{
+		RunID:         req.Run.ID,
+		IssueID:       req.Issue.ID,
+		Kind:          kind,
+		ActionSummary: jsonRPCApprovalActionSummary(kind, msg.Params),
+		RiskLevel:     payloadString(msg.Params, "risk_level"),
+		PolicyMatch:   payloadString(msg.Params, "policy_match"),
+		RequestID:     requestID,
+		CWD:           payloadString(msg.Params, "cwd"),
+		Fingerprint:   jsonRPCApprovalFingerprint(kind, msg.Params),
+		TimeoutMS:     payloadInt64(msg.Params, "timeout_ms"),
+	}, target, nil
+}
+
+func jsonRPCApprovalKind(msg protocolMessage) string {
+	switch strings.TrimSpace(msg.Method) {
+	case "item/fileChange/requestApproval":
+		return "file_change"
+	case "item/permissions/requestApproval":
+		return jsonRPCPermissionApprovalKind(msg.Params)
+	}
+	if hasNetworkApprovalContext(msg.Params) {
+		return "network"
+	}
+	return "command"
+}
+
+func jsonRPCPermissionApprovalKind(params map[string]any) string {
+	permissions, _ := params["permissions"].(map[string]any)
+	if _, ok := permissions["network"]; ok {
+		return "network"
+	}
+	if _, ok := permissions["fileSystem"]; ok {
+		return "file_change"
+	}
+	if _, ok := permissions["filesystem"]; ok {
+		return "file_change"
+	}
+	return "file_change"
+}
+
+func jsonRPCRequestedPermissions(params map[string]any) map[string]any {
+	permissions, ok := params["permissions"].(map[string]any)
+	if !ok || permissions == nil {
+		return map[string]any{}
+	}
+	return permissions
+}
+
+func jsonRPCApprovalFingerprint(kind string, params map[string]any) string {
+	switch kind {
+	case "command":
+		return jsonRPCCommandApprovalFingerprint(params)
+	case "file_change":
+		if value := payloadString(params, "grantRoot"); value != "" {
+			return "grantRoot:" + value
+		}
+		if value := payloadString(params, "path"); value != "" {
+			return "path:" + value
+		}
+		return jsonRPCValueFingerprint("changes", params["changes"])
+	case "network":
+		if value := jsonRPCValueFingerprint("networkApprovalContext", params["networkApprovalContext"]); value != "" {
+			return value
+		}
+		if additional, ok := params["additionalPermissions"].(map[string]any); ok {
+			if value := jsonRPCValueFingerprint("additionalPermissions.network", additional["network"]); value != "" {
+				return value
+			}
+		}
+		if permissions, ok := params["permissions"].(map[string]any); ok {
+			if value := jsonRPCValueFingerprint("permissions.network", permissions["network"]); value != "" {
+				return value
+			}
+		}
+		if value := jsonRPCValueFingerprint("policyAmendment", params["policyAmendment"]); value != "" {
+			return value
+		}
+		return jsonRPCValueFingerprint("policy_amendment", params["policy_amendment"])
+	default:
+		return ""
+	}
+}
+
+func jsonRPCCommandApprovalFingerprint(params map[string]any) string {
+	parts := make([]string, 0, 2)
+	if value := jsonRPCValueFingerprint("command", params["command"]); value != "" {
+		parts = append(parts, value)
+	}
+	if value := jsonRPCValueFingerprint("additionalPermissions", params["additionalPermissions"]); value != "" {
+		parts = append(parts, value)
+	}
+	return strings.Join(parts, "|")
+}
+
+func jsonRPCValueFingerprint(key string, value any) string {
+	if value == nil {
+		return ""
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return key + ":" + string(b)
+}
+
+func hasNetworkApprovalContext(params map[string]any) bool {
+	if hasJSONRPCCommand(params) {
+		return false
+	}
+	if _, ok := params["networkApprovalContext"]; ok {
+		return true
+	}
+	additional, ok := params["additionalPermissions"].(map[string]any)
+	if !ok {
+		return false
+	}
+	network, ok := additional["network"].(map[string]any)
+	if !ok {
+		return false
+	}
+	enabled, _ := network["enabled"].(bool)
+	return enabled
+}
+
+func hasJSONRPCCommand(params map[string]any) bool {
+	command, ok := params["command"]
+	if !ok || command == nil {
+		return false
+	}
+	switch value := command.(type) {
+	case string:
+		return strings.TrimSpace(value) != ""
+	case []any:
+		return len(value) > 0
+	default:
+		return true
+	}
+}
+
+func isJSONRPCApprovalMethod(method string) bool {
+	switch strings.TrimSpace(method) {
+	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval":
+		return true
+	default:
+		return false
+	}
+}
+
+func jsonRPCApprovalActionSummary(kind string, params map[string]any) string {
+	if kind != "command" {
+		if summary := jsonRPCPermissionActionSummary(params); summary != "" {
+			return summary
+		}
+	}
+	if kind == "command" {
+		if summary := jsonRPCCommandActionSummary(params); summary != "" {
+			return summary
+		}
+	}
+	if kind == "file_change" {
+		if summary := jsonRPCFileChangeActionSummary(params); summary != "" {
+			return summary
+		}
+	}
+	if value := payloadString(params, "action_summary"); value != "" {
+		return value
+	}
+	if value := payloadString(params, "reason"); value != "" {
+		return value
+	}
+	if kind == "command" {
+		return jsonRPCCommandSummary(params["command"])
+	}
+	return payloadString(params, "summary")
+}
+
+func jsonRPCPermissionActionSummary(params map[string]any) string {
+	permissions, ok := params["permissions"].(map[string]any)
+	if !ok || permissions == nil {
+		return ""
+	}
+	summary := payloadString(params, "reason")
+	if summary == "" {
+		summary = payloadString(params, "action_summary")
+	}
+	if summary == "" {
+		summary = payloadString(params, "summary")
+	}
+	permissionsJSON, err := json.Marshal(permissions)
+	if err != nil {
+		return summary
+	}
+	if summary == "" {
+		return "permissions: " + string(permissionsJSON)
+	}
+	return summary + " | permissions: " + string(permissionsJSON)
+}
+
+func jsonRPCCommandActionSummary(params map[string]any) string {
+	command := jsonRPCCommandDisplay(params["command"])
+	if command == "" {
+		return ""
+	}
+	cwd := payloadString(params, "cwd")
+	reason := payloadString(params, "reason")
+	actionSummary := payloadString(params, "action_summary")
+	additionalPermissions := jsonRPCSummaryValue("additionalPermissions", params["additionalPermissions"])
+	if cwd == "" && reason == "" && actionSummary == "" && additionalPermissions == "" {
+		return command
+	}
+	parts := []string{command}
+	if cwd != "" {
+		parts = append(parts, "cwd: "+cwd)
+	}
+	if reason != "" {
+		parts = append(parts, "reason: "+reason)
+	}
+	if actionSummary != "" {
+		parts = append(parts, "summary: "+actionSummary)
+	}
+	if additionalPermissions != "" {
+		parts = append(parts, additionalPermissions)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func jsonRPCCommandDisplay(value any) string {
+	switch command := value.(type) {
+	case string:
+		return strings.TrimSpace(command)
+	case []any:
+		parts := make([]string, 0, len(command))
+		for _, part := range command {
+			text, ok := part.(string)
+			if !ok {
+				return ""
+			}
+			parts = append(parts, text)
+		}
+		b, err := json.Marshal(parts)
+		if err != nil {
+			return ""
+		}
+		return "argv: " + string(b)
+	default:
+		return ""
+	}
+}
+
+func jsonRPCFileChangeActionSummary(params map[string]any) string {
+	parts := make([]string, 0, 5)
+	if reason := payloadString(params, "reason"); reason != "" {
+		parts = append(parts, reason)
+	} else if summary := payloadString(params, "action_summary"); summary != "" {
+		parts = append(parts, summary)
+	} else if summary := payloadString(params, "summary"); summary != "" {
+		parts = append(parts, summary)
+	}
+	if value := payloadString(params, "grantRoot"); value != "" {
+		parts = append(parts, "grantRoot: "+value)
+	}
+	if value := payloadString(params, "path"); value != "" {
+		parts = append(parts, "path: "+value)
+	}
+	if value := jsonRPCSummaryValue("paths", params["paths"]); value != "" {
+		parts = append(parts, value)
+	}
+	if value := payloadString(params, "diff"); value != "" {
+		parts = append(parts, "diff: "+value)
+	}
+	if value := jsonRPCSummaryValue("changes", params["changes"]); value != "" {
+		parts = append(parts, value)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func jsonRPCSummaryValue(label string, value any) string {
+	if value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return ""
+		}
+		return label + ": " + text
+	}
+	b, err := json.Marshal(value)
+	if err != nil || len(b) == 0 || string(b) == "null" {
+		return ""
+	}
+	return label + ": " + string(b)
+}
+
+func jsonRPCCommandSummary(value any) string {
+	switch command := value.(type) {
+	case string:
+		return strings.TrimSpace(command)
+	case []any:
+		parts := make([]string, 0, len(command))
+		for _, part := range command {
+			text, ok := part.(string)
+			if !ok {
+				return ""
+			}
+			parts = append(parts, text)
+		}
+		return strings.TrimSpace(strings.Join(parts, " "))
+	default:
+		return ""
+	}
+}
+
+func jsonRPCIDString(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+func (r *Runner) waitForApprovalDecision(ctx context.Context, req agent.RunRequest, session *processSession, approvalID string, target approvalResponseTarget, timeoutMS int64, turnC <-chan time.Time) (agent.RunResult, bool, error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var timeoutC <-chan time.Time
+	var timeout *time.Timer
+	if timeoutMS > 0 {
+		timeout = time.NewTimer(time.Duration(timeoutMS) * time.Millisecond)
+		defer timeout.Stop()
+		timeoutC = timeout.C
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			if err := markApprovalCancelledIfPending(req.Gateway.Store, approvalID, "operator cancelled"); err != nil {
+				return agent.RunResult{}, false, err
+			}
+			return failed(core.FailureOperatorCancelled, "operator cancelled"), true, nil
+		case <-turnC:
+			if err := markApprovalTimeoutIfPending(req.Gateway.Store, approvalID, "codex turn timeout"); err != nil {
+				return agent.RunResult{}, false, err
+			}
+			return failed(core.FailureTurnTimeout, "codex turn timeout"), true, nil
+		case err := <-session.waitCh:
+			session.closed = true
+			session.processExited = true
+			emitProcessExited(req, err, session.stderrCounter)
+			r.session = nil
+			if cancelErr := markApprovalCancelledIfPending(req.Gateway.Store, approvalID, "codex process exited"); cancelErr != nil {
+				return agent.RunResult{}, false, cancelErr
+			}
+			if err != nil {
+				return failed(core.FailureCodexProtocolError, err.Error()), true, nil
+			}
+			return failed(core.FailureCodexProtocolError, "codex process exited before approval decision"), true, nil
+		case <-timeoutC:
+			if err := markApprovalTimeoutIfPending(req.Gateway.Store, approvalID, "approval timed out"); err != nil {
+				return agent.RunResult{}, false, err
+			}
+			return failed(core.FailureApprovalTimeout, "approval timed out"), true, nil
+		case <-ticker.C:
+			approval, err := req.Gateway.Store.ApprovalByID(approvalID)
+			if err != nil {
+				return agent.RunResult{}, false, err
+			}
+			if approval.Status == "timeout" {
+				return failed(core.FailureApprovalTimeout, "approval timed out"), true, nil
+			}
+			decision, ok := approvalDecisionForStatus(approval.Status)
+			if !ok {
+				continue
+			}
+			if decision == "cancel_run" {
+				return failed(core.FailureOperatorCancelled, "operator cancelled"), true, nil
+			}
+			if err := writeApprovalDecision(session.stdin, approvalIDForCodex(approvalID, target.requestID), target, decision); err != nil {
+				return failed(core.FailureCodexProtocolError, "codex stdin write failed"), true, nil
+			}
+			emit(req, "approval.resolved", map[string]any{"decision": "redacted"})
+			return agent.RunResult{}, false, nil
+		}
+	}
+}
+
+func markApprovalTimeoutIfPending(st *store.Store, approvalID, reason string) error {
+	if err := st.MarkApprovalTimeout(approvalID, reason); err != nil {
+		if core.AsAPIError(err).Code == core.ErrApprovalNotPending {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func markApprovalCancelledIfPending(st *store.Store, approvalID, reason string) error {
+	if err := st.MarkApprovalCancelled(approvalID, reason); err != nil {
+		if core.AsAPIError(err).Code == core.ErrApprovalNotPending {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func payloadString(payload map[string]any, key string) string {
+	value, ok := payload[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func payloadInt64(payload map[string]any, key string) int64 {
+	switch value := payload[key].(type) {
+	case float64:
+		if value > 0 {
+			return int64(value)
+		}
+	case int64:
+		if value > 0 {
+			return value
+		}
+	case int:
+		if value > 0 {
+			return int64(value)
+		}
+	}
+	return 0
+}
+
+func approvalDecisionForStatus(status string) (string, bool) {
+	switch status {
+	case "approved_once":
+		return "approve_once", true
+	case "approved_for_run":
+		return "approve_for_run", true
+	case "approved_for_session":
+		return "approve_for_session", true
+	case "denied":
+		return "deny", true
+	case "cancelled":
+		return "cancel_run", true
+	default:
+		return "", false
+	}
+}
+
+func approvalIDForCodex(approvalID, requestID string) string {
+	if strings.TrimSpace(requestID) != "" {
+		return strings.TrimSpace(requestID)
+	}
+	return approvalID
+}
+
+func writeApprovalDecision(w io.Writer, approvalID string, target approvalResponseTarget, decision string) error {
+	if len(bytes.TrimSpace(target.jsonrpcID)) != 0 {
+		if target.permissionsResponse {
+			return writeJSONRPCPermissionApprovalDecision(w, target.jsonrpcID, decision, target.requestedPermissions)
+		}
+		return writeJSONRPCApprovalDecision(w, target.jsonrpcID, jsonRPCApprovalDecision(decision))
+	}
+	return json.NewEncoder(w).Encode(map[string]string{
+		"type":        "approval_decision",
+		"approval_id": approvalID,
+		"decision":    decision,
+	})
+}
+
+func jsonRPCApprovalDecision(decision string) string {
+	switch decision {
+	case "approve_once", "approve_for_run":
+		return "accept"
+	case "approve_for_session":
+		return "acceptForSession"
+	case "deny":
+		return "decline"
+	case "cancel_run":
+		return "cancel"
+	default:
+		return decision
+	}
+}
+
+func writeJSONRPCPermissionApprovalDecision(w io.Writer, id json.RawMessage, decision string, permissions map[string]any) error {
+	result := map[string]any{"permissions": map[string]any{}}
+	switch decision {
+	case "approve_once", "approve_for_run", "approve_for_session":
+		if permissions != nil {
+			result["permissions"] = permissions
+		}
+		if decision == "approve_for_session" {
+			result["scope"] = "session"
+		}
+	}
+	return json.NewEncoder(w).Encode(map[string]any{
+		"id":     json.RawMessage(bytes.TrimSpace(id)),
+		"result": result,
+	})
+}
+
+func writeJSONRPCApprovalDecision(w io.Writer, id json.RawMessage, decision string) error {
+	var buf bytes.Buffer
+	buf.WriteString(`{"id":`)
+	buf.Write(bytes.TrimSpace(id))
+	buf.WriteString(`,"result":{"decision":`)
+	decisionJSON, err := json.Marshal(decision)
+	if err != nil {
+		return err
+	}
+	buf.Write(decisionJSON)
+	buf.WriteString("}}\n")
+	_, err = w.Write(buf.Bytes())
+	return err
 }
 
 func (r *Runner) closeSession(req agent.RunRequest) error {
@@ -367,10 +1010,19 @@ func (r *Runner) closeSession(req agent.RunRequest) error {
 	return waitErr
 }
 
-func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line string, handshakeDone *bool, startupC *<-chan time.Time, handoffReceived *bool, threadID *string) (agent.RunResult, bool, error) {
+func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line string, handshakeDone *bool, startupC *<-chan time.Time, handoffReceived *bool, threadID *string, jsonrpcItems map[string]map[string]any) (agent.RunResult, bool, error) {
 	var msg protocolMessage
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
 		return agent.RunResult{}, false, err
+	}
+	if msg.Type == "" && strings.TrimSpace(msg.Method) != "" {
+		if !*handshakeDone {
+			return agent.RunResult{}, false, fmt.Errorf("json-rpc notification before handshake")
+		}
+		if isExpectedJSONRPCNotification(msg.Method) {
+			return handleExpectedJSONRPCNotification(req, msg, handoffReceived, threadID, jsonrpcItems)
+		}
+		return agent.RunResult{}, false, fmt.Errorf("unsupported json-rpc notification %q", msg.Method)
 	}
 	switch msg.Type {
 	case "handshake":
@@ -449,6 +1101,132 @@ func handleProtocolLine(req agent.RunRequest, selected *SelectedFixture, line st
 		return agent.RunResult{}, false, fmt.Errorf("unsupported codex message type %q", msg.Type)
 	}
 	return agent.RunResult{}, false, nil
+}
+
+func rememberJSONRPCStartedItem(params map[string]any, items map[string]map[string]any) {
+	if len(params) == 0 || items == nil {
+		return
+	}
+	details := copyStringAnyMap(params)
+	if item, ok := params["item"].(map[string]any); ok {
+		details = copyStringAnyMap(item)
+		for key, value := range params {
+			if key == "item" {
+				continue
+			}
+			if _, exists := details[key]; !exists {
+				details[key] = value
+			}
+		}
+	}
+	itemID := jsonRPCItemID(details)
+	if itemID == "" {
+		itemID = jsonRPCItemID(params)
+	}
+	if itemID == "" {
+		return
+	}
+	items[itemID] = details
+}
+
+func mergeJSONRPCApprovalItemDetails(msg protocolMessage, items map[string]map[string]any) protocolMessage {
+	if strings.TrimSpace(msg.Method) != "item/fileChange/requestApproval" || len(items) == 0 {
+		return msg
+	}
+	itemID := jsonRPCItemID(msg.Params)
+	if itemID == "" {
+		return msg
+	}
+	details, ok := items[itemID]
+	if !ok || len(details) == 0 {
+		return msg
+	}
+	merged := copyStringAnyMap(details)
+	for key, value := range msg.Params {
+		merged[key] = value
+	}
+	msg.Params = merged
+	return msg
+}
+
+func jsonRPCItemID(params map[string]any) string {
+	for _, key := range []string{"itemId", "item_id", "id"} {
+		if value := payloadString(params, key); value != "" {
+			return value
+		}
+	}
+	if item, ok := params["item"].(map[string]any); ok {
+		return jsonRPCItemID(item)
+	}
+	return ""
+}
+
+func copyStringAnyMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func jsonRPCTurnCompletionStatus(params map[string]any) string {
+	if turn, ok := params["turn"].(map[string]any); ok {
+		if status := payloadString(turn, "status"); status != "" {
+			return strings.ToLower(status)
+		}
+	}
+	if status := payloadString(params, "status"); status != "" {
+		return strings.ToLower(status)
+	}
+	return ""
+}
+
+func isFailedJSONRPCTurnStatus(status string) bool {
+	switch strings.TrimSpace(strings.ToLower(status)) {
+	case "", "completed", "success", "succeeded":
+		return false
+	default:
+		return true
+	}
+}
+
+func handleExpectedJSONRPCNotification(req agent.RunRequest, msg protocolMessage, handoffReceived *bool, threadID *string, jsonrpcItems map[string]map[string]any) (agent.RunResult, bool, error) {
+	switch strings.TrimSpace(msg.Method) {
+	case "thread/started":
+		if id := payloadString(msg.Params, "threadId"); id != "" {
+			*threadID = id
+		}
+		emit(req, "agent.thread_started", map[string]any{"thread_id": *threadID})
+	case "turn/started":
+		emit(req, "agent.turn_started", map[string]any{"turn_id": payloadString(msg.Params, "turnId")})
+	case "turn/completed":
+		status := jsonRPCTurnCompletionStatus(msg.Params)
+		if isFailedJSONRPCTurnStatus(status) {
+			emit(req, "agent.turn_failed", map[string]any{"failure_code": core.FailureCodexProtocolError, "status": status, "message": "redacted"})
+			return failed(core.FailureCodexProtocolError, "codex turn failed"), true, nil
+		}
+		emit(req, "agent.turn_completed", map[string]any{})
+		if !*handoffReceived {
+			return agent.RunResult{Kind: agent.RunResultMissingHandoff, FailureCode: core.FailureMissingHandoff, FailureMessage: "handoff missing"}, true, nil
+		}
+		return agent.RunResult{Kind: agent.RunResultSucceeded}, true, nil
+	case "item/started":
+		rememberJSONRPCStartedItem(msg.Params, jsonrpcItems)
+	}
+	return agent.RunResult{}, false, nil
+}
+
+func isExpectedJSONRPCNotification(method string) bool {
+	method = strings.TrimSpace(method)
+	if strings.HasPrefix(method, "item/") {
+		return true
+	}
+	switch method {
+	case "thread/started", "turn/started", "turn/completed", "serverRequest/resolved":
+		return true
+	default:
+		return false
+	}
 }
 
 func ParseCodexVersionOutput(output string) (string, error) {

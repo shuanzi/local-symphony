@@ -10,6 +10,12 @@
     "handoff",
     "approval_requested",
     "approval_resolved",
+    "thread/started",
+    "turn/started",
+    "turn/completed",
+    "serverRequest/resolved",
+    "item/started",
+    "item/completed",
     "tool_call",
     "turn_completed",
     "turn_failed"
@@ -17,7 +23,10 @@
   "supported_requests": [
     "initialize",
     "thread.start",
-    "turn.start"
+    "turn.start",
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval"
   ],
   "experimental_api": false
 }
