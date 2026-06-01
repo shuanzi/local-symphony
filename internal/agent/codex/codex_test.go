@@ -1543,6 +1543,16 @@ func TestHandleProtocolLineAcceptsAppServerLifecycleJSONRPCNotifications(t *test
 		t.Fatalf("item_jsonrpc was not remembered: %#v", items)
 	}
 
+	for _, method := range []string{"item/agentMessage/delta", "item/reasoning/delta", "item/toolCall/delta"} {
+		_, done, err = handleProtocolLine(req, nil, `{"method":"`+method+`","params":{"itemId":"item_jsonrpc"}}`, &handshakeDone, &startupC, &handoffReceived, &threadID, items)
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		if done {
+			t.Fatalf("%s done = true, want false", method)
+		}
+	}
+
 	handoffReceived = true
 	result, done, err := handleProtocolLine(req, nil, `{"method":"turn/completed","params":{"turnId":"turn_jsonrpc"}}`, &handshakeDone, &startupC, &handoffReceived, &threadID, items)
 	if err != nil {

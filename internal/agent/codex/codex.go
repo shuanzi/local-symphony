@@ -1191,8 +1191,12 @@ func handleExpectedJSONRPCNotification(req agent.RunRequest, msg protocolMessage
 }
 
 func isExpectedJSONRPCNotification(method string) bool {
-	switch strings.TrimSpace(method) {
-	case "thread/started", "turn/started", "turn/completed", "serverRequest/resolved", "item/started", "item/completed":
+	method = strings.TrimSpace(method)
+	if strings.HasPrefix(method, "item/") {
+		return true
+	}
+	switch method {
+	case "thread/started", "turn/started", "turn/completed", "serverRequest/resolved":
 		return true
 	default:
 		return false
