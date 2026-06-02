@@ -75,7 +75,7 @@ func (p Policy) EvaluateCommand(req CommandRequest) PolicyDecision {
 	if shellPipeToShell(argv, "curl") || shellPipeToShell(argv, "wget") {
 		return PolicyDecision{Outcome: PolicyDeny, Reason: "command_deny", PolicyMatch: "command.deny.default"}
 	}
-	if hasShellControlOperator(argv) {
+	if hasShellReviewSyntax(argv) || shellCommandHasReviewSyntax(req.CommandLine) {
 		return PolicyDecision{Outcome: PolicyReview, Reason: "command_compound", PolicyMatch: "command.review.compound"}
 	}
 	switch {
@@ -247,14 +247,89 @@ func shellPipeToShell(argv []string, downloader string) bool {
 	return false
 }
 
-func hasShellControlOperator(argv []string) bool {
+func hasShellReviewSyntax(argv []string) bool {
 	for _, arg := range argv {
 		switch arg {
 		case "|", "||", "&&", ";", "&", "\n":
 			return true
 		}
+		if argHasCommandSubstitution(arg) || argHasRedirection(arg) {
+			return true
+		}
 	}
 	return false
+}
+
+func argHasCommandSubstitution(arg string) bool {
+	return strings.Contains(arg, "$(") || strings.Contains(arg, "`")
+}
+
+func argHasRedirection(arg string) bool {
+	if arg == "" {
+		return false
+	}
+	if arg[0] == '>' || arg[0] == '<' {
+		return true
+	}
+	if strings.HasPrefix(arg, "&>") {
+		return true
+	}
+	for i := 0; i < len(arg); i++ {
+		if arg[i] != '>' && arg[i] != '<' {
+			continue
+		}
+		if i > 0 && (arg[i-1] == '&' || isASCIIDigit(arg[i-1])) {
+			return true
+		}
+	}
+	return false
+}
+
+func shellCommandHasReviewSyntax(command string) bool {
+	var quote rune
+	escaped := false
+	for i, r := range command {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if quote == '\'' {
+			if r == quote {
+				quote = 0
+			}
+			continue
+		}
+		if quote == '"' {
+			if r == quote {
+				quote = 0
+				continue
+			}
+			if r == '`' || commandSubstitutionAt(command, i) {
+				return true
+			}
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			continue
+		}
+		if r == '`' || commandSubstitutionAt(command, i) || r == '>' || r == '<' {
+			return true
+		}
+	}
+	return false
+}
+
+func commandSubstitutionAt(command string, idx int) bool {
+	return idx+1 < len(command) && command[idx] == '$' && command[idx+1] == '('
+}
+
+func isASCIIDigit(b byte) bool {
+	return b >= '0' && b <= '9'
 }
 
 func commandPathCandidates(argv []string) []string {

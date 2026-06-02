@@ -111,6 +111,56 @@ func TestDefaultPolicyDoesNotAllowNewlineSeparatedShellCommandWithDeniedTail(t *
 	}
 }
 
+func TestDefaultPolicyReviewsShellRedirectionsBeforeAllowlist(t *testing.T) {
+	policy := DefaultPolicy()
+	tests := []struct {
+		name    string
+		request CommandRequest
+	}{
+		{name: "spaced stdout redirect", request: CommandRequest{CommandLine: "rg TODO > internal/foo.go"}},
+		{name: "compact stdout redirect", request: CommandRequest{CommandLine: "rg TODO>internal/foo.go"}},
+		{name: "append redirect", request: CommandRequest{CommandLine: "rg TODO >> internal/foo.go"}},
+		{name: "stdin redirect", request: CommandRequest{CommandLine: "rg TODO < input.txt"}},
+		{name: "descriptor redirect", request: CommandRequest{CommandLine: "rg TODO 2>errors.log"}},
+		{name: "argv redirect token", request: CommandRequest{Argv: []string{"rg", "TODO", ">", "internal/foo.go"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := policy.EvaluateCommand(tt.request)
+			if got.Outcome != PolicyReview {
+				t.Fatalf("redirection command outcome = %s, want %s", got.Outcome, PolicyReview)
+			}
+			if got.Reason != "command_compound" {
+				t.Fatalf("redirection command reason = %q, want command_compound", got.Reason)
+			}
+		})
+	}
+}
+
+func TestDefaultPolicyReviewsCommandSubstitutionsBeforeAllowlist(t *testing.T) {
+	policy := DefaultPolicy()
+	tests := []struct {
+		name    string
+		request CommandRequest
+	}{
+		{name: "dollar paren", request: CommandRequest{CommandLine: "rg $(git push origin main)"}},
+		{name: "backtick", request: CommandRequest{CommandLine: "rg `git push origin main`"}},
+		{name: "double quoted substitution", request: CommandRequest{CommandLine: "rg \"$(git push origin main)\""}},
+		{name: "argv substitution token", request: CommandRequest{Argv: []string{"rg", "$(git push origin main)"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := policy.EvaluateCommand(tt.request)
+			if got.Outcome != PolicyReview {
+				t.Fatalf("command substitution outcome = %s, want %s", got.Outcome, PolicyReview)
+			}
+			if got.Reason != "command_compound" {
+				t.Fatalf("command substitution reason = %q, want command_compound", got.Reason)
+			}
+		})
+	}
+}
+
 func TestDefaultPolicyDeniesPipeToShellDownloaders(t *testing.T) {
 	policy := DefaultPolicy()
 	tests := []struct {
