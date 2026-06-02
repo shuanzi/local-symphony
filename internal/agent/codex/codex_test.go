@@ -373,6 +373,48 @@ printf '%s\n' '{"type":"turn_completed"}'
 	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "command-allow-decision.json"), "command-allow-1", "accept")
 }
 
+func TestRunnerCommandPolicyMissingStructuredCommandStaysUnderReview(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	script := writeFakeCodexBinary(t, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex 0.0.0-test"
+  exit 0
+fi
+read start_turn
+printf '%s\n' '{"type":"handshake","codex_version":"0.0.0-test","protocol_version":"protocol-test-v1","schema_version":"schema-test-v1","experimental_api":false}'
+printf '%s\n' '{"type":"thread_started","thread_id":"thread_fixture"}'
+printf '%s\n' '{"type":"turn_started","turn_id":"turn_fixture"}'
+printf '%s\n' '{"id":"command-missing-argv-1","method":"item/commandExecution/requestApproval","params":{"action_summary":"rg TODO","cwd":"/workspace","timeout_ms":5000}}'
+read approval_decision
+printf '%s\n' "$approval_decision" > "$SYMPHONY_WORKSPACE_PATH/command-missing-argv-decision.json"
+printf '%s\n' '{"type":"handoff","payload":{"summary":"Reviewed command completed.","changed_files":[],"tests":[],"risks":[],"verification":[],"followups":[],"target_state":"Human Review"}}'
+printf '%s\n' '{"type":"turn_completed"}'
+`)
+	runner := &Runner{Command: script + " app-server"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultC := make(chan agent.RunResult, 1)
+	errC := make(chan error, 1)
+	go func() {
+		result, err := runner.Run(ctx, codexTestRunRequest(st, run, issue, workspacePath, token))
+		resultC <- result
+		errC <- err
+	}()
+
+	approval := waitForApprovalOrFailOnResultByRequestID(t, st, resultC, errC, "command-missing-argv-1")
+	if approval.Status != "pending" || approval.PolicyMatch != "command.review.unclassified" {
+		t.Fatalf("approval = %#v, want pending unclassified review", approval)
+	}
+	if err := st.DecideApproval(approval.ID, "approved_once", "reviewed missing command details"); err != nil {
+		t.Fatalf("DecideApproval: %v", err)
+	}
+	result := waitCodexResult(t, resultC, errC)
+	if result.Kind != agent.RunResultSucceeded {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	assertJSONRPCApprovalDecisionFile(t, filepath.Join(workspacePath, "command-missing-argv-decision.json"), "command-missing-argv-1", "accept")
+}
+
 func TestRunnerCommandPolicyDeniesProtectedCWD(t *testing.T) {
 	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
 	req := codexTestRunRequest(st, run, issue, workspacePath, token)

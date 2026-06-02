@@ -573,9 +573,6 @@ func approvalCommandRequest(data map[string]any) security.CommandRequest {
 		}
 		return security.CommandRequest{Argv: argv}
 	default:
-		if summary := payloadString(data, "action_summary"); summary != "" {
-			return security.CommandRequest{CommandLine: summary}
-		}
 		return security.CommandRequest{}
 	}
 }
