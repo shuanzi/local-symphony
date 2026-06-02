@@ -342,17 +342,48 @@ func commandPathCandidates(argv []string) []string {
 			continue
 		}
 		if strings.HasPrefix(arg, "-") {
-			if before, after, ok := strings.Cut(arg, "="); ok && before != "" && after != "" {
-				arg = after
-			} else {
+			candidate, ok := flagPathCandidate(arg)
+			if !ok {
 				continue
 			}
+			arg = candidate
 		}
-		if strings.Contains(arg, "/") || strings.Contains(arg, ".") || strings.HasPrefix(arg, "~") {
+		if pathLikeCommandArg(arg) {
 			out = append(out, arg)
 		}
 	}
 	return out
+}
+
+func flagPathCandidate(arg string) (string, bool) {
+	if before, after, ok := strings.Cut(arg, "="); ok && before != "" && after != "" {
+		return after, true
+	}
+	if strings.HasPrefix(arg, "--") || len(arg) < 3 {
+		return "", false
+	}
+	option := arg[1]
+	if !shortOptionTakesPathValue(option) {
+		return "", false
+	}
+	value := arg[2:]
+	if value == "" || strings.HasPrefix(value, "-") {
+		return "", false
+	}
+	return value, true
+}
+
+func shortOptionTakesPathValue(option byte) bool {
+	switch option {
+	case 'f', 'g', 'o':
+		return true
+	default:
+		return false
+	}
+}
+
+func pathLikeCommandArg(arg string) bool {
+	return strings.Contains(arg, "/") || strings.Contains(arg, ".") || strings.HasPrefix(arg, "~")
 }
 
 func shellFields(command string) []string {

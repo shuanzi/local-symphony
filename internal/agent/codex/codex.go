@@ -479,15 +479,18 @@ func (r *Runner) evaluateApprovalPolicy(msg protocolMessage, input store.CreateA
 		decision := policy.EvaluateNetwork(security.NetworkRequest{Host: approvalNetworkHost(data)})
 		return approvalPolicyDecision{decision: decision, failureCode: core.FailureNetworkDenied}
 	case "command":
-		if approvalRequestsNetwork(data) {
-			decision := policy.EvaluateNetwork(security.NetworkRequest{Host: approvalNetworkHost(data)})
-			if decision.Outcome != security.PolicyAllow {
-				return approvalPolicyDecision{decision: decision, failureCode: core.FailureNetworkDenied}
-			}
-		}
 		command := approvalCommandRequest(data)
 		command.Paths = append(command.Paths, paths...)
 		decision := policy.EvaluateCommand(command)
+		if decision.Outcome == security.PolicyDeny {
+			return approvalPolicyDecision{decision: decision, failureCode: commandFailureCode(decision)}
+		}
+		if approvalRequestsNetwork(data) {
+			networkDecision := policy.EvaluateNetwork(security.NetworkRequest{Host: approvalNetworkHost(data)})
+			if networkDecision.Outcome != security.PolicyAllow {
+				return approvalPolicyDecision{decision: networkDecision, failureCode: core.FailureNetworkDenied}
+			}
+		}
 		return approvalPolicyDecision{decision: decision, failureCode: commandFailureCode(decision)}
 	case "file_change":
 		return approvalPolicyDecision{

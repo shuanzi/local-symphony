@@ -181,13 +181,25 @@ func TestDefaultPolicyDeniesPipeToShellDownloaders(t *testing.T) {
 }
 
 func TestDefaultPolicyCommandProtectedPathOverrideChecksFlagValues(t *testing.T) {
-	got := DefaultPolicy().EvaluateCommand(CommandRequest{Argv: []string{"go", "test", "./...", "-coverprofile=.env"}})
-
-	if got.Outcome != PolicyDeny {
-		t.Fatalf("protected flag path outcome = %s, want %s", got.Outcome, PolicyDeny)
+	policy := DefaultPolicy()
+	tests := []struct {
+		name string
+		argv []string
+	}{
+		{name: "long flag equals", argv: []string{"go", "test", "./...", "-coverprofile=.env"}},
+		{name: "rg attached glob", argv: []string{"rg", "-g.env", "SECRET", "."}},
+		{name: "attached output", argv: []string{"go", "test", "./...", "-o.env"}},
 	}
-	if got.Reason != "protected_path" {
-		t.Fatalf("protected flag path reason = %q, want protected_path", got.Reason)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := policy.EvaluateCommand(CommandRequest{Argv: tt.argv})
+			if got.Outcome != PolicyDeny {
+				t.Fatalf("protected flag path outcome = %s, want %s", got.Outcome, PolicyDeny)
+			}
+			if got.Reason != "protected_path" {
+				t.Fatalf("protected flag path reason = %q, want protected_path", got.Reason)
+			}
+		})
 	}
 }
 

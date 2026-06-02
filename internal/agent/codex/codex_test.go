@@ -469,6 +469,36 @@ func TestRunnerMixedPermissionApprovalWithAllowlistedNetworkStaysUnderReview(t *
 	}
 }
 
+func TestRunnerCommandPolicyDenyWinsBeforeNetworkReview(t *testing.T) {
+	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
+	req := codexTestRunRequest(st, run, issue, workspacePath, token)
+	msg := protocolMessage{
+		ID:     json.RawMessage(`"command-network-deny-1"`),
+		Method: "item/commandExecution/requestApproval",
+		Params: map[string]any{
+			"command": []any{"git", "push"},
+			"cwd":     workspacePath,
+			"additionalPermissions": map[string]any{
+				"network": map[string]any{"enabled": true, "host": "example.invalid"},
+			},
+		},
+	}
+	input, _, err := approvalInputFromMessage(req, msg)
+	if err != nil {
+		t.Fatalf("approvalInputFromMessage: %v", err)
+	}
+	runner := &Runner{Policy: security.Policy{NetworkDefault: security.PolicyReview}}
+
+	decision := runner.evaluateApprovalPolicy(msg, input)
+
+	if decision.decision.Outcome != security.PolicyDeny || decision.failureCode != core.FailureCommandDenied {
+		t.Fatalf("decision = %#v, want command denial before network review", decision)
+	}
+	if decision.decision.PolicyMatch != "command.deny.default" {
+		t.Fatalf("policy match = %q, want command.deny.default", decision.decision.PolicyMatch)
+	}
+}
+
 func TestRunnerCommandPolicyReviewKeepsPendingApprovalBehavior(t *testing.T) {
 	st, run, issue, workspacePath, token := newCodexRunnerFixture(t)
 	script := writeFakeCodexBinary(t, `#!/bin/sh
