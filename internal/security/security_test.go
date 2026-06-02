@@ -100,6 +100,17 @@ func TestDefaultPolicyDoesNotAllowCompoundShellCommandWithDeniedTail(t *testing.
 	}
 }
 
+func TestDefaultPolicyDoesNotAllowNewlineSeparatedShellCommandWithDeniedTail(t *testing.T) {
+	got := DefaultPolicy().EvaluateCommand(CommandRequest{CommandLine: "rg TODO\ngit push origin main"})
+
+	if got.Outcome != PolicyReview {
+		t.Fatalf("newline-separated command outcome = %s, want %s", got.Outcome, PolicyReview)
+	}
+	if got.Reason != "command_compound" {
+		t.Fatalf("newline-separated command reason = %q, want command_compound", got.Reason)
+	}
+}
+
 func TestDefaultPolicyDeniesPipeToShellDownloaders(t *testing.T) {
 	policy := DefaultPolicy()
 	tests := []struct {

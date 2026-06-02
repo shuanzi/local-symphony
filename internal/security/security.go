@@ -250,7 +250,7 @@ func shellPipeToShell(argv []string, downloader string) bool {
 func hasShellControlOperator(argv []string) bool {
 	for _, arg := range argv {
 		switch arg {
-		case "|", "||", "&&", ";", "&":
+		case "|", "||", "&&", ";", "&", "\n":
 			return true
 		}
 	}
@@ -305,6 +305,14 @@ func shellFields(command string) []string {
 		}
 		if r == '\'' || r == '"' {
 			quote = r
+			continue
+		}
+		if r == '\n' || r == '\r' {
+			if cur.Len() > 0 {
+				fields = append(fields, cur.String())
+				cur.Reset()
+			}
+			fields = append(fields, "\n")
 			continue
 		}
 		if strings.TrimSpace(string(r)) == "" {
