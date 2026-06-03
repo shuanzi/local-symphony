@@ -1839,6 +1839,26 @@ func TestJSONRPCCommandApprovalFingerprintIncludesAdditionalPermissions(t *testi
 	}
 }
 
+func TestJSONRPCCommandApprovalFingerprintIncludesNetworkApprovalContext(t *testing.T) {
+	base := map[string]any{"command": []any{"go", "test", "./..."}}
+	withNetworkContext := map[string]any{
+		"command":                []any{"go", "test", "./..."},
+		"networkApprovalContext": map[string]any{"host": "example.invalid"},
+	}
+
+	baseFingerprint := jsonRPCApprovalFingerprint("command", base)
+	networkFingerprint := jsonRPCApprovalFingerprint("command", withNetworkContext)
+	if baseFingerprint == "" || networkFingerprint == "" {
+		t.Fatalf("fingerprints must be populated: base=%q network=%q", baseFingerprint, networkFingerprint)
+	}
+	if baseFingerprint == networkFingerprint {
+		t.Fatalf("fingerprints should differ when networkApprovalContext differs: %q", baseFingerprint)
+	}
+	if !strings.Contains(networkFingerprint, "networkApprovalContext") || !strings.Contains(networkFingerprint, "example.invalid") {
+		t.Fatalf("fingerprint %q missing network approval context", networkFingerprint)
+	}
+}
+
 func TestHandleProtocolLineAcceptsAppServerLifecycleJSONRPCNotifications(t *testing.T) {
 	req := agent.RunRequest{}
 	handshakeDone := true

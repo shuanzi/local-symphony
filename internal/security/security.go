@@ -78,6 +78,9 @@ func (p Policy) EvaluateCommand(req CommandRequest) PolicyDecision {
 	if hasShellReviewSyntax(argv) || shellCommandHasReviewSyntax(req.CommandLine) {
 		return PolicyDecision{Outcome: PolicyReview, Reason: "command_compound", PolicyMatch: "command.review.compound"}
 	}
+	if ripgrepHiddenOrUnrestrictedSearch(argv) {
+		return PolicyDecision{Outcome: PolicyReview, Reason: "command_review", PolicyMatch: "command.review.rg_hidden"}
+	}
 	switch {
 	case commandMatches(argv, "git", "push"),
 		commandMatches(argv, "git", "push", "--force"),
@@ -214,6 +217,27 @@ func commandMatches(argv []string, prefix ...string) bool {
 		}
 	}
 	return true
+}
+
+func ripgrepHiddenOrUnrestrictedSearch(argv []string) bool {
+	if !commandMatches(argv, "rg") {
+		return false
+	}
+	for _, arg := range argv[1:] {
+		if arg == "--" {
+			return false
+		}
+		if arg == "--hidden" || arg == "--unrestricted" {
+			return true
+		}
+		if strings.HasPrefix(arg, "--") {
+			continue
+		}
+		if strings.HasPrefix(arg, "-") && strings.Contains(arg[1:], "u") {
+			return true
+		}
+	}
+	return false
 }
 
 func allowedSymphonyTool(argv []string) bool {

@@ -778,8 +778,11 @@ func jsonRPCApprovalFingerprint(kind string, params map[string]any) string {
 }
 
 func jsonRPCCommandApprovalFingerprint(params map[string]any) string {
-	parts := make([]string, 0, 2)
+	parts := make([]string, 0, 3)
 	if value := jsonRPCValueFingerprint("command", params["command"]); value != "" {
+		parts = append(parts, value)
+	}
+	if value := jsonRPCValueFingerprint("networkApprovalContext", params["networkApprovalContext"]); value != "" {
 		parts = append(parts, value)
 	}
 	if value := jsonRPCValueFingerprint("additionalPermissions", params["additionalPermissions"]); value != "" {

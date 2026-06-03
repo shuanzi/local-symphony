@@ -111,6 +111,30 @@ func TestDefaultPolicyDoesNotAllowNewlineSeparatedShellCommandWithDeniedTail(t *
 	}
 }
 
+func TestDefaultPolicyReviewsRipgrepHiddenAndUnrestrictedSearches(t *testing.T) {
+	policy := DefaultPolicy()
+	tests := []struct {
+		name string
+		argv []string
+	}{
+		{name: "hidden long flag", argv: []string{"rg", "--hidden", "SECRET", "."}},
+		{name: "unrestricted long flag", argv: []string{"rg", "--unrestricted", "SECRET", "."}},
+		{name: "single unrestricted short flag", argv: []string{"rg", "-u", "SECRET", "."}},
+		{name: "clustered unrestricted short flag", argv: []string{"rg", "-nu", "SECRET", "."}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := policy.EvaluateCommand(CommandRequest{Argv: tt.argv})
+			if got.Outcome != PolicyReview {
+				t.Fatalf("ripgrep hidden/unrestricted outcome = %s, want %s", got.Outcome, PolicyReview)
+			}
+			if got.PolicyMatch != "command.review.rg_hidden" {
+				t.Fatalf("ripgrep hidden/unrestricted policy match = %q, want command.review.rg_hidden", got.PolicyMatch)
+			}
+		})
+	}
+}
+
 func TestDefaultPolicyReviewsShellRedirectionsBeforeAllowlist(t *testing.T) {
 	policy := DefaultPolicy()
 	tests := []struct {
