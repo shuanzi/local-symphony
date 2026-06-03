@@ -362,15 +362,17 @@ func flagPathCandidate(arg string) (string, bool) {
 	if strings.HasPrefix(arg, "--") || len(arg) < 3 {
 		return "", false
 	}
-	option := arg[1]
-	if !shortOptionTakesPathValue(option) {
-		return "", false
+	for i := 1; i < len(arg)-1; i++ {
+		if !shortOptionTakesPathValue(arg[i]) {
+			continue
+		}
+		value := arg[i+1:]
+		if value == "" || strings.HasPrefix(value, "-") {
+			return "", false
+		}
+		return value, true
 	}
-	value := arg[2:]
-	if value == "" || strings.HasPrefix(value, "-") {
-		return "", false
-	}
-	return value, true
+	return "", false
 }
 
 func shortOptionTakesPathValue(option byte) bool {

@@ -188,6 +188,8 @@ func TestDefaultPolicyCommandProtectedPathOverrideChecksFlagValues(t *testing.T)
 	}{
 		{name: "long flag equals", argv: []string{"go", "test", "./...", "-coverprofile=.env"}},
 		{name: "rg attached glob", argv: []string{"rg", "-g.env", "SECRET", "."}},
+		{name: "rg clustered attached glob", argv: []string{"rg", "-ig.env", "SECRET", "."}},
+		{name: "rg multi clustered attached glob", argv: []string{"rg", "-nig.env", "SECRET", "."}},
 		{name: "attached output", argv: []string{"go", "test", "./...", "-o.env"}},
 	}
 	for _, tt := range tests {
