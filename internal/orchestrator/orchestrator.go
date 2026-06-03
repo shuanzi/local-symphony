@@ -79,6 +79,23 @@ func reasonOrDefault(s, d string) string {
 	return s
 }
 
+func shouldRunAfterCreate(st *store.Store, issue *core.Issue) (bool, error) {
+	if issue.Workspace == nil || issue.Workspace.Status != "prepared" {
+		return true, nil
+	}
+	rows, err := st.Project.Query(
+		`SELECT event_type FROM run_events WHERE issue_id=? AND event_type IN ('hook.after_create.started','hook.after_create.output','hook.after_create.completed','hook.after_create.failed','hook.after_create.timeout') ORDER BY seq DESC LIMIT 1`,
+		issue.ID,
+	)
+	if err != nil {
+		return false, err
+	}
+	if len(rows) == 0 {
+		return false, nil
+	}
+	return rows[0]["event_type"].String() != "hook.after_create.completed", nil
+}
+
 func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	run, err := o.Store.GetRun(runID)
 	if err != nil {
@@ -92,10 +109,25 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		return nil
 	}
 	mgr := workspace.Manager{Store: o.Store, Config: wf.Config}
+	runAfterCreate, err := shouldRunAfterCreate(o.Store, issue)
+	if err != nil {
+		_ = o.Store.FailRun(runID, core.FailureAfterCreateFailed, fmt.Sprintf("load after_create state: %v", err), core.RunFailed)
+		return nil
+	}
 	ws, err := mgr.Prepare(run, issue)
 	if err != nil {
 		_ = o.Store.FailRun(runID, core.FailureWorkspacePrepareFailed, err.Error(), core.RunFailed)
 		return nil
+	}
+	if runAfterCreate {
+		if err := runWorkflowHook(o.Store, wf, ws.Path, runID, issue.ID, "after_create", wf.Config.Hooks.AfterCreate); err != nil {
+			_ = o.Store.FailRun(runID, core.FailureAfterCreateFailed, err.Error(), core.RunFailed)
+			return nil
+		}
+		active, activeErr := o.runIsActive(runID)
+		if activeErr != nil || !active {
+			return nil
+		}
 	}
 	if !o.advanceRun(runID, core.RunRenderingPrompt, map[string]any{}) {
 		return nil
@@ -117,6 +149,10 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	ph := sha256.Sum256([]byte(prompt))
 	ch := sha256.Sum256([]byte(issue.ID + runID))
 	_, _ = o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), filepath.Join(o.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, runID))
+	if err := runWorkflowHook(o.Store, wf, ws.Path, runID, issue.ID, "before_run", wf.Config.Hooks.BeforeRun); err != nil {
+		_ = o.Store.FailRun(runID, core.FailureBeforeRunFailed, err.Error(), core.RunFailed)
+		return nil
+	}
 	if !o.advanceRun(runID, core.RunStartingAgent, map[string]any{}) {
 		return nil
 	}
@@ -312,12 +348,17 @@ func (o Orchestrator) advanceRun(runID string, status core.RunStatus, fields map
 }
 
 func runAfterHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID string) error {
-	if wf.Config.Hooks.AfterRun == nil || strings.TrimSpace(*wf.Config.Hooks.AfterRun) == "" {
-		_ = st.AppendEvent("hook.after_run.completed", "hook", &issueID, &runID, map[string]any{"configured": false})
+	return runWorkflowHook(st, wf, cwd, runID, issueID, "after_run", wf.Config.Hooks.AfterRun)
+}
+
+func runWorkflowHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID, hookName string, command *string) error {
+	eventPrefix := "hook." + hookName
+	if command == nil || strings.TrimSpace(*command) == "" {
+		_ = st.AppendEvent(eventPrefix+".completed", "hook", &issueID, &runID, map[string]any{"configured": false})
 		return nil
 	}
-	cmdText := *wf.Config.Hooks.AfterRun
-	_ = st.AppendEvent("hook.after_run.started", "hook", &issueID, &runID, map[string]any{"command": "redacted"})
+	cmdText := *command
+	_ = st.AppendEvent(eventPrefix+".started", "hook", &issueID, &runID, map[string]any{"command": "redacted"})
 	cmd := exec.Command("/bin/sh", "-c", cmdText)
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -332,19 +373,19 @@ func runAfterHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID stri
 	output := &boundedHookOutput{limit: maxOutputBytes}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": output.String()})
-		_ = st.AppendEvent("hook.after_run.failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
+		_ = appendHookOutputEvent(st, eventPrefix, issueID, runID, output)
+		_ = st.AppendEvent(eventPrefix+".failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
 		return err
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": output.String()})
-		_ = st.AppendEvent("hook.after_run.failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
+		_ = appendHookOutputEvent(st, eventPrefix, issueID, runID, output)
+		_ = st.AppendEvent(eventPrefix+".failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
 		return err
 	}
 	if err := cmd.Start(); err != nil {
-		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": output.String()})
-		_ = st.AppendEvent("hook.after_run.failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
+		_ = appendHookOutputEvent(st, eventPrefix, issueID, runID, output)
+		_ = st.AppendEvent(eventPrefix+".failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
 		return err
 	}
 	var readers sync.WaitGroup
@@ -360,20 +401,31 @@ func runAfterHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID stri
 	defer timer.Stop()
 	select {
 	case err := <-done:
-		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": output.String()})
+		_ = appendHookOutputEvent(st, eventPrefix, issueID, runID, output)
 		if err != nil {
-			_ = st.AppendEvent("hook.after_run.failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
+			_ = st.AppendEvent(eventPrefix+".failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
 			return err
 		}
-		_ = st.AppendEvent("hook.after_run.completed", "hook", &issueID, &runID, map[string]any{})
+		_ = st.AppendEvent(eventPrefix+".completed", "hook", &issueID, &runID, map[string]any{})
 		return nil
 	case <-timer.C:
 		killHookProcess(cmd.Process)
 		waitForHookReadersAfterKill(done, stdout, stderr)
-		_ = st.AppendEvent("hook.after_run.output", "hook", &issueID, &runID, map[string]any{"output": output.String()})
-		_ = st.AppendEvent("hook.after_run.timeout", "hook", &issueID, &runID, map[string]any{})
-		return fmt.Errorf("after_run timeout")
+		_ = appendHookOutputEvent(st, eventPrefix, issueID, runID, output)
+		_ = st.AppendEvent(eventPrefix+".timeout", "hook", &issueID, &runID, map[string]any{})
+		return fmt.Errorf("%s timeout", hookName)
 	}
+}
+
+func appendHookOutputEvent(st *store.Store, eventPrefix, issueID, runID string, output *boundedHookOutput) error {
+	return st.AppendEvent(eventPrefix+".output", "hook", &issueID, &runID, map[string]any{"output": redactedHookOutput(output.String())})
+}
+
+func redactedHookOutput(output string) string {
+	if output == "" {
+		return ""
+	}
+	return "redacted"
 }
 
 func waitForHookReadersAfterKill(done <-chan error, stdout, stderr io.Closer) {

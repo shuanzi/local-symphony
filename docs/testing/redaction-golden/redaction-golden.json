@@ -1,0 +1,26 @@
+{
+  "name": "redaction-golden",
+  "description": "Synthetic fixture for B3 redaction coverage metadata.",
+  "cases": [
+    {
+      "surface": "prompt",
+      "input": "Prompt includes SYNTHETIC_SECRET_TOKEN.",
+      "redacted": "Prompt includes [REDACTED]."
+    },
+    {
+      "surface": "codex_log",
+      "input": "Codex log includes SYNTHETIC_SECRET_TOKEN.",
+      "redacted": "Codex log includes [REDACTED]."
+    },
+    {
+      "surface": "secret",
+      "input": "Secret value is SYNTHETIC_SECRET_TOKEN.",
+      "redacted": "Secret value is [REDACTED]."
+    },
+    {
+      "surface": "diagnostics",
+      "input": "Diagnostics include SYNTHETIC_SECRET_TOKEN.",
+      "redacted": "Diagnostics include [REDACTED]."
+    }
+  ]
+}

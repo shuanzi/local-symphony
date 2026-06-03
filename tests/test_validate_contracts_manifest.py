@@ -50,6 +50,8 @@ FORBIDDEN_OPENAPI_INJECTION_CASES = (
     ("prefixed issue delete", "DELETE", "/api/v1/issues/{issue_ref}"),
 )
 
+REQUIRED_REDACTION_GOLDEN_FIXTURE_SURFACES = ("prompt", "codex_log", "secret", "diagnostics")
+
 
 def load_validator():
     spec = importlib.util.spec_from_file_location("validate_contracts", ROOT / "scripts" / "validate_contracts.py")
@@ -67,6 +69,15 @@ def copy_contract_root(temp_root: Path) -> None:
 
 def load_manifest() -> dict[str, Any]:
     return json.loads((ROOT / "docs/testing/CONTRACT_VALIDATION_MANIFEST.json").read_text(encoding="utf-8"))
+
+
+def write_manifest_required_paths(temp_root: Path, manifest: dict[str, Any]) -> None:
+    for rel in manifest["docs"]["required_directories"]:
+        (temp_root / rel).mkdir(parents=True, exist_ok=True)
+    for rel in manifest["docs"]["required_files"]:
+        path = temp_root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("placeholder\n", encoding="utf-8")
 
 
 def is_forbidden_operation(operation: dict[str, Any], method: str, path: str) -> bool:
@@ -88,6 +99,173 @@ class ManifestContractTests(unittest.TestCase):
         self.assertGreaterEqual(len(manifest["handler_route_inventory"]["required_routes"]), 1)
         self.assertGreaterEqual(len(manifest["dashboard_action_inventory"]["required_actions"]), 1)
         self.assertGreaterEqual(len(manifest["security_regression"]["topics"]), 1)
+
+    def test_manifest_redaction_golden_fixture_metadata_is_validated(self) -> None:
+        validator = load_validator()
+
+        cases = (
+            (
+                "missing committed fixture path",
+                {
+                    "path": "docs/testing/redaction-golden/missing.json",
+                    "covers": list(REQUIRED_REDACTION_GOLDEN_FIXTURE_SURFACES),
+                },
+            ),
+            (
+                "incomplete fixture metadata",
+                {
+                    "path": "docs/testing/redaction-golden/redaction-golden.json",
+                },
+            ),
+            (
+                "missing prompt coverage",
+                {
+                    "path": "docs/testing/redaction-golden/redaction-golden.json",
+                    "covers": ["codex_log", "secret", "diagnostics"],
+                },
+            ),
+            (
+                "missing Codex log coverage",
+                {
+                    "path": "docs/testing/redaction-golden/redaction-golden.json",
+                    "covers": ["prompt", "secret", "diagnostics"],
+                },
+            ),
+            (
+                "missing secret coverage",
+                {
+                    "path": "docs/testing/redaction-golden/redaction-golden.json",
+                    "covers": ["prompt", "codex_log", "diagnostics"],
+                },
+            ),
+            (
+                "missing diagnostics coverage",
+                {
+                    "path": "docs/testing/redaction-golden/redaction-golden.json",
+                    "covers": ["prompt", "codex_log", "secret"],
+                },
+            ),
+        )
+
+        for name, fixture in cases:
+            with self.subTest(name=name):
+                manifest = load_manifest()
+                manifest["security_regression"]["redaction_golden_fixtures"] = [fixture]
+
+                with self.assertRaises(SystemExit):
+                    validator.validate_contract_manifest(manifest)
+
+    def test_manifest_redaction_golden_fixture_path_must_stay_under_repo(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            fixture_path = temp_root / "external-redaction-golden.json"
+            fixture_path.write_text((ROOT / "docs/testing/redaction-golden/redaction-golden.json").read_text(encoding="utf-8"), encoding="utf-8")
+            manifest["security_regression"]["redaction_golden_fixtures"] = [
+                {
+                    "path": str(fixture_path),
+                    "covers": list(REQUIRED_REDACTION_GOLDEN_FIXTURE_SURFACES),
+                }
+            ]
+
+            with self.assertRaises(SystemExit):
+                validator.validate_contract_manifest(manifest)
+
+    def test_manifest_redaction_golden_fixture_case_content_is_validated(self) -> None:
+        validator = load_validator()
+
+        valid_fixture_cases = [
+            {
+                "surface": surface,
+                "input": f"{surface} includes SYNTHETIC_SECRET_TOKEN.",
+                "redacted": f"{surface} includes [REDACTED].",
+            }
+            for surface in REQUIRED_REDACTION_GOLDEN_FIXTURE_SURFACES
+        ]
+        cases = (
+            (
+                "missing diagnostics case",
+                [
+                    case
+                    for case in valid_fixture_cases
+                    if case["surface"] != "diagnostics"
+                ],
+            ),
+            (
+                "blank input",
+                [
+                    {**case, "input": "   "} if case["surface"] == "prompt" else case
+                    for case in valid_fixture_cases
+                ],
+            ),
+            (
+                "blank redacted",
+                [
+                    {**case, "redacted": ""} if case["surface"] == "codex_log" else case
+                    for case in valid_fixture_cases
+                ],
+            ),
+            (
+                "redacted leaks sentinel",
+                [
+                    {**case, "redacted": case["input"]} if case["surface"] == "secret" else case
+                    for case in valid_fixture_cases
+                ],
+            ),
+            (
+                "redacted leaks second synthetic sentinel",
+                [
+                    {
+                        **case,
+                        "input": "prompt includes SYNTHETIC_SECRET_ONE and SYNTHETIC_SECRET_TWO.",
+                        "redacted": "prompt includes [REDACTED] and SYNTHETIC_SECRET_TWO.",
+                    }
+                    if case["surface"] == "prompt"
+                    else case
+                    for case in valid_fixture_cases
+                ],
+            ),
+            (
+                "redacted does not match synthetic golden output",
+                [
+                    {**case, "redacted": "arbitrary"} if case["surface"] == "diagnostics" else case
+                    for case in valid_fixture_cases
+                ],
+            ),
+        )
+
+        for name, fixture_cases in cases:
+            with self.subTest(name=name):
+                manifest = load_manifest()
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    write_manifest_required_paths(temp_root, manifest)
+                    fixture_rel = manifest["security_regression"]["redaction_golden_fixtures"][0]["path"]
+                    fixture_path = temp_root / fixture_rel
+                    fixture_path.parent.mkdir(parents=True, exist_ok=True)
+                    fixture_path.write_text(
+                        json.dumps(
+                            {
+                                "name": "redaction-golden",
+                                "description": "Synthetic fixture for content validation.",
+                                "cases": fixture_cases,
+                            },
+                            indent=2,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_contract_manifest(manifest)
+                    finally:
+                        validator.ROOT = old_root
 
     def test_openapi_forbidden_delete_issue_operation_fails(self) -> None:
         validator = load_validator()

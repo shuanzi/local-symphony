@@ -354,6 +354,17 @@
       "go test ./internal/security ./internal/agent/codex ./internal/store ./internal/toolgateway ./internal/observability"
     ],
     "real_codex_command": "SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex/...",
+    "redaction_golden_fixtures": [
+      {
+        "path": "docs/testing/redaction-golden/redaction-golden.json",
+        "covers": [
+          "prompt",
+          "codex_log",
+          "secret",
+          "diagnostics"
+        ]
+      }
+    ],
     "topics": [
       "loopback required bind validation",
       "browser session invalid expired revoked",

@@ -289,6 +289,194 @@ func TestRunWorkerRunsAfterRunOnlyAfterFinalRunnerResult(t *testing.T) {
 	}
 }
 
+func TestRunWorkerRunsAfterCreateOnlyForNewWorkspace(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, issue := newReadyDispatchIssue(t)
+	marker := filepath.Join(t.TempDir(), "after-create")
+	afterCreate := fmt.Sprintf("printf x >> %q", marker)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.AfterCreate = &afterCreate
+
+	firstRun, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun first: %v", err)
+	}
+	if err := (Orchestrator{Store: st}).runWorker(firstRun.ID, wf); err != nil {
+		t.Fatalf("runWorker first: %v", err)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read after_create marker: %v", err)
+	}
+	if got := string(data); got != "x" {
+		t.Fatalf("after_create executions wrote %q, want one execution", got)
+	}
+	assertRunEventCount(t, st, firstRun.ID, "hook.after_create.started", 1)
+
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "rerun", ""); err != nil {
+		t.Fatalf("TransitionIssue Ready: %v", err)
+	}
+	secondRun, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun second: %v", err)
+	}
+	if err := (Orchestrator{Store: st}).runWorker(secondRun.ID, wf); err != nil {
+		t.Fatalf("runWorker second: %v", err)
+	}
+	data, err = os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read after_create marker after reuse: %v", err)
+	}
+	if got := string(data); got != "x" {
+		t.Fatalf("after_create executions wrote %q after reused workspace, want still one execution", got)
+	}
+	assertRunEventCount(t, st, secondRun.ID, "hook.after_create.started", 0)
+}
+
+func TestRunWorkerAfterCreateFailureFailsBeforeTokenAndAgent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, issue := newReadyDispatchIssue(t)
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	afterCreate := "printf abcdef; exit 7"
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.AfterCreate = &afterCreate
+	wf.Config.Hooks.MaxOutputBytes = 3
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	assertHookFailureBeforeTokenAndAgent(t, st, run.ID, core.FailureAfterCreateFailed, "exit status 7")
+	assertHookEvents(t, st, run.ID, "hook.after_create", []string{"started", "output", "failed"})
+	assertHookStartedCommandRedacted(t, st, run.ID, "hook.after_create.started")
+	assertHookOutput(t, st, run.ID, "hook.after_create.output", "redacted")
+}
+
+func TestRunWorkerRetriesAfterCreateAfterFailedAttempt(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, issue := newReadyDispatchIssue(t)
+	marker := filepath.Join(t.TempDir(), "after-create-attempts")
+	afterCreate := fmt.Sprintf(`if [ ! -f %[1]q ]; then printf f > %[1]q; exit 7; fi; printf s >> %[1]q`, marker)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.AfterCreate = &afterCreate
+
+	firstRun, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun first: %v", err)
+	}
+	if err := (Orchestrator{Store: st}).runWorker(firstRun.ID, wf); err != nil {
+		t.Fatalf("runWorker first: %v", err)
+	}
+	assertHookFailureBeforeTokenAndAgent(t, st, firstRun.ID, core.FailureAfterCreateFailed, "exit status 7")
+
+	if _, err := st.DispatchResume(issue.ID, "retry after_create"); err != nil {
+		t.Fatalf("DispatchResume: %v", err)
+	}
+	secondRun, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun second: %v", err)
+	}
+	if err := (Orchestrator{Store: st}).runWorker(secondRun.ID, wf); err != nil {
+		t.Fatalf("runWorker second: %v", err)
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read after_create marker: %v", err)
+	}
+	if got := string(data); got != "fs" {
+		t.Fatalf("after_create attempts = %q, want failed attempt then retry success", got)
+	}
+	assertRunEventCount(t, st, secondRun.ID, "hook.after_create.started", 1)
+}
+
+func TestRunWorkerRetriesAfterCreateAfterInterruptedAttempt(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, issue := newReadyDispatchIssue(t)
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	if _, err := st.CreateOrUpdateWorkspace(issue.ID, workspace, "test", "auto", "main", "base-sha"); err != nil {
+		t.Fatalf("CreateOrUpdateWorkspace: %v", err)
+	}
+	crashedRunID := "run_crashed_after_create"
+	if err := st.AppendEvent("hook.after_create.started", "hook", &issue.ID, &crashedRunID, map[string]any{"command": "redacted"}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "after-create-retried")
+	afterCreate := fmt.Sprintf("printf retried > %q", marker)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.AfterCreate = &afterCreate
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read after_create marker: %v", err)
+	}
+	if got := string(data); got != "retried" {
+		t.Fatalf("after_create retry marker = %q, want retried", got)
+	}
+	assertRunEventCount(t, st, run.ID, "hook.after_create.started", 1)
+}
+
+func TestRunWorkerBeforeRunFailureFailsBeforeTokenAndAgent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, run := newRunWorkerTestFixture(t)
+	beforeRun := "printf abcdef; exit 7"
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.BeforeRun = &beforeRun
+	wf.Config.Hooks.MaxOutputBytes = 3
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	assertHookFailureBeforeTokenAndAgent(t, st, run.ID, core.FailureBeforeRunFailed, "exit status 7")
+	assertHookEvents(t, st, run.ID, "hook.before_run", []string{"started", "output", "failed"})
+	assertHookStartedCommandRedacted(t, st, run.ID, "hook.before_run.started")
+	assertHookOutput(t, st, run.ID, "hook.before_run.output", "redacted")
+}
+
+func TestRunWorkerHookOutputDoesNotStoreSyntheticSecret(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, run := newRunWorkerTestFixture(t)
+	beforeRun := "printf SYNTHETIC_SECRET_TOKEN"
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.BeforeRun = &beforeRun
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	rows, err := st.Project.Query(`SELECT data_json FROM run_events WHERE event_type='hook.before_run.output' AND run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("query hook output event: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("hook output event count = %d, want 1", len(rows))
+	}
+	if got := rows[0]["data_json"].String(); strings.Contains(got, "SYNTHETIC_SECRET_TOKEN") {
+		t.Fatalf("hook output leaked synthetic secret: %s", got)
+	}
+}
+
 func TestRunWorkerFailsWhenWorkflowSnapshotInsertFails(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
@@ -555,7 +743,7 @@ func TestRunAfterHookWithNegativeMaxOutputBytesDoesNotPanic(t *testing.T) {
 	}
 }
 
-func TestRunAfterHookStoresOnlyMaxOutputBytesFromLargeOutput(t *testing.T) {
+func TestRunAfterHookStoresRedactedOutputFromLargeOutput(t *testing.T) {
 	st, err := store.InitProject(t.TempDir(), "TST")
 	if err != nil {
 		t.Fatalf("InitProject: %v", err)
@@ -604,10 +792,7 @@ func TestRunAfterHookStoresOnlyMaxOutputBytesFromLargeOutput(t *testing.T) {
 		t.Fatalf("decode hook output event: %v", err)
 	}
 	got, _ := data["output"].(string)
-	if len(got) != cfg.Hooks.MaxOutputBytes {
-		t.Fatalf("hook output length = %d, want %d", len(got), cfg.Hooks.MaxOutputBytes)
-	}
-	if want := "0123456789abcdef0123456789abcde"; got != want {
+	if want := "redacted"; got != want {
 		t.Fatalf("hook output = %q, want %q", got, want)
 	}
 }
@@ -693,8 +878,8 @@ func TestRunAfterHookTimeoutRecordsBoundedOutputBeforeReturning(t *testing.T) {
 	if err := json.Unmarshal([]byte(rows[1]["data_json"].String()), &data); err != nil {
 		t.Fatalf("decode hook output event: %v", err)
 	}
-	if got := data["output"]; got != "abc" {
-		t.Fatalf("hook output = %q, want bounded output", got)
+	if got := data["output"]; got != "redacted" {
+		t.Fatalf("hook output = %q, want redacted output", got)
 	}
 }
 
@@ -924,6 +1109,103 @@ func assertRunFailedBeforeAgent(t *testing.T, st *store.Store, runID, wantMessag
 	}
 	if len(handoffRows) != 0 {
 		t.Fatalf("handoff count = %d, want 0", len(handoffRows))
+	}
+}
+
+func assertHookFailureBeforeTokenAndAgent(t *testing.T, st *store.Store, runID string, wantCode core.FailureCode, wantMessage string) {
+	t.Helper()
+	gotRun, err := st.GetRun(runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Status != core.RunFailed {
+		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunFailed)
+	}
+	if gotRun.FailureCode == nil || *gotRun.FailureCode != wantCode {
+		t.Fatalf("failure code = %v, want %s", gotRun.FailureCode, wantCode)
+	}
+	if gotRun.FailureMessage == nil || !strings.Contains(*gotRun.FailureMessage, wantMessage) {
+		t.Fatalf("failure message = %v, want containing %q", gotRun.FailureMessage, wantMessage)
+	}
+	gotIssue, err := st.GetIssue(gotRun.IssueID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if gotIssue.State != gotRun.SourceIssueState {
+		t.Fatalf("issue state = %s, want restored source state %s", gotIssue.State, gotRun.SourceIssueState)
+	}
+	if !gotIssue.DispatchPaused {
+		t.Fatal("issue dispatch_paused = false, want true")
+	}
+	if gotIssue.DispatchPauseReason == nil || *gotIssue.DispatchPauseReason != string(wantCode) {
+		t.Fatalf("dispatch pause reason = %v, want %s", gotIssue.DispatchPauseReason, wantCode)
+	}
+	tokenRows, err := st.Project.Query(`SELECT id FROM run_tool_tokens WHERE run_id=?`, runID)
+	if err != nil {
+		t.Fatalf("query run tool tokens: %v", err)
+	}
+	if len(tokenRows) != 0 {
+		t.Fatalf("run tool token count = %d, want 0", len(tokenRows))
+	}
+	agentRows, err := st.Project.Query(`SELECT event_type FROM run_events WHERE run_id=? AND event_type LIKE 'agent.%'`, runID)
+	if err != nil {
+		t.Fatalf("query agent events: %v", err)
+	}
+	if len(agentRows) != 0 {
+		t.Fatalf("agent event count = %d, want 0", len(agentRows))
+	}
+}
+
+func assertHookEvents(t *testing.T, st *store.Store, runID, prefix string, suffixes []string) {
+	t.Helper()
+	rows, err := st.Project.Query(`SELECT event_type FROM run_events WHERE run_id=? AND event_type LIKE ? ORDER BY seq ASC`, runID, prefix+".%")
+	if err != nil {
+		t.Fatalf("query hook events: %v", err)
+	}
+	if len(rows) != len(suffixes) {
+		t.Fatalf("hook event count = %d, want %d", len(rows), len(suffixes))
+	}
+	for i, suffix := range suffixes {
+		want := prefix + "." + suffix
+		if got := rows[i]["event_type"].String(); got != want {
+			t.Fatalf("hook event %d = %s, want %s", i, got, want)
+		}
+	}
+}
+
+func assertHookStartedCommandRedacted(t *testing.T, st *store.Store, runID, eventType string) {
+	t.Helper()
+	rows, err := st.Project.Query(`SELECT data_json FROM run_events WHERE run_id=? AND event_type=?`, runID, eventType)
+	if err != nil {
+		t.Fatalf("query hook started event: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("%s event count = %d, want 1", eventType, len(rows))
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(rows[0]["data_json"].String()), &data); err != nil {
+		t.Fatalf("decode hook started event: %v", err)
+	}
+	if got := data["command"]; got != "redacted" {
+		t.Fatalf("hook command = %q, want redacted", got)
+	}
+}
+
+func assertHookOutput(t *testing.T, st *store.Store, runID, eventType, want string) {
+	t.Helper()
+	rows, err := st.Project.Query(`SELECT data_json FROM run_events WHERE run_id=? AND event_type=?`, runID, eventType)
+	if err != nil {
+		t.Fatalf("query hook output event: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("%s event count = %d, want 1", eventType, len(rows))
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(rows[0]["data_json"].String()), &data); err != nil {
+		t.Fatalf("decode hook output event: %v", err)
+	}
+	if got := data["output"]; got != want {
+		t.Fatalf("hook output = %q, want %q", got, want)
 	}
 }
 
