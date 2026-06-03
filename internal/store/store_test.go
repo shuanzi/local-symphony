@@ -1584,6 +1584,41 @@ func TestCreatePendingApprovalRequestStoresStructuredFieldsAndTimeout(t *testing
 	}
 }
 
+func TestCreateAutoDeniedApprovalRequestStoresResolvedRow(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, run := prepareActiveRun(t, st, "Auto denied approval helper")
+
+	approval, err := st.CreateAutoDeniedApprovalRequest(CreateApprovalRequestInput{
+		RunID:         run.ID,
+		IssueID:       issue.ID,
+		Kind:          "network",
+		ActionSummary: "Access example.invalid",
+		RiskLevel:     "high",
+		PolicyMatch:   "network.default_deny",
+		RequestID:     "network-auto-deny-1",
+		Fingerprint:   `networkApprovalContext:{"host":"example.invalid"}`,
+	}, "network policy denied")
+	if err != nil {
+		t.Fatalf("CreateAutoDeniedApprovalRequest: %v", err)
+	}
+	if approval.Status != "auto_denied" || approval.ResolvedAt == nil {
+		t.Fatalf("approval status/resolved_at = %#v, want auto_denied with resolved_at", approval)
+	}
+	if approval.Kind != "network" || approval.ActionSummary != "Access example.invalid" || approval.RiskLevel != "high" || approval.PolicyMatch != "network.default_deny" {
+		t.Fatalf("approval structured fields = %#v", approval)
+	}
+	if approval.Reason == nil || *approval.Reason != "network policy denied" {
+		t.Fatalf("approval reason = %#v, want network policy denied", approval.Reason)
+	}
+	err = st.DecideApproval(approval.ID, "approved_once", "too late")
+	if err == nil {
+		t.Fatal("DecideApproval after auto_denied succeeded, want approval_not_pending")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrApprovalNotPending {
+		t.Fatalf("DecideApproval error code = %s, want %s", got, core.ErrApprovalNotPending)
+	}
+}
+
 func TestHasApprovedForRunApprovalRequiresNetworkFingerprint(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, run := prepareActiveRun(t, st, "Approval run scope network fingerprint")

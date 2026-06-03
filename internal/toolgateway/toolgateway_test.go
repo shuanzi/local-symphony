@@ -153,6 +153,45 @@ func TestArtifactAttachReturnsFailureAndDoesNotInsertArtifactWhenWriteFails(t *t
 	assertArtifactCount(t, st, run.ID, 0)
 }
 
+func TestArtifactAttachProtectedPathFailsToolCallWithoutApprovalOrRunTermination(t *testing.T) {
+	st := newGatewayTestStore(t)
+	_, run, workspace := prepareGatewayRun(t, st)
+	if err := os.WriteFile(filepath.Join(workspace, ".env"), []byte("SECRET=1\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	token, err := NewTokenForRun(st, run, workspace)
+	if err != nil {
+		t.Fatalf("NewTokenForRun: %v", err)
+	}
+
+	resp := (Gateway{Store: st}).Call(token, workspace, Request{
+		Tool:  "artifact.attach",
+		Input: map[string]any{"path": ".env", "kind": "agent_file"},
+	})
+
+	if resp.Success {
+		t.Fatal("artifact.attach success = true, want protected path failure")
+	}
+	if resp.Error == nil || resp.Error.Code != string(core.ErrToolGatewayFailed) {
+		t.Fatalf("artifact.attach error = %#v, want %s", resp.Error, core.ErrToolGatewayFailed)
+	}
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM tool_calls WHERE run_id=? AND tool_name='artifact.attach' AND status='failed' AND error_code=?`, run.ID, string(core.ErrToolGatewayFailed))
+	if err != nil {
+		t.Fatalf("query tool call: %v", err)
+	}
+	if got := row["c"].Int(); got != 1 {
+		t.Fatalf("failed tool_gateway_failed tool calls = %d, want 1", got)
+	}
+	assertApprovalCount(t, st, run.ID, 0)
+	gotRun, err := st.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Status != core.RunRunning {
+		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunRunning)
+	}
+}
+
 func TestArtifactAttachUsesTokenArtifactMaxBytes(t *testing.T) {
 	st := newGatewayTestStore(t)
 	_, run, workspace := prepareGatewayRun(t, st)
@@ -1068,6 +1107,17 @@ func assertArtifactCount(t *testing.T, st *store.Store, runID string, want int) 
 	}
 	if got := row["c"].Int(); got != want {
 		t.Fatalf("artifact count = %d, want %d", got, want)
+	}
+}
+
+func assertApprovalCount(t *testing.T, st *store.Store, runID string, want int) {
+	t.Helper()
+	row, err := st.Project.QueryOne(`SELECT COUNT(*) AS c FROM approval_requests WHERE run_id=?`, runID)
+	if err != nil {
+		t.Fatalf("count approvals: %v", err)
+	}
+	if got := row["c"].Int(); got != want {
+		t.Fatalf("approval count = %d, want %d", got, want)
 	}
 }
 

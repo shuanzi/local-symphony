@@ -351,7 +351,7 @@
   },
   "security_regression": {
     "default_commands": [
-      "go test ./internal/security/..."
+      "go test ./internal/security ./internal/agent/codex ./internal/store ./internal/toolgateway ./internal/observability"
     ],
     "real_codex_command": "SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex/...",
     "topics": [

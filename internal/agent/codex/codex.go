@@ -18,6 +18,7 @@ import (
 
 	"local-symphony/internal/agent"
 	"local-symphony/internal/core"
+	"local-symphony/internal/security"
 	"local-symphony/internal/store"
 	"local-symphony/internal/toolgateway"
 )
@@ -68,6 +69,7 @@ type Runner struct {
 	Command         string
 	FixtureRoot     string
 	ExperimentalAPI bool
+	Policy          security.Policy
 	session         *processSession
 }
 
@@ -407,6 +409,24 @@ func (r *Runner) handleApprovalRequest(ctx context.Context, req agent.RunRequest
 	if err != nil {
 		return agent.RunResult{}, false, err
 	}
+	policyDecision := r.evaluateApprovalPolicy(msg, approvalInput)
+	if policyDecision.decision.Outcome == security.PolicyDeny {
+		applyPolicyFields(&approvalInput, policyDecision.decision, true)
+		approval, err := req.Gateway.Store.CreateAutoDeniedApprovalRequest(approvalInput, policyDecision.decision.Reason)
+		if err != nil {
+			return agent.RunResult{}, false, err
+		}
+		emit(req, "approval.resolved", map[string]any{"decision": "redacted", "approval_id": approval.ID})
+		return failed(policyDecision.failureCode, string(policyDecision.failureCode)), true, nil
+	}
+	if policyDecision.decision.Outcome == security.PolicyAllow {
+		if err := writeApprovalDecision(session.stdin, approvalIDForCodex("", responseTarget.requestID), responseTarget, "approve_once"); err != nil {
+			return failed(core.FailureCodexProtocolError, "codex stdin write failed"), true, nil
+		}
+		emit(req, "approval.resolved", map[string]any{"decision": "redacted"})
+		return agent.RunResult{}, false, nil
+	}
+	applyPolicyFields(&approvalInput, policyDecision.decision, false)
 	if handled, err := r.tryApprovedForRunDecision(req, session, approvalInput, responseTarget); err != nil {
 		return failed(core.FailureCodexProtocolError, "codex stdin write failed"), true, nil
 	} else if handled {
@@ -439,6 +459,82 @@ func (r *Runner) tryApprovedForRunDecision(req agent.RunRequest, session *proces
 	return true, nil
 }
 
+type approvalPolicyDecision struct {
+	decision    security.PolicyDecision
+	failureCode core.FailureCode
+}
+
+func (r *Runner) evaluateApprovalPolicy(msg protocolMessage, input store.CreateApprovalRequestInput) approvalPolicyDecision {
+	policy := r.securityPolicy()
+	data := msg.Params
+	if len(data) == 0 {
+		data = msg.Payload
+	}
+	paths := approvalPathCandidates(data)
+	if protected := policy.EvaluateProtectedPaths(paths); protected.Outcome == security.PolicyDeny {
+		return approvalPolicyDecision{decision: protected, failureCode: core.FailureProtectedPathDenied}
+	}
+	switch input.Kind {
+	case "network":
+		decision := policy.EvaluateNetwork(security.NetworkRequest{Host: approvalNetworkHost(data)})
+		return approvalPolicyDecision{decision: decision, failureCode: core.FailureNetworkDenied}
+	case "command":
+		command := approvalCommandRequest(data)
+		command.Paths = append(command.Paths, paths...)
+		decision := policy.EvaluateCommand(command)
+		if decision.Outcome == security.PolicyDeny {
+			return approvalPolicyDecision{decision: decision, failureCode: commandFailureCode(decision)}
+		}
+		if approvalRequestsNetwork(data) {
+			networkDecision := policy.EvaluateNetwork(security.NetworkRequest{Host: approvalNetworkHost(data)})
+			if networkDecision.Outcome != security.PolicyAllow {
+				return approvalPolicyDecision{decision: networkDecision, failureCode: core.FailureNetworkDenied}
+			}
+		}
+		return approvalPolicyDecision{decision: decision, failureCode: commandFailureCode(decision)}
+	case "file_change":
+		return approvalPolicyDecision{
+			decision:    security.PolicyDecision{Outcome: security.PolicyReview, Reason: "file_change_review", PolicyMatch: "file_change.review.default"},
+			failureCode: core.FailureProtectedPathDenied,
+		}
+	default:
+		return approvalPolicyDecision{
+			decision:    security.PolicyDecision{Outcome: security.PolicyReview, Reason: "approval_review", PolicyMatch: "approval.review.default"},
+			failureCode: core.FailureCommandDenied,
+		}
+	}
+}
+
+func (r *Runner) securityPolicy() security.Policy {
+	if r.Policy.NetworkDefault == "" {
+		return security.DefaultPolicy()
+	}
+	return r.Policy
+}
+
+func commandFailureCode(decision security.PolicyDecision) core.FailureCode {
+	if decision.Reason == "protected_path" {
+		return core.FailureProtectedPathDenied
+	}
+	return core.FailureCommandDenied
+}
+
+func applyPolicyFields(input *store.CreateApprovalRequestInput, decision security.PolicyDecision, overridePolicyMatch bool) {
+	if strings.TrimSpace(decision.PolicyMatch) != "" && (overridePolicyMatch || strings.TrimSpace(input.PolicyMatch) == "") {
+		input.PolicyMatch = decision.PolicyMatch
+	}
+	if input.RiskLevel == "" {
+		switch decision.Outcome {
+		case security.PolicyDeny:
+			input.RiskLevel = "high"
+		case security.PolicyReview:
+			input.RiskLevel = "medium"
+		case security.PolicyAllow:
+			input.RiskLevel = "low"
+		}
+	}
+}
+
 func approvalInputFromMessage(req agent.RunRequest, msg protocolMessage) (store.CreateApprovalRequestInput, approvalResponseTarget, error) {
 	if isJSONRPCApprovalMethod(msg.Method) {
 		return approvalInputFromJSONRPCRequest(req, msg)
@@ -462,6 +558,126 @@ func approvalInputFromMessage(req agent.RunRequest, msg protocolMessage) (store.
 		Fingerprint:   payloadString(msg.Payload, "fingerprint"),
 		TimeoutMS:     payloadInt64(msg.Payload, "timeout_ms"),
 	}, approvalResponseTarget{requestID: requestID}, nil
+}
+
+func approvalCommandRequest(data map[string]any) security.CommandRequest {
+	value := data["command"]
+	switch command := value.(type) {
+	case string:
+		return security.CommandRequest{CommandLine: command}
+	case []any:
+		argv := make([]string, 0, len(command))
+		for _, item := range command {
+			text, ok := item.(string)
+			if !ok {
+				return security.CommandRequest{}
+			}
+			argv = append(argv, text)
+		}
+		return security.CommandRequest{Argv: argv}
+	default:
+		return security.CommandRequest{}
+	}
+}
+
+func approvalNetworkHost(data map[string]any) string {
+	for _, value := range []any{
+		data["networkApprovalContext"],
+		mapValue(data["additionalPermissions"], "network"),
+		mapValue(data["permissions"], "network"),
+		data["network"],
+	} {
+		if host := networkHostFromValue(value); host != "" {
+			return host
+		}
+	}
+	return payloadString(data, "host")
+}
+
+func approvalRequestsNetwork(data map[string]any) bool {
+	for _, value := range []any{
+		data["networkApprovalContext"],
+		mapValue(data["additionalPermissions"], "network"),
+		mapValue(data["permissions"], "network"),
+		data["network"],
+	} {
+		if networkPermissionEnabled(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func networkPermissionEnabled(value any) bool {
+	if value == nil {
+		return false
+	}
+	m, ok := value.(map[string]any)
+	if !ok {
+		return true
+	}
+	enabled, ok := m["enabled"].(bool)
+	return !ok || enabled
+}
+
+func networkHostFromValue(value any) string {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	for _, key := range []string{"host", "hostname", "domain"} {
+		if host := payloadString(m, key); host != "" {
+			return host
+		}
+	}
+	return ""
+}
+
+func mapValue(value any, key string) any {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return m[key]
+}
+
+func approvalPathCandidates(data map[string]any) []string {
+	var paths []string
+	collectPathCandidates(data, &paths)
+	return paths
+}
+
+func collectPathCandidates(value any, paths *[]string) {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			lower := strings.ToLower(key)
+			if lower == "path" || lower == "paths" || lower == "grantroot" || lower == "read" || lower == "write" || lower == "cwd" {
+				collectStringValues(child, paths)
+				continue
+			}
+			collectPathCandidates(child, paths)
+		}
+	case []any:
+		for _, child := range v {
+			collectPathCandidates(child, paths)
+		}
+	}
+}
+
+func collectStringValues(value any, paths *[]string) {
+	switch v := value.(type) {
+	case string:
+		if strings.TrimSpace(v) != "" {
+			*paths = append(*paths, v)
+		}
+	case []any:
+		for _, child := range v {
+			collectStringValues(child, paths)
+		}
+	case map[string]any:
+		collectPathCandidates(v, paths)
+	}
 }
 
 func approvalInputFromJSONRPCRequest(req agent.RunRequest, msg protocolMessage) (store.CreateApprovalRequestInput, approvalResponseTarget, error) {
@@ -504,16 +720,18 @@ func jsonRPCApprovalKind(msg protocolMessage) string {
 
 func jsonRPCPermissionApprovalKind(params map[string]any) string {
 	permissions, _ := params["permissions"].(map[string]any)
-	if _, ok := permissions["network"]; ok {
+	if permissionRequestIsNetworkOnly(permissions) {
 		return "network"
 	}
-	if _, ok := permissions["fileSystem"]; ok {
-		return "file_change"
-	}
-	if _, ok := permissions["filesystem"]; ok {
-		return "file_change"
-	}
 	return "file_change"
+}
+
+func permissionRequestIsNetworkOnly(permissions map[string]any) bool {
+	if len(permissions) != 1 {
+		return false
+	}
+	_, ok := permissions["network"]
+	return ok
 }
 
 func jsonRPCRequestedPermissions(params map[string]any) map[string]any {
@@ -560,8 +778,11 @@ func jsonRPCApprovalFingerprint(kind string, params map[string]any) string {
 }
 
 func jsonRPCCommandApprovalFingerprint(params map[string]any) string {
-	parts := make([]string, 0, 2)
+	parts := make([]string, 0, 3)
 	if value := jsonRPCValueFingerprint("command", params["command"]); value != "" {
+		parts = append(parts, value)
+	}
+	if value := jsonRPCValueFingerprint("networkApprovalContext", params["networkApprovalContext"]); value != "" {
 		parts = append(parts, value)
 	}
 	if value := jsonRPCValueFingerprint("additionalPermissions", params["additionalPermissions"]); value != "" {

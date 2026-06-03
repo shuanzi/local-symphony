@@ -53,6 +53,13 @@ codex:
   experimental_api: false
   require_committed_fixture: true
 
+approvals:
+  mode: balanced
+  network:
+    default: deny
+    allowlist: []
+  protected_paths: [".env", ".env.*", "**/*.pem", "**/*.key", "**/*_rsa", "**/*_ed25519", ".ssh/**", ".aws/**", ".gcp/**", ".azure/**", ".kube/**", ".npmrc", ".pypirc", ".netrc"]
+
 tools:
   gateway: cli
   require_handoff_tool: true

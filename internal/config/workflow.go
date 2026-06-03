@@ -61,6 +61,14 @@ type EffectiveConfig struct {
 		StartupTimeoutMS        int    `json:"startup_timeout_ms"`
 		ReadTimeoutMS           int    `json:"read_timeout_ms"`
 	} `json:"codex"`
+	Approvals struct {
+		Mode    string `json:"mode"`
+		Network struct {
+			Default   string   `json:"default"`
+			Allowlist []string `json:"allowlist"`
+		} `json:"network"`
+		ProtectedPaths []string `json:"protected_paths"`
+	} `json:"approvals"`
 	Tools struct {
 		Gateway                  string `json:"gateway"`
 		RequireHandoffTool       bool   `json:"require_handoff_tool"`
@@ -140,6 +148,10 @@ func Defaults(repoRoot string) EffectiveConfig {
 	c.Codex.TurnTimeoutMS = 3600000
 	c.Codex.StallTimeoutMS = 300000
 	c.Codex.ReadTimeoutMS = 5000
+	c.Approvals.Mode = "balanced"
+	c.Approvals.Network.Default = "deny"
+	c.Approvals.Network.Allowlist = []string{}
+	c.Approvals.ProtectedPaths = []string{".env", ".env.*", "**/*.pem", "**/*.key", "**/*_rsa", "**/*_ed25519", ".ssh/**", ".aws/**", ".gcp/**", ".azure/**", ".kube/**", ".npmrc", ".pypirc", ".netrc"}
 	c.Tools.Gateway = "cli"
 	c.Tools.RequireHandoffTool = true
 	c.Tools.AllowDynamicTools = false
@@ -385,6 +397,24 @@ func applyMap(c *EffectiveConfig, m map[string]any, baseDir string, warnings, er
 			c.Codex.ReadTimeoutMS = v
 		}
 	}
+	if a := section("approvals"); a != nil {
+		if v, ok := str(a, "mode", errors); ok {
+			c.Approvals.Mode = v
+		}
+		if n, ok := a["network"].(map[string]any); ok {
+			if v, ok := str(n, "default", errors); ok {
+				c.Approvals.Network.Default = v
+			}
+			if v, ok := strSlice(n, "allowlist", errors); ok {
+				c.Approvals.Network.Allowlist = v
+			}
+		} else if _, ok := a["network"]; ok {
+			*errors = append(*errors, "approvals.network must be an object")
+		}
+		if v, ok := strSlice(a, "protected_paths", errors); ok {
+			c.Approvals.ProtectedPaths = v
+		}
+	}
 	if t := section("tools"); t != nil {
 		if v, ok := boolv(t, "allow_dynamic_tools", errors); ok {
 			c.Tools.AllowDynamicTools = v
@@ -470,6 +500,28 @@ func boolv(m map[string]any, k string, errs *[]string) (bool, bool) {
 	return false, false
 }
 
+func strSlice(m map[string]any, k string, errs *[]string) ([]string, bool) {
+	v, ok := m[k]
+	if !ok {
+		return nil, false
+	}
+	raw, ok := v.([]any)
+	if !ok {
+		*errs = append(*errs, k+" must be an inline string array")
+		return nil, false
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		s, ok := item.(string)
+		if !ok {
+			*errs = append(*errs, k+" must be an inline string array")
+			return nil, false
+		}
+		out = append(out, s)
+	}
+	return out, true
+}
+
 var fullEnv = regexp.MustCompile(`^\$[A-Za-z_][A-Za-z0-9_]*$`)
 
 func expandEnv(v string, errs *[]string) string {
@@ -553,6 +605,14 @@ func hardValidate(c EffectiveConfig, errs *[]string) {
 	}
 	if c.Security.AllowRemoteAPI {
 		*errs = append(*errs, "security.allow_remote_api must be false")
+	}
+	if c.Approvals.Mode != "balanced" {
+		*errs = append(*errs, "approvals.mode must equal balanced")
+	}
+	switch c.Approvals.Network.Default {
+	case "deny", "review":
+	default:
+		*errs = append(*errs, "approvals.network.default must be deny or review")
 	}
 	if filepath.Clean(c.Workspace.Root) == filepath.Clean(c.Git.RepoRoot) {
 		*errs = append(*errs, "workspace.root must not equal git.repo_root")

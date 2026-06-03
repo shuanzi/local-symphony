@@ -1,7 +1,7 @@
 # v1 真实产品化执行计划
 
-**状态**：执行中，阶段 A 与 B1 已完成
-**更新日期**：2026-05-29
+**状态**：执行中，阶段 A 已完成；阶段 B policy-execution slice 已验证，B3 redaction golden fixture 待补后才能收口
+**更新日期**：2026-06-01
 **需求来源**：`docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md`
 **目标**：把 R1-R17 的产品化缺口拆成可落地、可审查、可验收的实施批次，推进 Local Symphony 从本地 fake runner MVP 进入真实 Codex 可运行的本地产品化版本。
 
@@ -34,9 +34,9 @@ R15 是横切要求，不作为单独最后阶段处理。每完成一个需求�
 - [x] 阶段 A / 真实 Codex 最小闭环：A0-A5 已完成，合并记录为 PR #11；验收记录见 `docs/productization/V1_PHASE_A_ACCEPTANCE.md`。
 - [x] B1 / Approval API contract 补齐：已完成并合并 PR #12，Approval DTO、OpenAPI、JSON Schema、DB/fallback schema、store/httpapi、dashboard 类型与测试已对齐。
 - [x] B2 / Codex approval producer 与 writeback：已完成；Codex command/file_change/network approval request 会写入 `approval_requests`，operator 决策可写回 Codex，并覆盖 deny、cancel_run 与 timeout 语义。
-- [ ] B3 / 安全策略执行与回归套件：未完成；依赖 B2 的 approval bridge 形成可执行策略闭环。
-- [ ] 阶段 B 收口：未完成；需在 B1-B3 全部完成后运行阶段 B 门禁并生成阶段 B 验收记录。
-- [ ] 阶段 C / Daemon 产品行为补齐：未开始。
+- [ ] B3 / 安全策略执行与回归套件：policy execution slice 已验证；默认 command/network/protected-path policy evaluator 接入 Codex approval bridge，auto-deny 写入 `approval_requests(auto_denied)` 并返回 canonical failure code。redaction golden fixture 仍待补，B3 未完全收口。
+- [ ] 阶段 B 收口：未完成；`docs/productization/V1_PHASE_B_ACCEPTANCE.md` 记录的是已验证的 policy-execution slice，待 redaction golden fixture 补齐后才能关闭阶段 B。
+- [ ] 阶段 C / Daemon 产品行为补齐：未开始；可作为阶段 B 收口后的下一阶段，不应在 redaction golden fixture 待补时无条件进入。
 - [ ] 阶段 D / Operator 体验与发布：未开始。
 
 ## 3. 全局 Definition of Done

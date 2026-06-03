@@ -231,6 +231,67 @@ Do the work.
 	}
 }
 
+func TestLoadPathParsesApprovalNetworkPolicy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "WORKFLOW.md")
+	content := `---
+approvals:
+  mode: balanced
+  network:
+    default: review
+    allowlist: [example.invalid, api.local]
+  protected_paths: [.env, .npmrc]
+---
+Do the work.
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	w, err := LoadPath(path, dir)
+	if err != nil {
+		t.Fatalf("LoadPath returned error: %v", err)
+	}
+	if !w.Validation.Valid {
+		t.Fatalf("Validation.Valid = false, errors = %v", w.Validation.Errors)
+	}
+	if got := w.Config.Approvals.Network.Default; got != "review" {
+		t.Fatalf("approvals.network.default = %q, want review", got)
+	}
+	if got := w.Config.Approvals.Network.Allowlist; !slices.Equal(got, []string{"example.invalid", "api.local"}) {
+		t.Fatalf("approvals.network.allowlist = %v", got)
+	}
+	if got := w.Config.Approvals.ProtectedPaths; !slices.Equal(got, []string{".env", ".npmrc"}) {
+		t.Fatalf("approvals.protected_paths = %v", got)
+	}
+}
+
+func TestLoadPathRejectsUnsupportedApprovalNetworkDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "WORKFLOW.md")
+	content := `---
+approvals:
+  network:
+    default: allow
+---
+Do the work.
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	w, err := LoadPath(path, dir)
+	if err != nil {
+		t.Fatalf("LoadPath returned error: %v", err)
+	}
+	if w.Validation.Valid {
+		t.Fatalf("Validation.Valid = true, want false")
+	}
+	if !slices.Contains(w.Validation.Errors, "approvals.network.default must be deny or review") {
+		t.Fatalf("Validation.Errors = %v, want network default error", w.Validation.Errors)
+	}
+}
+
 func TestLoadPathExpandsOnlyCurrentUserHome(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
