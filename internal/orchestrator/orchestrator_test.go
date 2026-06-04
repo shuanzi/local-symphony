@@ -396,6 +396,40 @@ func TestRunWorkerRetriesAfterCreateAfterFailedAttempt(t *testing.T) {
 	assertRunEventCount(t, st, secondRun.ID, "hook.after_create.started", 1)
 }
 
+func TestRunWorkerRetriesAfterCreateWhenPreparedWorkspaceHasNoHookEvents(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, issue := newReadyDispatchIssue(t)
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	if _, err := st.CreateOrUpdateWorkspace(issue.ID, workspace, "test", "auto", "main", "base-sha"); err != nil {
+		t.Fatalf("CreateOrUpdateWorkspace: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "after-create-no-events")
+	afterCreate := fmt.Sprintf("printf retried > %q", marker)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.AfterCreate = &afterCreate
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read after_create marker: %v", err)
+	}
+	if got := string(data); got != "retried" {
+		t.Fatalf("after_create retry marker = %q, want retried", got)
+	}
+	assertRunEventCount(t, st, run.ID, "hook.after_create.started", 1)
+}
+
 func TestRunWorkerRetriesAfterCreateAfterInterruptedAttempt(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")

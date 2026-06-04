@@ -91,7 +91,7 @@ func shouldRunAfterCreate(st *store.Store, issue *core.Issue) (bool, error) {
 		return false, err
 	}
 	if len(rows) == 0 {
-		return false, nil
+		return true, nil
 	}
 	return rows[0]["event_type"].String() != "hook.after_create.completed", nil
 }
