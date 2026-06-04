@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -124,7 +125,10 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		return nil
 	}
 	if runAfterCreate {
-		if err := runWorkflowHook(o.Store, wf, ws.Path, runID, issue.ID, "after_create", wf.Config.Hooks.AfterCreate); err != nil {
+		hookCtx, stopHookContext := o.runContext(runID)
+		err := runWorkflowHook(hookCtx, o.Store, wf, ws.Path, runID, issue.ID, "after_create", wf.Config.Hooks.AfterCreate)
+		stopHookContext()
+		if err != nil {
 			o.failRunAfterHook(runID, issue.ID, ws.Path, wf, core.FailureAfterCreateFailed, err.Error(), core.RunFailed)
 			return nil
 		}
@@ -157,7 +161,10 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	if activeErr != nil || !active {
 		return nil
 	}
-	if err := runWorkflowHook(o.Store, wf, ws.Path, runID, issue.ID, "before_run", wf.Config.Hooks.BeforeRun); err != nil {
+	hookCtx, stopHookContext := o.runContext(runID)
+	err = runWorkflowHook(hookCtx, o.Store, wf, ws.Path, runID, issue.ID, "before_run", wf.Config.Hooks.BeforeRun)
+	stopHookContext()
+	if err != nil {
 		o.failRunAfterHook(runID, issue.ID, ws.Path, wf, core.FailureBeforeRunFailed, err.Error(), core.RunFailed)
 		return nil
 	}
@@ -223,7 +230,9 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	if activeErr != nil || !active {
 		return nil
 	}
-	_ = runAfterHook(o.Store, wf, ws.Path, runID, issue.ID)
+	afterRunCtx, stopAfterRunContext := o.runContext(runID)
+	_ = runAfterHook(afterRunCtx, o.Store, wf, ws.Path, runID, issue.ID)
+	stopAfterRunContext()
 	active, activeErr = o.runIsActive(runID)
 	if activeErr != nil || !active {
 		return nil
@@ -308,7 +317,9 @@ func failureMessageOrDefault(message, fallback string) string {
 }
 
 func (o Orchestrator) failRunAfterHook(runID, issueID, workspacePath string, wf *config.Workflow, code core.FailureCode, message string, status core.RunStatus) {
-	_ = runAfterHook(o.Store, wf, workspacePath, runID, issueID)
+	afterRunCtx, stopAfterRunContext := o.runContext(runID)
+	_ = runAfterHook(afterRunCtx, o.Store, wf, workspacePath, runID, issueID)
+	stopAfterRunContext()
 	active, err := o.runIsActive(runID)
 	if err != nil || !active {
 		return
@@ -326,6 +337,9 @@ func (o Orchestrator) runIsActive(runID string) (bool, error) {
 
 func (o Orchestrator) runContext(runID string) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
+	if active, err := o.runIsActive(runID); err != nil || !active {
+		cancel()
+	}
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
@@ -364,22 +378,34 @@ func (o Orchestrator) advanceRun(runID string, status core.RunStatus, fields map
 	return err == nil && active
 }
 
-func runAfterHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID string) error {
-	return runWorkflowHook(st, wf, cwd, runID, issueID, "after_run", wf.Config.Hooks.AfterRun)
+func runAfterHook(ctx context.Context, st *store.Store, wf *config.Workflow, cwd, runID, issueID string) error {
+	return runWorkflowHook(ctx, st, wf, cwd, runID, issueID, "after_run", wf.Config.Hooks.AfterRun)
 }
 
-func runWorkflowHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID, hookName string, command *string) error {
+func runWorkflowHook(ctx context.Context, st *store.Store, wf *config.Workflow, cwd, runID, issueID, hookName string, command *string) error {
 	eventPrefix := "hook." + hookName
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if command == nil || strings.TrimSpace(*command) == "" {
-		_ = st.AppendEvent(eventPrefix+".completed", "hook", &issueID, &runID, map[string]any{"configured": false})
-		return nil
+		return st.AppendEvent(eventPrefix+".completed", "hook", &issueID, &runID, map[string]any{"configured": false})
 	}
 	cmdText := *command
-	_ = st.AppendEvent(eventPrefix+".started", "hook", &issueID, &runID, map[string]any{"command": "redacted"})
-	cmd := exec.Command("/bin/sh", "-c", cmdText)
+	if err := st.AppendEvent(eventPrefix+".started", "hook", &issueID, &runID, map[string]any{"command": "redacted"}); err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", cmdText)
 	cmd.Dir = cwd
 	cmd.Env = hookEnv(st, runID, issueID, cwd)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		killHookProcess(cmd.Process)
+		return nil
+	}
+	cmd.WaitDelay = 2 * time.Second
 	timeout := time.Duration(wf.Config.Hooks.TimeoutMS) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
@@ -391,20 +417,14 @@ func runWorkflowHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID, 
 	output := &boundedHookOutput{limit: maxOutputBytes}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		_ = appendHookOutputEvent(st, eventPrefix, issueID, runID, output)
-		_ = st.AppendEvent(eventPrefix+".failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
-		return err
+		return appendHookFailureEvent(st, eventPrefix, issueID, runID, output, err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		_ = appendHookOutputEvent(st, eventPrefix, issueID, runID, output)
-		_ = st.AppendEvent(eventPrefix+".failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
-		return err
+		return appendHookFailureEvent(st, eventPrefix, issueID, runID, output, err)
 	}
 	if err := cmd.Start(); err != nil {
-		_ = appendHookOutputEvent(st, eventPrefix, issueID, runID, output)
-		_ = st.AppendEvent(eventPrefix+".failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
-		return err
+		return appendHookFailureEvent(st, eventPrefix, issueID, runID, output, err)
 	}
 	var readers sync.WaitGroup
 	readers.Add(2)
@@ -419,18 +439,44 @@ func runWorkflowHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID, 
 	defer timer.Stop()
 	select {
 	case err := <-done:
-		_ = appendHookOutputEvent(st, eventPrefix, issueID, runID, output)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if appendErr := appendHookOutputEvent(st, eventPrefix, issueID, runID, output); appendErr != nil {
+				return errors.Join(ctxErr, appendErr)
+			}
+			if appendErr := st.AppendEvent(eventPrefix+".cancelled", "hook", &issueID, &runID, map[string]any{}); appendErr != nil {
+				return errors.Join(ctxErr, appendErr)
+			}
+			return ctxErr
+		}
 		if err != nil {
-			_ = st.AppendEvent(eventPrefix+".failed", "hook", &issueID, &runID, map[string]any{"error": err.Error()})
+			return appendHookFailureEvent(st, eventPrefix, issueID, runID, output, err)
+		}
+		if err := appendHookOutputEvent(st, eventPrefix, issueID, runID, output); err != nil {
 			return err
 		}
-		_ = st.AppendEvent(eventPrefix+".completed", "hook", &issueID, &runID, map[string]any{})
+		if err := st.AppendEvent(eventPrefix+".completed", "hook", &issueID, &runID, map[string]any{}); err != nil {
+			return err
+		}
 		return nil
+	case <-ctx.Done():
+		killHookProcess(cmd.Process)
+		waitForHookReadersAfterKill(done, stdout, stderr)
+		if err := appendHookOutputEvent(st, eventPrefix, issueID, runID, output); err != nil {
+			return errors.Join(ctx.Err(), err)
+		}
+		if err := st.AppendEvent(eventPrefix+".cancelled", "hook", &issueID, &runID, map[string]any{}); err != nil {
+			return errors.Join(ctx.Err(), err)
+		}
+		return ctx.Err()
 	case <-timer.C:
 		killHookProcess(cmd.Process)
 		waitForHookReadersAfterKill(done, stdout, stderr)
-		_ = appendHookOutputEvent(st, eventPrefix, issueID, runID, output)
-		_ = st.AppendEvent(eventPrefix+".timeout", "hook", &issueID, &runID, map[string]any{})
+		if err := appendHookOutputEvent(st, eventPrefix, issueID, runID, output); err != nil {
+			return err
+		}
+		if err := st.AppendEvent(eventPrefix+".timeout", "hook", &issueID, &runID, map[string]any{}); err != nil {
+			return err
+		}
 		return fmt.Errorf("%s timeout", hookName)
 	}
 }
@@ -466,6 +512,16 @@ func minimalHookHostEnv() []string {
 		}
 	}
 	return env
+}
+
+func appendHookFailureEvent(st *store.Store, eventPrefix, issueID, runID string, output *boundedHookOutput, cause error) error {
+	if err := appendHookOutputEvent(st, eventPrefix, issueID, runID, output); err != nil {
+		return errors.Join(cause, err)
+	}
+	if err := st.AppendEvent(eventPrefix+".failed", "hook", &issueID, &runID, map[string]any{"error": cause.Error()}); err != nil {
+		return errors.Join(cause, err)
+	}
+	return cause
 }
 
 func appendHookOutputEvent(st *store.Store, eventPrefix, issueID, runID string, output *boundedHookOutput) error {

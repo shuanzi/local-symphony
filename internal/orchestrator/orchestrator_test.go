@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -532,6 +533,123 @@ func TestRunWorkerRetriesAfterCreateAfterInterruptedAttempt(t *testing.T) {
 	assertRunEventCount(t, st, run.ID, "hook.after_create.started", 1)
 }
 
+func TestRunWorkerFailsWhenAfterCreateCompletedEventCannotPersist(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, issue := newReadyDispatchIssue(t)
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	if err := st.Project.Exec(`CREATE TRIGGER fail_after_create_completed_insert BEFORE INSERT ON run_events WHEN NEW.event_type='hook.after_create.completed' BEGIN SELECT RAISE(ABORT, 'after_create completion insert failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "after-create-completed")
+	afterCreate := fmt.Sprintf("printf side-effect > %q", marker)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.AfterCreate = &afterCreate
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read after_create marker: %v", err)
+	}
+	if got := string(data); got != "side-effect" {
+		t.Fatalf("after_create marker = %q, want side-effect", got)
+	}
+	assertHookFailureBeforeTokenAndAgent(t, st, run.ID, core.FailureAfterCreateFailed, "after_create completion insert failed")
+	assertHookEvents(t, st, run.ID, "hook.after_create", []string{"started", "output"})
+}
+
+func TestRunWorkerCancelsAfterCreateHookProcessGroupWhenRunCancelled(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, issue := newReadyDispatchIssue(t)
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	tempDir := t.TempDir()
+	started := filepath.Join(tempDir, "after-create-started")
+	childOutput := filepath.Join(tempDir, "after-create-child-output")
+	afterCreate := fmt.Sprintf("touch %q; (while true; do printf c >> %q; sleep 0.05; done) & wait", started, childOutput)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.AfterCreate = &afterCreate
+	wf.Config.Hooks.TimeoutMS = 5000
+
+	done := make(chan error, 1)
+	go func() {
+		done <- (Orchestrator{Store: st}).runWorker(run.ID, wf)
+	}()
+	waitForFile(t, started)
+	waitForFile(t, childOutput)
+	if err := st.CancelRun(run.ID, "cancel during after_create"); err != nil {
+		t.Fatalf("CancelRun: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runWorker: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runWorker did not return promptly after after_create cancellation")
+	}
+	assertChildOutputStopsGrowing(t, childOutput)
+	gotRun, err := st.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Status != core.RunCancelled {
+		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunCancelled)
+	}
+	assertHookEvents(t, st, run.ID, "hook.after_create", []string{"started", "output", "cancelled"})
+	assertRunEventCount(t, st, run.ID, "hook.after_run.completed", 0)
+}
+
+func TestRunWorkerCancelsBeforeRunHookProcessGroupWhenRunCancelled(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, run := newRunWorkerTestFixture(t)
+	tempDir := t.TempDir()
+	started := filepath.Join(tempDir, "before-run-started")
+	childOutput := filepath.Join(tempDir, "before-run-child-output")
+	beforeRun := fmt.Sprintf("touch %q; (while true; do printf c >> %q; sleep 0.05; done) & wait", started, childOutput)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.BeforeRun = &beforeRun
+	wf.Config.Hooks.TimeoutMS = 5000
+
+	done := make(chan error, 1)
+	go func() {
+		done <- (Orchestrator{Store: st}).runWorker(run.ID, wf)
+	}()
+	waitForFile(t, started)
+	waitForFile(t, childOutput)
+	if err := st.CancelRun(run.ID, "cancel during before_run"); err != nil {
+		t.Fatalf("CancelRun: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runWorker: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runWorker did not return promptly after before_run cancellation")
+	}
+	assertChildOutputStopsGrowing(t, childOutput)
+	gotRun, err := st.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Status != core.RunCancelled {
+		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunCancelled)
+	}
+	assertHookEvents(t, st, run.ID, "hook.before_run", []string{"started", "output", "cancelled"})
+	assertRunEventCount(t, st, run.ID, "hook.after_run.completed", 0)
+}
+
 func TestRunWorkerSkipsBeforeRunWhenCancelledDuringPromptRender(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
@@ -905,7 +1023,7 @@ func TestRunAfterHookWithNegativeMaxOutputBytesDoesNotPanic(t *testing.T) {
 		Validation: config.Validation{Valid: true},
 	}
 
-	if err := runAfterHook(st, wf, t.TempDir(), run.ID, issue.ID); err != nil {
+	if err := runAfterHook(context.Background(), st, wf, t.TempDir(), run.ID, issue.ID); err != nil {
 		t.Fatalf("runAfterHook: %v", err)
 	}
 	rows, err := st.Project.Query(`SELECT data_json FROM run_events WHERE event_type='hook.after_run.output' AND run_id=?`, run.ID)
@@ -957,7 +1075,7 @@ func TestRunAfterHookStoresRedactedOutputFromLargeOutput(t *testing.T) {
 		Validation: config.Validation{Valid: true},
 	}
 
-	if err := runAfterHook(st, wf, t.TempDir(), run.ID, issue.ID); err != nil {
+	if err := runAfterHook(context.Background(), st, wf, t.TempDir(), run.ID, issue.ID); err != nil {
 		t.Fatalf("runAfterHook: %v", err)
 	}
 
@@ -1017,7 +1135,7 @@ func TestRunAfterHookTimeoutRecordsBoundedOutputBeforeReturning(t *testing.T) {
 	started := time.Now()
 	done := make(chan error, 1)
 	go func() {
-		done <- runAfterHook(st, wf, tempDir, run.ID, issue.ID)
+		done <- runAfterHook(context.Background(), st, wf, tempDir, run.ID, issue.ID)
 	}()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -1251,6 +1369,36 @@ func waitForRunEvent(t *testing.T, st *store.Store, runID, eventType string) {
 	t.Fatalf("%s event was not recorded before deadline", eventType)
 }
 
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s was not created before deadline", path)
+}
+
+func assertChildOutputStopsGrowing(t *testing.T, path string) {
+	t.Helper()
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat child output before stability check: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat child output after stability check: %v", err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("child output kept growing after hook cancellation: size %d -> %d", before.Size(), after.Size())
+	}
+}
+
 func assertEventOrder(t *testing.T, st *store.Store, runID string, want []string) {
 	t.Helper()
 	quoted := make([]string, 0, len(want))
@@ -1443,7 +1591,7 @@ func TestRunAfterHookStartFailureDoesNotPanic(t *testing.T) {
 	}
 	missingCWD := filepath.Join(t.TempDir(), "missing")
 
-	if err := runAfterHook(st, wf, missingCWD, run.ID, issue.ID); err == nil {
+	if err := runAfterHook(context.Background(), st, wf, missingCWD, run.ID, issue.ID); err == nil {
 		t.Fatalf("runAfterHook error = nil, want start failure")
 	}
 
