@@ -119,7 +119,7 @@ python3 scripts/validate_contracts.py
 ### R5. Approval bridge 与安全策略生产路径
 
 **优先级**：P0  
-**现状**：Approval API、CLI、dashboard 决策入口存在，但当前真实运行路径没有 Codex approval request producer；响应字段和 OpenAPI schema 也未完整满足 TECH 对 `action_summary`、`risk_level`、`policy_match` 的要求。  
+**现状**：阶段 B 已补齐 Approval API/model 与 Codex approval producer/writeback；Codex command/file_change/network approval request 会进入 `approval_requests`，operator 决策、deny、cancel_run 与 timeout 语义已验证。
 **目标**：Codex 请求命令、文件、网络或 protected path 时，adapter 能生成 approval row、等待 operator 决策或 timeout，并把决策写回 Codex。
 
 验收要求：
@@ -148,7 +148,7 @@ python3 scripts/validate_contracts.py
 ### R7. Hook lifecycle 完整落地
 
 **优先级**：P1  
-**现状**：当前只执行 `after_run`，且未完整实现 `after_create`、`before_run`；TECH 中对应 failure code 已存在。  
+**现状**：阶段 C1 已补齐 `after_create` 与 `before_run` 执行路径；`after_create_failed` / `before_run_failed` 会 fail run、恢复 issue source state、pause dispatch，且不创建 tool token 或启动 runner。hook review packet / diagnostics summary 仍待后续展示面补齐。
 **目标**：workspace 生命周期 hook 与 run 生命周期一致。
 
 验收要求：
@@ -157,7 +157,7 @@ python3 scripts/validate_contracts.py
 - 每次 run 启动前运行 `before_run`，包括首次 run 和 rework run。
 - `after_create_failed`、`before_run_failed` 按 failure matrix 恢复 issue、pause dispatch，并不启动 runner。
 - 只要 workspace 已准备，terminal worker outcome 都尝试 `after_run`。
-- hook 输出受 `hooks.max_output_bytes` 限制，并进入 redacted event/diagnostics/review packet 摘要。
+- hook 输出受 `hooks.max_output_bytes` 限制，并进入 redacted event；diagnostics/review packet 摘要仍待后续展示面补齐。
 
 ### R8. Scheduler tick loop 与单 daemon 项目所有权
 
@@ -219,7 +219,7 @@ python3 scripts/validate_contracts.py
 ### R12. 安全策略与回归套件
 
 **优先级**：P1  
-**现状**：已有部分 token/path/redaction 基础，但真实 Codex-mediated command/network/protected-path 路径未完整出现。  
+**现状**：阶段 B 已完成安全策略执行与回归套件；默认 command allow/review/deny、network default deny、protected-path auto-deny、Tool Gateway protected artifact hard-deny 和 redaction golden fixture 已验证。
 **目标**：安全策略可执行、可验证、可诊断。
 
 验收要求：

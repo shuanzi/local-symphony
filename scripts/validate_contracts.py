@@ -303,6 +303,8 @@ REQUIRED_SECURITY_TOPIC_SLUGS = frozenset(
         "raw_prompt_raw_codex_log_raw_secret_api_refusal",
     }
 )
+REQUIRED_REDACTION_GOLDEN_FIXTURE_SURFACES = frozenset({"prompt", "codex_log", "secret", "diagnostics"})
+SYNTHETIC_SENTINEL_RE = re.compile(r"\bSYNTHETIC_[A-Z0-9_]+\b")
 
 OPENAPI_HTTP_METHODS = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})
 
@@ -456,6 +458,64 @@ def slugify_topic(value: Any) -> str:
     return re.sub(r"_+", "_", slug)
 
 
+def validate_redaction_golden_fixtures(manifest: dict[str, Any]) -> None:
+    fixtures = require_list(manifest, ("security_regression", "redaction_golden_fixtures"))
+    for fixture in fixtures:
+        if not isinstance(fixture, dict):
+            fail(f"{CONTRACT_MANIFEST_REL} redaction golden fixture entries must be objects")
+        rel = fixture.get("path")
+        if not isinstance(rel, str) or Path(rel).is_absolute() or not is_under(ROOT / rel, ROOT) or not (ROOT / rel).is_file():
+            fail(f"{CONTRACT_MANIFEST_REL} redaction golden fixture file is missing: {rel}")
+        covers = fixture.get("covers")
+        if not isinstance(covers, list):
+            fail(f"{CONTRACT_MANIFEST_REL} redaction golden fixture covers must be a list: {rel}")
+        missing_surfaces = REQUIRED_REDACTION_GOLDEN_FIXTURE_SURFACES - set(covers)
+        if missing_surfaces:
+            fail(f"{CONTRACT_MANIFEST_REL} redaction golden fixture coverage is incomplete: {sorted(missing_surfaces)}")
+        body = load_json(rel)
+        if not isinstance(body, dict):
+            fail(f"{rel} redaction golden fixture must be a JSON object")
+        cases = body.get("cases")
+        if not isinstance(cases, list):
+            fail(f"{rel} redaction golden fixture cases must be a list")
+        covered_cases: set[str] = set()
+        for case in cases:
+            if not isinstance(case, dict):
+                fail(f"{rel} redaction golden fixture cases must be objects")
+            surface = case.get("surface")
+            if surface not in REQUIRED_REDACTION_GOLDEN_FIXTURE_SURFACES:
+                continue
+            input_text = case.get("input")
+            redacted = case.get("redacted")
+            if not isinstance(input_text, str) or not input_text.strip():
+                fail(f"{rel} redaction golden case input must be a non-empty string: {surface}")
+            if not isinstance(redacted, str) or not redacted.strip():
+                fail(f"{rel} redaction golden case redacted must be a non-empty string: {surface}")
+            synthetic_sentinels = set(SYNTHETIC_SENTINEL_RE.findall(input_text))
+            sentinel = case.get("sentinel")
+            sentinels = set(synthetic_sentinels)
+            if sentinel is not None:
+                if not isinstance(sentinel, str) or not sentinel.strip():
+                    fail(f"{rel} redaction golden case sentinel must be a non-empty string: {surface}")
+                sentinels.add(sentinel)
+            else:
+                if not sentinels:
+                    fail(f"{rel} redaction golden case sentinel could not be derived: {surface}")
+            expected_redacted = input_text
+            for value in sorted(sentinels, key=len, reverse=True):
+                if value not in input_text:
+                    fail(f"{rel} redaction golden case input must contain sentinel: {surface}")
+                if value in redacted:
+                    fail(f"{rel} redaction golden case redacted output leaks sentinel: {surface}")
+                expected_redacted = expected_redacted.replace(value, "[REDACTED]")
+            if redacted != expected_redacted:
+                fail(f"{rel} redaction golden case redacted output does not match expected golden output: {surface}")
+            covered_cases.add(surface)
+        missing_case_surfaces = REQUIRED_REDACTION_GOLDEN_FIXTURE_SURFACES - covered_cases
+        if missing_case_surfaces:
+            fail(f"{rel} redaction golden fixture cases are incomplete: {sorted(missing_case_surfaces)}")
+
+
 def validate_contract_manifest(manifest: dict[str, Any]) -> None:
     required_lists = [
         ("openapi", "required_routes"),
@@ -474,6 +534,7 @@ def validate_contract_manifest(manifest: dict[str, Any]) -> None:
         ("docs", "agent_work_order_forbidden_command_like_patterns"),
         ("security_regression", "default_commands"),
         ("security_regression", "topics"),
+        ("security_regression", "redaction_golden_fixtures"),
     ]
     for path in required_lists:
         require_list(manifest, path)
@@ -502,6 +563,7 @@ def validate_contract_manifest(manifest: dict[str, Any]) -> None:
     missing_security_topics = REQUIRED_SECURITY_TOPIC_SLUGS - security_topic_slugs
     if missing_security_topics:
         fail(f"{CONTRACT_MANIFEST_REL} missing security regression topics: {sorted(missing_security_topics)}")
+    validate_redaction_golden_fixtures(manifest)
 
     cli_section_text = "\n".join(manifest_strings(manifest.get("cli", {})))
     cli_required_commands = set(require_list(manifest, ("cli", "required_commands")))

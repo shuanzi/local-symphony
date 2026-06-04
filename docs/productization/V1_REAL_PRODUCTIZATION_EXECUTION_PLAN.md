@@ -1,7 +1,7 @@
 # v1 真实产品化执行计划
 
-**状态**：执行中，阶段 A 已完成；阶段 B policy-execution slice 已验证，B3 redaction golden fixture 待补后才能收口
-**更新日期**：2026-06-01
+**状态**：执行中，阶段 A、阶段 B 已完成；阶段 C 已启动，C1 hook lifecycle 已完成，下一入口为 C2 / Scheduler tick loop
+**更新日期**：2026-06-03
 **需求来源**：`docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md`
 **目标**：把 R1-R17 的产品化缺口拆成可落地、可审查、可验收的实施批次，推进 Local Symphony 从本地 fake runner MVP 进入真实 Codex 可运行的本地产品化版本。
 
@@ -34,9 +34,9 @@ R15 是横切要求，不作为单独最后阶段处理。每完成一个需求�
 - [x] 阶段 A / 真实 Codex 最小闭环：A0-A5 已完成，合并记录为 PR #11；验收记录见 `docs/productization/V1_PHASE_A_ACCEPTANCE.md`。
 - [x] B1 / Approval API contract 补齐：已完成并合并 PR #12，Approval DTO、OpenAPI、JSON Schema、DB/fallback schema、store/httpapi、dashboard 类型与测试已对齐。
 - [x] B2 / Codex approval producer 与 writeback：已完成；Codex command/file_change/network approval request 会写入 `approval_requests`，operator 决策可写回 Codex，并覆盖 deny、cancel_run 与 timeout 语义。
-- [ ] B3 / 安全策略执行与回归套件：policy execution slice 已验证；默认 command/network/protected-path policy evaluator 接入 Codex approval bridge，auto-deny 写入 `approval_requests(auto_denied)` 并返回 canonical failure code。redaction golden fixture 仍待补，B3 未完全收口。
-- [ ] 阶段 B 收口：未完成；`docs/productization/V1_PHASE_B_ACCEPTANCE.md` 记录的是已验证的 policy-execution slice，待 redaction golden fixture 补齐后才能关闭阶段 B。
-- [ ] 阶段 C / Daemon 产品行为补齐：未开始；可作为阶段 B 收口后的下一阶段，不应在 redaction golden fixture 待补时无条件进入。
+- [x] B3 / 安全策略执行与回归套件：默认 command/network/protected-path policy evaluator 已接入 Codex approval bridge，auto-deny 写入 `approval_requests(auto_denied)` 并返回 canonical failure code；redaction golden fixture 已补齐并纳入 contract validation，覆盖 prompt、Codex log、secret、diagnostics。
+- [x] 阶段 B 收口：已完成；验收记录见 `docs/productization/V1_PHASE_B_ACCEPTANCE.md`。
+- [ ] 阶段 C / Daemon 产品行为补齐：进行中；C1 hook lifecycle 已完成，C2 scheduler tick loop 待推进。
 - [ ] 阶段 D / Operator 体验与发布：未开始。
 
 ## 3. 全局 Definition of Done
@@ -378,6 +378,8 @@ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
 
 覆盖 R12。
 
+**进度**：已完成。policy execution slice、Tool Gateway protected artifact hard-deny、redaction golden fixture 与安全回归均已验证；redaction fixture 位于 `docs/testing/redaction-golden/redaction-golden.json`，并由 `scripts/validate_contracts.py` 校验 manifest metadata 与 fixture case content。
+
 目标：
 
 - command policy 支持 allow/review/deny。
@@ -425,6 +427,8 @@ bash scripts/acceptance-local.sh
 
 覆盖 R7。
 
+**进度**：已完成。`after_create` 仅在新 workspace 创建后运行，`before_run` 在 runner/token 创建前运行；两者失败分别映射 `after_create_failed` / `before_run_failed`，通过现有 `Store.FailRun` 终止 run、恢复 issue source state 并 pause dispatch。hook 输出沿用 bounded/redacted 事件路径。
+
 目标：
 
 - 新 workspace 创建后运行 `after_create`。
@@ -442,16 +446,17 @@ bash scripts/acceptance-local.sh
 
 任务拆分：
 
-1. 建立 hook executor 统一输出截断和 redaction。
-2. workspace 创建成功后运行 after_create。
-3. runner 启动前运行 before_run。
-4. terminal outcome 后运行 after_run。
-5. review packet 和 diagnostics 纳入 hook summary。
+1. [x] 建立 hook executor 统一输出截断和 redaction。
+2. [x] workspace 创建成功后运行 after_create。
+3. [x] runner 启动前运行 before_run。
+4. [x] terminal outcome 后运行 after_run。
+5. [ ] review packet 和 diagnostics 纳入 hook summary。
 
 验收：
 
-- `after_create_failed`、`before_run_failed` 不启动 runner。
-- hook 输出受 `hooks.max_output_bytes` 限制。
+- [x] `after_create_failed`、`before_run_failed` 不启动 runner。
+- [x] hook 输出受 `hooks.max_output_bytes` 限制。
+- [ ] hook summary 纳入 review packet / diagnostics。
 
 ### C2. Scheduler tick loop 与 dispatch preflight 统一
 
@@ -835,4 +840,4 @@ R15
 6. [x] **A5 / R6**：missing handoff continuation。
 7. [x] **B1 / R5**：Approval API contract 字段补齐。
 
-第一批已完成。下一步建议优先推进 **B2 / Codex approval producer 与 writeback**，因为 B1 已把 operator API/dashboard/schema 合同补齐，B2 可以在该合同上接入真实 Codex approval request 与 writeback；若真实 Codex opt-in integration 出现阻塞，再切换到 C 阶段 daemon ownership/tick loop。
+第一批、阶段 B 与 C1 已完成。下一步建议优先推进 **C2 / Scheduler tick loop 与 dispatch preflight 统一**，先让 `symphony serve` 按 polling interval 周期调度 eligible issue，并确保 tick 与手动 dispatch 共用同一 preflight。
