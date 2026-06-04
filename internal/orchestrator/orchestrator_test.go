@@ -532,6 +532,36 @@ func TestRunWorkerRetriesAfterCreateAfterInterruptedAttempt(t *testing.T) {
 	assertRunEventCount(t, st, run.ID, "hook.after_create.started", 1)
 }
 
+func TestRunWorkerSkipsBeforeRunWhenCancelledDuringPromptRender(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, run := newRunWorkerTestFixture(t)
+	now := core.Now()
+	if err := st.Project.Exec(`CREATE TRIGGER cancel_run_after_prompt_snapshot_insert AFTER INSERT ON prompt_snapshots BEGIN UPDATE run_attempts SET status='cancelled', failure_code='operator_cancelled', failure_message='cancelled during prompt render', ended_at='` + now + `', updated_at='` + now + `' WHERE id=NEW.run_id AND status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running'); END`); err != nil {
+		t.Fatalf("create cancel trigger: %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "before-run-cancelled")
+	beforeRun := fmt.Sprintf("printf should-not-run > %q", marker)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.BeforeRun = &beforeRun
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("before_run marker stat error = %v, want not exist", err)
+	}
+	gotRun, err := st.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Status != core.RunCancelled {
+		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunCancelled)
+	}
+	assertRunEventCount(t, st, run.ID, "hook.before_run.started", 0)
+}
+
 func TestRunWorkerBeforeRunFailureFailsBeforeTokenAndAgent(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")

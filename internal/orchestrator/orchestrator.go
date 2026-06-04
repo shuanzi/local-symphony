@@ -153,6 +153,10 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	ph := sha256.Sum256([]byte(prompt))
 	ch := sha256.Sum256([]byte(issue.ID + runID))
 	_, _ = o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), filepath.Join(o.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, runID))
+	active, activeErr = o.runIsActive(runID)
+	if activeErr != nil || !active {
+		return nil
+	}
 	if err := runWorkflowHook(o.Store, wf, ws.Path, runID, issue.ID, "before_run", wf.Config.Hooks.BeforeRun); err != nil {
 		o.failRunAfterHook(runID, issue.ID, ws.Path, wf, core.FailureBeforeRunFailed, err.Error(), core.RunFailed)
 		return nil
