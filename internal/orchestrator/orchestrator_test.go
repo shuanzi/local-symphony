@@ -355,6 +355,36 @@ func TestRunWorkerAfterCreateFailureFailsBeforeTokenAndAgent(t *testing.T) {
 	assertHookEvents(t, st, run.ID, "hook.after_create", []string{"started", "output", "failed"})
 	assertHookStartedCommandRedacted(t, st, run.ID, "hook.after_create.started")
 	assertHookOutput(t, st, run.ID, "hook.after_create.output", "redacted")
+	assertHookEvents(t, st, run.ID, "hook.after_run", []string{"completed"})
+}
+
+func TestRunWorkerAfterCreateFailureRunsAfterRunBeforeFail(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, issue := newReadyDispatchIssue(t)
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "hook-order")
+	afterCreate := fmt.Sprintf("printf a >> %q; exit 7", marker)
+	afterRun := fmt.Sprintf("printf r >> %q", marker)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.AfterCreate = &afterCreate
+	wf.Config.Hooks.AfterRun = &afterRun
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read hook order marker: %v", err)
+	}
+	if got := string(data); got != "ar" {
+		t.Fatalf("hook order marker = %q, want after_create then after_run", got)
+	}
+	assertEventOrder(t, st, run.ID, []string{"hook.after_create.failed", "hook.after_run.started", "run.failed"})
 }
 
 func TestRunWorkerRetriesAfterCreateAfterFailedAttempt(t *testing.T) {
@@ -430,6 +460,40 @@ func TestRunWorkerRetriesAfterCreateWhenPreparedWorkspaceHasNoHookEvents(t *test
 	assertRunEventCount(t, st, run.ID, "hook.after_create.started", 1)
 }
 
+func TestRunWorkerSkipsAfterCreateWhenCancelledDuringPrepare(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, issue := newReadyDispatchIssue(t)
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	now := core.Now()
+	if err := st.Project.Exec(`CREATE TRIGGER cancel_run_after_workspace_insert AFTER INSERT ON workspaces BEGIN UPDATE run_attempts SET status='cancelled', failure_code='operator_cancelled', failure_message='cancelled during prepare', ended_at='` + now + `', updated_at='` + now + `' WHERE issue_id=NEW.issue_id AND status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running'); END`); err != nil {
+		t.Fatalf("create cancel trigger: %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "after-create-cancelled")
+	afterCreate := fmt.Sprintf("printf should-not-run > %q", marker)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.AfterCreate = &afterCreate
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("after_create marker stat error = %v, want not exist", err)
+	}
+	gotRun, err := st.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Status != core.RunCancelled {
+		t.Fatalf("run status = %s, want %s", gotRun.Status, core.RunCancelled)
+	}
+	assertRunEventCount(t, st, run.ID, "hook.after_create.started", 0)
+}
+
 func TestRunWorkerRetriesAfterCreateAfterInterruptedAttempt(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
@@ -485,6 +549,32 @@ func TestRunWorkerBeforeRunFailureFailsBeforeTokenAndAgent(t *testing.T) {
 	assertHookEvents(t, st, run.ID, "hook.before_run", []string{"started", "output", "failed"})
 	assertHookStartedCommandRedacted(t, st, run.ID, "hook.before_run.started")
 	assertHookOutput(t, st, run.ID, "hook.before_run.output", "redacted")
+	assertHookEvents(t, st, run.ID, "hook.after_run", []string{"completed"})
+}
+
+func TestRunWorkerBeforeRunFailureRunsAfterRunBeforeFail(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	st, run := newRunWorkerTestFixture(t)
+	marker := filepath.Join(t.TempDir(), "hook-order")
+	beforeRun := fmt.Sprintf("printf b >> %q; exit 7", marker)
+	afterRun := fmt.Sprintf("printf r >> %q", marker)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.BeforeRun = &beforeRun
+	wf.Config.Hooks.AfterRun = &afterRun
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read hook order marker: %v", err)
+	}
+	if got := string(data); got != "br" {
+		t.Fatalf("hook order marker = %q, want before_run then after_run", got)
+	}
+	assertEventOrder(t, st, run.ID, []string{"hook.before_run.failed", "hook.after_run.started", "run.failed"})
 }
 
 func TestRunWorkerHookOutputDoesNotStoreSyntheticSecret(t *testing.T) {
@@ -508,6 +598,33 @@ func TestRunWorkerHookOutputDoesNotStoreSyntheticSecret(t *testing.T) {
 	}
 	if got := rows[0]["data_json"].String(); strings.Contains(got, "SYNTHETIC_SECRET_TOKEN") {
 		t.Fatalf("hook output leaked synthetic secret: %s", got)
+	}
+}
+
+func TestRunWorkerHooksUseMinimalEnvironment(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "")
+	t.Setenv("DAEMON_RAW_SECRET", "should-not-leak")
+	st, issue := newReadyDispatchIssue(t)
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "hook-env")
+	afterCreate := fmt.Sprintf(`if [ -n "$DAEMON_RAW_SECRET" ]; then printf leaked > %[1]q; elif [ "$SYMPHONY_RUN_ID" != %[2]q ]; then printf missing-run > %[1]q; elif [ -z "$SYMPHONY_WORKSPACE_PATH" ]; then printf missing-workspace > %[1]q; else printf clean > %[1]q; fi`, marker, run.ID)
+	wf := newRunWorkerTestWorkflow(st)
+	wf.Config.Hooks.AfterCreate = &afterCreate
+
+	if err := (Orchestrator{Store: st}).runWorker(run.ID, wf); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read hook env marker: %v", err)
+	}
+	if got := string(data); got != "clean" {
+		t.Fatalf("hook env marker = %q, want clean", got)
 	}
 }
 
@@ -1102,6 +1219,26 @@ func waitForRunEvent(t *testing.T, st *store.Store, runID, eventType string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("%s event was not recorded before deadline", eventType)
+}
+
+func assertEventOrder(t *testing.T, st *store.Store, runID string, want []string) {
+	t.Helper()
+	quoted := make([]string, 0, len(want))
+	for _, eventType := range want {
+		quoted = append(quoted, "'"+strings.ReplaceAll(eventType, "'", "''")+"'")
+	}
+	rows, err := st.Project.Query(`SELECT event_type FROM run_events WHERE run_id=? AND event_type IN (`+strings.Join(quoted, ",")+`) ORDER BY seq ASC`, runID)
+	if err != nil {
+		t.Fatalf("query run events: %v", err)
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("event count = %d, want %d", len(rows), len(want))
+	}
+	for i, eventType := range want {
+		if got := rows[i]["event_type"].String(); got != eventType {
+			t.Fatalf("event %d = %s, want %s", i, got, eventType)
+		}
+	}
 }
 
 func assertRunEventCount(t *testing.T, st *store.Store, runID, eventType string, want int) {

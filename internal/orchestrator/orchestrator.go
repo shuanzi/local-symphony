@@ -119,12 +119,16 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		_ = o.Store.FailRun(runID, core.FailureWorkspacePrepareFailed, err.Error(), core.RunFailed)
 		return nil
 	}
+	active, activeErr := o.runIsActive(runID)
+	if activeErr != nil || !active {
+		return nil
+	}
 	if runAfterCreate {
 		if err := runWorkflowHook(o.Store, wf, ws.Path, runID, issue.ID, "after_create", wf.Config.Hooks.AfterCreate); err != nil {
-			_ = o.Store.FailRun(runID, core.FailureAfterCreateFailed, err.Error(), core.RunFailed)
+			o.failRunAfterHook(runID, issue.ID, ws.Path, wf, core.FailureAfterCreateFailed, err.Error(), core.RunFailed)
 			return nil
 		}
-		active, activeErr := o.runIsActive(runID)
+		active, activeErr = o.runIsActive(runID)
 		if activeErr != nil || !active {
 			return nil
 		}
@@ -150,7 +154,7 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	ch := sha256.Sum256([]byte(issue.ID + runID))
 	_, _ = o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), filepath.Join(o.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, runID))
 	if err := runWorkflowHook(o.Store, wf, ws.Path, runID, issue.ID, "before_run", wf.Config.Hooks.BeforeRun); err != nil {
-		_ = o.Store.FailRun(runID, core.FailureBeforeRunFailed, err.Error(), core.RunFailed)
+		o.failRunAfterHook(runID, issue.ID, ws.Path, wf, core.FailureBeforeRunFailed, err.Error(), core.RunFailed)
 		return nil
 	}
 	if !o.advanceRun(runID, core.RunStartingAgent, map[string]any{}) {
@@ -211,7 +215,7 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 			return nil
 		}
 	}
-	active, activeErr := o.runIsActive(runID)
+	active, activeErr = o.runIsActive(runID)
 	if activeErr != nil || !active {
 		return nil
 	}
@@ -299,6 +303,15 @@ func failureMessageOrDefault(message, fallback string) string {
 	return message
 }
 
+func (o Orchestrator) failRunAfterHook(runID, issueID, workspacePath string, wf *config.Workflow, code core.FailureCode, message string, status core.RunStatus) {
+	_ = runAfterHook(o.Store, wf, workspacePath, runID, issueID)
+	active, err := o.runIsActive(runID)
+	if err != nil || !active {
+		return
+	}
+	_ = o.Store.FailRun(runID, code, message, status)
+}
+
 func (o Orchestrator) runIsActive(runID string) (bool, error) {
 	run, err := o.Store.GetRun(runID)
 	if err != nil {
@@ -361,6 +374,7 @@ func runWorkflowHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID, 
 	_ = st.AppendEvent(eventPrefix+".started", "hook", &issueID, &runID, map[string]any{"command": "redacted"})
 	cmd := exec.Command("/bin/sh", "-c", cmdText)
 	cmd.Dir = cwd
+	cmd.Env = hookEnv(st, runID, issueID, cwd)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	timeout := time.Duration(wf.Config.Hooks.TimeoutMS) * time.Millisecond
 	if timeout <= 0 {
@@ -415,6 +429,39 @@ func runWorkflowHook(st *store.Store, wf *config.Workflow, cwd, runID, issueID, 
 		_ = st.AppendEvent(eventPrefix+".timeout", "hook", &issueID, &runID, map[string]any{})
 		return fmt.Errorf("%s timeout", hookName)
 	}
+}
+
+func hookEnv(st *store.Store, runID, issueID, workspacePath string) []string {
+	env := minimalHookHostEnv()
+	if st.ProjectID != "" {
+		env = append(env, "SYMPHONY_PROJECT_ID="+st.ProjectID)
+	}
+	if runID != "" {
+		env = append(env, "SYMPHONY_RUN_ID="+runID)
+	}
+	if issueID != "" {
+		env = append(env, "SYMPHONY_ISSUE_ID="+issueID)
+	}
+	if workspacePath != "" {
+		env = append(env, "SYMPHONY_WORKSPACE_PATH="+workspacePath)
+	}
+	return env
+}
+
+func minimalHookHostEnv() []string {
+	keys := []string{"PATH", "HOME", "TMPDIR", "TMP", "TEMP", "SHELL", "USER", "LOGNAME", "LANG", "LC_ALL"}
+	env := make([]string, 0, len(keys))
+	seen := map[string]bool{}
+	for _, key := range keys {
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if value, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
 }
 
 func appendHookOutputEvent(st *store.Store, eventPrefix, issueID, runID string, output *boundedHookOutput) error {
