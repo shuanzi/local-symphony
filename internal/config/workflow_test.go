@@ -148,6 +148,31 @@ Do the work.
 	}
 }
 
+func TestLoadPathRejectsPollingIntervalBelowMinimum(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "WORKFLOW.md")
+	content := `---
+polling:
+  interval_ms: 999
+---
+Do the work.
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	w, err := LoadPath(path, dir)
+	if err != nil {
+		t.Fatalf("LoadPath returned error: %v", err)
+	}
+	if w.Validation.Valid {
+		t.Fatalf("Validation.Valid = true, want false")
+	}
+	if !slices.Contains(w.Validation.Errors, "polling.interval_ms must be greater than or equal to 1000") {
+		t.Fatalf("Validation.Errors = %v, want polling interval minimum error", w.Validation.Errors)
+	}
+}
+
 func TestLoadPathHonorsAgentMaxTurnsAliasWhenMaxTurnsPerRunUnset(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "WORKFLOW.md")

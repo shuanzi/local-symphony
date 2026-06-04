@@ -1,13 +1,18 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"local-symphony/internal/config"
 	"local-symphony/internal/core"
 	"local-symphony/internal/db"
 	"local-symphony/internal/store"
@@ -138,6 +143,131 @@ func TestServeReturnsReconcileError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "serve reconcile failed") {
 		t.Fatalf("Serve error = %v, want reconcile failure", err)
+	}
+}
+
+func TestSchedulerTickLoopRunsOnIntervalAndStopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var ticks atomic.Int32
+
+	done := runSchedulerTickLoop(ctx, time.Millisecond, func() error {
+		if ticks.Add(1) == 2 {
+			cancel()
+		}
+		return nil
+	})
+
+	select {
+	case err, ok := <-done:
+		if ok && err != nil {
+			t.Fatalf("tick loop returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tick loop did not stop after context cancellation")
+	}
+	if got := ticks.Load(); got < 2 {
+		t.Fatalf("ticks = %d, want at least 2", got)
+	}
+	before := ticks.Load()
+	time.Sleep(5 * time.Millisecond)
+	if got := ticks.Load(); got != before {
+		t.Fatalf("ticks after cancellation = %d, want %d", got, before)
+	}
+}
+
+func TestSchedulerTickLoopContinuesAfterTickError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var ticks atomic.Int32
+
+	done := runSchedulerTickLoop(ctx, time.Millisecond, func() error {
+		switch ticks.Add(1) {
+		case 1:
+			return errors.New("transient tick failure")
+		case 2:
+			cancel()
+		}
+		return nil
+	})
+
+	select {
+	case err, ok := <-done:
+		if ok && err != nil {
+			t.Fatalf("tick loop returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tick loop did not stop after context cancellation")
+	}
+	if got := ticks.Load(); got < 2 {
+		t.Fatalf("ticks = %d, want tick after transient error", got)
+	}
+}
+
+func TestSchedulerTickLoopCancelDoesNotWaitForBlockedTick(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	var ticks atomic.Int32
+
+	done := runSchedulerTickLoop(ctx, time.Millisecond, func() error {
+		if ticks.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return nil
+	})
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("tick did not start")
+	}
+	cancel()
+	select {
+	case err, ok := <-done:
+		if ok && err != nil {
+			t.Fatalf("tick loop returned error: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("tick loop waited for blocked tick after cancellation")
+	}
+	if got := ticks.Load(); got != 1 {
+		t.Fatalf("ticks after cancellation = %d, want 1", got)
+	}
+}
+
+func TestSchedulerIntervalUsesDefaultWhenWorkflowInvalid(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := config.Defaults(repoRoot)
+	cfg.Polling.IntervalMS = 999
+	wf := &config.Workflow{Config: cfg, Validation: config.Validation{Valid: false, Errors: []string{"polling.interval_ms must be greater than or equal to 1000"}}}
+
+	got := schedulerTickInterval(wf, repoRoot)
+
+	if got != 30*time.Second {
+		t.Fatalf("scheduler interval = %s, want 30s default for invalid workflow", got)
+	}
+}
+
+func TestCloseStoreAfterSchedulerDrainWaits(t *testing.T) {
+	drained := make(chan struct{})
+	closed := make(chan struct{})
+
+	go closeStoreAfterSchedulerDrain(drained, func() { close(closed) })
+
+	select {
+	case <-closed:
+		t.Fatal("store closed before scheduler drained")
+	case <-time.After(5 * time.Millisecond):
+	}
+	close(drained)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("store did not close after scheduler drained")
 	}
 }
 

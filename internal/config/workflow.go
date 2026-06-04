@@ -305,6 +305,9 @@ func applyMap(c *EffectiveConfig, m map[string]any, baseDir string, warnings, er
 		if v, ok := str(t, "kind", errors); ok {
 			c.Tracker.Kind = v
 		}
+		if v, ok := strSlice(t, "dispatch_candidate_states", errors); ok {
+			c.Tracker.DispatchCandidateStates = v
+		}
 	}
 	if w := section("workspace"); w != nil {
 		if v, ok := str(w, "root", errors); ok {
@@ -563,6 +566,19 @@ func homeDir() string {
 func hardValidate(c EffectiveConfig, errs *[]string) {
 	if c.Tracker.Kind != "local" {
 		*errs = append(*errs, "tracker.kind must equal local")
+	}
+	if len(c.Tracker.DispatchCandidateStates) == 0 {
+		*errs = append(*errs, "tracker.dispatch_candidate_states must not be empty")
+	}
+	for _, state := range c.Tracker.DispatchCandidateStates {
+		switch state {
+		case "Ready", "Rework":
+		default:
+			*errs = append(*errs, "tracker.dispatch_candidate_states must contain only Ready or Rework")
+		}
+	}
+	if c.Polling.IntervalMS < 1000 {
+		*errs = append(*errs, "polling.interval_ms must be greater than or equal to 1000")
 	}
 	if !c.Agent.HandoffRequired {
 		*errs = append(*errs, "agent.handoff_required must be true")
