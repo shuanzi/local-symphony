@@ -16,9 +16,8 @@ import (
 	"local-symphony/internal/app"
 	"local-symphony/internal/config"
 	"local-symphony/internal/core"
+	"local-symphony/internal/daemonclient"
 	"local-symphony/internal/httpapi"
-	"local-symphony/internal/observability"
-	"local-symphony/internal/orchestrator"
 	"local-symphony/internal/store"
 	"local-symphony/internal/toolgateway"
 )
@@ -38,17 +37,7 @@ func Main(args []string) int {
 	case "open":
 		return cmdOpen(args[1:])
 	case "status":
-		return withStore(args[1:], func(st *store.Store) (any, error) {
-			issues, err := st.ListIssues(store.ListIssueOptions{Limit: 20})
-			if err != nil {
-				return nil, err
-			}
-			runs, err := st.ListRuns()
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{"project_id": st.ProjectID, "repo_root": st.RepoRoot, "issues": issues, "runs": runs}, nil
-		})
+		return runStatusCommand(contextWithTimeout(), args[1:])
 	case "issue":
 		return cmdIssue(args[1:])
 	case "run":
@@ -63,6 +52,8 @@ func Main(args []string) int {
 		return cmdDiagnostics(args[1:])
 	case "tool":
 		return cmdTool(args[1:])
+	case "login":
+		return cmdLogin(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
 		printHelp()
@@ -122,6 +113,9 @@ func serveOptionsFromArgs(args []string) (app.ServeOptions, error) {
 func cmdOpen(args []string) int {
 	desc, err := openDescriptor(flagValue(args, "--project", "."))
 	if err != nil {
+		// openDescriptor already returns a friendly ErrDaemonUnavailable-style
+		// error; surface the standardized guidance message in addition to the
+		// underlying envelope.
 		return printErr(err)
 	}
 	return printJSON(desc)
@@ -217,102 +211,63 @@ func cmdIssue(args []string) int {
 		printIssueHelp()
 		return 2
 	}
+	ctx := contextWithTimeout()
+	projectRoot := flagValue(args[1:], "--project", ".")
 	switch args[0] {
 	case "create":
-		return withStore(args[1:], func(st *store.Store) (any, error) {
-			pri := 3
-			if rawPriority, ok := flagValuePresent(args[1:], "--priority"); ok {
-				parsedPriority, err := strconv.Atoi(rawPriority)
-				if err != nil {
-					return nil, core.NewError(core.ErrInvalidRequest, "--priority must be an integer", map[string]any{"priority": rawPriority})
-				}
-				pri = parsedPriority
-			}
-			ac := multiFlag(args[1:], "--acceptance")
-			labels := multiFlag(args[1:], "--label")
-			return st.CreateIssue(store.CreateIssueInput{Title: flagValue(args[1:], "--title", ""), Description: flagValue(args[1:], "--description", ""), AcceptanceCriteria: ac, Priority: pri, Labels: labels})
-		})
+		return dispatchWithStore(ctx, projectRoot, args[1:], issueCreateViaDaemon(args[1:]), issueCreateLocal(args[1:]))
 	case "list":
-		return withStore(args[1:], func(st *store.Store) (any, error) {
-			opts := store.ListIssueOptions{Limit: store.ParseInt(flagValue(args[1:], "--limit", "50"), 50), Sort: flagValue(args[1:], "--sort", "priority"), Query: flagValue(args[1:], "--q", "")}
-			if stf := flagValue(args[1:], "--state", ""); stf != "" {
-				opts.States = strings.Split(stf, ",")
-			}
-			issues, err := st.ListIssues(opts)
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{"items": issues, "page": map[string]any{"limit": opts.Limit, "next_cursor": nil, "has_more": false}}, nil
-		})
+		return dispatchWithStore(ctx, projectRoot, args[1:], issueListViaDaemon(args[1:]), issueListLocal(args[1:]))
 	case "show":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) { return st.GetIssue(args[1]) })
+		return dispatchWithStore(ctx, projectRoot, args[2:], issueShowViaDaemon(args[1]), issueShowLocal(args[1]))
 	case "update":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) {
-			fields := map[string]any{}
-			if v := flagValue(args[2:], "--title", ""); v != "" {
-				fields["title"] = v
-			}
-			if v := flagValue(args[2:], "--description", ""); v != "" {
-				fields["description"] = v
-			}
-			if v := flagValue(args[2:], "--priority", ""); v != "" {
-				i, _ := strconv.Atoi(v)
-				fields["priority"] = i
-			}
-			ac := multiFlag(args[2:], "--acceptance")
-			if len(ac) > 0 {
-				fields["acceptance_criteria"] = ac
-			}
-			labels := multiFlag(args[2:], "--label")
-			if len(labels) > 0 {
-				fields["labels"] = labels
-			}
-			return st.UpdateIssue(args[1], fields)
-		})
+		return dispatchWithStore(ctx, projectRoot, args[2:], issueUpdateViaDaemon(args[1], args[2:]), issueUpdateLocal(args[1], args[2:]))
 	case "transition":
 		if len(args) < 3 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "usage: issue transition REF STATE", nil))
 		}
-		return withStore(args[3:], func(st *store.Store) (any, error) {
-			return st.TransitionIssue(args[1], core.IssueState(args[2]), flagValue(args[3:], "--reason", ""), flagValue(args[3:], "--duplicate-of", ""))
-		})
+		reason := flagValue(args[3:], "--reason", "")
+		dup := flagValue(args[3:], "--duplicate-of", "")
+		return dispatchWithStore(ctx, projectRoot, args[3:],
+			issueTransitionViaDaemon(args[1], args[2], reason, dup),
+			issueTransitionLocal(args[1], args[2], reason, dup))
 	case "comment":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) {
-			if err := st.AddComment(args[1], "operator", flagValue(args[2:], "--body", ""), nil); err != nil {
-				return nil, err
-			}
-			return st.GetIssue(args[1])
-		})
+		body := flagValue(args[2:], "--body", "")
+		return dispatchWithStore(ctx, projectRoot, args[2:], issueCommentViaDaemon(args[1], body), issueCommentLocal(args[1], body))
 	case "blocker":
 		if len(args) < 4 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "usage: issue blocker add/remove REF BLOCKER", nil))
 		}
 		if args[1] == "add" {
-			return withStore(args[4:], func(st *store.Store) (any, error) { return st.AddBlocker(args[2], args[3]) })
+			return dispatchWithStore(ctx, projectRoot, args[4:],
+				issueBlockerAddViaDaemon(args[2], args[3]),
+				issueBlockerAddLocal(args[2], args[3]))
 		}
 		if args[1] == "remove" {
-			return withStore(args[4:], func(st *store.Store) (any, error) { return st.RemoveBlocker(args[2], args[3]) })
+			return dispatchWithStore(ctx, projectRoot, args[4:],
+				issueBlockerRemoveViaDaemon(args[2], args[3]),
+				issueBlockerRemoveLocal(args[2], args[3]))
 		}
 	case "duplicate":
 		if len(args) >= 4 && args[1] == "remove" {
-			return withStore(args[4:], func(st *store.Store) (any, error) { return st.RemoveDuplicate(args[2], args[3]) })
+			return dispatchWithStore(ctx, projectRoot, args[4:],
+				issueDuplicateRemoveViaDaemon(args[2], args[3]),
+				issueDuplicateRemoveLocal(args[2], args[3]))
 		}
 	case "dispatch":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) {
-			return orchestrator.Orchestrator{Store: st}.DispatchIssue(args[1], "manual")
-		})
+		return dispatchWithStore(ctx, projectRoot, args[2:], issueDispatchViaDaemon(args[1]), issueDispatchLocal(args[1]))
 	case "dispatch-pause":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
@@ -321,7 +276,9 @@ func cmdIssue(args []string) int {
 		if strings.TrimSpace(reason) == "" {
 			return printErr(core.NewError(core.ErrInvalidRequest, "reason is required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) { return st.DispatchPause(args[1], reason) })
+		return dispatchWithStore(ctx, projectRoot, args[2:],
+			issueDispatchPauseViaDaemon(args[1], reason),
+			issueDispatchPauseLocal(args[1], reason))
 	case "dispatch-resume":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
@@ -330,7 +287,9 @@ func cmdIssue(args []string) int {
 		if strings.TrimSpace(reason) == "" {
 			return printErr(core.NewError(core.ErrInvalidRequest, "reason is required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) { return st.DispatchResume(args[1], reason) })
+		return dispatchWithStore(ctx, projectRoot, args[2:],
+			issueDispatchResumeViaDaemon(args[1], reason),
+			issueDispatchResumeLocal(args[1], reason))
 	}
 	return printErr(core.NewError(core.ErrInvalidRequest, "unknown issue command", nil))
 }
@@ -340,35 +299,30 @@ func cmdRun(args []string) int {
 		printRunHelp()
 		return 2
 	}
+	ctx := contextWithTimeout()
+	projectRoot := flagValue(args[1:], "--project", ".")
 	if isIssueRefArg(args[0]) {
-		return withStore(args[1:], func(st *store.Store) (any, error) {
-			return orchestrator.Orchestrator{Store: st}.DispatchIssue(args[0], "manual")
-		})
+		return dispatchWithStore(ctx, projectRoot, args[1:], runDispatchViaDaemon(args[0]), runDispatchLocal(args[0]))
 	}
 	switch args[0] {
 	case "list":
-		return withStore(args[1:], func(st *store.Store) (any, error) { return st.ListRuns() })
+		return dispatchWithStore(ctx, projectRoot, args[1:], runListViaDaemon(), runListLocal())
 	case "show":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "run id required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) { return st.GetRun(args[1]) })
+		return dispatchWithStore(ctx, projectRoot, args[2:], runShowViaDaemon(args[1]), runShowLocal(args[1]))
 	case "events":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "run id required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) { return st.RunEvents(args[1], 0, 500) })
+		return dispatchWithStore(ctx, projectRoot, args[2:], runEventsViaDaemon(args[1]), runEventsLocal(args[1]))
 	case "cancel":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "run id required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) {
-			err := st.CancelRun(args[1], flagValue(args[2:], "--reason", "operator cancelled"))
-			if err != nil {
-				return nil, err
-			}
-			return st.GetRun(args[1])
-		})
+		reason := flagValue(args[2:], "--reason", "operator cancelled")
+		return dispatchWithStore(ctx, projectRoot, args[2:], runCancelViaDaemon(args[1], reason), runCancelLocal(args[1], reason))
 	}
 	return printErr(core.NewError(core.ErrInvalidRequest, "unknown run command", nil))
 }
@@ -398,26 +352,39 @@ func cmdApproval(args []string) int {
 	if len(args) == 0 {
 		return printErr(core.NewError(core.ErrInvalidRequest, "approval command required", nil))
 	}
+	ctx := contextWithTimeout()
+	projectRoot := flagValue(args[1:], "--project", ".")
 	switch args[0] {
 	case "list":
-		return withStore(args[1:], func(st *store.Store) (any, error) { return st.PendingApprovals() })
+		return dispatchWithStore(ctx, projectRoot, args[1:], approvalListViaDaemon(), approvalListLocal())
 	case "decide":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "approval id required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) {
-			status := ""
-			for _, p := range []string{"approve-once", "approve-for-run", "approve-for-session", "deny", "cancel-run"} {
-				if hasFlag(args[2:], "--"+p) {
-					status = map[string]string{"approve-once": "approved_once", "approve-for-run": "approved_for_run", "approve-for-session": "approved_for_session", "deny": "denied", "cancel-run": "cancelled"}[p]
+		decision := ""
+		for _, p := range []string{"approve-once", "approve-for-run", "approve-for-session", "deny", "cancel-run"} {
+			if hasFlag(args[2:], "--"+p) {
+				if d, ok := approvalDecisionString("--" + p); ok {
+					decision = d
 				}
+				break
 			}
-			if status == "" {
-				return nil, core.NewError(core.ErrInvalidRequest, "approval decision required", nil)
-			}
-			err := st.DecideApproval(args[1], status, flagValue(args[2:], "--reason", ""))
-			return map[string]any{"id": args[1], "status": status}, err
-		})
+		}
+		if decision == "" {
+			return printErr(core.NewError(core.ErrInvalidRequest, "approval decision required", nil))
+		}
+		reason := flagValue(args[2:], "--reason", "")
+		// local store uses the internal status name; map from decision
+		status := map[string]string{
+			"approve_once":         "approved_once",
+			"approve_for_run":      "approved_for_run",
+			"approve_for_session":  "approved_for_session",
+			"deny":                 "denied",
+			"cancel_run":           "cancelled",
+		}[decision]
+		return dispatchWithStore(ctx, projectRoot, args[2:],
+			approvalDecideViaDaemon(args[1], decision, reason),
+			approvalDecideLocal(args[1], status, reason))
 	}
 	return printErr(core.NewError(core.ErrInvalidRequest, "unknown approval command", nil))
 }
@@ -426,6 +393,8 @@ func cmdReview(args []string) int {
 		printReviewHelp()
 		return 2
 	}
+	ctx := contextWithTimeout()
+	projectRoot := flagValue(args[1:], "--project", ".")
 	switch args[0] {
 	case "send-to-rework":
 		if len(args) < 2 {
@@ -435,7 +404,9 @@ func cmdReview(args []string) int {
 		if strings.TrimSpace(reason) == "" {
 			return printErr(core.NewError(core.ErrInvalidRequest, "reason is required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) { return st.SendToRework(args[1], reason) })
+		return dispatchWithStore(ctx, projectRoot, args[2:],
+			reviewSendToReworkViaDaemon(args[1], reason),
+			reviewSendToReworkLocal(args[1], reason))
 	case "mark-done":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
@@ -444,15 +415,19 @@ func cmdReview(args []string) int {
 		if strings.TrimSpace(reason) == "" {
 			return printErr(core.NewError(core.ErrInvalidRequest, "reason is required", nil))
 		}
-		return withStore(args[2:], func(st *store.Store) (any, error) { return st.MarkDone(args[1], reason) })
+		return dispatchWithStore(ctx, projectRoot, args[2:],
+			reviewMarkDoneViaDaemon(args[1], reason),
+			reviewMarkDoneLocal(args[1], reason))
 	case "path":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
 		}
+		// review path is a local-store-only flow: it surfaces the
+		// filesystem path to a review packet and never needs the daemon.
 		return withStore(args[2:], reviewMetaFor(args[1]))
 	default:
 		ref := args[0]
-		return withStore(args[1:], reviewMetaFor(ref))
+		return dispatchWithStore(ctx, projectRoot, args[1:], reviewGetViaDaemon(ref), reviewGetLocal(ref))
 	}
 }
 func reviewMetaFor(ref string) func(*store.Store) (any, error) {
@@ -476,33 +451,97 @@ func cmdWorkflow(args []string) int {
 	if len(args) == 0 {
 		return printErr(core.NewError(core.ErrInvalidRequest, "workflow command required", nil))
 	}
+	ctx := contextWithTimeout()
+	projectRoot := flagValue(args[1:], "--project", ".")
 	switch args[0] {
 	case "validate":
-		return withStore(args[1:], func(st *store.Store) (any, error) {
-			wf, _ := config.Load(st.RepoRoot)
-			return map[string]any{"source": "current_filesystem", "workflow_path": wf.Path, "validation": wf.Validation, "side_effects": map[string]any{"effective_config_replaced": false, "last_valid_config_updated": false, "prompt_rendered": false, "run_dispatched": false, "review_artifacts_written": false}}, nil
-		})
+		return dispatchWithStore(ctx, projectRoot, args[1:],
+			workflowDataFromClient("validate"),
+			workflowData)
 	case "reload":
-		return withStore(args[1:], func(st *store.Store) (any, error) {
-			wf, _ := config.Load(st.RepoRoot)
-			return map[string]any{"reloaded": wf.Validation.Valid, "validation": wf.Validation}, nil
-		})
+		return dispatchWithStore(ctx, projectRoot, args[1:],
+			workflowDataFromClient("reload"),
+			func(st *store.Store) (any, error) {
+				wf, _ := config.Load(st.RepoRoot)
+				return map[string]any{"reloaded": wf.Validation.Valid, "validation": wf.Validation}, nil
+			})
 	case "show":
-		return withStore(args[1:], func(st *store.Store) (any, error) { wf, _ := config.Load(st.RepoRoot); return wf, nil })
+		return dispatchWithStore(ctx, projectRoot, args[1:],
+			workflowDataFromClient("show"),
+			func(st *store.Store) (any, error) { wf, _ := config.Load(st.RepoRoot); return wf, nil })
 	}
 	return printErr(core.NewError(core.ErrInvalidRequest, "unknown workflow command", nil))
 }
 func cmdDiagnostics(args []string) int {
+	ctx := contextWithTimeout()
+	projectRoot := flagValue(args, "--project", ".")
 	if len(args) > 0 && args[0] == "export" {
-		return withStore(args[1:], func(st *store.Store) (any, error) {
-			p, err := observability.Export(st)
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{"path": p}, nil
+		return dispatchWithStore(ctx, projectRoot, args[1:],
+			diagnosticsExportViaDaemon,
+			diagnosticsExportData)
+	}
+	return dispatchWithStore(ctx, projectRoot, args, diagnosticsViaDaemon, diagnosticsData)
+}
+
+// cmdLogin verifies the operator's CLI bearer session against the daemon.
+// The CLI session is normally minted by `symphony serve` and stored in
+// ~/.symphony/cli-sessions/<project>.json. The `symphony login` command is
+// the operator-visible way to ask "am I logged in?" and to surface a
+// helpful, project-aware error when the daemon is not running.
+func cmdLogin(args []string) int {
+	projectRoot := flagValue(args, "--project", ".")
+	st, err := store.Open(projectRoot)
+	if err != nil {
+		return printErr(err)
+	}
+	defer st.Close()
+	ctx := contextWithTimeout()
+
+	if hasFlag(args, "--list") {
+		sessions, err := daemonclient.ReadAllSessionFiles()
+		if err != nil {
+			return printErr(err)
+		}
+		out := make([]map[string]any, 0, len(sessions))
+		for _, s := range sessions {
+			out = append(out, map[string]any{"project_id": s.ProjectID, "repo_root": s.RepoRoot, "api_url": s.APIURL, "created_at": s.CreatedAt})
+		}
+		return printJSON(map[string]any{"sessions": out})
+	}
+
+	if hasFlag(args, "--logout") {
+		if err := daemonclient.DeleteSessionFile(st.ProjectID); err != nil {
+			return printErr(err)
+		}
+		return printJSON(map[string]any{"logged_out": true, "project_id": st.ProjectID})
+	}
+
+	dc, err := newDaemonContext(ctx, st)
+	if err != nil {
+		return printErr(err)
+	}
+	if !dc.Available {
+		fmt.Fprintln(os.Stderr, daemonUnavailableMessage())
+		return 7
+	}
+	// Probe /api/v1/auth/session to confirm the bearer is recognized.
+	data, err := dc.Client.UnwrapMap(ctx, "GET", "/api/v1/auth/session", nil)
+	if err != nil {
+		return printErr(err)
+	}
+	if v, ok := data["authenticated"].(bool); ok && v {
+		return printJSON(map[string]any{
+			"project_id":  st.ProjectID,
+			"repo_root":   st.RepoRoot,
+			"api_url":     dc.Client.BaseURL,
+			"session":     "active",
+			"created_at":  "redacted",
 		})
 	}
-	return withStore(args, func(st *store.Store) (any, error) { return observability.Diagnostics(st), nil })
+	return printJSON(map[string]any{
+		"project_id": st.ProjectID,
+		"session":    "unauthenticated",
+	})
 }
 
 func cmdTool(args []string) int {
@@ -572,9 +611,9 @@ func cmdTool(args []string) int {
 	resp := toolgateway.HTTPClientCall(endpoint, token, toolgateway.Request{Tool: toolName, Input: input})
 	if resp.Error != nil {
 		_ = printJSON(resp)
-		if resp.Error.Code == "handoff_conflict" {
-			return 7
-		}
+		// All tool-gateway errors map to exit code 7 (operator-actionable
+		// conflict). v1's exit code policy does not single out
+		// handoff_conflict; the prior if/return 7 was dead code.
 		return 7
 	}
 	return printJSON(resp)
@@ -661,6 +700,15 @@ Commands:
   symphony workflow validate|reload|show
   symphony diagnostics|diagnostics export
   symphony tool issue get|comment|block; artifact attach; followup create; handoff submit --json -
+
+Operator commands prefer the local daemon (symphony serve) and fall back to
+the on-disk store when the daemon is unreachable. The CLI session is minted
+automatically when 'symphony serve' starts; rotate it with
+'symphony tool login' (token path is separate from the operator REST
+session). When no daemon is running and the on-disk store cannot satisfy a
+command, the CLI prints: 'daemon is not running, start with symphony serve
+or run symphony open --help for project init'. The CLI never auto-starts a
+daemon.
 
 No v1 commands exist for publish, create-pr, backup, restore, migrate, audit, workspace-delete, secret, project settings, issue delete, arbitrary state mutation.`)
 }

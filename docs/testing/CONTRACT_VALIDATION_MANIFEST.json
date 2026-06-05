@@ -206,6 +206,7 @@
       "symphony init",
       "symphony serve",
       "symphony open",
+      "symphony login",
       "symphony status",
       "symphony issue create",
       "symphony issue list",
@@ -245,7 +246,9 @@
       "approve-for-session",
       "cancel-run",
       "send-to-rework",
-      "mark-done"
+      "mark-done",
+      "daemon is not running",
+      "symphony serve"
     ],
     "forbidden_commands": [
       "symphony publish",
