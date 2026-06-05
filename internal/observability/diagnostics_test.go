@@ -96,6 +96,19 @@ func TestDiagnosticsIncludesStoredRuntimeDescriptorWithoutSecrets(t *testing.T) 
 	if got := intValue(desc["daemon_pid"]); got != os.Getpid() {
 		t.Fatalf("runtime descriptor daemon_pid = %d, want %d", got, os.Getpid())
 	}
+	fp, ok := desc["owner_nonce_fingerprint"].(string)
+	if !ok || len(fp) != 8 {
+		t.Fatalf("runtime descriptor owner_nonce_fingerprint = %v, want 8-char fingerprint", desc["owner_nonce_fingerprint"])
+	}
+	if desc["heartbeat_at"] == nil {
+		t.Fatalf("runtime descriptor heartbeat_at missing")
+	}
+	if desc["heartbeat_ttl_ms"] == nil {
+		t.Fatalf("runtime descriptor heartbeat_ttl_ms missing")
+	}
+	if desc["acquired_at"] == nil {
+		t.Fatalf("runtime descriptor acquired_at missing")
+	}
 	assertNoSensitiveRuntimeDescriptorFields(t, desc)
 }
 
@@ -125,7 +138,7 @@ func assertNoSensitiveRuntimeDescriptorFields(t *testing.T, v any) {
 		case map[string]any:
 			for k, child := range x {
 				key := strings.ToLower(k)
-				if key == "token" || key == "owner_token" || strings.Contains(key, "secret") {
+				if key == "token" || key == "owner_token" || strings.Contains(key, "secret") || key == "owner_nonce" {
 					t.Fatalf("runtime descriptor contains sensitive field %q in %s", k, string(b))
 				}
 				walk(child)
@@ -137,4 +150,62 @@ func assertNoSensitiveRuntimeDescriptorFields(t *testing.T, v any) {
 		}
 	}
 	walk(v)
+}
+
+// TestDiagnosticsDefaultRuntimeDescriptorIsSchemaValid exercises the
+// no-serve path: when no runtime descriptor row exists (CLI invocation
+// before any daemon has run), the diagnostics output must still emit
+// the full DiagnosticsRuntimeDescriptor shape with null values for the
+// nonce-related fields. This is the regression test for C3 review P2.
+func TestDiagnosticsDefaultRuntimeDescriptorIsSchemaValid(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.InitProject(t.TempDir(), "LOC")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+
+	diag := Diagnostics(st)
+	daemon, ok := diag["daemon"].(map[string]any)
+	if !ok {
+		t.Fatalf("daemon diagnostics has type %T, want map[string]any", diag["daemon"])
+	}
+	desc, ok := daemon["runtime_descriptor"].(map[string]any)
+	if !ok {
+		t.Fatalf("runtime_descriptor has type %T, want map[string]any", daemon["runtime_descriptor"])
+	}
+	for _, field := range []string{
+		"api_url",
+		"tool_gateway_endpoint",
+		"daemon_pid",
+		"acquired_at",
+		"heartbeat_at",
+		"heartbeat_ttl_ms",
+		"owner_nonce_fingerprint",
+	} {
+		if _, ok := desc[field]; !ok {
+			t.Fatalf("runtime descriptor default projection missing %q; have keys %v", field, mapKeys(desc))
+		}
+	}
+	if got := desc["api_url"]; got != nil {
+		t.Fatalf("runtime descriptor default api_url = %v, want nil", got)
+	}
+	if got := desc["tool_gateway_endpoint"]; got != nil {
+		t.Fatalf("runtime descriptor default tool_gateway_endpoint = %v, want nil", got)
+	}
+	if got := desc["daemon_pid"]; got != nil {
+		t.Fatalf("runtime descriptor default daemon_pid = %v, want nil", got)
+	}
+	if got := desc["owner_nonce_fingerprint"]; got != nil {
+		t.Fatalf("runtime descriptor default owner_nonce_fingerprint = %v, want nil", got)
+	}
+	assertNoSensitiveRuntimeDescriptorFields(t, desc)
+}
+
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

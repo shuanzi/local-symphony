@@ -139,7 +139,7 @@ DIAGNOSTICS_DEFINITION_REQUIRED_FIELDS = {
     "workflowValidation": frozenset({"valid", "warnings", "errors"}),
     "lastValidConfig": frozenset({"available", "path", "validated_at", "content_hash"}),
     "daemon": frozenset({"pid", "uptime_ms", "runtime_descriptor"}),
-    "runtimeDescriptor": frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid"}),
+    "runtimeDescriptor": frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid", "acquired_at", "heartbeat_at", "heartbeat_ttl_ms", "owner_nonce_fingerprint"}),
     "codex": frozenset({"available", "version", "support"}),
     "codexSupport": frozenset({"cli", "model", "sandbox"}),
     "git": frozenset({"repository", "worktree"}),
@@ -160,7 +160,7 @@ OPENAPI_DIAGNOSTICS_REQUIRED_FIELDS = {
     "DiagnosticsWorkflowValidation": frozenset({"valid", "warnings", "errors"}),
     "DiagnosticsLastValidConfig": frozenset({"available", "path", "validated_at", "content_hash"}),
     "DiagnosticsDaemon": frozenset({"pid", "uptime_ms", "runtime_descriptor"}),
-    "DiagnosticsRuntimeDescriptor": frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid"}),
+    "DiagnosticsRuntimeDescriptor": frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid", "acquired_at", "heartbeat_at", "heartbeat_ttl_ms", "owner_nonce_fingerprint"}),
     "DiagnosticsCodex": frozenset({"available", "version", "support"}),
     "DiagnosticsCodexSupport": frozenset({"cli", "model", "sandbox"}),
     "DiagnosticsGit": frozenset({"repository", "worktree"}),
@@ -852,7 +852,7 @@ def validate_diagnostics_schema_contract() -> None:
     daemon = require_dict(defs.get("daemon"), "schemas/diagnostics.schema.json.$defs.daemon")
     assert_required_fields(daemon, "schemas/diagnostics.schema.json.$defs.daemon", frozenset({"pid", "uptime_ms", "runtime_descriptor"}))
     runtime_descriptor = require_dict(defs.get("runtimeDescriptor"), "schemas/diagnostics.schema.json.$defs.runtimeDescriptor")
-    assert_required_fields(runtime_descriptor, "schemas/diagnostics.schema.json.$defs.runtimeDescriptor", frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid"}))
+    assert_required_fields(runtime_descriptor, "schemas/diagnostics.schema.json.$defs.runtimeDescriptor", frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid", "acquired_at", "heartbeat_at", "heartbeat_ttl_ms", "owner_nonce_fingerprint"}))
 
     codex = require_dict(defs.get("codex"), "schemas/diagnostics.schema.json.$defs.codex")
     assert_required_fields(codex, "schemas/diagnostics.schema.json.$defs.codex", frozenset({"available", "version", "support"}))
@@ -908,7 +908,8 @@ def validate_sql() -> None:
             "app_settings": {"key", "value_json", "updated_at"},
             "local_sessions": {"id", "project_id", "kind", "token_hash", "csrf_hash", "last_seen_at"},
             "open_tokens": {"id", "project_id", "token_hash", "expires_at", "consumed_at"},
-            "runtime_descriptors": {"project_id", "api_url", "tool_gateway_endpoint", "daemon_pid"},
+            "runtime_descriptors": {"project_id", "api_url", "tool_gateway_endpoint", "daemon_pid", "owner_nonce", "heartbeat_at", "heartbeat_ttl_ms", "acquired_at"},
+            "runtime_owner_events": {"id", "project_id", "event_type", "actor_type", "data_json", "redacted", "created_at"},
         },
         "db/schema/v1_project.sql": {
             "schema_meta": {"key", "value"},
@@ -1031,7 +1032,7 @@ def validate_openapi_diagnostics_contract(data: dict[str, Any]) -> None:
     daemon = require_dict(schemas.get("DiagnosticsDaemon"), "OpenAPI DiagnosticsDaemon")
     assert_required_fields(daemon, "OpenAPI DiagnosticsDaemon", frozenset({"pid", "uptime_ms", "runtime_descriptor"}))
     runtime_descriptor = require_dict(schemas.get("DiagnosticsRuntimeDescriptor"), "OpenAPI DiagnosticsRuntimeDescriptor")
-    assert_required_fields(runtime_descriptor, "OpenAPI DiagnosticsRuntimeDescriptor", frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid"}))
+    assert_required_fields(runtime_descriptor, "OpenAPI DiagnosticsRuntimeDescriptor", frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid", "acquired_at", "heartbeat_at", "heartbeat_ttl_ms", "owner_nonce_fingerprint"}))
 
     codex = require_dict(schemas.get("DiagnosticsCodex"), "OpenAPI DiagnosticsCodex")
     assert_required_fields(codex, "OpenAPI DiagnosticsCodex", frozenset({"available", "version", "support"}))

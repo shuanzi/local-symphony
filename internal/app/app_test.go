@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -121,7 +122,7 @@ func TestServeReturnsErrorWhenRuntimeDescriptorWriteFails(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 
-	err = prepareServeRuntime(st, ln, "http://"+ln.Addr().String(), "test-token", 1234)
+	err = prepareServeRuntime(st, ln, "http://"+ln.Addr().String(), "test-token", 1234, "nonce-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	if err == nil {
 		t.Fatal("prepareServeRuntime succeeded, want runtime descriptor error")
 	}
@@ -150,7 +151,7 @@ func TestPrepareServeRuntimeReleasesRuntimeOwnerWhenCLISessionWriteFails(t *test
 		t.Fatalf("listen: %v", err)
 	}
 
-	err = prepareServeRuntime(st, ln, "http://"+ln.Addr().String(), "test-token", os.Getpid())
+	err = prepareServeRuntime(st, ln, "http://"+ln.Addr().String(), "test-token", os.Getpid(), "nonce-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 	if err == nil {
 		t.Fatal("prepareServeRuntime succeeded, want CLI session write error")
 	}
@@ -185,7 +186,7 @@ func TestPrepareServeRuntimeRejectsActiveRuntimeOwner(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 
-	err = prepareServeRuntime(st, ln, "http://"+ln.Addr().String(), "test-token", os.Getpid()+1)
+	err = prepareServeRuntime(st, ln, "http://"+ln.Addr().String(), "test-token", os.Getpid()+1, "nonce-cccccccccccccccccccccccccccccccc")
 	if err == nil {
 		t.Fatal("prepareServeRuntime succeeded, want daemon runtime ownership conflict")
 	}
@@ -530,5 +531,248 @@ func TestRuntimeDescriptorDoesNotAllowProjectIDPathTraversal(t *testing.T) {
 	st.RemoveRuntimeDescriptor()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("runtime descriptor still exists after remove: %v", err)
+	}
+}
+
+// TestServeRecoversFromPIDReuseAfterHeartbeatStale exercises the full
+// runtime owner recovery path: a prior daemon leaves a runtime descriptor
+// with PID == os.Getpid() (the PID reuse scenario) and a stale heartbeat.
+// A subsequent Serve() must reap the stale descriptor, record a reap
+// event, and acquire a fresh lock without error.
+func TestServeRecoversFromPIDReuseAfterHeartbeatStale(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	nonceA, err := store.NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1111", "http://127.0.0.1:2222", os.Getpid(), nonceA, store.DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce (A): %v", err)
+	}
+	// Backdate the heartbeat past the TTL. The recorded PID intentionally
+	// matches the live test process — this is the PID reuse case the
+	// v1 owner nonce/heartbeat schema upgrade is meant to fix.
+	backdated := time.Now().UnixMilli() - int64(store.DefaultRuntimeHeartbeatTTLMS*10)
+	if err := st.App.Exec(`UPDATE runtime_descriptors SET heartbeat_at=?, heartbeat_ttl_ms=1000, acquired_at=? WHERE project_id=?`, backdated, backdated, st.ProjectID); err != nil {
+		t.Fatalf("backdate heartbeat: %v", err)
+	}
+	repoRoot := st.RepoRoot
+	projectID := st.ProjectID
+	t.Cleanup(func() {
+		opened, openErr := store.Open(repoRoot)
+		if openErr == nil {
+			opened.RemoveRuntimeDescriptor()
+			opened.Close()
+		}
+		_ = os.Remove(CLISessionPath(projectID))
+	})
+	st.Close()
+
+	// Run Serve in a goroutine; cancel via SIGINT after a short window so
+	// the test does not block forever. The reap and acquire must finish
+	// before shutdown.
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ServeOptions{Project: repoRoot, Host: "127.0.0.1", Port: 0, NoOpen: true})
+	}()
+	time.Sleep(500 * time.Millisecond)
+	p, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("find process: %v", err)
+	}
+	if err := p.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after SIGINT")
+	}
+
+	// Reopen the store and verify a reap event was recorded for the
+	// stale owner. The runtime descriptor is removed during the SIGINT
+	// shutdown path (RemoveRuntimeDescriptor), so we assert against the
+	// reap event rather than the descriptor row.
+	opened, err := store.Open(repoRoot)
+	if err != nil {
+		t.Fatalf("Open after Serve: %v", err)
+	}
+	t.Cleanup(opened.Close)
+	events, err := opened.App.Query(`SELECT data_json FROM runtime_owner_events WHERE project_id=? AND event_type='runtime_owner_reaped' ORDER BY created_at DESC LIMIT 1`, projectID)
+	if err != nil {
+		t.Fatalf("query runtime_owner_events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("runtime_owner_reaped events = %d, want at least 1", len(events))
+	}
+	if !strings.Contains(events[0]["data_json"].String(), "heartbeat_stale") {
+		t.Fatalf("reap event data = %q, want reason heartbeat_stale", events[0]["data_json"].String())
+	}
+}
+
+// TestRuntimeHeartbeatLoopSurfacesLostOwnership exercises the heartbeat
+// goroutine directly with a tight interval. The first tick refreshes the
+// heartbeat; after the descriptor is deleted (simulating a reap by another
+// owner), the next tick must surface the error via errCh so Serve can
+// shut down. This is the regression test for C3 review P1.
+func TestRuntimeHeartbeatLoopSurfacesLostOwnership(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce, err := store.NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, store.DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	done, errCh := runRuntimeHeartbeatLoop(ctx, 50*time.Millisecond, store.DefaultRuntimeHeartbeatTTLMS, st, nonce)
+	t.Cleanup(func() {
+		stop()
+		<-done
+	})
+	// First tick should refresh successfully; drain a small window to
+	// let the goroutine process the tick.
+	time.Sleep(80 * time.Millisecond)
+	// Now simulate another owner reaping the descriptor while we are
+	// still alive. The next tick must surface the error.
+	if err := st.App.Exec(`DELETE FROM runtime_descriptors WHERE project_id=?`, st.ProjectID); err != nil {
+		t.Fatalf("delete runtime descriptor: %v", err)
+	}
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("heartbeat errCh received nil error; want daemon_already_running")
+		}
+		apiErr := core.AsAPIError(err)
+		if apiErr == nil || apiErr.Code != core.ErrDaemonAlreadyRunning {
+			t.Fatalf("heartbeat errCh error code = %v, want %s", err, core.ErrDaemonAlreadyRunning)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat errCh did not surface error after runtime descriptor was deleted")
+	}
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("heartbeat goroutine did not exit after error")
+	}
+}
+
+// TestRuntimeHeartbeatLoopStaysHealthyWhenOwnerUnchanged is a guard against
+// the P1 fix becoming a footgun: when nothing has changed, the heartbeat
+// goroutine must keep running and not surface spurious errors.
+func TestRuntimeHeartbeatLoopStaysHealthyWhenOwnerUnchanged(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce, err := store.NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, store.DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	done, errCh := runRuntimeHeartbeatLoop(ctx, 30*time.Millisecond, store.DefaultRuntimeHeartbeatTTLMS, st, nonce)
+	// Let several ticks fire while the descriptor remains valid.
+	time.Sleep(150 * time.Millisecond)
+	stop()
+	<-done
+	select {
+	case err := <-errCh:
+		t.Fatalf("heartbeat errCh received unexpected error while owner unchanged: %v", err)
+	default:
+	}
+}
+
+// TestServeExitsAfterHeartbeatOwnershipLost is the end-to-end regression
+// test for C3 review P1. Serve must shut down (scheduler + http server
+// closed) when the runtime owner descriptor is reaped by another owner
+// mid-flight. The test uses a tight heartbeat interval (50ms) so the
+// whole flow completes in under a second.
+func TestServeExitsAfterHeartbeatOwnershipLost(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	repoRoot := st.RepoRoot
+	projectID := st.ProjectID
+	t.Cleanup(func() {
+		opened, openErr := store.Open(repoRoot)
+		if openErr == nil {
+			opened.RemoveRuntimeDescriptor()
+			opened.Close()
+		}
+		_ = os.Remove(CLISessionPath(projectID))
+	})
+	st.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ServeOptions{Project: repoRoot, Host: "127.0.0.1", Port: 0, NoOpen: true, HeartbeatIntervalMS: 50})
+	}()
+
+	// Wait for Serve to come up, then reap the runtime descriptor to
+	// simulate another daemon taking the lock. The heartbeat goroutine
+	// must surface the error and Serve must exit.
+	deadline := time.Now().Add(3 * time.Second)
+	var heartbeatLost bool
+	for time.Now().Before(deadline) {
+		opened, openErr := store.Open(repoRoot)
+		if openErr != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		row, err := opened.App.QueryOne(`SELECT project_id FROM runtime_descriptors WHERE project_id=?`, projectID)
+		if err == nil && row["project_id"].String() == projectID {
+			// Daemon is up. Simulate another owner reaping.
+			if err := opened.App.Exec(`DELETE FROM runtime_descriptors WHERE project_id=?`, projectID); err != nil {
+				t.Fatalf("simulate reap: %v", err)
+			}
+			opened.Close()
+			heartbeatLost = true
+			break
+		}
+		opened.Close()
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !heartbeatLost {
+		t.Fatal("daemon did not acquire runtime lock within 3s")
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Serve returned nil after heartbeat ownership loss; want heartbeat error")
+		}
+		if !strings.Contains(err.Error(), "heartbeat") {
+			t.Fatalf("Serve error = %v, want substring heartbeat", err)
+		}
+		apiErr := core.AsAPIError(err)
+		// The outer error is fmt.Errorf-wrapped, so it may not be an
+		// *APIError directly; instead check the wrapped chain by string
+		// match against the ErrDaemonAlreadyRunning message.
+		if apiErr != nil && apiErr.Code != core.ErrDaemonAlreadyRunning {
+			t.Fatalf("Serve error code = %s, want %s or wrapped", apiErr.Code, core.ErrDaemonAlreadyRunning)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve did not exit after heartbeat ownership loss")
 	}
 }

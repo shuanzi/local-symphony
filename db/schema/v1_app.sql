@@ -62,7 +62,24 @@ CREATE TABLE IF NOT EXISTS runtime_descriptors (
   api_url TEXT NOT NULL,
   tool_gateway_endpoint TEXT NOT NULL,
   daemon_pid INTEGER NOT NULL,
+  owner_nonce TEXT NOT NULL,
+  heartbeat_at INTEGER NOT NULL,
+  heartbeat_ttl_ms INTEGER NOT NULL DEFAULT 30000,
+  acquired_at INTEGER NOT NULL,
   started_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS runtime_owner_events (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  actor_type TEXT NOT NULL,
+  data_json TEXT NOT NULL,
+  redacted INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_owner_events_project ON runtime_owner_events(project_id, created_at);

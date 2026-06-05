@@ -181,6 +181,11 @@ func TestCreateRuntimeDescriptorRecoversStaleOwner(t *testing.T) {
 	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1111", "http://127.0.0.1:2222", stalePID); err != nil {
 		t.Fatalf("CreateRuntimeDescriptor stale owner: %v", err)
 	}
+	// Simulate the stale daemon's heartbeat going silent long ago. Owner
+	// recovery now keys on heartbeat staleness + ttl, not just PID liveness.
+	if err := st.App.Exec(`UPDATE runtime_descriptors SET heartbeat_at=0, heartbeat_ttl_ms=1000, acquired_at=0 WHERE project_id=?`, st.ProjectID); err != nil {
+		t.Fatalf("backdate heartbeat: %v", err)
+	}
 
 	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:3333", "http://127.0.0.1:4444", os.Getpid()); err != nil {
 		t.Fatalf("CreateRuntimeDescriptor should recover stale owner: %v", err)
@@ -211,6 +216,220 @@ func TestCreateRuntimeDescriptorRollsBackOwnerWhenFileWriteFails(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("runtime_descriptors rows = %d, want 0 after file write failure", len(rows))
+	}
+}
+
+func TestCreateRuntimeDescriptorWithNonceRejectsActiveHeartbeat(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce1, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1111", "http://127.0.0.1:2222", os.Getpid(), nonce1, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce first owner: %v", err)
+	}
+	nonce2, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	err = st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:3333", "http://127.0.0.1:4444", os.Getpid()+1, nonce2, DefaultRuntimeHeartbeatTTLMS)
+	if err == nil {
+		t.Fatal("CreateRuntimeDescriptorWithNonce succeeded, want daemon_already_running")
+	}
+	apiErr := core.AsAPIError(err)
+	if apiErr.Code != core.ErrDaemonAlreadyRunning {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce error code = %s, want %s", apiErr.Code, core.ErrDaemonAlreadyRunning)
+	}
+	row := runtimeDescriptorRow(t, st)
+	if got := row["daemon_pid"].Int(); got != os.Getpid() {
+		t.Fatalf("runtime descriptor daemon_pid = %d, want first owner %d", got, os.Getpid())
+	}
+	if got := row["owner_nonce"].String(); got != nonce1 {
+		t.Fatalf("runtime descriptor owner_nonce = %q, want first owner nonce", got)
+	}
+}
+
+func TestCreateRuntimeDescriptorRecoversFromStaleHeartbeatEvenIfPIDAlive(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonceA, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1111", "http://127.0.0.1:2222", os.Getpid(), nonceA, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce first owner: %v", err)
+	}
+	// Backdate the heartbeat well past the TTL while leaving the recorded
+	// PID pointing at the live test process. PID alive + heartbeat stale
+	// must still be treated as a recoverable owner.
+	if err := st.App.Exec(`UPDATE runtime_descriptors SET heartbeat_at=?, heartbeat_ttl_ms=1000, acquired_at=0 WHERE project_id=?`, time.Now().UnixMilli()-10_000_000, st.ProjectID); err != nil {
+		t.Fatalf("backdate heartbeat: %v", err)
+	}
+	nonceB, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:3333", "http://127.0.0.1:4444", os.Getpid(), nonceB, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce should recover stale heartbeat: %v", err)
+	}
+	row := runtimeDescriptorRow(t, st)
+	if got := row["owner_nonce"].String(); got != nonceB {
+		t.Fatalf("runtime descriptor owner_nonce = %q, want new owner nonce %q", got, nonceB)
+	}
+	if got := row["acquired_at"].Int(); got == 0 {
+		t.Fatalf("runtime descriptor acquired_at = 0, want fresh value")
+	}
+}
+
+func TestCreateRuntimeDescriptorRecoversFromPIDReuseWhenHeartbeatStale(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonceA, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	// Daemon A claims the lock. Its PID matches the live test process.
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1111", "http://127.0.0.1:2222", os.Getpid(), nonceA, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce A: %v", err)
+	}
+	// Simulate A's heartbeat going silent long ago — but the recorded PID
+	// is intentionally identical to the test process, exercising the PID
+	// reuse path. A second daemon (B) should be able to claim the lock
+	// once the heartbeat is stale.
+	if err := st.App.Exec(`UPDATE runtime_descriptors SET heartbeat_at=?, heartbeat_ttl_ms=1000, acquired_at=? WHERE project_id=?`, time.Now().UnixMilli()-10_000_000, time.Now().UnixMilli()-10_000_000, st.ProjectID); err != nil {
+		t.Fatalf("backdate heartbeat: %v", err)
+	}
+	nonceB, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:3333", "http://127.0.0.1:4444", os.Getpid(), nonceB, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce B (PID reuse) should take over: %v", err)
+	}
+	row := runtimeDescriptorRow(t, st)
+	if got := row["owner_nonce"].String(); got != nonceB {
+		t.Fatalf("runtime descriptor owner_nonce = %q, want new owner %q", got, nonceB)
+	}
+	events, err := st.App.Query(`SELECT data_json FROM runtime_owner_events WHERE project_id=? AND event_type='runtime_owner_reaped' ORDER BY created_at DESC LIMIT 1`, st.ProjectID)
+	if err != nil {
+		t.Fatalf("query runtime_owner_events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("runtime_owner_reaped events = %d, want 1", len(events))
+	}
+	if !strings.Contains(events[0]["data_json"].String(), "heartbeat_stale") {
+		t.Fatalf("reap event data = %q, want reason heartbeat_stale", events[0]["data_json"].String())
+	}
+}
+
+func TestUpdateRuntimeHeartbeatRefreshesAndDetectsLostOwnership(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
+	}
+	if err := st.UpdateRuntimeHeartbeat(st.ProjectID, nonce, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("UpdateRuntimeHeartbeat: %v", err)
+	}
+	row := runtimeDescriptorRow(t, st)
+	if got := row["owner_nonce"].String(); got != nonce {
+		t.Fatalf("runtime descriptor owner_nonce = %q, want %q", got, nonce)
+	}
+	if err := st.UpdateRuntimeHeartbeat(st.ProjectID, "wrong-nonce-32-bytes-padding-padding", DefaultRuntimeHeartbeatTTLMS); err == nil {
+		t.Fatal("UpdateRuntimeHeartbeat with wrong nonce succeeded, want error")
+	} else if apiErr := core.AsAPIError(err); apiErr.Code != core.ErrDaemonAlreadyRunning {
+		t.Fatalf("UpdateRuntimeHeartbeat error code = %s, want %s", apiErr.Code, core.ErrDaemonAlreadyRunning)
+	}
+}
+
+func TestReapStaleRuntimeDescriptorsRemovesStaleRows(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
+	}
+	if err := st.App.Exec(`UPDATE runtime_descriptors SET heartbeat_at=?, heartbeat_ttl_ms=1000 WHERE project_id=?`, time.Now().UnixMilli()-10_000_000, st.ProjectID); err != nil {
+		t.Fatalf("backdate heartbeat: %v", err)
+	}
+	count, err := st.ReapStaleRuntimeDescriptors()
+	if err != nil {
+		t.Fatalf("ReapStaleRuntimeDescriptors: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("ReapStaleRuntimeDescriptors reaped = %d, want 1", count)
+	}
+	rows, err := st.App.Query(`SELECT project_id FROM runtime_descriptors WHERE project_id=?`, st.ProjectID)
+	if err != nil {
+		t.Fatalf("query runtime_descriptors: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("runtime_descriptors rows = %d, want 0 after reap", len(rows))
+	}
+}
+
+func TestReapStaleRuntimeDescriptorsLeavesFreshOwnersAlone(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
+	}
+	count, err := st.ReapStaleRuntimeDescriptors()
+	if err != nil {
+		t.Fatalf("ReapStaleRuntimeDescriptors: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("ReapStaleRuntimeDescriptors reaped fresh owner = %d, want 0", count)
+	}
+	row := runtimeDescriptorRow(t, st)
+	if got := row["owner_nonce"].String(); got != nonce {
+		t.Fatalf("runtime descriptor owner_nonce = %q, want %q", got, nonce)
+	}
+}
+
+func TestNewOwnerNonceReturnsAtLeast32HexBytes(t *testing.T) {
+	got, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if len(got) < 32 {
+		t.Fatalf("NewOwnerNonce length = %d, want >= 32", len(got))
 	}
 }
 
@@ -3215,7 +3434,7 @@ func readRuntimeDescriptorFile(t *testing.T, projectID string) map[string]any {
 
 func runtimeDescriptorRow(t *testing.T, st *Store) map[string]db.Value {
 	t.Helper()
-	rows, err := st.App.Query(`SELECT project_id, api_url, tool_gateway_endpoint, daemon_pid FROM runtime_descriptors WHERE project_id=?`, st.ProjectID)
+	rows, err := st.App.Query(`SELECT project_id, api_url, tool_gateway_endpoint, daemon_pid, owner_nonce, heartbeat_at, heartbeat_ttl_ms, acquired_at FROM runtime_descriptors WHERE project_id=?`, st.ProjectID)
 	if err != nil {
 		t.Fatalf("query runtime_descriptors: %v", err)
 	}

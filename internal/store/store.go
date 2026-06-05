@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -30,6 +31,27 @@ type Store struct {
 }
 
 const SupportedSchemaVersion = "1"
+
+// DefaultRuntimeHeartbeatTTLMS is the default TTL (milliseconds) for the
+// runtime owner heartbeat. It is used both as the DB default column value
+// and as the fallback when callers pass ttlMS <= 0.
+const DefaultRuntimeHeartbeatTTLMS = 30000
+
+// DefaultRuntimeHeartbeatIntervalMS is the default ticker interval for the
+// serve-loop heartbeat goroutine. The TTL/interval ratio leaves headroom
+// for at least 5 missed heartbeats before another daemon can take over.
+const DefaultRuntimeHeartbeatIntervalMS = 5000
+
+// DefaultRuntimeReapIntervalMS is the default cadence at which the
+// serve-loop scans for stale runtime owners in projects we do not currently
+// own. The reap is fail-closed: any error stops the loop and is logged so
+// the operator can investigate.
+const DefaultRuntimeReapIntervalMS = 60000
+
+// MinOwnerNonceLength is the minimum byte length of an owner nonce. 32
+// bytes of crypto/rand output is what v1 generates; rejecting shorter
+// values keeps the diagnostics fingerprint and DB column meaningful.
+const MinOwnerNonceLength = 32
 
 type SchemaVersionStatus struct {
 	Version string
@@ -205,6 +227,9 @@ func InitProject(repoRoot, issuePrefix string) (*Store, error) {
 	if err := s.Project.ExecScript(projSchema); err != nil {
 		return nil, err
 	}
+	if err := db.MigrateAppSchema(s.App); err != nil {
+		return nil, err
+	}
 	if err := validateSchemaVersion(s.App, s.AppDBPath); err != nil {
 		return nil, err
 	}
@@ -273,6 +298,9 @@ func Open(repoRoot string) (*Store, error) {
 		if err := s.App.ExecScript(appSchema); err != nil {
 			return nil, err
 		}
+	}
+	if err := db.MigrateAppSchema(s.App); err != nil {
+		return nil, err
 	}
 	if err := validateSchemaVersion(s.App, s.AppDBPath); err != nil {
 		return nil, err
@@ -2400,32 +2428,224 @@ func (s *Store) ReconcileStaleActiveRuns() error {
 	return errors.Join(errs...)
 }
 func (s *Store) CreateRuntimeDescriptor(apiURL, toolURL string, pid int) error {
+	nonce, err := NewOwnerNonce()
+	if err != nil {
+		return err
+	}
+	return s.CreateRuntimeDescriptorWithNonce(apiURL, toolURL, pid, nonce, DefaultRuntimeHeartbeatTTLMS)
+}
+
+// CreateRuntimeDescriptorWithNonce is the v1 owner-nonce variant of
+// CreateRuntimeDescriptor. The nonce is a 32+ byte random value identifying
+// this daemon's claim; heartbeat is the unix ms timestamp of the most recent
+// successful heartbeat. The combined check (heartbeat_at + heartbeat_ttl_ms)
+// is what determines whether an existing row still owns the project — this
+// is required because PID reuse alone is not a reliable liveness signal.
+//
+// If an existing row's heartbeat is still inside its TTL, this returns
+// core.ErrDaemonAlreadyRunning (the operator should investigate the live
+// owner before acquiring). If the existing row's heartbeat is stale
+// (heartbeat_at + ttl <= now) OR the recorded PID is no longer alive, the
+// stale row is reaped (and a diagnostics event recorded) before the new
+// descriptor is written.
+func (s *Store) CreateRuntimeDescriptorWithNonce(apiURL, toolURL string, pid int, nonce string, ttlMS int) error {
+	if err := validateOwnerNonce(nonce); err != nil {
+		return err
+	}
+	if ttlMS <= 0 {
+		ttlMS = DefaultRuntimeHeartbeatTTLMS
+	}
 	if err := os.MkdirAll(db.RuntimeDir(), 0o700); err != nil {
 		return err
 	}
 	now := core.Now()
+	nowMS := time.Now().UnixMilli()
 	if err := s.App.WithTx(func(tx *db.Tx) error {
-		row, err := tx.QueryOne(`SELECT daemon_pid FROM runtime_descriptors WHERE project_id=?`, s.ProjectID)
+		row, err := tx.QueryOne(`SELECT daemon_pid, owner_nonce, heartbeat_at, heartbeat_ttl_ms FROM runtime_descriptors WHERE project_id=?`, s.ProjectID)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		if err == nil {
 			existingPID := row["daemon_pid"].Int()
-			if daemonProcessExists(existingPID) {
-				return fmt.Errorf("runtime ownership conflict: daemon pid %d already owns project %s", existingPID, s.ProjectID)
+			existingHB := row["heartbeat_at"].Int64()
+			existingTTL := int64(row["heartbeat_ttl_ms"].Int())
+			if existingTTL <= 0 {
+				existingTTL = DefaultRuntimeHeartbeatTTLMS
+			}
+			if runtimeOwnerIsLive(existingPID, existingHB, existingTTL, nowMS) {
+				return core.NewError(core.ErrDaemonAlreadyRunning, "runtime ownership conflict: another daemon still owns this project", map[string]any{
+					"project_id":    s.ProjectID,
+					"daemon_pid":    existingPID,
+					"heartbeat_at":  existingHB,
+					"heartbeat_ttl_ms": existingTTL,
+					"operator_guidance": "another active daemon holds the runtime lock. Stop it (symphony serve shutdown) or wait for heartbeat ttl to expire before retrying.",
+				})
+			}
+			if err := reapStaleRuntimeDescriptorInTx(tx, s.ProjectID, existingPID, existingHB, existingTTL, nowMS); err != nil {
+				return err
 			}
 		}
-		return tx.Exec(`INSERT OR REPLACE INTO runtime_descriptors(project_id,api_url,tool_gateway_endpoint,daemon_pid,started_at,updated_at) VALUES(?,?,?,?,?,?)`, s.ProjectID, apiURL, toolURL, pid, now, now)
+		return tx.Exec(`INSERT OR REPLACE INTO runtime_descriptors(project_id,api_url,tool_gateway_endpoint,daemon_pid,owner_nonce,heartbeat_at,heartbeat_ttl_ms,acquired_at,started_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, s.ProjectID, apiURL, toolURL, pid, nonce, nowMS, ttlMS, nowMS, now, now)
 	}); err != nil {
 		return err
 	}
-	payload := map[string]any{"project_id": s.ProjectID, "repo_root": s.RepoRoot, "api_url": apiURL, "tool_gateway_endpoint": toolURL, "daemon_pid": pid, "started_at": now}
+	payload := map[string]any{"project_id": s.ProjectID, "repo_root": s.RepoRoot, "api_url": apiURL, "tool_gateway_endpoint": toolURL, "daemon_pid": pid, "owner_nonce_fingerprint": ownerNonceFingerprint(nonce), "heartbeat_at": nowMS, "heartbeat_ttl_ms": ttlMS, "acquired_at": nowMS, "started_at": now}
 	b, _ := json.MarshalIndent(payload, "", "  ")
 	if err := os.WriteFile(db.RuntimeDescriptorPath(s.ProjectID), b, 0o600); err != nil {
 		s.RemoveRuntimeDescriptorForPID(pid)
 		return err
 	}
 	return nil
+}
+
+// UpdateRuntimeHeartbeat refreshes heartbeat_at for the matching project+nonce
+// row. It returns an error if no row matches OR the nonce does not match —
+// both indicate the caller no longer owns the runtime lock (e.g. another
+// daemon has taken over after a missed heartbeat window).
+func (s *Store) UpdateRuntimeHeartbeat(projectID, nonce string, ttlMS int) error {
+	if err := validateOwnerNonce(nonce); err != nil {
+		return err
+	}
+	if ttlMS <= 0 {
+		ttlMS = DefaultRuntimeHeartbeatTTLMS
+	}
+	nowMS := time.Now().UnixMilli()
+	now := core.Now()
+	if err := s.App.Exec(`UPDATE runtime_descriptors SET heartbeat_at=?, heartbeat_ttl_ms=?, updated_at=? WHERE project_id=? AND owner_nonce=?`, nowMS, ttlMS, now, projectID, nonce); err != nil {
+		return err
+	}
+	row, err := s.App.QueryOne(`SELECT project_id FROM runtime_descriptors WHERE project_id=? AND owner_nonce=?`, projectID, nonce)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return core.NewError(core.ErrDaemonAlreadyRunning, "runtime owner heartbeat lost; another owner has taken the lock", map[string]any{
+				"project_id": projectID,
+			})
+		}
+		return err
+	}
+	if row["project_id"].String() != projectID {
+		return core.NewError(core.ErrDaemonAlreadyRunning, "runtime owner heartbeat lost; another owner has taken the lock", map[string]any{
+			"project_id": projectID,
+		})
+	}
+	return nil
+}
+
+// ReapStaleRuntimeDescriptors removes all rows whose heartbeat has expired.
+// PID reuse must not affect this judgment — heartbeat staleness is the
+// authoritative signal. Returns the number of rows reaped.
+func (s *Store) ReapStaleRuntimeDescriptors() (int, error) {
+	nowMS := time.Now().UnixMilli()
+	rows, err := s.App.Query(`SELECT project_id, daemon_pid, owner_nonce, heartbeat_at, heartbeat_ttl_ms FROM runtime_descriptors`)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, r := range rows {
+		projectID := r["project_id"].String()
+		existingPID := r["daemon_pid"].Int()
+		hb := r["heartbeat_at"].Int64()
+		ttl := int64(r["heartbeat_ttl_ms"].Int())
+		if ttl <= 0 {
+			ttl = DefaultRuntimeHeartbeatTTLMS
+		}
+		if runtimeOwnerIsLive(existingPID, hb, ttl, nowMS) {
+			continue
+		}
+		if err := s.App.WithTx(func(tx *db.Tx) error {
+			return reapStaleRuntimeDescriptorInTx(tx, projectID, existingPID, hb, ttl, nowMS)
+		}); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func reapStaleRuntimeDescriptorInTx(tx *db.Tx, projectID string, pid int, hbMS, ttlMS, nowMS int64) error {
+	row, err := tx.QueryOne(`SELECT owner_nonce, heartbeat_at, heartbeat_ttl_ms FROM runtime_descriptors WHERE project_id=? AND daemon_pid=?`, projectID, pid)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	storedHB := row["heartbeat_at"].Int64()
+	storedTTL := row["heartbeat_ttl_ms"].Int()
+	if storedTTL <= 0 {
+		storedTTL = DefaultRuntimeHeartbeatTTLMS
+	}
+	if storedHB != hbMS || storedTTL != int(ttlMS) {
+		// Row was updated between the stale scan and this reap; leave it
+		// alone so we never trample a freshly acquired owner.
+		return nil
+	}
+	if err := tx.Exec(`DELETE FROM runtime_descriptors WHERE project_id=? AND daemon_pid=?`, projectID, pid); err != nil {
+		return err
+	}
+	if err := emitReapEvent(tx, projectID, pid, hbMS, ttlMS, nowMS); err != nil {
+		return err
+	}
+	_ = os.Remove(db.RuntimeDescriptorPath(projectID))
+	return nil
+}
+
+func emitReapEvent(tx *db.Tx, projectID string, pid int, hbMS, ttlMS, nowMS int64) error {
+	body := map[string]any{
+		"reason":           "heartbeat_stale",
+		"daemon_pid":       pid,
+		"heartbeat_at":     hbMS,
+		"heartbeat_ttl_ms": ttlMS,
+		"reaped_at":        nowMS,
+	}
+	b, _ := json.Marshal(body)
+	return tx.Exec(`INSERT INTO runtime_owner_events(id,project_id,event_type,actor_type,data_json,redacted,created_at) VALUES(?,?,?,?,?,?,?)`, core.NewID("rev_"), projectID, "runtime_owner_reaped", "system", string(b), 1, core.Now())
+}
+
+// runtimeOwnerIsLive returns true when the recorded owner should still hold
+// the lock: heartbeat_at + ttl is in the future, OR the original PID is
+// still alive and the row was acquired recently enough that we should defer
+// to a fresh owner acquiring. The TTL is the primary signal — PID alive
+// alone is insufficient because PID reuse is possible.
+func runtimeOwnerIsLive(pid int, hbMS, ttlMS, nowMS int64) bool {
+	if hbMS > 0 && ttlMS > 0 && hbMS+ttlMS > nowMS {
+		return true
+	}
+	if pid > 0 && daemonProcessExists(pid) && hbMS == 0 {
+		// Migrated row with no heartbeat yet: respect the legacy PID-only
+		// check so we never trample a daemon that just started up after
+		// the schema migration.
+		return true
+	}
+	return false
+}
+
+func validateOwnerNonce(nonce string) error {
+	if len(nonce) < MinOwnerNonceLength {
+		return fmt.Errorf("owner nonce must be at least %d bytes; got %d", MinOwnerNonceLength, len(nonce))
+	}
+	return nil
+}
+
+// NewOwnerNonce returns a 32-byte hex-encoded random nonce suitable for
+// runtime owner claims. crypto/rand failures are surfaced as errors so the
+// caller can fail-closed rather than fall back to a weak source.
+func NewOwnerNonce() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate owner nonce: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// ownerNonceFingerprint returns the first 8 hex characters of a nonce. This
+// is the value exposed via diagnostics — it lets operators correlate logs
+// without ever revealing the full secret value.
+func ownerNonceFingerprint(nonce string) string {
+	if len(nonce) < 8 {
+		return nonce
+	}
+	return nonce[:8]
 }
 func (s *Store) RemoveRuntimeDescriptor() {
 	s.RemoveRuntimeDescriptorForPID(os.Getpid())
@@ -2441,17 +2661,25 @@ func (s *Store) RemoveRuntimeDescriptorForPID(pid int) {
 }
 
 func (s *Store) RuntimeDescriptorSnapshot() (map[string]any, error) {
-	row, err := s.App.QueryOne(`SELECT api_url, tool_gateway_endpoint, daemon_pid FROM runtime_descriptors WHERE project_id=?`, s.ProjectID)
+	row, err := s.App.QueryOne(`SELECT api_url, tool_gateway_endpoint, daemon_pid, owner_nonce, heartbeat_at, heartbeat_ttl_ms, acquired_at FROM runtime_descriptors WHERE project_id=?`, s.ProjectID)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	// Diagnostics projection must never include the plaintext owner_nonce;
+	// the 8-char fingerprint is enough for operators to correlate logs
+	// across restart cycles without exposing secret material.
+	nonce := row["owner_nonce"].String()
 	return map[string]any{
-		"api_url":               row["api_url"].String(),
-		"tool_gateway_endpoint": row["tool_gateway_endpoint"].String(),
-		"daemon_pid":            row["daemon_pid"].Int(),
+		"api_url":                  row["api_url"].String(),
+		"tool_gateway_endpoint":    row["tool_gateway_endpoint"].String(),
+		"daemon_pid":               row["daemon_pid"].Int(),
+		"acquired_at":              row["acquired_at"].Int64(),
+		"heartbeat_at":             row["heartbeat_at"].Int64(),
+		"heartbeat_ttl_ms":         row["heartbeat_ttl_ms"].Int(),
+		"owner_nonce_fingerprint":  ownerNonceFingerprint(nonce),
 	}, nil
 }
 
