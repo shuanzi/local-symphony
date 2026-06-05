@@ -1,7 +1,7 @@
 # v1 真实产品化执行计划
 
-**状态**：执行中，阶段 A、阶段 B 已完成；阶段 C 已启动，C1 hook lifecycle 已完成，下一入口为 C2 / Scheduler tick loop
-**更新日期**：2026-06-03
+**状态**：执行中，阶段 A、阶段 B 已完成；阶段 C 已启动，C1 hook lifecycle 与 C2 scheduler tick loop 已完成，下一入口为 C3 / 单 daemon 项目所有权与 runtime lock
+**更新日期**：2026-06-04
 **需求来源**：`docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md`
 **目标**：把 R1-R17 的产品化缺口拆成可落地、可审查、可验收的实施批次，推进 Local Symphony 从本地 fake runner MVP 进入真实 Codex 可运行的本地产品化版本。
 
@@ -36,7 +36,7 @@ R15 是横切要求，不作为单独最后阶段处理。每完成一个需求�
 - [x] B2 / Codex approval producer 与 writeback：已完成；Codex command/file_change/network approval request 会写入 `approval_requests`，operator 决策可写回 Codex，并覆盖 deny、cancel_run 与 timeout 语义。
 - [x] B3 / 安全策略执行与回归套件：默认 command/network/protected-path policy evaluator 已接入 Codex approval bridge，auto-deny 写入 `approval_requests(auto_denied)` 并返回 canonical failure code；redaction golden fixture 已补齐并纳入 contract validation，覆盖 prompt、Codex log、secret、diagnostics。
 - [x] 阶段 B 收口：已完成；验收记录见 `docs/productization/V1_PHASE_B_ACCEPTANCE.md`。
-- [ ] 阶段 C / Daemon 产品行为补齐：进行中；C1 hook lifecycle 已完成，C2 scheduler tick loop 待推进。
+- [ ] 阶段 C / Daemon 产品行为补齐：进行中；C1 hook lifecycle 与 C2 scheduler tick loop 已完成，C3 single daemon ownership/runtime lock 待推进。
 - [ ] 阶段 D / Operator 体验与发布：未开始。
 
 ## 3. 全局 Definition of Done
@@ -462,12 +462,14 @@ bash scripts/acceptance-local.sh
 
 覆盖 R8 的 scheduler 部分。
 
+**进度**：已完成。`symphony serve` 会按 workflow `polling.interval_ms` 启动 scheduler tick loop；tick 候选状态来自 effective `tracker.dispatch_candidate_states`，默认仍为 `Ready` / `Rework`；scheduler 和手动 dispatch 共用同一 `ClaimRun` preflight 路径。tick error 不会终止 daemon，会记录到 stderr 后等待下一次 tick；取消 serve 会停止后续 tick，已启动的 tick drain 后再关闭 store。
+
 目标：
 
-- `symphony serve` 根据 workflow polling interval 启动 tick loop。
-- tick 只选择 `Ready` 和 `Rework`。
-- tick 和手动 dispatch 共享同一 preflight。
-- failure 后 pause 的 issue 不会自动 redispatch。
+- [x] `symphony serve` 根据 workflow polling interval 启动 tick loop。
+- [x] tick 只选择 `Ready` 和 `Rework`。
+- [x] tick 和手动 dispatch 共享同一 preflight。
+- [x] failure 后 pause 的 issue 不会自动 redispatch。
 
 主要改动面：
 
@@ -478,15 +480,19 @@ bash scripts/acceptance-local.sh
 
 任务拆分：
 
-1. 在 serve runtime 启动 tick loop，支持 graceful shutdown。
-2. 统一 manual dispatch 和 tick dispatch 的 eligibility/preflight。
-3. 增加 polling interval config tests。
-4. 增加 paused issue 不 redispatch 的 regression tests。
+1. [x] 在 serve runtime 启动 tick loop，支持 graceful shutdown。
+2. [x] 统一 manual dispatch 和 tick dispatch 的 eligibility/preflight。
+3. [x] 增加 polling interval config tests。
+4. [x] 增加 paused issue 不 redispatch 的 regression tests。
 
 验收：
 
-- `Working` 不作为正常 tick 候选。
-- stale active run reconciliation 后仍遵守 dispatch pause。
+- [x] `Working` 不作为正常 tick 候选。
+- [x] stale active run reconciliation 后仍遵守 dispatch pause。
+
+已知边界：
+
+- tick 内部 dispatch 仍同步执行；如果 in-flight tick 永久卡住，store close 会延后到 tick drain 后。完整 daemon owner、runtime lock 和 shutdown cancellation 属于 C3/Codex lifecycle 后续收口。
 
 ### C3. 单 daemon 项目所有权与 runtime lock
 
@@ -840,4 +846,4 @@ R15
 6. [x] **A5 / R6**：missing handoff continuation。
 7. [x] **B1 / R5**：Approval API contract 字段补齐。
 
-第一批、阶段 B 与 C1 已完成。下一步建议优先推进 **C2 / Scheduler tick loop 与 dispatch preflight 统一**，先让 `symphony serve` 按 polling interval 周期调度 eligible issue，并确保 tick 与手动 dispatch 共用同一 preflight。
+第一批、阶段 B、C1 与 C2 已完成。下一步建议优先推进 **C3 / 单 daemon 项目所有权与 runtime lock**，先明确 runtime lock 存储、owner token redaction、serve startup ownership guard 和 stale owner 恢复语义。

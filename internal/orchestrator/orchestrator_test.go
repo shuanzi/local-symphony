@@ -120,6 +120,121 @@ func TestDispatchIssueCodexMissingHandoffContinuationUsesSameProcess(t *testing.
 	assertRecordedStartTurn(t, filepath.Join(gotIssue.Workspace.Path, "turn-2.json"), true, "thread_fixture")
 }
 
+func TestTickReturnsNonEligibilityDispatchError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_RUNNER_KIND", "")
+	st, _ := newReadyDispatchIssue(t)
+	if err := st.Project.Exec(`CREATE TRIGGER fail_scheduler_run BEFORE INSERT ON run_attempts WHEN NEW.dispatch_reason='scheduler' BEGIN SELECT RAISE(ABORT, 'scheduler run insert failed'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err := (Orchestrator{Store: st}).Tick()
+	if err == nil {
+		t.Fatal("Tick succeeded, want scheduler run insert error")
+	}
+	if !strings.Contains(err.Error(), "scheduler run insert failed") {
+		t.Fatalf("Tick error = %v, want scheduler run insert failure", err)
+	}
+}
+
+func TestTickSkipsPausedReadyAndWorkingIssues(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	paused, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Paused ready",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue paused: %v", err)
+	}
+	if _, err := st.TransitionIssue(paused.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue paused: %v", err)
+	}
+	if _, err := st.DispatchPause(paused.ID, "operator pause"); err != nil {
+		t.Fatalf("DispatchPause: %v", err)
+	}
+	working, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Working issue",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue working: %v", err)
+	}
+	if err := st.Project.Exec(`UPDATE issues SET state='Working' WHERE id=?`, working.ID); err != nil {
+		t.Fatalf("set working state: %v", err)
+	}
+
+	if err := (Orchestrator{Store: st}).Tick(); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	assertRunAttemptCount(t, st, 0)
+}
+
+func TestTickUsesWorkflowDispatchCandidateStates(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_RUNNER_KIND", "")
+	st, err := store.InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	body := `---
+tracker:
+  dispatch_candidate_states: [Rework]
+---
+Do the work.
+`
+	if err := os.WriteFile(filepath.Join(st.RepoRoot, "WORKFLOW.md"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+	ready, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Ready issue",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue ready: %v", err)
+	}
+	if _, err := st.TransitionIssue(ready.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue ready: %v", err)
+	}
+	rework, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Rework issue",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue rework: %v", err)
+	}
+	if err := st.Project.Exec(`UPDATE issues SET state='Rework' WHERE id=?`, rework.ID); err != nil {
+		t.Fatalf("set rework state: %v", err)
+	}
+
+	if err := (Orchestrator{Store: st}).Tick(); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	rows, err := st.Project.Query(`SELECT source_issue_state FROM run_attempts ORDER BY created_at`)
+	if err != nil {
+		t.Fatalf("query run attempts: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("run attempts = %d, want 1", len(rows))
+	}
+	if got := rows[0]["source_issue_state"].String(); got != string(core.StateRework) {
+		t.Fatalf("source_issue_state = %q, want %q", got, core.StateRework)
+	}
+}
+
 func TestRunWorkerCancelsCodexProcessWhenRunCancelled(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SYMPHONY_RUNNER_KIND", "codex")
@@ -1427,6 +1542,20 @@ func assertRunEventCount(t *testing.T, st *store.Store, runID, eventType string,
 	}
 	if len(rows) != want {
 		t.Fatalf("%s event count = %d, want %d", eventType, len(rows), want)
+	}
+}
+
+func assertRunAttemptCount(t *testing.T, st *store.Store, want int) {
+	t.Helper()
+	rows, err := st.Project.Query(`SELECT COUNT(*) AS c FROM run_attempts`)
+	if err != nil {
+		t.Fatalf("query run attempt count: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("run attempt count rows = %d, want 1", len(rows))
+	}
+	if got := rows[0]["c"].Int(); got != want {
+		t.Fatalf("run attempt count = %d, want %d", got, want)
 	}
 }
 

@@ -40,6 +40,10 @@ func (o Orchestrator) DispatchIssue(issueRef, reason string) (*DispatchResult, e
 	if err != nil {
 		return nil, err
 	}
+	return o.dispatchIssueWithWorkflow(wf, issueRef, reason)
+}
+
+func (o Orchestrator) dispatchIssueWithWorkflow(wf *config.Workflow, issueRef, reason string) (*DispatchResult, error) {
 	if !wf.Validation.Valid {
 		return nil, core.NewError(core.ErrWorkflowInvalid, "WORKFLOW.md is invalid", map[string]any{"errors": wf.Validation.Errors, "warnings": wf.Validation.Warnings})
 	}
@@ -590,15 +594,39 @@ func (b *boundedHookOutput) String() string {
 }
 
 func (o Orchestrator) Tick() error {
-	issues, err := o.Store.ListIssues(store.ListIssueOptions{States: []string{"Ready", "Rework"}, Limit: 50, Sort: "priority"})
+	wf, err := config.Load(o.Store.RepoRoot)
+	if err != nil {
+		return err
+	}
+	if !wf.Validation.Valid {
+		return core.NewError(core.ErrWorkflowInvalid, "WORKFLOW.md is invalid", map[string]any{"errors": wf.Validation.Errors, "warnings": wf.Validation.Warnings})
+	}
+	issues, err := o.Store.ListIssues(store.ListIssueOptions{States: wf.Config.Tracker.DispatchCandidateStates, Limit: 50, Sort: "priority"})
 	if err != nil {
 		return err
 	}
 	for _, iss := range issues {
-		if iss.DispatchPaused || iss.ActiveRunID != nil || len(iss.BlockedBy) > 0 {
-			continue
+		if _, err := o.dispatchIssueWithWorkflow(wf, iss.Identifier, "scheduler"); err != nil && !isSchedulerSkippableDispatchError(err) {
+			return err
 		}
-		_, _ = o.DispatchIssue(iss.Identifier, "scheduler")
 	}
 	return nil
+}
+
+func isSchedulerSkippableDispatchError(err error) bool {
+	var apiErr *core.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.Code {
+	case core.ErrInvalidRequest,
+		core.ErrInvalidStateTransition,
+		core.ErrIssueBlocked,
+		core.ErrIssueDispatchPaused,
+		core.ErrIssueAlreadyRunning,
+		core.ErrConcurrencyLimitReached:
+		return true
+	default:
+		return false
+	}
 }
