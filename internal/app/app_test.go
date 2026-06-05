@@ -79,6 +79,30 @@ func TestWriteCLISessionWritesProjectScopedSession(t *testing.T) {
 	}
 }
 
+func TestWriteCLISessionRollsBackDBRowWhenSessionFileWriteFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	if err := os.MkdirAll(CLISessionPath(st.ProjectID), 0o700); err != nil {
+		t.Fatalf("create session file path directory: %v", err)
+	}
+
+	if err := writeCLISession(st, "http://127.0.0.1:1", "test-token"); err == nil {
+		t.Fatal("writeCLISession succeeded, want session file write error")
+	}
+	rows, err := st.App.Query(`SELECT id FROM local_sessions WHERE project_id=? AND kind='cli'`, st.ProjectID)
+	if err != nil {
+		t.Fatalf("query local_sessions: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("local_sessions rows = %d, want 0 after session file write failure", len(rows))
+	}
+}
+
 func TestServeReturnsErrorWhenRuntimeDescriptorWriteFails(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -101,11 +125,157 @@ func TestServeReturnsErrorWhenRuntimeDescriptorWriteFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("prepareServeRuntime succeeded, want runtime descriptor error")
 	}
-	if _, readErr := os.ReadFile(CLISessionPath(projectID)); readErr != nil {
-		t.Fatalf("CLI session was not written before runtime descriptor failure: %v", readErr)
+	if _, readErr := os.ReadFile(CLISessionPath(projectID)); !os.IsNotExist(readErr) {
+		t.Fatalf("CLI session was written before runtime lock failure: %v", readErr)
 	}
 	if closeErr := ln.Close(); closeErr == nil {
 		t.Fatal("listener remained open after runtime descriptor failure")
+	}
+}
+
+func TestPrepareServeRuntimeReleasesRuntimeOwnerWhenCLISessionWriteFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	sessionDir := filepath.Join(home, ".symphony", "cli-sessions")
+	if err := os.WriteFile(sessionDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("create cli session path conflict: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	err = prepareServeRuntime(st, ln, "http://"+ln.Addr().String(), "test-token", os.Getpid())
+	if err == nil {
+		t.Fatal("prepareServeRuntime succeeded, want CLI session write error")
+	}
+	if closeErr := ln.Close(); closeErr == nil {
+		t.Fatal("listener remained open after CLI session write failure")
+	}
+	if _, err := RuntimeDescriptor(st.ProjectID); !os.IsNotExist(err) {
+		t.Fatalf("runtime descriptor remains after CLI session write failure: %v", err)
+	}
+	rows, err := st.App.Query(`SELECT project_id FROM runtime_descriptors WHERE project_id=?`, st.ProjectID)
+	if err != nil {
+		t.Fatalf("query runtime descriptors: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("runtime descriptor DB rows = %d, want 0 after CLI session write failure", len(rows))
+	}
+}
+
+func TestPrepareServeRuntimeRejectsActiveRuntimeOwner(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1111", "http://127.0.0.1:2222", os.Getpid()); err != nil {
+		t.Fatalf("CreateRuntimeDescriptor existing owner: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	err = prepareServeRuntime(st, ln, "http://"+ln.Addr().String(), "test-token", os.Getpid()+1)
+	if err == nil {
+		t.Fatal("prepareServeRuntime succeeded, want daemon runtime ownership conflict")
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "runtime") || !strings.Contains(msg, "ownership") || !strings.Contains(msg, "conflict") {
+		t.Fatalf("prepareServeRuntime error = %v, want daemon/runtime ownership conflict", err)
+	}
+	if closeErr := ln.Close(); closeErr == nil {
+		t.Fatal("listener remained open after runtime ownership conflict")
+	}
+	desc, err := RuntimeDescriptor(st.ProjectID)
+	if err != nil {
+		t.Fatalf("RuntimeDescriptor after conflict: %v", err)
+	}
+	if got := desc["api_url"]; got != "http://127.0.0.1:1111" {
+		t.Fatalf("runtime descriptor api_url = %v, want existing owner value", got)
+	}
+	if _, readErr := os.ReadFile(CLISessionPath(st.ProjectID)); !os.IsNotExist(readErr) {
+		t.Fatalf("CLI session was written despite runtime ownership conflict: %v", readErr)
+	}
+}
+
+func TestServeRuntimeOwnershipConflictDoesNotReconcileActiveRuns(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Ownership conflict",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	approval, err := st.CreatePendingApprovalRequest(store.CreateApprovalRequestInput{
+		RunID: run.ID, IssueID: issue.ID, Kind: "command", ActionSummary: "go test", RiskLevel: "medium", PolicyMatch: "manual", RequestID: "apr_test", CWD: st.RepoRoot, Fingerprint: "fp_test", TimeoutMS: 60000,
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingApprovalRequest: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1111", "http://127.0.0.1:2222", os.Getpid()); err != nil {
+		t.Fatalf("CreateRuntimeDescriptor existing owner: %v", err)
+	}
+	repoRoot := st.RepoRoot
+	projectID := st.ProjectID
+	st.Close()
+
+	err = Serve(ServeOptions{Project: repoRoot, Host: "127.0.0.1", Port: 0, NoOpen: true})
+	if err == nil {
+		t.Fatal("Serve succeeded, want runtime ownership conflict")
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "runtime") || !strings.Contains(msg, "ownership") || !strings.Contains(msg, "conflict") {
+		t.Fatalf("Serve error = %v, want runtime ownership conflict", err)
+	}
+	if _, err := os.ReadFile(CLISessionPath(projectID)); !os.IsNotExist(err) {
+		t.Fatalf("CLI session was written despite runtime ownership conflict: %v", err)
+	}
+	opened, err := store.Open(repoRoot)
+	if err != nil {
+		t.Fatalf("Open after Serve conflict: %v", err)
+	}
+	t.Cleanup(opened.Close)
+	runRow, err := opened.Project.QueryOne(`SELECT status, failure_code FROM run_attempts WHERE id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("query run after Serve conflict: %v", err)
+	}
+	if got := runRow["status"].String(); got != string(core.RunPending) {
+		t.Fatalf("run status = %s, want %s", got, core.RunPending)
+	}
+	if got := runRow["failure_code"].String(); got != "" {
+		t.Fatalf("run failure_code = %q, want empty", got)
+	}
+	approvalRow, err := opened.Project.QueryOne(`SELECT status FROM approval_requests WHERE id=?`, approval.ID)
+	if err != nil {
+		t.Fatalf("query approval after Serve conflict: %v", err)
+	}
+	if got := approvalRow["status"].String(); got != "pending" {
+		t.Fatalf("approval status = %s, want pending", got)
 	}
 }
 
@@ -137,12 +307,15 @@ func TestServeReturnsReconcileError(t *testing.T) {
 	repoRoot := st.RepoRoot
 	st.Close()
 
-	err = Serve(ServeOptions{Project: repoRoot, Host: "0.0.0.0", Port: 0, NoOpen: true})
+	err = Serve(ServeOptions{Project: repoRoot, Host: "127.0.0.1", Port: 0, NoOpen: true})
 	if err == nil {
 		t.Fatal("Serve succeeded, want reconcile error")
 	}
 	if !strings.Contains(err.Error(), "serve reconcile failed") {
 		t.Fatalf("Serve error = %v, want reconcile failure", err)
+	}
+	if _, err := os.ReadFile(CLISessionPath(st.ProjectID)); !os.IsNotExist(err) {
+		t.Fatalf("CLI session remains after serve startup failure: %v", err)
 	}
 }
 
@@ -299,7 +472,7 @@ func TestRuntimeDescriptorPreservesSafeProjectIDFileName(t *testing.T) {
 	t.Cleanup(st.Close)
 	st.ProjectID = "prj_abc123"
 
-	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1", "http://127.0.0.1:2", 1234); err != nil {
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid()); err != nil {
 		t.Fatalf("CreateRuntimeDescriptor: %v", err)
 	}
 	path := filepath.Join(db.RuntimeDir(), "prj_abc123.json")
@@ -325,7 +498,7 @@ func TestRuntimeDescriptorDoesNotAllowProjectIDPathTraversal(t *testing.T) {
 	t.Cleanup(st.Close)
 	st.ProjectID = "../../outside-runtime"
 
-	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1", "http://127.0.0.1:2", 1234); err != nil {
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid()); err != nil {
 		t.Fatalf("CreateRuntimeDescriptor: %v", err)
 	}
 	base := db.RuntimeDir()

@@ -35,9 +35,6 @@ func Serve(opts ServeOptions) error {
 	}
 	closeStore := func() { st.Close() }
 	defer func() { closeStore() }()
-	if err := st.ReconcileStaleActiveRuns(); err != nil {
-		return err
-	}
 	host := opts.Host
 	if host == "" {
 		host = "127.0.0.1"
@@ -55,9 +52,15 @@ func Serve(opts ServeOptions) error {
 		return err
 	}
 	defer st.RemoveRuntimeDescriptor()
+	if err := st.ReconcileStaleActiveRuns(); err != nil {
+		_ = ln.Close()
+		removeCLISession(st)
+		return err
+	}
 	wf, err := config.Load(st.RepoRoot)
 	if err != nil {
 		_ = ln.Close()
+		removeCLISession(st)
 		return err
 	}
 	srv := &http.Server{Handler: httpapi.New(st).Handler()}
@@ -163,11 +166,12 @@ func runSchedulerTickLoopWithDrain(ctx context.Context, interval time.Duration, 
 }
 
 func prepareServeRuntime(st *store.Store, ln net.Listener, addr, token string, pid int) error {
-	if err := writeCLISession(st, addr, token); err != nil {
+	if err := st.CreateRuntimeDescriptor(addr, addr, pid); err != nil {
 		_ = ln.Close()
 		return err
 	}
-	if err := st.CreateRuntimeDescriptor(addr, addr, pid); err != nil {
+	if err := writeCLISession(st, addr, token); err != nil {
+		st.RemoveRuntimeDescriptorForPID(pid)
 		_ = ln.Close()
 		return err
 	}
@@ -191,9 +195,19 @@ func writeCLISession(st *store.Store, apiURL, token string) error {
 		return err
 	}
 	if err := os.WriteFile(path, b, 0o600); err != nil {
+		removeCLISession(st)
 		return err
 	}
-	return os.Chmod(path, 0o600)
+	if err := os.Chmod(path, 0o600); err != nil {
+		removeCLISession(st)
+		return err
+	}
+	return nil
+}
+
+func removeCLISession(st *store.Store) {
+	_ = os.Remove(CLISessionPath(st.ProjectID))
+	_ = st.App.Exec(`DELETE FROM local_sessions WHERE id=? AND project_id=? AND kind='cli'`, "cli_"+st.ProjectID, st.ProjectID)
 }
 
 func CLISessionPath(projectID string) string {

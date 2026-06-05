@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -134,6 +135,118 @@ func TestOpenRepopulatesProjectMetadataAfterAppDBRebuild(t *testing.T) {
 	}
 	if err := opened.App.Exec(`INSERT INTO local_sessions(id,project_id,kind,token_hash,user_label,created_at) VALUES(?,?,?,?,?,?)`, core.NewID("ses_"), opened.ProjectID, "cli", "token_hash", "test-session", core.Now()); err != nil {
 		t.Fatalf("insert local session after app DB rebuild: %v", err)
+	}
+}
+
+func TestCreateRuntimeDescriptorRejectsActiveOwnerWithoutOverwriting(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1111", "http://127.0.0.1:2222", os.Getpid()); err != nil {
+		t.Fatalf("CreateRuntimeDescriptor first owner: %v", err)
+	}
+	err = st.CreateRuntimeDescriptor("http://127.0.0.1:3333", "http://127.0.0.1:4444", os.Getpid()+1)
+	if err == nil {
+		t.Fatal("CreateRuntimeDescriptor succeeded, want daemon runtime ownership conflict")
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "runtime") || !strings.Contains(msg, "ownership") || !strings.Contains(msg, "conflict") {
+		t.Fatalf("CreateRuntimeDescriptor error = %v, want daemon/runtime ownership conflict", err)
+	}
+	desc := readRuntimeDescriptorFile(t, st.ProjectID)
+	if got := desc["api_url"]; got != "http://127.0.0.1:1111" {
+		t.Fatalf("runtime descriptor file api_url = %v, want first owner value", got)
+	}
+	row := runtimeDescriptorRow(t, st)
+	if got := row["api_url"].String(); got != "http://127.0.0.1:1111" {
+		t.Fatalf("runtime descriptor DB api_url = %q, want first owner value", got)
+	}
+}
+
+func TestCreateRuntimeDescriptorRecoversStaleOwner(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	stalePID := 2147483647
+	if processExists(stalePID) {
+		t.Fatalf("test stale PID %d unexpectedly exists", stalePID)
+	}
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1111", "http://127.0.0.1:2222", stalePID); err != nil {
+		t.Fatalf("CreateRuntimeDescriptor stale owner: %v", err)
+	}
+
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:3333", "http://127.0.0.1:4444", os.Getpid()); err != nil {
+		t.Fatalf("CreateRuntimeDescriptor should recover stale owner: %v", err)
+	}
+	desc := readRuntimeDescriptorFile(t, st.ProjectID)
+	if got := desc["daemon_pid"]; int(got.(float64)) != os.Getpid() {
+		t.Fatalf("runtime descriptor daemon_pid = %v, want %d", got, os.Getpid())
+	}
+}
+
+func TestCreateRuntimeDescriptorRollsBackOwnerWhenFileWriteFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	if err := os.MkdirAll(db.RuntimeDescriptorPath(st.ProjectID), 0o700); err != nil {
+		t.Fatalf("create runtime descriptor path directory: %v", err)
+	}
+
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1111", "http://127.0.0.1:2222", os.Getpid()); err == nil {
+		t.Fatal("CreateRuntimeDescriptor succeeded, want runtime descriptor file write error")
+	}
+	rows, err := st.App.Query(`SELECT project_id FROM runtime_descriptors WHERE project_id=?`, st.ProjectID)
+	if err != nil {
+		t.Fatalf("query runtime_descriptors: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("runtime_descriptors rows = %d, want 0 after file write failure", len(rows))
+	}
+}
+
+func TestRemoveRuntimeDescriptorDoesNotReleaseDifferentOwner(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1111", "http://127.0.0.1:2222", os.Getpid()); err != nil {
+		t.Fatalf("CreateRuntimeDescriptor first owner: %v", err)
+	}
+	if err := st.App.Exec(`UPDATE runtime_descriptors SET daemon_pid=?, api_url=?, tool_gateway_endpoint=? WHERE project_id=?`, os.Getpid()+1, "http://127.0.0.1:3333", "http://127.0.0.1:4444", st.ProjectID); err != nil {
+		t.Fatalf("simulate transferred runtime owner in DB: %v", err)
+	}
+	desc := readRuntimeDescriptorFile(t, st.ProjectID)
+	desc["daemon_pid"] = os.Getpid() + 1
+	desc["api_url"] = "http://127.0.0.1:3333"
+	desc["tool_gateway_endpoint"] = "http://127.0.0.1:4444"
+	b, err := json.MarshalIndent(desc, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal transferred descriptor: %v", err)
+	}
+	if err := os.WriteFile(db.RuntimeDescriptorPath(st.ProjectID), b, 0o600); err != nil {
+		t.Fatalf("write transferred descriptor: %v", err)
+	}
+
+	st.RemoveRuntimeDescriptor()
+
+	if _, err := os.Stat(db.RuntimeDescriptorPath(st.ProjectID)); err != nil {
+		t.Fatalf("runtime descriptor for different owner was removed: %v", err)
+	}
+	row := runtimeDescriptorRow(t, st)
+	if got := row["daemon_pid"].Int(); got != os.Getpid()+1 {
+		t.Fatalf("runtime descriptor DB daemon_pid = %d, want transferred owner", got)
 	}
 }
 
@@ -3085,6 +3198,39 @@ func assertIssueCommentCount(t *testing.T, st *Store, issueID, body string, want
 	if got := row["c"].Int(); got != want {
 		t.Fatalf("operator comments with body %q = %d, want %d", body, got, want)
 	}
+}
+
+func readRuntimeDescriptorFile(t *testing.T, projectID string) map[string]any {
+	t.Helper()
+	b, err := os.ReadFile(db.RuntimeDescriptorPath(projectID))
+	if err != nil {
+		t.Fatalf("read runtime descriptor file: %v", err)
+	}
+	var desc map[string]any
+	if err := json.Unmarshal(b, &desc); err != nil {
+		t.Fatalf("unmarshal runtime descriptor file: %v", err)
+	}
+	return desc
+}
+
+func runtimeDescriptorRow(t *testing.T, st *Store) map[string]db.Value {
+	t.Helper()
+	rows, err := st.App.Query(`SELECT project_id, api_url, tool_gateway_endpoint, daemon_pid FROM runtime_descriptors WHERE project_id=?`, st.ProjectID)
+	if err != nil {
+		t.Fatalf("query runtime_descriptors: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("runtime_descriptors rows = %d, want 1", len(rows))
+	}
+	return rows[0]
+}
+
+func processExists(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
 }
 
 func insertPendingApproval(t *testing.T, st *Store, runID, issueID string) string {

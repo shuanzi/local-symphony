@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,4 +65,76 @@ func TestDiagnosticsReadsSchemaVersionsFromStore(t *testing.T) {
 	if got := database["project_version_status"]; got != "unsupported" {
 		t.Fatalf("project_version_status = %v, want unsupported", got)
 	}
+}
+
+func TestDiagnosticsIncludesStoredRuntimeDescriptorWithoutSecrets(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.InitProject(t.TempDir(), "LOC")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.CreateRuntimeDescriptor("http://127.0.0.1:1111", "http://127.0.0.1:2222", os.Getpid()); err != nil {
+		t.Fatalf("CreateRuntimeDescriptor: %v", err)
+	}
+
+	diag := Diagnostics(st)
+	daemon, ok := diag["daemon"].(map[string]any)
+	if !ok {
+		t.Fatalf("daemon diagnostics has type %T, want map[string]any", diag["daemon"])
+	}
+	desc, ok := daemon["runtime_descriptor"].(map[string]any)
+	if !ok {
+		t.Fatalf("runtime_descriptor has type %T, want map[string]any", daemon["runtime_descriptor"])
+	}
+	if got := desc["api_url"]; got != "http://127.0.0.1:1111" {
+		t.Fatalf("runtime descriptor api_url = %v, want stored value", got)
+	}
+	if got := desc["tool_gateway_endpoint"]; got != "http://127.0.0.1:2222" {
+		t.Fatalf("runtime descriptor tool_gateway_endpoint = %v, want stored value", got)
+	}
+	if got := intValue(desc["daemon_pid"]); got != os.Getpid() {
+		t.Fatalf("runtime descriptor daemon_pid = %d, want %d", got, os.Getpid())
+	}
+	assertNoSensitiveRuntimeDescriptorFields(t, desc)
+}
+
+func intValue(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	default:
+		return 0
+	}
+}
+
+func assertNoSensitiveRuntimeDescriptorFields(t *testing.T, v any) {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal runtime descriptor: %v", err)
+	}
+	var walk func(any)
+	walk = func(node any) {
+		t.Helper()
+		switch x := node.(type) {
+		case map[string]any:
+			for k, child := range x {
+				key := strings.ToLower(k)
+				if key == "token" || key == "owner_token" || strings.Contains(key, "secret") {
+					t.Fatalf("runtime descriptor contains sensitive field %q in %s", k, string(b))
+				}
+				walk(child)
+			}
+		case []any:
+			for _, child := range x {
+				walk(child)
+			}
+		}
+	}
+	walk(v)
 }
