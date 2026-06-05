@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 
 	"local-symphony/internal/app"
 	"local-symphony/internal/core"
+	"local-symphony/internal/daemonclient"
 	"local-symphony/internal/security"
 	"local-symphony/internal/store"
 )
@@ -500,6 +502,272 @@ func TestReadCLISessionTokenRejectsEmptyToken(t *testing.T) {
 	}
 	if got := core.AsAPIError(err).Code; got != core.ErrUnauthorized {
 		t.Fatalf("error code = %s, want %s", got, core.ErrUnauthorized)
+	}
+}
+
+func TestExitCodeMappingMatchesProductizationPlan(t *testing.T) {
+	tests := []struct {
+		name string
+		code core.APIErrorCode
+		want int
+	}{
+		// invalid_request -> 2
+		{name: "invalid_request", code: core.ErrInvalidRequest, want: 2},
+
+		// workflow / prompt related -> 9
+		{name: "workflow_invalid", code: core.ErrWorkflowInvalid, want: 9},
+		{name: "workflow_validation_failed", code: core.ErrWorkflowValidationFailed, want: 9},
+		{name: "prompt_render_failed", code: core.ErrPromptRenderFailed, want: 9},
+		{name: "prompt_blocked", code: core.ErrPromptBlocked, want: 9},
+		{name: "policy_denied", code: core.ErrPolicyDenied, want: 9},
+		{name: "command_denied", code: core.ErrCommandDenied, want: 9},
+
+		// operation conflicts (other) -> 7
+		{name: "unauthorized", code: core.ErrUnauthorized, want: 7},
+		{name: "forbidden", code: core.ErrForbidden, want: 7},
+		{name: "csrf_required", code: core.ErrCSRFRequired, want: 7},
+		{name: "not_found", code: core.ErrNotFound, want: 7},
+		{name: "unsupported_db_version", code: core.ErrUnsupportedDBVersion, want: 7},
+		{name: "invalid_state_transition", code: core.ErrInvalidStateTransition, want: 7},
+		{name: "issue_blocked", code: core.ErrIssueBlocked, want: 7},
+		{name: "issue_dispatch_paused", code: core.ErrIssueDispatchPaused, want: 7},
+		{name: "issue_already_running", code: core.ErrIssueAlreadyRunning, want: 7},
+		{name: "concurrency_limit_reached", code: core.ErrConcurrencyLimitReached, want: 7},
+		{name: "workspace_conflict", code: core.ErrWorkspaceConflict, want: 7},
+		{name: "workspace_prepare_failed", code: core.ErrWorkspacePrepareFailed, want: 7},
+		{name: "review_packet_required", code: core.ErrReviewPacketRequired, want: 7},
+		{name: "review_packet_failed", code: core.ErrReviewPacketFailed, want: 7},
+		{name: "tool_token_invalid", code: core.ErrToolTokenInvalid, want: 7},
+		{name: "tool_gateway_failed", code: core.ErrToolGatewayFailed, want: 7},
+		{name: "approval_not_pending", code: core.ErrApprovalNotPending, want: 7},
+		{name: "approval_timeout", code: core.ErrApprovalTimeout, want: 7},
+		{name: "not_owner", code: core.ErrNotOwner, want: 7},
+		{name: "daemon_unavailable", code: core.ErrDaemonUnavailable, want: 7},
+		{name: "raw_log_access_not_supported", code: core.ErrRawLogAccessUnsupported, want: 7},
+
+		// unclassified (internal + unmapped) -> 1
+		{name: "internal_error", code: core.ErrInternal, want: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := core.ExitCodeForError(tt.code); got != tt.want {
+				t.Fatalf("ExitCodeForError(%s) = %d, want %d", tt.code, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrintErrRendersEnvelopeAndExitsWithCode(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		wantCode int
+	}{
+		{
+			name:     "invalid_request", err: core.NewError(core.ErrInvalidRequest, "bad", nil),
+			wantCode: 2,
+		},
+		{
+			name:     "workflow_invalid", err: core.NewError(core.ErrWorkflowInvalid, "wf", nil),
+			wantCode: 9,
+		},
+		{
+			name:     "issue_already_running", err: core.NewError(core.ErrIssueAlreadyRunning, "running", nil),
+			wantCode: 7,
+		},
+		{
+			name:     "internal_error", err: core.NewError(core.ErrInternal, "boom", nil),
+			wantCode: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, _, stderr := captureCLIOutput(t, func() int { return printErr(tt.err) })
+			if code != tt.wantCode {
+				t.Fatalf("exit code = %d, want %d; stderr = %s", code, tt.wantCode, stderr)
+			}
+			var envelope core.ErrorEnvelope
+			if err := json.Unmarshal([]byte(stderr), &envelope); err != nil {
+				t.Fatalf("decode stderr: %v; stderr = %s", err, stderr)
+			}
+			em, ok := envelope.Error["code"].(string)
+			if !ok || em != string(tt.err.(*core.APIError).Code) {
+				t.Fatalf("envelope code = %v, want %s", envelope.Error["code"], tt.err.(*core.APIError).Code)
+			}
+		})
+	}
+}
+
+func TestPrintErrRendersAsEnvelopeForRawError(t *testing.T) {
+	code, _, stderr := captureCLIOutput(t, func() int { return printErr(fmt.Errorf("plain error")) })
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	var envelope core.ErrorEnvelope
+	if err := json.Unmarshal([]byte(stderr), &envelope); err != nil {
+		t.Fatalf("decode stderr: %v; stderr = %s", err, stderr)
+	}
+	if got := envelope.Error["code"]; got != "internal_error" {
+		t.Fatalf("code = %v, want internal_error", got)
+	}
+}
+
+func TestDaemonUnavailableMessageMatchesPlan(t *testing.T) {
+	got := daemonUnavailableMessage()
+	want := "daemon is not running, start with 'symphony serve' or run 'symphony open --help' for project init"
+	if got != want {
+		t.Fatalf("daemonUnavailableMessage = %q, want %q", got, want)
+	}
+}
+
+func TestPrintDaemonUnavailableWritesMessageAndExitsSeven(t *testing.T) {
+	code, _, stderr := captureCLIOutput(t, func() int { return PrintDaemonUnavailable() })
+	if code != 7 {
+		t.Fatalf("exit code = %d, want 7", code)
+	}
+	if !strings.Contains(stderr, "daemon is not running, start with 'symphony serve'") {
+		t.Fatalf("stderr = %q, want guidance phrase", stderr)
+	}
+}
+
+func TestLoginCommandSurfacesGuidanceWhenDaemonUnreachable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(daemonclient.EnvOverride, "")
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	st.Close()
+	code, _, stderr := captureCLIOutput(t, func() int { return Main([]string{"login", "--project", dir}) })
+	if code != 7 {
+		t.Fatalf("login exit code = %d, want 7; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "daemon is not running") {
+		t.Fatalf("login stderr = %q, want guidance", stderr)
+	}
+}
+
+func TestHelpTextMentionsDaemonFallback(t *testing.T) {
+	_, stdout, _ := captureCLIOutput(t, func() int { return Main([]string{"--help"}) })
+	for _, want := range []string{"daemon", "symphony serve", "symphony open", "fall back"} {
+		if !strings.Contains(strings.ToLower(stdout), strings.ToLower(want)) {
+			t.Fatalf("help text missing %q; got: %s", want, stdout)
+		}
+	}
+}
+
+// TestIssueListUsesDaemonWhenAvailable exercises the full REST path:
+// the CLI is given a server that returns a /api/v1/issues envelope, the
+// discovery probe finds the same server through the session-file
+// fallback, and the data is rendered as a stable JSON object.
+func TestIssueListUsesDaemonWhenAvailable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	var seenAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		seenAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"data":{"items":[],"page":{"limit":50,"next_cursor":null,"has_more":false}},"meta":{}}`+"\n")
+	}))
+	t.Cleanup(server.Close)
+
+	// Persist a session that points at the test server. The discovery
+	// fallback reads api_url from this file when env / user config /
+	// runtime descriptor are absent.
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, stdout, stderr := captureCLIOutput(t, func() int { return Main([]string{"issue", "list", "--project", dir}) })
+	if code != 0 {
+		t.Fatalf("issue list exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(seenAuth, "Bearer tok") {
+		t.Fatalf("daemon did not see bearer auth header: %q", seenAuth)
+	}
+	if !strings.Contains(stdout, `"items"`) {
+		t.Fatalf("stdout missing items: %s", stdout)
+	}
+}
+
+// TestIssueListFallsBackToLocalStoreWhenDaemonUnreachable ensures that
+// when the daemon cannot be reached, the CLI runs the local-store
+// fallback so existing offline flows keep working.
+func TestIssueListFallsBackToLocalStoreWhenDaemonUnreachable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	st.Close()
+
+	code, stdout, stderr := captureCLIOutput(t, func() int { return Main([]string{"issue", "list", "--project", dir}) })
+	if code != 0 {
+		t.Fatalf("issue list exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stdout, `"items"`) {
+		t.Fatalf("stdout missing items: %s", stdout)
+	}
+}
+
+// TestIssueCreatePropagatesInvalidRequestFromDaemon ensures that API
+// errors (not network errors) are surfaced verbatim rather than
+// falling back to the local store.
+func TestIssueCreatePropagatesInvalidRequestFromDaemon(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintln(w, `{"error":{"code":"invalid_request","message":"--title is required","details":{"field":"title"},"request_id":"req_1"}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"issue", "create", "--project", dir, "--description", "x"})
+	})
+	if code != 2 {
+		t.Fatalf("issue create exit code = %d, want 2; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "invalid_request") {
+		t.Fatalf("stderr missing invalid_request code: %s", stderr)
 	}
 }
 
