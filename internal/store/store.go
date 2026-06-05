@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"local-symphony/internal/core"
@@ -2402,14 +2403,64 @@ func (s *Store) CreateRuntimeDescriptor(apiURL, toolURL string, pid int) error {
 	if err := os.MkdirAll(db.RuntimeDir(), 0o700); err != nil {
 		return err
 	}
-	payload := map[string]any{"project_id": s.ProjectID, "repo_root": s.RepoRoot, "api_url": apiURL, "tool_gateway_endpoint": toolURL, "daemon_pid": pid, "started_at": core.Now()}
+	now := core.Now()
+	if err := s.App.WithTx(func(tx *db.Tx) error {
+		row, err := tx.QueryOne(`SELECT daemon_pid FROM runtime_descriptors WHERE project_id=?`, s.ProjectID)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err == nil {
+			existingPID := row["daemon_pid"].Int()
+			if daemonProcessExists(existingPID) {
+				return fmt.Errorf("runtime ownership conflict: daemon pid %d already owns project %s", existingPID, s.ProjectID)
+			}
+		}
+		return tx.Exec(`INSERT OR REPLACE INTO runtime_descriptors(project_id,api_url,tool_gateway_endpoint,daemon_pid,started_at,updated_at) VALUES(?,?,?,?,?,?)`, s.ProjectID, apiURL, toolURL, pid, now, now)
+	}); err != nil {
+		return err
+	}
+	payload := map[string]any{"project_id": s.ProjectID, "repo_root": s.RepoRoot, "api_url": apiURL, "tool_gateway_endpoint": toolURL, "daemon_pid": pid, "started_at": now}
 	b, _ := json.MarshalIndent(payload, "", "  ")
-	_ = s.App.Exec(`INSERT OR REPLACE INTO runtime_descriptors(project_id,api_url,tool_gateway_endpoint,daemon_pid,started_at,updated_at) VALUES(?,?,?,?,?,?)`, s.ProjectID, apiURL, toolURL, pid, core.Now(), core.Now())
-	return os.WriteFile(db.RuntimeDescriptorPath(s.ProjectID), b, 0o600)
+	if err := os.WriteFile(db.RuntimeDescriptorPath(s.ProjectID), b, 0o600); err != nil {
+		s.RemoveRuntimeDescriptorForPID(pid)
+		return err
+	}
+	return nil
 }
 func (s *Store) RemoveRuntimeDescriptor() {
+	s.RemoveRuntimeDescriptorForPID(os.Getpid())
+}
+
+func (s *Store) RemoveRuntimeDescriptorForPID(pid int) {
+	row, err := s.App.QueryOne(`SELECT daemon_pid FROM runtime_descriptors WHERE project_id=?`, s.ProjectID)
+	if err != nil || row["daemon_pid"].Int() != pid {
+		return
+	}
 	_ = os.Remove(db.RuntimeDescriptorPath(s.ProjectID))
-	_ = s.App.Exec(`DELETE FROM runtime_descriptors WHERE project_id=?`, s.ProjectID)
+	_ = s.App.Exec(`DELETE FROM runtime_descriptors WHERE project_id=? AND daemon_pid=?`, s.ProjectID, pid)
+}
+
+func (s *Store) RuntimeDescriptorSnapshot() (map[string]any, error) {
+	row, err := s.App.QueryOne(`SELECT api_url, tool_gateway_endpoint, daemon_pid FROM runtime_descriptors WHERE project_id=?`, s.ProjectID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"api_url":               row["api_url"].String(),
+		"tool_gateway_endpoint": row["tool_gateway_endpoint"].String(),
+		"daemon_pid":            row["daemon_pid"].Int(),
+	}, nil
+}
+
+func daemonProcessExists(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
 }
 
 func ParseBool(s string) *bool {

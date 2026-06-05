@@ -1,6 +1,6 @@
 # v1 真实产品化执行计划
 
-**状态**：执行中，阶段 A、阶段 B 已完成；阶段 C 已启动，C1 hook lifecycle 与 C2 scheduler tick loop 已完成，下一入口为 C3 / 单 daemon 项目所有权与 runtime lock
+**状态**：执行中，阶段 A、阶段 B 已完成；阶段 C 已启动，C1 hook lifecycle 与 C2 scheduler tick loop 已完成，C3 runtime ownership guard 已启动，owner nonce/heartbeat stale recovery 待收口
 **更新日期**：2026-06-04
 **需求来源**：`docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md`
 **目标**：把 R1-R17 的产品化缺口拆成可落地、可审查、可验收的实施批次，推进 Local Symphony 从本地 fake runner MVP 进入真实 Codex 可运行的本地产品化版本。
@@ -36,7 +36,7 @@ R15 是横切要求，不作为单独最后阶段处理。每完成一个需求�
 - [x] B2 / Codex approval producer 与 writeback：已完成；Codex command/file_change/network approval request 会写入 `approval_requests`，operator 决策可写回 Codex，并覆盖 deny、cancel_run 与 timeout 语义。
 - [x] B3 / 安全策略执行与回归套件：默认 command/network/protected-path policy evaluator 已接入 Codex approval bridge，auto-deny 写入 `approval_requests(auto_denied)` 并返回 canonical failure code；redaction golden fixture 已补齐并纳入 contract validation，覆盖 prompt、Codex log、secret、diagnostics。
 - [x] 阶段 B 收口：已完成；验收记录见 `docs/productization/V1_PHASE_B_ACCEPTANCE.md`。
-- [ ] 阶段 C / Daemon 产品行为补齐：进行中；C1 hook lifecycle 与 C2 scheduler tick loop 已完成，C3 single daemon ownership/runtime lock 待推进。
+- [ ] 阶段 C / Daemon 产品行为补齐：进行中；C1 hook lifecycle 与 C2 scheduler tick loop 已完成，C3 single daemon ownership/runtime lock 已启动，PID 复用下的 owner nonce/heartbeat stale recovery 待收口。
 - [ ] 阶段 D / Operator 体验与发布：未开始。
 
 ## 3. 全局 Definition of Done
@@ -497,6 +497,8 @@ bash scripts/acceptance-local.sh
 ### C3. 单 daemon 项目所有权与 runtime lock
 
 覆盖 R8 的 ownership 部分。
+
+**进度**：已启动。当前切片已实现 app DB `runtime_descriptors` owner guard：`serve` 在任何 project DB mutation 前获取 runtime owner，active owner conflict 不写 CLI session、不执行 stale-run reconciliation；shutdown 只释放当前 daemon PID owner；dead PID descriptor 可恢复；diagnostics 只展示 non-secret runtime descriptor。已知边界：stale 判断仍基于 PID 存活，PID 复用场景需要 owner nonce/heartbeat 或 OS lock 后续收口后才能声明 C3 全量完成。
 
 目标：
 
