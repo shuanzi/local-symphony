@@ -32,6 +32,13 @@ type ServeOptions struct {
 	// Production code paths should leave this unset; tests use it to
 	// exercise heartbeat-lost shutdown within a short window.
 	HeartbeatIntervalMS int
+	// ShutdownContext lets callers stop Serve by cancelling a context
+	// rather than signalling the process. Tests use this to avoid
+	// raising SIGINT against the entire `go test` process (which on
+	// slow CI, or if Serve fails before reaching signal.Notify, can
+	// abort the whole test suite). Production callers leave this nil
+	// and rely on SIGINT/SIGTERM.
+	ShutdownContext context.Context
 }
 
 func Serve(opts ServeOptions) error {
@@ -123,9 +130,24 @@ func Serve(opts ServeOptions) error {
 	}()
 	fmt.Printf("Local Symphony serving %s\n", addr)
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	if opts.ShutdownContext == nil {
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sig)
+	}
 	select {
 	case <-sig:
+		stopReap()
+		<-reapDone
+		stopHeartbeat()
+		<-heartbeatDone
+		stopScheduler()
+		<-schedulerDone
+		_ = srv.Close()
+		return nil
+	case <-shutdownChannel(opts.ShutdownContext):
+		// Caller-supplied shutdown signal (test hook). Same cleanup
+		// sequence as SIGINT; the caller stays in control of how
+		// the test process is affected.
 		stopReap()
 		<-reapDone
 		stopHeartbeat()
@@ -164,6 +186,16 @@ func Serve(opts ServeOptions) error {
 		}
 		return fmt.Errorf("runtime heartbeat ownership lost: %w", hbErr)
 	}
+}
+
+// shutdownChannel returns a channel that is closed when the supplied
+// context is cancelled. When ctx is nil it returns a never-closing
+// channel so the select case is effectively disabled.
+func shutdownChannel(ctx context.Context) <-chan struct{} {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Done()
 }
 
 // reapInterval is the cadence for the periodic reap goroutine. The default

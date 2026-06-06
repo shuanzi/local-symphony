@@ -546,10 +546,11 @@ func TestReapStaleRuntimeDescriptorsWithLivePIDStaleHeartbeat(t *testing.T) {
 // the C3 round-3 review P2#1 fix. A v1 app DB that was upgraded by
 // MigrateAppSchema carries a row with owner_nonce = '' and heartbeat_at
 // = 0; if the original daemon crashed and the OS later reuses the same
-// PID for an unrelated process, the legacy compat path used to keep
-// the row live forever. The fix requires a non-empty owner_nonce for
-// the legacy compat branch, so the migrated row is reapable here and
-// the new owner can acquire the lock.
+// PID for an unrelated process, the row must be reapable so the new
+// owner can acquire the lock. We model "legacy daemon exited and the
+// PID is no longer in use" by pointing the row at a dead PID; the
+// round-4 P1 sibling test (TestReapStaleRuntimeDescriptorsPreservesLiveMigratedPID)
+// covers the case where the legacy daemon is still running.
 func TestReapStaleRuntimeDescriptorsReapsMigratedRowWithEmptyNonce(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st, err := InitProject(t.TempDir(), "TST")
@@ -564,23 +565,21 @@ func TestReapStaleRuntimeDescriptorsReapsMigratedRowWithEmptyNonce(t *testing.T)
 	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, DefaultRuntimeHeartbeatTTLMS); err != nil {
 		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
 	}
-	// Simulate a row that the schema migration wrote: same daemon PID
-	// (we use os.Getpid() so processExists returns true and the dead
-	// PID check does not preempt the test), but with empty owner_nonce
-	// and heartbeat_at = 0. This is the worst-case migrated DB row:
-	// the recorded PID is alive in the OS (via reuse or coincidence)
-	// AND the row has no real owner_nonce to bind the lock to a
-	// specific daemon. The reap must remove it so the new owner can
-	// acquire the lock.
-	if err := st.App.Exec(`UPDATE runtime_descriptors SET owner_nonce='', heartbeat_at=0, heartbeat_ttl_ms=? WHERE project_id=?`, DefaultRuntimeHeartbeatTTLMS, st.ProjectID); err != nil {
-		t.Fatalf("simulate migrated-row state: %v", err)
+	deadPID := 2147483647
+	if processExists(deadPID) {
+		t.Fatalf("test dead PID %d unexpectedly exists", deadPID)
+	}
+	// Simulate a migrated v1 row whose legacy daemon has exited: empty
+	// owner_nonce, heartbeat_at = 0, recorded PID no longer alive.
+	if err := st.App.Exec(`UPDATE runtime_descriptors SET owner_nonce='', heartbeat_at=0, heartbeat_ttl_ms=?, daemon_pid=? WHERE project_id=?`, DefaultRuntimeHeartbeatTTLMS, deadPID, st.ProjectID); err != nil {
+		t.Fatalf("simulate migrated-row-with-dead-PID state: %v", err)
 	}
 	count, err := st.ReapStaleRuntimeDescriptors()
 	if err != nil {
 		t.Fatalf("ReapStaleRuntimeDescriptors: %v", err)
 	}
 	if count != 1 {
-		t.Fatalf("ReapStaleRuntimeDescriptors reaped = %d, want 1 (migrated row with empty nonce must be reapable)", count)
+		t.Fatalf("ReapStaleRuntimeDescriptors reaped = %d, want 1 (migrated row with empty nonce and dead PID must be reapable)", count)
 	}
 	rows, err := st.App.Query(`SELECT project_id FROM runtime_descriptors WHERE project_id=?`, st.ProjectID)
 	if err != nil {
@@ -600,6 +599,58 @@ func TestReapStaleRuntimeDescriptorsReapsMigratedRowWithEmptyNonce(t *testing.T)
 	row := runtimeDescriptorRow(t, st)
 	if got := row["owner_nonce"].String(); got != freshNonce {
 		t.Fatalf("runtime descriptor owner_nonce = %q, want fresh %q", got, freshNonce)
+	}
+}
+
+// TestReapStaleRuntimeDescriptorsPreservesLiveMigratedPID is the
+// C3 round-4 review P1 regression test. A v1 app DB upgraded by
+// MigrateAppSchema while an older legacy daemon was still running
+// produces a row with owner_nonce='', heartbeat_at=0, and the legacy
+// daemon's PID (which is still alive). The reap MUST NOT remove this
+// row; doing so would let a new C3 daemon acquire the lock and
+// dispatch concurrently with the still-running legacy daemon,
+// breaking the single-owner guarantee. The row becomes reapable once
+// the legacy daemon exits.
+func TestReapStaleRuntimeDescriptorsPreservesLiveMigratedPID(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
+	}
+	// Simulate a migrated v1 row whose legacy daemon is still
+	// running: empty owner_nonce, heartbeat_at = 0, but the recorded
+	// PID is the live test process. The reap must leave it alone.
+	if err := st.App.Exec(`UPDATE runtime_descriptors SET owner_nonce='', heartbeat_at=0, heartbeat_ttl_ms=?, daemon_pid=? WHERE project_id=?`, DefaultRuntimeHeartbeatTTLMS, os.Getpid(), st.ProjectID); err != nil {
+		t.Fatalf("simulate live-migrated-row state: %v", err)
+	}
+	count, err := st.ReapStaleRuntimeDescriptors()
+	if err != nil {
+		t.Fatalf("ReapStaleRuntimeDescriptors: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("ReapStaleRuntimeDescriptors reaped = %d, want 0 (live migrated PID must NOT be reaped)", count)
+	}
+	// The row still pins the lock; a fresh owner must hit
+	// daemon_already_running, not silently take over.
+	freshNonce, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce (fresh): %v", err)
+	}
+	err = st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:3", "http://127.0.0.1:4", os.Getpid(), freshNonce, DefaultRuntimeHeartbeatTTLMS)
+	if err == nil {
+		t.Fatal("CreateRuntimeDescriptorWithNonce succeeded, want daemon_already_running while live legacy PID holds the lock")
+	}
+	apiErr := core.AsAPIError(err)
+	if apiErr == nil || apiErr.Code != core.ErrDaemonAlreadyRunning {
+		t.Fatalf("acquire error code = %v, want %s", err, core.ErrDaemonAlreadyRunning)
 	}
 }
 

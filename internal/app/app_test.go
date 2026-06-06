@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -572,34 +571,32 @@ func TestServeRecoversFromPIDReuseAfterHeartbeatStale(t *testing.T) {
 	})
 	st.Close()
 
-	// Run Serve in a goroutine; cancel via SIGINT after a short window so
-	// the test does not block forever. The reap and acquire must finish
-	// before shutdown.
+	// Run Serve in a goroutine; cancel via context after a short window
+	// so the test does not block forever. The reap and acquire must
+	// finish before shutdown. Using context cancellation (instead of
+	// raising SIGINT against the test process) keeps the signal
+	// scoped to this Serve call and prevents a slow start or an
+	// early Serve failure from aborting the rest of the test suite.
+	shutdownCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- Serve(ServeOptions{Project: repoRoot, Host: "127.0.0.1", Port: 0, NoOpen: true})
+		done <- Serve(ServeOptions{Project: repoRoot, Host: "127.0.0.1", Port: 0, NoOpen: true, ShutdownContext: shutdownCtx})
 	}()
 	time.Sleep(500 * time.Millisecond)
-	p, err := os.FindProcess(os.Getpid())
-	if err != nil {
-		t.Fatalf("find process: %v", err)
-	}
-	if err := p.Signal(syscall.SIGINT); err != nil {
-		t.Fatalf("signal: %v", err)
-	}
+	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("Serve error: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Serve did not return after SIGINT")
+		t.Fatal("Serve did not return after context cancel")
 	}
 
 	// Reopen the store and verify a reap event was recorded for the
-	// stale owner. The runtime descriptor is removed during the SIGINT
-	// shutdown path (RemoveRuntimeDescriptor), so we assert against the
-	// reap event rather than the descriptor row.
+	// stale owner. The runtime descriptor is removed during the
+	// shutdown path (RemoveRuntimeDescriptor), so we assert against
+	// the reap event rather than the descriptor row.
 	opened, err := store.Open(repoRoot)
 	if err != nil {
 		t.Fatalf("Open after Serve: %v", err)
@@ -826,5 +823,54 @@ func TestVerifyOwnerNonceForDispatchGatesDispatch(t *testing.T) {
 	}
 	if apiErr := core.AsAPIError(gateErr); apiErr == nil || apiErr.Code != core.ErrDaemonAlreadyRunning {
 		t.Fatalf("takeover gate error code = %v, want %s", gateErr, core.ErrDaemonAlreadyRunning)
+	}
+}
+
+// TestServeRespondsToShutdownContextCancel is the C3 round-4 review
+// P2 regression test. Serve must observe a caller-supplied
+// ShutdownContext cancellation and shut down the HTTP server +
+// scheduler cleanly, without ever installing a SIGINT handler that
+// could end up targeting the entire `go test` process.
+func TestServeRespondsToShutdownContextCancel(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	repoRoot := st.RepoRoot
+	projectID := st.ProjectID
+	t.Cleanup(func() {
+		opened, openErr := store.Open(repoRoot)
+		if openErr == nil {
+			opened.RemoveRuntimeDescriptor()
+			opened.Close()
+		}
+		_ = os.Remove(CLISessionPath(projectID))
+	})
+	st.Close()
+
+	shutdownCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ServeOptions{Project: repoRoot, Host: "127.0.0.1", Port: 0, NoOpen: true, ShutdownContext: shutdownCtx, HeartbeatIntervalMS: 50})
+	}()
+	// Wait long enough for the listener to bind, then cancel via
+	// the context. Serve must return within the timeout and must
+	// not have raised any process-wide signal.
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve error after context cancel: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after ShutdownContext cancel")
+	}
+	// Cleanup sanity: the runtime descriptor should be gone after
+	// Serve's normal shutdown sequence.
+	if _, err := os.Stat(db.RuntimeDescriptorPath(projectID)); !os.IsNotExist(err) {
+		t.Fatalf("runtime descriptor still present after context-cancel shutdown: %v", err)
 	}
 }

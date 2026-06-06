@@ -2633,12 +2633,16 @@ func emitReapEvent(tx *db.Tx, projectID string, pid int, hbMS, ttlMS, nowMS int6
 //     TTL guard is the standard liveness signal; it remains in place so
 //     that PID reuse alone cannot fool a fresh owner into thinking the
 //     lock is held by the previous (gone) daemon.
-//  3. PID alive, heartbeat not yet recorded, AND the row carries a real
-//     owner_nonce → live. This is the legacy compat path for rows
-//     freshly written by a daemon that has not yet sent its first
-//     heartbeat tick. The nonce guard (C3 round-3 review P2#1)
-//     prevents a migrated v1 app DB row with owner_nonce = '' from
-//     pinning the lock to a reused PID forever.
+//  3. PID alive, heartbeat not yet recorded, AND (the row carries a real
+//     owner_nonce OR the row is a migrated v1 row with the legacy PID
+//     still alive) → live. The migrated-row subcase (round-4 review P1)
+//     preserves a live legacy daemon during takeover: a v1 app DB row
+//     upgraded by MigrateAppSchema has owner_nonce='' and heartbeat_at=0;
+//     if the recorded PID is still alive (the legacy daemon is running),
+//     the new C3 daemon must NOT reap it because doing so would allow
+//     the new daemon to dispatch concurrently with the still-running
+//     legacy daemon, breaking the single-owner guarantee. The same row
+//     is reapable once the legacy daemon exits.
 //  4. Otherwise → stale.
 func runtimeOwnerIsLive(pid int, hbMS, ttlMS, nowMS int64, ownerNonce string) bool {
 	if pid <= 0 || !daemonProcessExists(pid) {
@@ -2648,13 +2652,15 @@ func runtimeOwnerIsLive(pid int, hbMS, ttlMS, nowMS int64, ownerNonce string) bo
 		return true
 	}
 	if hbMS == 0 && ownerNonce != "" {
-		// Migrated row with no heartbeat yet: respect the legacy
-		// PID-only check so we never trample a daemon that just
-		// started up after the schema migration, but only when the
-		// row carries a real owner_nonce. An empty nonce marks a
-		// pre-migration row that the schema migration backfilled;
-		// such a row is reapable even if its (stale) PID happens to
-		// be reused by a fresh process.
+		// Fresh row written by a daemon that has not yet sent its
+		// first heartbeat tick; the nonce is real so the daemon
+		// is bound to a specific secret.
+		return true
+	}
+	if hbMS == 0 && ownerNonce == "" && pid > 0 {
+		// Migrated v1 row with the legacy PID still alive. The
+		// legacy daemon is still running; respect the PID-only
+		// check until it exits.
 		return true
 	}
 	return false
