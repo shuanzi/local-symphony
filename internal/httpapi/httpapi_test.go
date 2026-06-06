@@ -190,7 +190,62 @@ func TestSessionWithoutCookieDoesNotExposeCSRFToken(t *testing.T) {
 	}
 }
 
-// TestSessionAcceptsCLIBearer pins the P2 #1 fix: /api/v1/auth/session
+// TestRevokeCLISession pins the adversarial P2 #3 fix:
+// the daemon endpoint DELETE /api/v1/auth/cli-sessions/current
+// must mark the local_sessions row as revoked, and a
+// subsequent validBearerSession call must reject the
+// previously-bearer token.
+func TestRevokeCLISession(t *testing.T) {
+	srv := newTestServer(t)
+	bearer := insertLocalSession(t, srv, "cli")
+
+	// Sanity: bearer is valid before revoke.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pre-revoke state status = %d", rec.Code)
+	}
+
+	// Revoke.
+	delReq := httptest.NewRequest(http.MethodDelete, "/api/v1/auth/cli-sessions/current", nil)
+	delReq.Header.Set("Authorization", "Bearer "+bearer)
+	delRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(delRec, delReq)
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("revoke status = %d, body = %s", delRec.Code, delRec.Body.String())
+	}
+	var env struct {
+		Data struct {
+			Revoked bool `json:"revoked"`
+			Matched bool `json:"matched"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(delRec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode revoke: %v; body = %s", err, delRec.Body.String())
+	}
+	if !env.Data.Revoked || !env.Data.Matched {
+		t.Fatalf("revoke response = %+v, want revoked=true matched=true", env.Data)
+	}
+
+	// Post-revoke: the previously-bearer token is rejected.
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("post-revoke state status = %d, want 401", rec.Code)
+	}
+
+	// Idempotent: a no-bearer revoke still returns 200.
+	delReq = httptest.NewRequest(http.MethodDelete, "/api/v1/auth/cli-sessions/current", nil)
+	delRec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(delRec, delReq)
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("idempotent revoke status = %d, want 200", delRec.Code)
+	}
+}
 // must report authenticated=true when a valid CLI bearer is
 // presented, even without a browser cookie. The previous
 // implementation only checked the cookie and reported

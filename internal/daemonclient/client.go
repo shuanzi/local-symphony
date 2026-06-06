@@ -78,53 +78,71 @@ type NetworkError struct{ Err error }
 func (e *NetworkError) Error() string { return "network: " + e.Err.Error() }
 func (e *NetworkError) Unwrap() error { return e.Err }
 
-// Discover walks the discovery precedence chain and returns the first usable
-// daemon URL. It never starts a daemon; an operator must launch it
-// out-of-band.
+// Discover walks the discovery precedence chain and returns the first
+// usable daemon URL. It never starts a daemon; an operator must
+// launch it out-of-band.
+//
+// Project trust boundary: every candidate URL is reachable-tested,
+// and the daemon's /api/v1/health response must report
+// `data.project_id` equal to the requested projectID. A stale
+// runtime descriptor, session api_url, or user daemon config
+// pointing at the wrong project's daemon is rejected so a CLI
+// bearer for project A is never sent to a daemon hosting
+// project B. Discovery returns ErrDaemonUnavailable when no
+// candidate matches.
 func Discover(ctx context.Context, projectID, projectRoot string) (Discovery, error) {
 	if projectID == "" {
 		return Discovery{}, fmt.Errorf("daemonclient: projectID is required")
 	}
-	if raw := strings.TrimSpace(os.Getenv(EnvOverride)); raw != "" {
-		base, err := normalizeBaseURL(raw)
+	candidates := discoverCandidates(projectID, projectRoot)
+	for _, c := range candidates {
+		base, err := normalizeBaseURL(c.URL)
 		if err != nil {
-			return Discovery{}, err
+			continue
 		}
-		if reachable(ctx, base) {
-			return Discovery{BaseURL: base, Source: "env:" + EnvOverride}, nil
+		gotProjectID, ok := reachable(ctx, base, projectID)
+		if !ok {
+			continue
 		}
-		return Discovery{}, fmt.Errorf("%w: %s=%s is not reachable", ErrDaemonUnavailable, EnvOverride, base)
+		if gotProjectID != "" && gotProjectID != projectID {
+			// Mismatched project daemon: skip and keep looking.
+			continue
+		}
+		return Discovery{BaseURL: base, Source: c.Source}, nil
+	}
+	return Discovery{}, fmt.Errorf("%w: no candidate daemon reported project_id=%s", ErrDaemonUnavailable, projectID)
+}
+
+// discoverCandidate is a single (URL, source) pair to probe.
+type discoverCandidate struct {
+	URL    string
+	Source string
+}
+
+// discoverCandidates enumerates every daemon URL the discovery
+// process knows about, in precedence order. The slice is
+// deterministic so tests can assert which source won the race.
+func discoverCandidates(projectID, projectRoot string) []discoverCandidate {
+	out := []discoverCandidate{}
+	if raw := strings.TrimSpace(os.Getenv(EnvOverride)); raw != "" {
+		out = append(out, discoverCandidate{URL: raw, Source: "env:" + EnvOverride})
 	}
 	if path, ok := userDaemonConfigPath(); ok {
 		if raw, err := readDaemonConfigURL(path); err == nil && raw != "" {
-			base, err := normalizeBaseURL(raw)
-			if err != nil {
-				return Discovery{}, err
-			}
-			if reachable(ctx, base) {
-				return Discovery{BaseURL: base, Source: "config:" + path}, nil
-			}
+			out = append(out, discoverCandidate{URL: raw, Source: "config:" + path})
 		}
 	}
 	if projectRoot != "" {
 		if descPath := db.RuntimeDescriptorPath(projectID); descPath != "" {
 			if base, err := readRuntimeDescriptorAPIURL(descPath); err == nil && base != "" {
-				if reachable(ctx, base) {
-					return Discovery{BaseURL: base, Source: "runtime:" + descPath}, nil
-				}
+				out = append(out, discoverCandidate{URL: base, Source: "runtime:" + descPath})
 			}
 		}
 	}
-	// Last resort: the persisted session file remembers the daemon URL it
-	// was minted against. This is the only way an offline-stale operator
-	// can still get a useful "daemon is not reachable" error instead of a
-	// session parse error.
-	if sessionBase, ok := sessionFileAPIURL(projectID); ok {
-		if reachable(ctx, sessionBase) {
-			return Discovery{BaseURL: sessionBase, Source: "session:" + app.CLISessionPath(projectID)}, nil
-		}
+	if sessionBase, ok := sessionFileAPIURL(projectID); ok && sessionBase != "" {
+		out = append(out, discoverCandidate{URL: sessionBase, Source: "session:" + app.CLISessionPath(projectID)})
 	}
-	return Discovery{}, ErrDaemonUnavailable
+	return out
 }
 
 // New constructs a Client. When cfg.Token is empty, New will attempt to load
@@ -305,6 +323,27 @@ func (c *Client) Delete(ctx context.Context, path string, out any) error {
 	return json.Unmarshal(resp.Data, out)
 }
 
+// RevokeCLISession tells the daemon to mark the bearer token
+// carried by this client as revoked. It is the daemon-side
+// half of `symphony login --logout`; the local CLI session
+// file is deleted separately by DeleteSessionFile. The call
+// is idempotent on the server side: a no-bearer or
+// already-revoked token still returns 200.
+//
+// Returns the daemon's reported `matched` field so the
+// caller can surface degraded logout (daemon reachable but
+// the token wasn't recognised) to the operator.
+func (c *Client) RevokeCLISession(ctx context.Context) (matched bool, err error) {
+	out := struct {
+		Revoked bool `json:"revoked"`
+		Matched bool `json:"matched"`
+	}{}
+	if err := c.Delete(ctx, "/api/v1/auth/cli-sessions/current", &out); err != nil {
+		return false, err
+	}
+	return out.Matched, nil
+}
+
 // Unwrap returns the raw data as a generic map. The CLI prints this directly
 // so stable object structures are preserved.
 func (c *Client) UnwrapMap(ctx context.Context, method, path string, body any) (map[string]any, error) {
@@ -434,25 +473,66 @@ func normalizeBaseURL(raw string) (string, error) {
 	return u.String(), nil
 }
 
-// reachable pings the daemon's public /health endpoint. A 200 response is
-// enough; auth is verified on the actual command calls.
-func reachable(ctx context.Context, base string) bool {
+// reachable pings the daemon's public /health endpoint and, on a
+// 200 response, decodes the {data, meta} envelope to read the
+// daemon's `project_id`. The discovery caller MUST verify the
+// returned project_id matches the operating project; this
+// function returns ("", false) when the response is missing the
+// field so a daemon that fails to advertise its project_id is
+// treated as unreachable. Auth is verified on the actual command
+// calls.
+func reachable(ctx context.Context, base, expectedProjectID string) (string, bool) {
 	httpClient := &http.Client{Timeout: 2 * time.Second}
 	target, err := url.JoinPath(base, "/api/v1/health")
 	if err != nil {
-		return false
+		return "", false
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return false
+		return "", false
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return false
+		return "", false
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode == http.StatusOK
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", false
+	}
+	gotProjectID := parseHealthProjectID(body)
+	return gotProjectID, gotProjectID != ""
+}
+
+// parseHealthProjectID reads the project_id out of a /api/v1/health
+// response body. The daemon returns
+//
+//	{"data":{"ok":true,"project_id":"prj_..."},"meta":{}}
+//
+// so we tolerate either envelope-presence (the data key nested
+// under `data`) or flat-shape. An empty string is returned for
+// any body we cannot parse.
+func parseHealthProjectID(body []byte) string {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return ""
+	}
+	// Fast-path: envelope shape.
+	var env struct {
+		Data struct {
+			ProjectID string `json:"project_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err == nil && env.Data.ProjectID != "" {
+		return env.Data.ProjectID
+	}
+	// Fallback: flat shape (older daemons or test fixtures).
+	var flat struct {
+		ProjectID string `json:"project_id"`
+	}
+	if err := json.Unmarshal(body, &flat); err == nil {
+		return flat.ProjectID
+	}
+	return ""
 }
 
 // userDaemonConfigPath returns the path of the user-level daemon URL config.

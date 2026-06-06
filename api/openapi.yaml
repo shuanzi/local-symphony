@@ -84,6 +84,15 @@ paths:
       responses:
         "200": { description: Rotated CLI token, content: { application/json: { schema: { $ref: '#/components/schemas/CliTokenEnvelope' } } } }
         "401": { $ref: '#/components/responses/Error' }
+  /auth/cli-sessions/current:
+    delete:
+      operationId: revokeCliSession
+      description: Revokes the bearer CLI credential presented on this request. Idempotent: revoking an already-revoked or unrecognized token returns 200 with revoked=true. This is the server-side half of `symphony login --logout` so a copied bearer token cannot continue to authorize mutating REST calls after the operator believes they are logged out.
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Revoked, content: { application/json: { schema: { type: object, required: [revoked, matched], additionalProperties: false, properties: { revoked: { type: boolean }, matched: { type: boolean } } } } }
+        "401": { $ref: '#/components/responses/Error' }
   /issues:
     get:
       operationId: listIssues

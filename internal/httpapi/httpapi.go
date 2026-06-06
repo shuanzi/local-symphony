@@ -159,6 +159,8 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.openToken(w, r)
 	case r.Method == "POST" && path == "/auth/cli-token/rotate":
 		s.rotateCLIToken(w, r)
+	case r.Method == "DELETE" && path == "/auth/cli-sessions/current":
+		s.revokeCLISession(w, r)
 	case path == "/issues" && r.Method == "GET":
 		s.listIssues(w, r)
 	case path == "/issues" && r.Method == "POST":
@@ -1187,12 +1189,17 @@ func requiresCSRF(path, method string) bool {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return false
 	}
-	return path != "/auth/exchange" && path != "/auth/open-token" && path != "/auth/cli-token/rotate"
+	return path != "/auth/exchange" && path != "/auth/open-token" && path != "/auth/cli-token/rotate" && path != "/auth/cli-sessions/current"
 }
 
 func isPublicAPI(path, method string) bool {
 	return (method == http.MethodGet && (path == "/health" || path == "/auth/session")) ||
-		(method == http.MethodPost && path == "/auth/exchange")
+		(method == http.MethodPost && path == "/auth/exchange") ||
+		// DELETE on /auth/cli-sessions/current is idempotent
+		// when no bearer is presented; the handler returns
+		// matched=false but still 200. This lets the CLI
+		// race logout with rotation without auth errors.
+		(method == http.MethodDelete && path == "/auth/cli-sessions/current")
 }
 
 func (s *Server) authorizeAPI(w http.ResponseWriter, r *http.Request) bool {
@@ -1290,6 +1297,45 @@ func (s *Server) rotateCLIToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ok(w, map[string]any{"token": replacement, "expires_at": expiresAt})
+}
+
+// revokeCLISession revokes the bearer token presented on this
+// request. It is the server-side half of `symphony login
+// --logout`: the operator deletes the local session files AND
+// the daemon marks the local_sessions row as revoked, so a
+// copied bearer token cannot continue to authorize mutating
+// REST calls after the operator believes they are logged
+// out. Idempotent: revoking an already-revoked or
+// unrecognized token returns 200 with `revoked: true` so
+// logout flows that race with token rotation converge.
+func (s *Server) revokeCLISession(w http.ResponseWriter, r *http.Request) {
+	token := bearerToken(r)
+	if token == "" {
+		// No token presented; nothing to revoke. Idempotent.
+		ok(w, map[string]any{"revoked": true, "matched": false})
+		return
+	}
+	tokenHash := security.HashToken(token)
+	now := core.Now()
+	matched := false
+	if err := s.Store.App.WithTx(func(tx *db.Tx) error {
+		row, err := tx.QueryOne(`SELECT id,revoked_at FROM local_sessions WHERE project_id=? AND token_hash=? AND kind IN ('cli','desktop')`, s.Store.ProjectID, tokenHash)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		matched = true
+		if !row["revoked_at"].Null && row["revoked_at"].String() != "" {
+			return nil
+		}
+		return tx.Exec(`UPDATE local_sessions SET revoked_at=? WHERE id=?`, now, row["id"].String())
+	}); err != nil {
+		apiErr(w, err)
+		return
+	}
+	ok(w, map[string]any{"revoked": true, "matched": matched})
 }
 
 func (s *Server) rotateBearerSession(token string) (string, *string, error) {
