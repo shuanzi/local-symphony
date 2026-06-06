@@ -122,6 +122,19 @@ func DeleteSessionFile(projectID string) error {
 	return nil
 }
 
+// DeleteLegacySessionFile removes the pre-v1.1 single-file session at
+// ~/.symphony/cli-session.json. v1.1 stores per-project files under
+// ~/.symphony/cli-sessions/<project>.json; users upgraded from older
+// builds still have the legacy file, and `symphony login --logout`
+// must wipe it as well so a stale token cannot be replayed.
+func DeleteLegacySessionFile() error {
+	path := app.LegacyCLISessionPath()
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // ReadAllSessionFiles returns the session files currently on disk. It is
 // used by `symphony login --list` style flows. Missing files are reported
 // as an empty slice.

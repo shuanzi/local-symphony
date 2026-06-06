@@ -190,6 +190,41 @@ func TestSessionWithoutCookieDoesNotExposeCSRFToken(t *testing.T) {
 	}
 }
 
+// TestSessionAcceptsCLIBearer pins the P2 #1 fix: /api/v1/auth/session
+// must report authenticated=true when a valid CLI bearer is
+// presented, even without a browser cookie. The previous
+// implementation only checked the cookie and reported
+// authenticated=false, which made `symphony login` always say "you
+// are not logged in" even when subsequent commands worked.
+func TestSessionAcceptsCLIBearer(t *testing.T) {
+	srv := newTestServer(t)
+	bearer := insertLocalSession(t, srv, "cli")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	data := payload["data"].(map[string]any)
+	if data["authenticated"] != true {
+		t.Fatalf("session data = %#v, want authenticated true", data)
+	}
+	if data["bearer"] != true {
+		t.Fatalf("session data = %#v, want bearer=true", data)
+	}
+	if kind, _ := data["session_kind"].(string); kind != "cli" {
+		t.Fatalf("session kind = %q, want cli", kind)
+	}
+	// CLI bearer should NOT receive a CSRF token; CSRF is for
+	// browser sessions only.
+	if token, _ := data["csrf_token"].(string); token != "" {
+		t.Fatalf("bearer session leaked csrf_token %q", token)
+	}
+}
+
 func TestCreateIssueRejectsBlankLabels(t *testing.T) {
 	tests := []struct {
 		name string

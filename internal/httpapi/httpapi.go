@@ -129,11 +129,30 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "POST" && path == "/auth/exchange":
 		s.authExchange(w, r)
 	case r.Method == "GET" && path == "/auth/session":
-		if !s.validSession(r) {
+		// /auth/session must report authenticated=true for either a
+		// browser cookie session OR a valid CLI bearer session so
+		// `symphony login` can use it as a single-call probe. The
+		// CSRF token is only meaningful for browser sessions; the
+		// CLI bearer never needs it (see authorizeCommand).
+		bearerOK := s.validBearerSession(r)
+		cookieOK := s.validSession(r)
+		if !bearerOK && !cookieOK {
 			ok(w, map[string]any{"authenticated": false, "project_id": s.Store.ProjectID})
 			return
 		}
-		ok(w, map[string]any{"authenticated": true, "project_id": s.Store.ProjectID, "csrf_token": s.csrfToken, "csrf": s.csrfToken})
+		resp := map[string]any{"authenticated": true, "project_id": s.Store.ProjectID}
+		if cookieOK {
+			resp["csrf_token"] = s.csrfToken
+			resp["csrf"] = s.csrfToken
+			resp["session_kind"] = "browser"
+		}
+		if bearerOK {
+			resp["bearer"] = true
+			if _, alreadySet := resp["session_kind"]; !alreadySet {
+				resp["session_kind"] = "cli"
+			}
+		}
+		ok(w, resp)
 	case r.Method == "POST" && path == "/auth/logout":
 		s.authLogout(w, r)
 	case r.Method == "POST" && path == "/auth/open-token":
