@@ -2603,15 +2603,28 @@ func emitReapEvent(tx *db.Tx, projectID string, pid int, hbMS, ttlMS, nowMS int6
 }
 
 // runtimeOwnerIsLive returns true when the recorded owner should still hold
-// the lock: heartbeat_at + ttl is in the future, OR the original PID is
-// still alive and the row was acquired recently enough that we should defer
-// to a fresh owner acquiring. The TTL is the primary signal — PID alive
-// alone is insufficient because PID reuse is possible.
+// the lock. The decision tree, in priority order:
+//  1. PID missing or dead → stale (regardless of heartbeat). This prevents
+//     a crashed daemon from blocking the lock until heartbeat TTL expires;
+//     the previous behaviour treated a fresh heartbeat as live even when
+//     the PID was gone, which forced operators to wait up to one TTL after
+//     every `symphony serve` crash/restart cycle (C3 round-2 review).
+//  2. Heartbeat fresh → live (active owner with a recent heartbeat). The
+//     TTL guard is the standard liveness signal; it remains in place so
+//     that PID reuse alone cannot fool a fresh owner into thinking the
+//     lock is held by the previous (gone) daemon.
+//  3. PID alive and no heartbeat recorded (hbMS == 0) → live. This is the
+//     legacy compat path for rows freshly written by the schema migration
+//     that have not yet had their first heartbeat tick.
+//  4. Otherwise → stale.
 func runtimeOwnerIsLive(pid int, hbMS, ttlMS, nowMS int64) bool {
+	if pid <= 0 || !daemonProcessExists(pid) {
+		return false
+	}
 	if hbMS > 0 && ttlMS > 0 && hbMS+ttlMS > nowMS {
 		return true
 	}
-	if pid > 0 && daemonProcessExists(pid) && hbMS == 0 {
+	if hbMS == 0 {
 		// Migrated row with no heartbeat yet: respect the legacy PID-only
 		// check so we never trample a daemon that just started up after
 		// the schema migration.

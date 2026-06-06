@@ -423,6 +423,125 @@ func TestReapStaleRuntimeDescriptorsLeavesFreshOwnersAlone(t *testing.T) {
 	}
 }
 
+// TestReapStaleRuntimeDescriptorsWithDeadPIDFreshHeartbeat covers the
+// C3 round-2 review fix: a previously crashed daemon leaves a runtime
+// descriptor with PID == 0 (no live process) and a fresh heartbeat_at
+// (within TTL). The reaper must treat this as stale so a fresh
+// `symphony serve` can acquire the lock immediately rather than waiting
+// for the heartbeat TTL to expire.
+func TestReapStaleRuntimeDescriptorsWithDeadPIDFreshHeartbeat(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
+	}
+	// Simulate a crash: rewind the heartbeat so it is fresh
+	// (heartbeat_at + ttl > now), and point the recorded PID at a
+	// process that no longer exists. PID reuse is the
+	// failure mode round-2 surfaced.
+	deadPID := 2147483647
+	if processExists(deadPID) {
+		t.Fatalf("test dead PID %d unexpectedly exists", deadPID)
+	}
+	freshHB := time.Now().UnixMilli() - 1_000
+	if err := st.App.Exec(`UPDATE runtime_descriptors SET daemon_pid=?, heartbeat_at=?, heartbeat_ttl_ms=? WHERE project_id=?`, deadPID, freshHB, DefaultRuntimeHeartbeatTTLMS, st.ProjectID); err != nil {
+		t.Fatalf("simulate dead-PID fresh-heartbeat: %v", err)
+	}
+	count, err := st.ReapStaleRuntimeDescriptors()
+	if err != nil {
+		t.Fatalf("ReapStaleRuntimeDescriptors: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("ReapStaleRuntimeDescriptors reaped = %d, want 1 (dead PID must be reaped even with fresh heartbeat)", count)
+	}
+	rows, err := st.App.Query(`SELECT project_id FROM runtime_descriptors WHERE project_id=?`, st.ProjectID)
+	if err != nil {
+		t.Fatalf("query runtime_descriptors: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("runtime_descriptors rows = %d, want 0 after reap", len(rows))
+	}
+}
+
+// TestReapStaleRuntimeDescriptorsWithLivePIDFreshHeartbeat is the
+// regression guard for the round-2 fix: a live PID with a fresh
+// heartbeat must not be reaped, so two concurrent daemons cannot
+// both believe they own the lock.
+func TestReapStaleRuntimeDescriptorsWithLivePIDFreshHeartbeat(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	// The recorded PID is the live test process and the heartbeat is
+	// fresh — this is the active-owner case that must never be reaped.
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
+	}
+	count, err := st.ReapStaleRuntimeDescriptors()
+	if err != nil {
+		t.Fatalf("ReapStaleRuntimeDescriptors: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("ReapStaleRuntimeDescriptors reaped = %d, want 0 (live PID + fresh heartbeat must not be reaped)", count)
+	}
+	row := runtimeDescriptorRow(t, st)
+	if got := row["owner_nonce"].String(); got != nonce {
+		t.Fatalf("runtime descriptor owner_nonce = %q, want %q", got, nonce)
+	}
+}
+
+// TestReapStaleRuntimeDescriptorsWithLivePIDStaleHeartbeat exercises
+// the long-standing heartbeat-TTL rule: when the PID is alive but the
+// heartbeat is past TTL, the row is stale and must be reaped.
+func TestReapStaleRuntimeDescriptorsWithLivePIDStaleHeartbeat(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
+	}
+	// Backdate the heartbeat so it is past TTL while keeping the
+	// recorded PID pointing at the live test process.
+	if err := st.App.Exec(`UPDATE runtime_descriptors SET heartbeat_at=?, heartbeat_ttl_ms=1000 WHERE project_id=?`, time.Now().UnixMilli()-10_000_000, st.ProjectID); err != nil {
+		t.Fatalf("backdate heartbeat: %v", err)
+	}
+	count, err := st.ReapStaleRuntimeDescriptors()
+	if err != nil {
+		t.Fatalf("ReapStaleRuntimeDescriptors: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("ReapStaleRuntimeDescriptors reaped = %d, want 1 (live PID + stale heartbeat must be reaped)", count)
+	}
+	rows, err := st.App.Query(`SELECT project_id FROM runtime_descriptors WHERE project_id=?`, st.ProjectID)
+	if err != nil {
+		t.Fatalf("query runtime_descriptors: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("runtime_descriptors rows = %d, want 0 after reap", len(rows))
+	}
+}
+
 func TestNewOwnerNonceReturnsAtLeast32HexBytes(t *testing.T) {
 	got, err := NewOwnerNonce()
 	if err != nil {
