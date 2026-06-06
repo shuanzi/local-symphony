@@ -21,6 +21,7 @@ import (
 	"local-symphony/internal/app"
 	"local-symphony/internal/core"
 	"local-symphony/internal/db"
+	"local-symphony/internal/security"
 )
 
 // EnvOverride is the environment variable that lets operators point the CLI
@@ -50,6 +51,13 @@ type Config struct {
 	BaseURL     string
 	Token       string
 	HTTPClient  *http.Client
+	// AllowRemoteDaemonURL opts the client out of the loopback
+	// host check that v1 enforces. Production CLI invocations
+	// should never set this; it exists for tests and
+	// explicit-development-against-remote fixtures. The
+	// default (false) rejects any daemon URL whose host is
+	// not in 127.0.0.0/8, ::1, or `localhost`.
+	AllowRemoteDaemonURL bool
 }
 
 // Discovery surfaces the resolved daemon URL and the source that produced it.
@@ -90,13 +98,13 @@ func (e *NetworkError) Unwrap() error { return e.Err }
 // bearer for project A is never sent to a daemon hosting
 // project B. Discovery returns ErrDaemonUnavailable when no
 // candidate matches.
-func Discover(ctx context.Context, projectID, projectRoot string) (Discovery, error) {
+func Discover(ctx context.Context, projectID, projectRoot string, allowRemote bool) (Discovery, error) {
 	if projectID == "" {
 		return Discovery{}, fmt.Errorf("daemonclient: projectID is required")
 	}
 	candidates := discoverCandidates(projectID, projectRoot)
 	for _, c := range candidates {
-		base, err := normalizeBaseURL(c.URL)
+		base, err := normalizeBaseURL(c.URL, allowRemote)
 		if err != nil {
 			continue
 		}
@@ -155,13 +163,13 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	baseURL := strings.TrimSpace(cfg.BaseURL)
 	if baseURL == "" {
-		disc, err := Discover(ctx, cfg.ProjectID, cfg.ProjectRoot)
+		disc, err := Discover(ctx, cfg.ProjectID, cfg.ProjectRoot, cfg.AllowRemoteDaemonURL)
 		if err != nil {
 			return nil, err
 		}
 		baseURL = disc.BaseURL
 	}
-	normalized, err := normalizeBaseURL(baseURL)
+	normalized, err := normalizeBaseURL(baseURL, cfg.AllowRemoteDaemonURL)
 	if err != nil {
 		return nil, err
 	}
@@ -456,8 +464,16 @@ func httpCodeToCode(status int) string {
 	}
 }
 
-// normalizeBaseURL strips trailing slashes and ensures the URL has a scheme.
-func normalizeBaseURL(raw string) (string, error) {
+// normalizeBaseURL parses a daemon URL, validates its scheme
+// (http or https), and enforces the v1 loopback baseline:
+// only hosts in 127.0.0.0/8, ::1, or `localhost` are
+// accepted by default. This guard sits in front of any
+// bearer request so a poisoned SYMPHONY_DAEMON_URL,
+// daemon.json, runtime descriptor, or session api_url
+// cannot route the CLI bearer to a remote endpoint that
+// mimics the project_id. Pass `allowRemote=true` to opt
+// out (test-only).
+func normalizeBaseURL(raw string, allowRemote bool) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", fmt.Errorf("daemonclient: empty daemon URL")
@@ -468,6 +484,13 @@ func normalizeBaseURL(raw string) (string, error) {
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return "", fmt.Errorf("daemonclient: daemon URL %q must use http or https", raw)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("daemonclient: daemon URL %q has no host", raw)
+	}
+	if !allowRemote && !security.IsLoopbackHost(host) {
+		return "", fmt.Errorf("daemonclient: non-loopback daemon URL rejected: %s (set allowRemote=true to override)", host)
 	}
 	u.Path = strings.TrimRight(u.Path, "/")
 	return u.String(), nil

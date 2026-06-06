@@ -54,7 +54,7 @@ func TestDiscoverPrefersEnvOverride(t *testing.T) {
 	t.Cleanup(server.Close)
 	t.Setenv(EnvOverride, server.URL)
 
-	disc, err := Discover(context.Background(), "prj_x", t.TempDir())
+	disc, err := Discover(context.Background(), "prj_x", t.TempDir(), true)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestDiscoverFallsBackToUserConfig(t *testing.T) {
 		t.Fatalf("write daemon config: %v", err)
 	}
 
-	disc, err := Discover(context.Background(), "prj_x", t.TempDir())
+	disc, err := Discover(context.Background(), "prj_x", t.TempDir(), true)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestDiscoverFallsBackToRuntimeDescriptor(t *testing.T) {
 		t.Fatalf("write runtime descriptor: %v", err)
 	}
 
-	disc, err := Discover(context.Background(), projectID, projectRoot)
+	disc, err := Discover(context.Background(), projectID, projectRoot, true)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestDiscoverFallsBackToRuntimeDescriptor(t *testing.T) {
 func TestDiscoverReturnsErrDaemonUnavailableWhenNothingConfigured(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv(EnvOverride, "")
-	_, err := Discover(context.Background(), "prj_x", t.TempDir())
+	_, err := Discover(context.Background(), "prj_x", t.TempDir(), true)
 	if !errors.Is(err, ErrDaemonUnavailable) {
 		t.Fatalf("Discover error = %v, want ErrDaemonUnavailable", err)
 	}
@@ -379,7 +379,7 @@ func TestDiscoveryRejectsMismatchedProjectID(t *testing.T) {
 		t.Fatalf("write runtime: %v", err)
 	}
 
-	_, err := Discover(context.Background(), "prj_abc", t.TempDir())
+	_, err := Discover(context.Background(), "prj_abc", t.TempDir(), true)
 	if !errors.Is(err, ErrDaemonUnavailable) {
 		t.Fatalf("Discover error = %v, want ErrDaemonUnavailable", err)
 	}
@@ -414,7 +414,7 @@ func TestDiscoveryFallsBackWhenRuntimeDescriptorStale(t *testing.T) {
 		t.Fatalf("WriteSessionFile: %v", err)
 	}
 
-	disc, err := Discover(context.Background(), "prj_abc", t.TempDir())
+	disc, err := Discover(context.Background(), "prj_abc", t.TempDir(), true)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -454,7 +454,7 @@ func TestDiscoveryFallsBackWhenSessionURLStale(t *testing.T) {
 		t.Fatalf("WriteSessionFile: %v", err)
 	}
 
-	disc, err := Discover(context.Background(), "prj_abc", t.TempDir())
+	disc, err := Discover(context.Background(), "prj_abc", t.TempDir(), true)
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -490,7 +490,7 @@ func TestNormalizeBaseURL(t *testing.T) {
 		"  http://localhost:9000 ": "http://localhost:9000",
 	}
 	for in, want := range cases {
-		got, err := normalizeBaseURL(in)
+		got, err := normalizeBaseURL(in, true)
 		if err != nil {
 			t.Fatalf("normalizeBaseURL(%q): %v", in, err)
 		}
@@ -498,14 +498,24 @@ func TestNormalizeBaseURL(t *testing.T) {
 			t.Fatalf("normalizeBaseURL(%q) = %q, want %q", in, got, want)
 		}
 	}
-	if _, err := normalizeBaseURL("ftp://nope"); err == nil {
+	if _, err := normalizeBaseURL("ftp://nope", true); err == nil {
 		t.Fatal("normalizeBaseURL accepted non-http scheme")
 	}
-	if _, err := normalizeBaseURL(""); err == nil {
+	if _, err := normalizeBaseURL("", true); err == nil {
 		t.Fatal("normalizeBaseURL accepted empty")
 	}
-	if _, err := normalizeBaseURL("http://[::1"); err == nil {
+	if _, err := normalizeBaseURL("http://[::1", true); err == nil {
 		t.Fatal("normalizeBaseURL accepted malformed URL")
+	}
+	// v1 default (allowRemote=false) must reject any non-loopback host
+	// so a poisoned SYMPHONY_DAEMON_URL, daemon.json, runtime
+	// descriptor, or session api_url cannot route the CLI bearer to a
+	// remote endpoint that mimics the project_id.
+	if _, err := normalizeBaseURL("http://evil.example.com:8080/", false); err == nil {
+		t.Fatal("normalizeBaseURL accepted non-loopback host with allowRemote=false")
+	}
+	if _, err := normalizeBaseURL("https://8.8.8.8/", false); err == nil {
+		t.Fatal("normalizeBaseURL accepted public IPv4 with allowRemote=false")
 	}
 }
 

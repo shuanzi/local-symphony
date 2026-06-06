@@ -1872,9 +1872,18 @@ func TestLogoutRevokesBearerOnDaemon(t *testing.T) {
 }
 
 // TestLogoutReportsDegradedIfRevocationFails pins the
-// degraded path: when the daemon is unreachable, logout
-// still deletes local files but reports that the
-// daemon-side revocation could not be confirmed.
+// HIGH finding from adversarial round 2: when the daemon
+// is unreachable, logout must NOT silently report success.
+// The trust boundary here is that a copied bearer would
+// keep authorizing mutating REST calls if we deleted the
+// local files before confirming server-side revocation.
+//
+// Behavior:
+//   - exit code is 7 (degraded, operator-actionable) — not 0
+//   - local session file is preserved so the operator can retry
+//   - structured envelope reports revoke_status="degraded" and
+//     logged_out=false so downstream scripts can detect the
+//     half-completed state
 func TestLogoutReportsDegradedIfRevocationFails(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -1885,22 +1894,30 @@ func TestLogoutReportsDegradedIfRevocationFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitProject: %v", err)
 	}
+	projectID := st.ProjectID
 	st.Close()
 
 	// Point the session at an unreachable daemon so the
 	// revoke call fails.
-	if _, err := daemonclient.WriteSessionFile(st.ProjectID, daemonclient.SessionFile{ProjectID: st.ProjectID, APIURL: "http://127.0.0.1:1", Token: "tok"}); err != nil {
+	sessionPath := app.CLISessionPath(projectID)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: "http://127.0.0.1:1", Token: "tok"}); err != nil {
 		t.Fatalf("WriteSessionFile: %v", err)
 	}
 
-	code, stdout, _ := captureCLIOutput(t, func() int {
+	code, _, stderr := captureCLIOutput(t, func() int {
 		return Main([]string{"login", "--logout", "--project", dir})
 	})
-	if code != 0 {
-		t.Fatalf("logout exit code = %d, want 0", code)
+	if code != 7 {
+		t.Fatalf("logout exit code = %d, want 7 (degraded preserves files); stderr = %s", code, stderr)
 	}
-	if !strings.Contains(stdout, "degraded") {
-		t.Fatalf("logout stdout missing degraded status: %s", stdout)
+	if !strings.Contains(stderr, "degraded") {
+		t.Fatalf("logout stderr missing degraded status: %s", stderr)
+	}
+	if !strings.Contains(stderr, "preserved") {
+		t.Fatalf("logout stderr missing file-preserved phrase: %s", stderr)
+	}
+	if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
+		t.Fatalf("session file should be preserved on degraded logout, got: %v", err)
 	}
 }
 
@@ -2009,11 +2026,22 @@ func TestWorkflowReloadOfflineRefuses(t *testing.T) {
 	}
 }
 
-// TestLegacyLogoutRemovesLegacySession pins the P2 #3 fix:
-// `symphony login --logout` must also delete the legacy
-// ~/.symphony/cli-session.json file, not only the new
-// project-scoped file. Otherwise an upgraded user's stale
-// legacy token keeps authenticating.
+// TestLegacyLogoutRemovesLegacySession pins the legacy-file
+// cleanup alongside the degraded-logout trust boundary
+// (HIGH finding, adversarial round 2). The legacy
+// ~/.symphony/cli-session.json file is consulted by
+// upgraded operators; if logout deletes it before
+// confirming server-side revocation, a copied bearer
+// would keep authorizing mutating REST calls. So the
+// file must be preserved on the degraded path and
+// removed only when the daemon confirms `revoked:true
+// matched:true`.
+//
+// Behavior:
+//   - exit code is 7 (degraded) when the project-scoped
+//     session points at an unreachable daemon
+//   - both legacy and project-scoped files are preserved
+//     so the operator can retry revocation
 func TestLegacyLogoutRemovesLegacySession(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -2029,8 +2057,9 @@ func TestLegacyLogoutRemovesLegacySession(t *testing.T) {
 	projectID := st.ProjectID
 	st.Close()
 
-	// Write a project-scoped session file.
-	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: "http://unused", Token: "tok"}); err != nil {
+	// Write a project-scoped session file pointing at an
+	// unreachable daemon so the revoke call fails.
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: "http://127.0.0.1:1", Token: "tok"}); err != nil {
 		t.Fatalf("WriteSessionFile: %v", err)
 	}
 
@@ -2047,14 +2076,20 @@ func TestLegacyLogoutRemovesLegacySession(t *testing.T) {
 	code, _, stderr := captureCLIOutput(t, func() int {
 		return Main([]string{"login", "--logout", "--project", dir})
 	})
-	if code != 0 {
-		t.Fatalf("login --logout exit code = %d, want 0; stderr = %s", code, stderr)
+	if code != 7 {
+		t.Fatalf("login --logout exit code = %d, want 7 (degraded preserves files for retry); stderr = %s", code, stderr)
 	}
-
-	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
-		t.Fatalf("legacy session file still present after logout: %v", err)
+	if !strings.Contains(stderr, "degraded") {
+		t.Fatalf("login --logout stderr missing degraded status: %s", stderr)
 	}
-	if _, err := os.Stat(app.CLISessionPath(projectID)); !os.IsNotExist(err) {
-		t.Fatalf("project-scoped session file still present after logout: %v", err)
+	// Files must be preserved on degraded logout: a copied
+	// bearer must not keep authorizing mutating REST calls
+	// after logout silently "succeeds" without confirming
+	// server-side revocation.
+	if _, err := os.Stat(legacyPath); os.IsNotExist(err) {
+		t.Fatalf("legacy session file should be preserved on degraded logout, got: %v", err)
+	}
+	if _, err := os.Stat(app.CLISessionPath(projectID)); os.IsNotExist(err) {
+		t.Fatalf("project-scoped session file should be preserved on degraded logout, got: %v", err)
 	}
 }
