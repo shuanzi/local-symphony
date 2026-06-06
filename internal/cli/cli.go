@@ -216,26 +216,34 @@ func cmdIssue(args []string) int {
 	projectRoot := flagValue(args[1:], "--project", ".")
 	switch args[0] {
 	case "create":
-		return dispatchWithStore(ctx, projectRoot, args[1:], issueCreateViaDaemon(args[1:]), issueCreateLocal(args[1:]))
+		// Parse + validate flags before the dispatcher. This way
+		// invalid input (e.g. --priority=abc) fails consistently
+		// regardless of whether the daemon is reachable; the
+		// dispatcher's no-fallback rule for mutating commands
+		// never silently swallows a validation error.
+		if _, err := parseIssueCreateArgs(args[1:]); err != nil {
+			return printErr(err)
+		}
+		return dispatchWithStore(ctx, projectRoot, args[1:], true, issueCreateViaDaemon(args[1:]), issueCreateLocal(args[1:]))
 	case "list":
-		return dispatchWithStore(ctx, projectRoot, args[1:], issueListViaDaemon(args[1:]), issueListLocal(args[1:]))
+		return dispatchWithStore(ctx, projectRoot, args[1:], false, issueListViaDaemon(args[1:]), issueListLocal(args[1:]))
 	case "show":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
 		}
-		return dispatchWithStore(ctx, projectRoot, args[2:], issueShowViaDaemon(args[1]), issueShowLocal(args[1]))
+		return dispatchWithStore(ctx, projectRoot, args[2:], false, issueShowViaDaemon(args[1]), issueShowLocal(args[1]))
 	case "update":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
 		}
-		return dispatchWithStore(ctx, projectRoot, args[2:], issueUpdateViaDaemon(args[1], args[2:]), issueUpdateLocal(args[1], args[2:]))
+		return dispatchWithStore(ctx, projectRoot, args[2:], true, issueUpdateViaDaemon(args[1], args[2:]), issueUpdateLocal(args[1], args[2:]))
 	case "transition":
 		if len(args) < 3 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "usage: issue transition REF STATE", nil))
 		}
 		reason := flagValue(args[3:], "--reason", "")
 		dup := flagValue(args[3:], "--duplicate-of", "")
-		return dispatchWithStore(ctx, projectRoot, args[3:],
+		return dispatchWithStore(ctx, projectRoot, args[3:], true,
 			issueTransitionViaDaemon(args[1], args[2], reason, dup),
 			issueTransitionLocal(args[1], args[2], reason, dup))
 	case "comment":
@@ -243,24 +251,24 @@ func cmdIssue(args []string) int {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
 		}
 		body := flagValue(args[2:], "--body", "")
-		return dispatchWithStore(ctx, projectRoot, args[2:], issueCommentViaDaemon(args[1], body), issueCommentLocal(args[1], body))
+		return dispatchWithStore(ctx, projectRoot, args[2:], true, issueCommentViaDaemon(args[1], body), issueCommentLocal(args[1], body))
 	case "blocker":
 		if len(args) < 4 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "usage: issue blocker add/remove REF BLOCKER", nil))
 		}
 		if args[1] == "add" {
-			return dispatchWithStore(ctx, projectRoot, args[4:],
+			return dispatchWithStore(ctx, projectRoot, args[4:], true,
 				issueBlockerAddViaDaemon(args[2], args[3]),
 				issueBlockerAddLocal(args[2], args[3]))
 		}
 		if args[1] == "remove" {
-			return dispatchWithStore(ctx, projectRoot, args[4:],
+			return dispatchWithStore(ctx, projectRoot, args[4:], true,
 				issueBlockerRemoveViaDaemon(args[2], args[3]),
 				issueBlockerRemoveLocal(args[2], args[3]))
 		}
 	case "duplicate":
 		if len(args) >= 4 && args[1] == "remove" {
-			return dispatchWithStore(ctx, projectRoot, args[4:],
+			return dispatchWithStore(ctx, projectRoot, args[4:], true,
 				issueDuplicateRemoveViaDaemon(args[2], args[3]),
 				issueDuplicateRemoveLocal(args[2], args[3]))
 		}
@@ -268,7 +276,7 @@ func cmdIssue(args []string) int {
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
 		}
-		return dispatchWithStore(ctx, projectRoot, args[2:], issueDispatchViaDaemon(args[1]), issueDispatchLocal(args[1]))
+		return dispatchWithStore(ctx, projectRoot, args[2:], true, issueDispatchViaDaemon(args[1]), issueDispatchLocal(args[1]))
 	case "dispatch-pause":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "issue ref required", nil))
@@ -277,7 +285,7 @@ func cmdIssue(args []string) int {
 		if strings.TrimSpace(reason) == "" {
 			return printErr(core.NewError(core.ErrInvalidRequest, "reason is required", nil))
 		}
-		return dispatchWithStore(ctx, projectRoot, args[2:],
+		return dispatchWithStore(ctx, projectRoot, args[2:], true,
 			issueDispatchPauseViaDaemon(args[1], reason),
 			issueDispatchPauseLocal(args[1], reason))
 	case "dispatch-resume":
@@ -288,7 +296,7 @@ func cmdIssue(args []string) int {
 		if strings.TrimSpace(reason) == "" {
 			return printErr(core.NewError(core.ErrInvalidRequest, "reason is required", nil))
 		}
-		return dispatchWithStore(ctx, projectRoot, args[2:],
+		return dispatchWithStore(ctx, projectRoot, args[2:], true,
 			issueDispatchResumeViaDaemon(args[1], reason),
 			issueDispatchResumeLocal(args[1], reason))
 	}
@@ -303,27 +311,27 @@ func cmdRun(args []string) int {
 	ctx := contextWithTimeout()
 	projectRoot := flagValue(args[1:], "--project", ".")
 	if isIssueRefArg(args[0]) {
-		return dispatchWithStore(ctx, projectRoot, args[1:], runDispatchViaDaemon(args[0]), runDispatchLocal(args[0]))
+		return dispatchWithStore(ctx, projectRoot, args[1:], true, runDispatchViaDaemon(args[0]), runDispatchLocal(args[0]))
 	}
 	switch args[0] {
 	case "list":
-		return dispatchWithStore(ctx, projectRoot, args[1:], runListViaDaemon(), runListLocal())
+		return dispatchWithStore(ctx, projectRoot, args[1:], false, runListViaDaemon(), runListLocal())
 	case "show":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "run id required", nil))
 		}
-		return dispatchWithStore(ctx, projectRoot, args[2:], runShowViaDaemon(args[1]), runShowLocal(args[1]))
+		return dispatchWithStore(ctx, projectRoot, args[2:], false, runShowViaDaemon(args[1]), runShowLocal(args[1]))
 	case "events":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "run id required", nil))
 		}
-		return dispatchWithStore(ctx, projectRoot, args[2:], runEventsViaDaemon(args[1]), runEventsLocal(args[1]))
+		return dispatchWithStore(ctx, projectRoot, args[2:], false, runEventsViaDaemon(args[1]), runEventsLocal(args[1]))
 	case "cancel":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "run id required", nil))
 		}
 		reason := flagValue(args[2:], "--reason", "operator cancelled")
-		return dispatchWithStore(ctx, projectRoot, args[2:], runCancelViaDaemon(args[1], reason), runCancelLocal(args[1], reason))
+		return dispatchWithStore(ctx, projectRoot, args[2:], true, runCancelViaDaemon(args[1], reason), runCancelLocal(args[1], reason))
 	}
 	return printErr(core.NewError(core.ErrInvalidRequest, "unknown run command", nil))
 }
@@ -357,7 +365,7 @@ func cmdApproval(args []string) int {
 	projectRoot := flagValue(args[1:], "--project", ".")
 	switch args[0] {
 	case "list":
-		return dispatchWithStore(ctx, projectRoot, args[1:], approvalListViaDaemon(), approvalListLocal())
+		return dispatchWithStore(ctx, projectRoot, args[1:], false, approvalListViaDaemon(), approvalListLocal())
 	case "decide":
 		if len(args) < 2 {
 			return printErr(core.NewError(core.ErrInvalidRequest, "approval id required", nil))
@@ -383,7 +391,7 @@ func cmdApproval(args []string) int {
 			"deny":                 "denied",
 			"cancel_run":           "cancelled",
 		}[decision]
-		return dispatchWithStore(ctx, projectRoot, args[2:],
+		return dispatchWithStore(ctx, projectRoot, args[2:], true,
 			approvalDecideViaDaemon(args[1], decision, reason),
 			approvalDecideLocal(args[1], status, reason))
 	}
@@ -405,7 +413,7 @@ func cmdReview(args []string) int {
 		if strings.TrimSpace(reason) == "" {
 			return printErr(core.NewError(core.ErrInvalidRequest, "reason is required", nil))
 		}
-		return dispatchWithStore(ctx, projectRoot, args[2:],
+		return dispatchWithStore(ctx, projectRoot, args[2:], true,
 			reviewSendToReworkViaDaemon(args[1], reason),
 			reviewSendToReworkLocal(args[1], reason))
 	case "mark-done":
@@ -416,7 +424,7 @@ func cmdReview(args []string) int {
 		if strings.TrimSpace(reason) == "" {
 			return printErr(core.NewError(core.ErrInvalidRequest, "reason is required", nil))
 		}
-		return dispatchWithStore(ctx, projectRoot, args[2:],
+		return dispatchWithStore(ctx, projectRoot, args[2:], true,
 			reviewMarkDoneViaDaemon(args[1], reason),
 			reviewMarkDoneLocal(args[1], reason))
 	case "path":
@@ -428,7 +436,7 @@ func cmdReview(args []string) int {
 		return withStore(args[2:], reviewMetaFor(args[1]))
 	default:
 		ref := args[0]
-		return dispatchWithStore(ctx, projectRoot, args[1:], reviewGetViaDaemon(ref), reviewGetLocal(ref))
+		return dispatchWithStore(ctx, projectRoot, args[1:], false, reviewGetViaDaemon(ref), reviewGetLocal(ref))
 	}
 }
 func reviewMetaFor(ref string) func(*store.Store) (any, error) {
@@ -456,18 +464,18 @@ func cmdWorkflow(args []string) int {
 	projectRoot := flagValue(args[1:], "--project", ".")
 	switch args[0] {
 	case "validate":
-		return dispatchWithStore(ctx, projectRoot, args[1:],
+		return dispatchWithStore(ctx, projectRoot, args[1:], true,
 			workflowDataFromClient("validate"),
 			workflowData)
 	case "reload":
-		return dispatchWithStore(ctx, projectRoot, args[1:],
+		return dispatchWithStore(ctx, projectRoot, args[1:], true,
 			workflowDataFromClient("reload"),
 			func(st *store.Store) (any, error) {
 				wf, _ := config.Load(st.RepoRoot)
 				return map[string]any{"reloaded": wf.Validation.Valid, "validation": wf.Validation}, nil
 			})
 	case "show":
-		return dispatchWithStore(ctx, projectRoot, args[1:],
+		return dispatchWithStore(ctx, projectRoot, args[1:], false,
 			workflowDataFromClient("show"),
 			func(st *store.Store) (any, error) { wf, _ := config.Load(st.RepoRoot); return wf, nil })
 	}
@@ -477,11 +485,11 @@ func cmdDiagnostics(args []string) int {
 	ctx := contextWithTimeout()
 	projectRoot := flagValue(args, "--project", ".")
 	if len(args) > 0 && args[0] == "export" {
-		return dispatchWithStore(ctx, projectRoot, args[1:],
+		return dispatchWithStore(ctx, projectRoot, args[1:], true,
 			diagnosticsExportViaDaemon,
 			diagnosticsExportData)
 	}
-	return dispatchWithStore(ctx, projectRoot, args, diagnosticsViaDaemon, diagnosticsData)
+	return dispatchWithStore(ctx, projectRoot, args, false, diagnosticsViaDaemon, diagnosticsData)
 }
 
 // cmdLogin verifies the operator's CLI bearer session against the daemon.
@@ -511,13 +519,23 @@ func cmdLogin(args []string) int {
 
 	// --logout needs the project_id to delete the right file; resolve
 	// it lazily so the command works as long as the project root
-	// contains a valid project db.
+	// contains a valid project db. We also wipe the legacy
+	// ~/.symphony/cli-session.json file because users upgraded
+	// from pre-v1.1 still rely on it for token lookup, and a stale
+	// legacy token would otherwise keep authenticating after
+	// "logout" reports success.
 	if hasFlag(args, "--logout") {
 		projectID, err := loginResolveProjectID(flagValue(args, "--project", "."))
 		if err != nil {
 			return printErr(err)
 		}
 		if err := daemonclient.DeleteSessionFile(projectID); err != nil {
+			return printErr(err)
+		}
+		// DeleteLegacySessionFile returns nil on missing file, so
+		// there is no need to inspect the legacy path; we still
+		// surface any unexpected error to the operator.
+		if err := daemonclient.DeleteLegacySessionFile(); err != nil {
 			return printErr(err)
 		}
 		return printJSON(map[string]any{"logged_out": true, "project_id": projectID})

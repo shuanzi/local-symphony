@@ -558,3 +558,26 @@ func TestUnwrapArrayRejectsObjectResponse(t *testing.T) {
 		t.Fatal("UnwrapArray accepted an object response, want decode error")
 	}
 }
+
+func TestDeleteLegacySessionFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	// Write a legacy session file at the conventional path.
+	home, _ := os.UserHomeDir()
+	legacy := filepath.Join(home, ".symphony", "cli-session.json")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(legacy, []byte(`{"project_id":"prj_x","token":"legacy"}`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := DeleteLegacySessionFile(); err != nil {
+		t.Fatalf("DeleteLegacySessionFile: %v", err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy file still present: %v", err)
+	}
+	// Idempotent: second call must not fail.
+	if err := DeleteLegacySessionFile(); err != nil {
+		t.Fatalf("DeleteLegacySessionFile (idempotent): %v", err)
+	}
+}

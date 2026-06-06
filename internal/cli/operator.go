@@ -89,13 +89,20 @@ func daemonUnavailableMessage() string {
 }
 
 // withDaemonOrStore is the per-command dispatcher. It tries the daemon
-// first; if the daemon is unreachable (no URL, network failure), it falls
-// back to the provided local-store function. If the daemon is reachable
-// but the bearer is missing, it surfaces an auth error — never the local
-// store — so mutating commands cannot succeed without daemon-side
-// enforcement. Other daemon errors (4xx/5xx) are surfaced as APIError so
-// the operator sees the upstream error code.
-func withDaemonOrStore(ctx context.Context, st *store.Store, args []string, daemonFn func(*daemonclient.Client) (any, error), storeFn func(*store.Store) (any, error)) (any, error) {
+// first; if the daemon is unreachable (no URL, network failure), it
+// falls back to the provided local-store function **only when the
+// command is read-only**. Mutating commands (POST/PUT/PATCH/DELETE)
+// never retry against the local store: a successful daemon write
+// followed by a network failure on the response path would otherwise
+// cause the local store to apply the same change a second time, or
+// silently bypass daemon-side enforcement when the daemon URL is
+// reachable but the connection itself fails.
+//
+// If the daemon is reachable but the bearer is missing, the dispatcher
+// surfaces an auth error — never the local store — regardless of
+// mutating vs read. Other daemon errors (4xx/5xx) are surfaced as
+// APIError so the operator sees the upstream error code.
+func withDaemonOrStore(ctx context.Context, st *store.Store, args []string, mutating bool, daemonFn func(*daemonclient.Client) (any, error), storeFn func(*store.Store) (any, error)) (any, error) {
 	dc, derr := newDaemonContext(ctx, st)
 	if derr != nil {
 		// Hard auth error: daemon reachable but no session. Do not
@@ -107,10 +114,17 @@ func withDaemonOrStore(ctx context.Context, st *store.Store, args []string, daem
 		if err == nil {
 			return data, nil
 		}
-		if isOfflineFallback(err) {
+		if !mutating && isOfflineFallback(err) {
 			return storeFn(st)
 		}
 		return nil, err
+	}
+	// Daemon is not reachable at all. Read-only commands can still
+	// make progress against the local store; mutating commands
+	// refuse to fall back so the operator sees the daemon-required
+	// error and re-runs the command once the daemon is back.
+	if mutating {
+		return nil, daemonclient.ErrDaemonUnavailable
 	}
 	return storeFn(st)
 }
@@ -118,13 +132,13 @@ func withDaemonOrStore(ctx context.Context, st *store.Store, args []string, daem
 // dispatchWithStore opens the project store, runs the dispatcher, and
 // prints the result. It exists so each command's body can stay a single
 // line: open store → dispatch → print.
-func dispatchWithStore(ctx context.Context, projectRoot string, args []string, daemonFn func(*daemonclient.Client) (any, error), storeFn func(*store.Store) (any, error)) int {
+func dispatchWithStore(ctx context.Context, projectRoot string, args []string, mutating bool, daemonFn func(*daemonclient.Client) (any, error), storeFn func(*store.Store) (any, error)) int {
 	st, err := store.Open(projectRoot)
 	if err != nil {
 		return printErr(err)
 	}
 	defer st.Close()
-	data, err := withDaemonOrStore(ctx, st, args, daemonFn, storeFn)
+	data, err := withDaemonOrStore(ctx, st, args, mutating, daemonFn, storeFn)
 	if err != nil {
 		return printErr(err)
 	}
@@ -223,7 +237,7 @@ func runStatusCommand(ctx context.Context, args []string) int {
 	}
 	defer st.Close()
 
-	data, err := withDaemonOrStore(ctx, st, args, statusViaDaemon, statusData)
+	data, err := withDaemonOrStore(ctx, st, args, false, statusViaDaemon, statusData)
 	if err != nil {
 		return PrintErr(err)
 	}

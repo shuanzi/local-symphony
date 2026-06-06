@@ -70,40 +70,78 @@ func issueShowViaDaemon(ref string) func(*daemonclient.Client) (any, error) {
 	}
 }
 
+// parseIssueCreateArgs pulls the create-issue flags out of args and
+// returns a structured input. Validation errors (e.g. non-integer
+// --priority) are returned here so the CLI surfaces them before the
+// dispatcher decides between daemon and local store. Both
+// issueCreateLocal and issueCreateViaDaemon consume the parsed
+// input; this guarantees the validation contract is identical
+// regardless of which path runs.
+func parseIssueCreateArgs(args []string) (map[string]any, error) {
+	body := map[string]any{
+		"title":               flagValue(args, "--title", ""),
+		"description":         flagValue(args, "--description", ""),
+		"acceptance_criteria": multiFlag(args, "--acceptance"),
+		"labels":              multiFlag(args, "--label"),
+	}
+	pri := 3
+	if rawPriority, ok := flagValuePresent(args, "--priority"); ok {
+		parsed, err := strconv.Atoi(rawPriority)
+		if err != nil {
+			return nil, core.NewError(core.ErrInvalidRequest, "--priority must be an integer", map[string]any{"priority": rawPriority})
+		}
+		pri = parsed
+	}
+	body["priority"] = pri
+	return body, nil
+}
+
 // issueCreateLocal / issueCreateViaDaemon handle `symphony issue create`.
 func issueCreateLocal(args []string) func(*store.Store) (any, error) {
+	body, err := parseIssueCreateArgs(args)
+	if err != nil {
+		return func(*store.Store) (any, error) { return nil, err }
+	}
 	return func(st *store.Store) (any, error) {
-		pri := 3
-		if rawPriority, ok := flagValuePresent(args, "--priority"); ok {
-			parsedPriority, err := strconv.Atoi(rawPriority)
-			if err != nil {
-				return nil, core.NewError(core.ErrInvalidRequest, "--priority must be an integer", map[string]any{"priority": rawPriority})
-			}
-			pri = parsedPriority
-		}
-		ac := multiFlag(args, "--acceptance")
-		labels := multiFlag(args, "--label")
-		return st.CreateIssue(store.CreateIssueInput{Title: flagValue(args, "--title", ""), Description: flagValue(args, "--description", ""), AcceptanceCriteria: ac, Priority: pri, Labels: labels})
+		return st.CreateIssue(store.CreateIssueInput{
+			Title:              body["title"].(string),
+			Description:        body["description"].(string),
+			AcceptanceCriteria: stringSlice(body["acceptance_criteria"]),
+			Priority:           body["priority"].(int),
+			Labels:             stringSlice(body["labels"]),
+		})
 	}
 }
 
 func issueCreateViaDaemon(args []string) func(*daemonclient.Client) (any, error) {
+	body, err := parseIssueCreateArgs(args)
+	if err != nil {
+		return func(*daemonclient.Client) (any, error) { return nil, err }
+	}
 	return func(c *daemonclient.Client) (any, error) {
-		body := map[string]any{
-			"title":               flagValue(args, "--title", ""),
-			"description":         flagValue(args, "--description", ""),
-			"acceptance_criteria": multiFlag(args, "--acceptance"),
-			"labels":              multiFlag(args, "--label"),
-		}
-		if rawPriority, ok := flagValuePresent(args, "--priority"); ok {
-			parsed, err := strconv.Atoi(rawPriority)
-			if err != nil {
-				return nil, core.NewError(core.ErrInvalidRequest, "--priority must be an integer", map[string]any{"priority": rawPriority})
-			}
-			body["priority"] = parsed
-		}
 		return c.UnwrapMap(context.Background(), "POST", "/api/v1/issues", body)
 	}
+}
+
+// stringSlice is a small adapter that converts a generic []any to
+// []string. It is only used in this file's create-issue glue; the
+// daemon client already accepts map[string]any, so the conversion
+// happens at the local-store boundary.
+func stringSlice(v any) []string {
+	if v == nil {
+		return nil
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, x := range arr {
+		if s, ok := x.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // issueUpdateLocal / issueUpdateViaDaemon handle `symphony issue update`.

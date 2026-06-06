@@ -267,18 +267,54 @@ func captureCLIOutput(t *testing.T, fn func() int) (int, string, string) {
 }
 
 func TestIssueCreateDefaultsPriorityWhenFlagMissing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
 	dir := t.TempDir()
 	st, err := store.InitProject(dir, "APP")
 	if err != nil {
 		t.Fatalf("InitProject: %v", err)
 	}
+	projectID := st.ProjectID
 	st.Close()
+
+	// Mutating commands do not fall back to the local store, so
+	// the test must run a daemon. The daemon echoes the issue back
+	// as if the local store had created it; the priority default
+	// lives in the parsed CLI args, so the daemon's response is
+	// a passthrough.
+	var seenPriority int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if p, ok := body["priority"].(float64); ok {
+			seenPriority = int(p)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":{"id":"iss_1","identifier":"APP-1","sequence_no":1,"title":"x","description":"","acceptance_criteria":[],"priority":3,"state":"Inbox","url":null,"labels":[],"blocked_by":[],"blocks":[],"duplicate_of":null,"duplicates":[],"followup_of":null,"followups":[],"dispatch_paused":false,"dispatch_pause_reason":null,"dispatch_paused_at":null,"branch_name":null,"workspace_path":null,"base_ref":null,"base_ref_config":null,"base_sha":null,"workspace":null,"git":null,"latest_run":null,"active_run_id":null,"latest_run_id":null,"latest_review_packet":null,"latest_review_packet_id":null,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","completed_at":null,"archived_at":null},"meta":{}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
 
 	code := Main([]string{"issue", "create", "--project", dir, "--title", "Default priority"})
 	if code != 0 {
 		t.Fatalf("issue create exit code = %d, want 0", code)
 	}
+	if seenPriority != 3 {
+		t.Fatalf("daemon saw priority = %d, want default 3", seenPriority)
+	}
 
+	// The daemon now owns the write. The local store must remain
+	// untouched — mutating commands no longer fall back, so the
+	// dispatcher should not have applied the create locally.
 	st, err = store.Open(dir)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -288,37 +324,45 @@ func TestIssueCreateDefaultsPriorityWhenFlagMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListIssues: %v", err)
 	}
-	if len(issues) != 1 {
-		t.Fatalf("created %d issues, want 1", len(issues))
-	}
-	if issues[0].Priority != 3 {
-		t.Fatalf("priority = %d, want default 3", issues[0].Priority)
+	if len(issues) != 0 {
+		t.Fatalf("local store has %d issues, want 0 (daemon owns writes)", len(issues))
 	}
 }
 
 func TestRunAcceptsCustomIssuePrefix(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
 	dir := t.TempDir()
 	st, err := store.InitProject(dir, "APP")
 	if err != nil {
 		t.Fatalf("InitProject: %v", err)
 	}
-	issue, err := st.CreateIssue(store.CreateIssueInput{
-		Title:              "Custom prefix",
-		Description:        "desc",
-		AcceptanceCriteria: []string{"done"},
-		Priority:           3,
-	})
-	if err != nil {
-		t.Fatalf("CreateIssue: %v", err)
-	}
-	if issue.Identifier != "APP-1" {
-		t.Fatalf("identifier = %q, want APP-1", issue.Identifier)
-	}
-	if _, err := st.TransitionIssue(issue.Identifier, core.StateReady, "", ""); err != nil {
-		t.Fatalf("TransitionIssue: %v", err)
-	}
+	projectID := st.ProjectID
 	st.Close()
-	t.Setenv("SYMPHONY_FAKE_RUNNER_OUTCOME", "hold")
+
+	// `run APP-1` is a mutating command (issue dispatch via
+	// orchestrator). Under C4 it must hit the daemon, not fall
+	// back to the local store. Stand up a stub daemon that
+	// accepts the dispatch and returns an empty run list.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v1/issues/APP-1/dispatch" {
+			fmt.Fprintln(w, `{"data":{"id":"run_1","status":"pending","dispatch_reason":"manual"},"meta":{}}`)
+			return
+		}
+		fmt.Fprintln(w, `{"data":[],"meta":{}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
 
 	if code := Main([]string{"run", "APP-1", "--project", dir}); code != 0 {
 		t.Fatalf("run APP-1 exit code = %d, want 0", code)
@@ -850,10 +894,12 @@ func TestMutatingCommandSurfacesAuthWhenSessionMissing(t *testing.T) {
 	}
 }
 
-// TestOfflineStillFallsBackToLocalStore is the inverse of the P1
-// test: with no daemon reachable, the dispatcher must still run the
-// local store path so offline flows keep working.
-func TestOfflineStillFallsBackToLocalStore(t *testing.T) {
+// TestOfflineMutatingRefusesToFallBack pins the P2 #2 fix: with no
+// daemon reachable, mutating commands must NOT silently run the
+// local store. The CLI surfaces daemon_unavailable so the operator
+// knows the command did not land. (Read-only commands still
+// fall back — see TestOfflineReadOnlyFallsBackToLocalStore below.)
+func TestOfflineMutatingRefusesToFallBack(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv(daemonclient.EnvOverride, "")
 
@@ -864,14 +910,59 @@ func TestOfflineStillFallsBackToLocalStore(t *testing.T) {
 	}
 	st.Close()
 
-	code, stdout, _ := captureCLIOutput(t, func() int {
+	before, _ := func() ([]*core.Issue, error) {
+		s, _ := store.Open(dir)
+		defer s.Close()
+		return s.ListIssues(store.ListIssueOptions{Limit: 100})
+	}()
+
+	code, _, stderr := captureCLIOutput(t, func() int {
 		return Main([]string{"issue", "create", "--project", dir, "--title", "offline create"})
 	})
-	if code != 0 {
-		t.Fatalf("offline issue create exit code = %d, want 0", code)
+	if code == 0 {
+		t.Fatalf("offline issue create succeeded; want daemon_unavailable")
 	}
-	if !strings.Contains(stdout, "offline create") {
-		t.Fatalf("offline issue create stdout missing title: %s", stdout)
+	if !strings.Contains(stderr, "daemon_unavailable") {
+		t.Fatalf("offline issue create stderr missing daemon_unavailable: %s", stderr)
+	}
+
+	// Critical assertion: the local store was NOT mutated.
+	after, _ := func() ([]*core.Issue, error) {
+		s, _ := store.Open(dir)
+		defer s.Close()
+		return s.ListIssues(store.ListIssueOptions{Limit: 100})
+	}()
+	if len(after) != len(before) {
+		t.Fatalf("local store mutated despite daemon_unavailable: before=%d after=%d", len(before), len(after))
+	}
+}
+
+// TestOfflineReadOnlyFallsBackToLocalStore pins the read-only
+// offline fallback. With no daemon reachable, the CLI must still
+// surface local store data for read commands so offline flows
+// keep working.
+func TestOfflineReadOnlyFallsBackToLocalStore(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	if _, err := st.CreateIssue(store.CreateIssueInput{Title: "offline read", Description: "x", Priority: 3}); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	st.Close()
+
+	code, stdout, _ := captureCLIOutput(t, func() int {
+		return Main([]string{"issue", "list", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("offline issue list exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "offline read") {
+		t.Fatalf("offline issue list stdout missing title: %s", stdout)
 	}
 }
 
@@ -1317,5 +1408,207 @@ func TestReadCLISessionTokenRejectsInvalidLegacySession(t *testing.T) {
 				t.Fatalf("error code = %s, want %s", got, core.ErrUnauthorized)
 			}
 		})
+	}
+}
+
+// TestLoginAcceptsCLIBearer pins the P2 #1 fix: /api/v1/auth/session
+// must report authenticated=true when a valid CLI bearer is
+// presented, even without a browser cookie. The previous
+// implementation only checked the cookie and reported
+// authenticated=false, making `symphony login` always say "you are
+// not logged in" even when subsequent commands worked.
+func TestLoginAcceptsCLIBearer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		if r.Header.Get("Authorization") == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprintln(w, `{"error":{"code":"unauthorized","message":"session required","details":{}}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":{"authenticated":true,"project_id":"`+projectID+`","bearer":true,"session_kind":"cli"},"meta":{}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, stdout, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("login exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stdout, `"session": "active"`) {
+		t.Fatalf("login stdout missing active session: %s", stdout)
+	}
+}
+
+// TestLoginWithBearerRejectsCookieResponse pins the inverse: the
+// CLI bearer path must still report unauthenticated when the daemon
+// returns authenticated=false. The new behaviour must not lie.
+func TestLoginWithBearerRejectsCookieResponse(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintln(w, `{"error":{"code":"unauthorized","message":"session required","details":{}}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--project", dir})
+	})
+	if code == 0 {
+		t.Fatalf("login succeeded; want unauthenticated failure")
+	}
+	if !strings.Contains(stderr, "unauthorized") {
+		t.Fatalf("login stderr missing unauthorized: %s", stderr)
+	}
+}
+
+// TestMutatingNetworkErrorDoesNotFallBack pins the P2 #2 fix: when
+// the daemon is reachable but the request itself fails after the
+// network call (e.g. timeout, connection reset), a mutating
+// command must NOT retry the local store. The fallback path would
+// otherwise cause double-apply or bypass daemon-side enforcement.
+//
+// We simulate the network failure by closing the test server
+// after the CLI has already discovered the daemon URL via the
+// session file. Subsequent POSTs fail with a connection-refused
+// error.
+func TestMutatingNetworkErrorDoesNotFallBack(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+	}))
+	serverURL := server.URL
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: serverURL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+	// Now kill the server so subsequent POSTs fail.
+	server.Close()
+
+	before, _ := func() ([]*core.Issue, error) {
+		s, _ := store.Open(dir)
+		defer s.Close()
+		return s.ListIssues(store.ListIssueOptions{Limit: 100})
+	}()
+
+	code, _, _ := captureCLIOutput(t, func() int {
+		return Main([]string{"issue", "create", "--project", dir, "--title", "network failure"})
+	})
+	if code == 0 {
+		t.Fatalf("issue create succeeded under network failure; want daemon error")
+	}
+
+	// Critical assertion: local store was NOT mutated. The bug
+	// being fixed would have written a row via offline fallback.
+	after, _ := func() ([]*core.Issue, error) {
+		s, _ := store.Open(dir)
+		defer s.Close()
+		return s.ListIssues(store.ListIssueOptions{Limit: 100})
+	}()
+	if len(after) != len(before) {
+		t.Fatalf("local store mutated despite daemon network failure: before=%d after=%d", len(before), len(after))
+	}
+}
+
+// TestLegacyLogoutRemovesLegacySession pins the P2 #3 fix:
+// `symphony login --logout` must also delete the legacy
+// ~/.symphony/cli-session.json file, not only the new
+// project-scoped file. Otherwise an upgraded user's stale
+// legacy token keeps authenticating.
+func TestLegacyLogoutRemovesLegacySession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	// Initialize the project so the project-scoped session file
+	// can be created.
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	// Write a project-scoped session file.
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: "http://unused", Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	// Write a legacy session file at ~/.symphony/cli-session.json.
+	legacyDir := filepath.Join(home, ".symphony")
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	legacyPath := filepath.Join(legacyDir, "cli-session.json")
+	if err := os.WriteFile(legacyPath, []byte(`{"project_id":"`+projectID+`","token":"legacy-token"}`), 0o600); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("login --logout exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy session file still present after logout: %v", err)
+	}
+	if _, err := os.Stat(app.CLISessionPath(projectID)); !os.IsNotExist(err) {
+		t.Fatalf("project-scoped session file still present after logout: %v", err)
 	}
 }
