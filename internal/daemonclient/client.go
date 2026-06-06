@@ -210,7 +210,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body any) (Respons
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	target, err := url.JoinPath(c.BaseURL, path)
+	target, err := buildTargetURL(c.BaseURL, path)
 	if err != nil {
 		return Response{}, fmt.Errorf("daemonclient: build url: %w", err)
 	}
@@ -320,6 +320,62 @@ func (c *Client) UnwrapMap(ctx context.Context, method, path string, body any) (
 		return nil, fmt.Errorf("daemonclient: decode data as object: %w (body=%s)", err, summarize(resp.Raw))
 	}
 	return out, nil
+}
+
+// UnwrapArray returns the raw data as a generic slice. The CLI uses this
+// for endpoints whose `data` payload is a JSON array (e.g. /api/v1/runs,
+// /api/v1/approvals) so the envelope unwrap stays consistent with
+// UnwrapMap. Decoding an array with UnwrapMap would fail with
+// "json: cannot unmarshal object into Go value of type map[string]any"
+// — that's the regression this helper exists to prevent.
+func (c *Client) UnwrapArray(ctx context.Context, method, path string, body any) ([]any, error) {
+	resp, err := c.Do(ctx, method, path, body)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Data) == 0 {
+		return []any{}, nil
+	}
+	var out []any
+	if err := json.Unmarshal(resp.Data, &out); err != nil {
+		return nil, fmt.Errorf("daemonclient: decode data as array: %w (body=%s)", err, summarize(resp.Raw))
+	}
+	return out, nil
+}
+
+// buildTargetURL composes a final request URL by joining a base URL with
+// a path that may include a query string. url.JoinPath would percent-
+// encode the `?` separator, breaking GET filters like
+// `/api/v1/issues?limit=1`. The fix is to split at the first `?`, join
+// the path with url.JoinPath, and assign the query to RawQuery on the
+// resolved URL.
+func buildTargetURL(base, path string) (string, error) {
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	pathPart, rawQuery := splitPathQuery(path)
+	joined, err := url.JoinPath(base, pathPart)
+	if err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(joined)
+	if err != nil {
+		return "", err
+	}
+	if rawQuery != "" {
+		parsed.RawQuery = rawQuery
+	}
+	return parsed.String(), nil
+}
+
+// splitPathQuery returns the path and the raw query string of a URL
+// path. The input is expected to look like "/api/v1/issues?limit=1";
+// the second return is empty when no query is present.
+func splitPathQuery(p string) (string, string) {
+	if i := strings.Index(p, "?"); i >= 0 {
+		return p[:i], p[i+1:]
+	}
+	return p, ""
 }
 
 func decodeError(raw []byte, status int) (*core.APIError, error) {

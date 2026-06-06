@@ -260,7 +260,12 @@ func runListLocal() func(*store.Store) (any, error) {
 
 func runListViaDaemon() func(*daemonclient.Client) (any, error) {
 	return func(c *daemonclient.Client) (any, error) {
-		return c.UnwrapMap(context.Background(), "GET", "/api/v1/runs", nil)
+		// /api/v1/runs returns a JSON array, so use UnwrapArray.
+		items, err := c.UnwrapArray(context.Background(), "GET", "/api/v1/runs", nil)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"items": items}, nil
 	}
 }
 
@@ -280,7 +285,12 @@ func runEventsLocal(id string) func(*store.Store) (any, error) {
 
 func runEventsViaDaemon(id string) func(*daemonclient.Client) (any, error) {
 	return func(c *daemonclient.Client) (any, error) {
-		return c.UnwrapMap(context.Background(), "GET", "/api/v1/runs/"+url.PathEscape(id)+"/events", nil)
+		// /api/v1/runs/{id}/events returns a JSON array, so use UnwrapArray.
+		items, err := c.UnwrapArray(context.Background(), "GET", "/api/v1/runs/"+url.PathEscape(id)+"/events", nil)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"items": items}, nil
 	}
 }
 
@@ -318,7 +328,12 @@ func approvalListLocal() func(*store.Store) (any, error) {
 
 func approvalListViaDaemon() func(*daemonclient.Client) (any, error) {
 	return func(c *daemonclient.Client) (any, error) {
-		return c.UnwrapMap(context.Background(), "GET", "/api/v1/approvals", nil)
+		// /api/v1/approvals returns a JSON array, so use UnwrapArray.
+		items, err := c.UnwrapArray(context.Background(), "GET", "/api/v1/approvals", nil)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"items": items}, nil
 	}
 }
 

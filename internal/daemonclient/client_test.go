@@ -458,3 +458,103 @@ func TestPostSerializesJSONBody(t *testing.T) {
 		t.Fatalf("body = %s, want title=x", string(seenBody))
 	}
 }
+
+func TestBuildTargetURLPreservesQueryString(t *testing.T) {
+	cases := []struct {
+		base string
+		path string
+		want string
+	}{
+		{base: "http://127.0.0.1:7331", path: "/api/v1/issues?limit=1", want: "http://127.0.0.1:7331/api/v1/issues?limit=1"},
+		{base: "http://127.0.0.1:7331/", path: "/api/v1/issues?limit=1&state=Ready", want: "http://127.0.0.1:7331/api/v1/issues?limit=1&state=Ready"},
+		{base: "http://127.0.0.1:7331", path: "/api/v1/issues", want: "http://127.0.0.1:7331/api/v1/issues"},
+		{base: "http://127.0.0.1:7331", path: "api/v1/issues?limit=1", want: "http://127.0.0.1:7331/api/v1/issues?limit=1"},
+	}
+	for _, c := range cases {
+		got, err := buildTargetURL(c.base, c.path)
+		if err != nil {
+			t.Fatalf("buildTargetURL(%q, %q): %v", c.base, c.path, err)
+		}
+		if got != c.want {
+			t.Fatalf("buildTargetURL(%q, %q) = %q, want %q", c.base, c.path, got, c.want)
+		}
+	}
+}
+
+func TestSplitPathQuery(t *testing.T) {
+	cases := []struct {
+		in     string
+		path   string
+		rawQry string
+	}{
+		{in: "/api/v1/issues?limit=1", path: "/api/v1/issues", rawQry: "limit=1"},
+		{in: "/api/v1/issues", path: "/api/v1/issues", rawQry: ""},
+		{in: "/api/v1/issues?", path: "/api/v1/issues", rawQry: ""},
+		{in: "?", path: "", rawQry: ""},
+	}
+	for _, c := range cases {
+		p, q := splitPathQuery(c.in)
+		if p != c.path || q != c.rawQry {
+			t.Fatalf("splitPathQuery(%q) = (%q, %q), want (%q, %q)", c.in, p, q, c.path, c.rawQry)
+		}
+	}
+}
+
+func TestDoPreservesQueryStringInRequestURL(t *testing.T) {
+	var seenPath, seenRawQuery string
+	server := healthServer("prj_x", func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenRawQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":{"items":[]},"meta":{}}`)
+	})
+	t.Cleanup(server.Close)
+	c, err := New(context.Background(), Config{ProjectID: "prj_x", BaseURL: server.URL, Token: "tok"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := c.Get(context.Background(), "/api/v1/issues?limit=1", nil); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if seenPath != "/api/v1/issues" {
+		t.Fatalf("path = %q, want /api/v1/issues", seenPath)
+	}
+	if seenRawQuery != "limit=1" {
+		t.Fatalf("raw query = %q, want limit=1", seenRawQuery)
+	}
+}
+
+func TestUnwrapArrayDecodesListResponse(t *testing.T) {
+	server := healthServer("prj_x", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":[{"id":"run_1"},{"id":"run_2"}],"meta":{}}`)
+	})
+	t.Cleanup(server.Close)
+	c, err := New(context.Background(), Config{ProjectID: "prj_x", BaseURL: server.URL, Token: "tok"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	items, err := c.UnwrapArray(context.Background(), "GET", "/api/v1/runs", nil)
+	if err != nil {
+		t.Fatalf("UnwrapArray: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %v, want 2", items)
+	}
+}
+
+func TestUnwrapArrayRejectsObjectResponse(t *testing.T) {
+	server := healthServer("prj_x", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":{"items":[]},"meta":{}}`)
+	})
+	t.Cleanup(server.Close)
+	c, err := New(context.Background(), Config{ProjectID: "prj_x", BaseURL: server.URL, Token: "tok"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = c.UnwrapArray(context.Background(), "GET", "/api/v1/runs", nil)
+	if err == nil {
+		t.Fatal("UnwrapArray accepted an object response, want decode error")
+	}
+}

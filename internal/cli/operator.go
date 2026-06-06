@@ -19,23 +19,64 @@ import (
 // per-invocation daemon attempt. It is intentionally cheap to construct so
 // every command can call newDaemonContext without worrying about wasted work
 // — the discovery probe is bounded to a 2-second timeout.
+//
+// Available / AuthMode drive the dispatcher's policy:
+//
+//	Available=false                   → offline, fall back to local store
+//	Available=true,  AuthMode=ok      → daemon ready, run daemonFn
+//	Available=true,  AuthMode=missing → daemon reachable, no bearer; offline
+//	                                    fallback is *forbidden* for mutating
+//	                                    commands; dispatcher surfaces an auth
+//	                                    error
 type daemonContext struct {
 	Client    *daemonclient.Client
 	Available bool
+	AuthMode  daemonAuthMode
 	ProjectID string
 }
 
+type daemonAuthMode int
+
+const (
+	daemonAuthUnknown daemonAuthMode = iota
+	daemonAuthOK
+	daemonAuthMissing
+)
+
 func newDaemonContext(ctx context.Context, project *store.Store) (daemonContext, error) {
-	dc := daemonContext{ProjectID: project.ProjectID}
-	client, err := daemonclient.New(ctx, daemonclient.Config{ProjectID: project.ProjectID, ProjectRoot: project.RepoRoot})
+	dc := daemonContext{ProjectID: project.ProjectID, AuthMode: daemonAuthUnknown}
+	// First, discover whether a daemon URL is reachable at all. This
+	// never starts a daemon; it only inspects env / user config / runtime
+	// descriptor / session file. If no URL resolves, the operator is
+	// offline and local fallback is the only path that can succeed.
+	disc, err := daemonclient.Discover(ctx, project.ProjectID, project.RepoRoot)
 	if err != nil {
-		if errors.Is(err, daemonclient.ErrDaemonUnavailable) || errors.Is(err, daemonclient.ErrSessionMissing) {
+		if errors.Is(err, daemonclient.ErrDaemonUnavailable) {
 			return dc, nil
+		}
+		return dc, err
+	}
+	// Daemon URL is reachable. We need a bearer to call it. Construct a
+	// client with the discovered URL so the load path uses the same
+	// code as production traffic; this is the only place we can
+	// distinguish "no daemon" from "daemon up but no session".
+	dc.AuthMode = daemonAuthMissing
+	client, err := daemonclient.New(ctx, daemonclient.Config{ProjectID: project.ProjectID, ProjectRoot: project.RepoRoot, BaseURL: disc.BaseURL})
+	if err != nil {
+		if errors.Is(err, daemonclient.ErrSessionMissing) {
+			// Hard auth error: do NOT mark Available. Callers must
+			// not fall back to the local store when a daemon is
+			// reachable and only the bearer is missing — that would
+			// let mutating commands succeed silently without
+			// daemon-side enforcement.
+			dc.Available = false
+			return dc, err
 		}
 		return dc, err
 	}
 	dc.Client = client
 	dc.Available = true
+	dc.AuthMode = daemonAuthOK
 	return dc, nil
 }
 
@@ -48,12 +89,17 @@ func daemonUnavailableMessage() string {
 }
 
 // withDaemonOrStore is the per-command dispatcher. It tries the daemon
-// first; if the daemon is unreachable or un-authorized, it falls back to
-// the provided local-store function. Other daemon errors (4xx/5xx) are
-// surfaced as APIError so the operator sees the upstream error code.
+// first; if the daemon is unreachable (no URL, network failure), it falls
+// back to the provided local-store function. If the daemon is reachable
+// but the bearer is missing, it surfaces an auth error — never the local
+// store — so mutating commands cannot succeed without daemon-side
+// enforcement. Other daemon errors (4xx/5xx) are surfaced as APIError so
+// the operator sees the upstream error code.
 func withDaemonOrStore(ctx context.Context, st *store.Store, args []string, daemonFn func(*daemonclient.Client) (any, error), storeFn func(*store.Store) (any, error)) (any, error) {
 	dc, derr := newDaemonContext(ctx, st)
 	if derr != nil {
+		// Hard auth error: daemon reachable but no session. Do not
+		// fall back. Caller will see the auth error.
 		return nil, derr
 	}
 	if dc.Available {
@@ -86,17 +132,20 @@ func dispatchWithStore(ctx context.Context, projectRoot string, args []string, d
 }
 
 // isOfflineFallback reports whether the daemon-side error should be
-// downgraded to a local-store read. Network failures and missing
-// session tokens fall through; API errors and validation failures do
-// not — those are authoritative.
+// downgraded to a local-store read. Network failures fall through; API
+// errors and validation failures do not — those are authoritative.
+//
+// Note: ErrSessionMissing is intentionally NOT an offline fallback
+// signal. When a daemon is reachable but the bearer is missing, the
+// dispatcher must surface an auth error rather than silently run the
+// local store path; that path would let mutating commands succeed
+// without daemon-side enforcement. The AuthMode gate in
+// newDaemonContext / withDaemonOrStore enforces this.
 func isOfflineFallback(err error) bool {
 	if err == nil {
 		return false
 	}
 	if errors.Is(err, daemonclient.ErrDaemonUnavailable) {
-		return true
-	}
-	if errors.Is(err, daemonclient.ErrSessionMissing) {
 		return true
 	}
 	var netErr *daemonclient.NetworkError
@@ -192,16 +241,30 @@ func workflowData(st *store.Store) (any, error) {
 
 func workflowDataFromClient(action string) func(*daemonclient.Client) (any, error) {
 	return func(c *daemonclient.Client) (any, error) {
-		var endpoint string
+		// The daemon registers /workflow/validate and /workflow/reload
+		// as POST (per the openapi contract), so the operator CLI must
+		// match. /workflow is GET-only.
+		var (
+			endpoint string
+			method   = "GET"
+			body     any
+		)
 		switch action {
 		case "validate":
 			endpoint = "/api/v1/workflow/validate"
+			method = "POST"
+			// dry_run is implicit; the daemon's handler rejects
+			// dry_run=false. An empty object body is the
+			// convention the openapi contract documents.
+			body = map[string]any{"dry_run": true}
 		case "reload":
 			endpoint = "/api/v1/workflow/reload"
+			method = "POST"
+			body = map[string]any{}
 		default:
 			endpoint = "/api/v1/workflow"
 		}
-		return c.UnwrapMap(context.Background(), "GET", endpoint, nil)
+		return c.UnwrapMap(context.Background(), method, endpoint, body)
 	}
 }
 
