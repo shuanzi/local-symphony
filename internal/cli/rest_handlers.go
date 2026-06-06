@@ -292,8 +292,17 @@ func issueDispatchResumeViaDaemon(ref, reason string) func(*daemonclient.Client)
 }
 
 // runListLocal / runListViaDaemon handle `symphony run list`.
+// Both paths return the same {"items":[...]} object shape so
+// scripts and dashboards see a stable schema regardless of
+// whether the daemon is reachable.
 func runListLocal() func(*store.Store) (any, error) {
-	return func(st *store.Store) (any, error) { return st.ListRuns() }
+	return func(st *store.Store) (any, error) {
+		items, err := st.ListRuns()
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"items": items}, nil
+	}
 }
 
 func runListViaDaemon() func(*daemonclient.Client) (any, error) {
@@ -317,8 +326,18 @@ func runShowViaDaemon(id string) func(*daemonclient.Client) (any, error) {
 	}
 }
 
+// runEventsLocal returns the same {"items":[...]} object shape
+// as the daemon-backed path. Stable schema is required by the
+// v1 plan: scripts must not see different output structures
+// based on daemon availability.
 func runEventsLocal(id string) func(*store.Store) (any, error) {
-	return func(st *store.Store) (any, error) { return st.RunEvents(id, 0, 500) }
+	return func(st *store.Store) (any, error) {
+		items, err := st.RunEvents(id, 0, 500)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"items": items}, nil
+	}
 }
 
 func runEventsViaDaemon(id string) func(*daemonclient.Client) (any, error) {
@@ -360,8 +379,17 @@ func runDispatchViaDaemon(ref string) func(*daemonclient.Client) (any, error) {
 }
 
 // approvalListLocal / approvalListViaDaemon handle `symphony approval list`.
+// Both paths return the same {"items":[...]} object shape for
+// parity with the daemon-backed path (see runListLocal for the
+// design rationale).
 func approvalListLocal() func(*store.Store) (any, error) {
-	return func(st *store.Store) (any, error) { return st.PendingApprovals() }
+	return func(st *store.Store) (any, error) {
+		items, err := st.PendingApprovals()
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"items": items}, nil
+	}
 }
 
 func approvalListViaDaemon() func(*daemonclient.Client) (any, error) {

@@ -1568,6 +1568,195 @@ func TestMutatingNetworkErrorDoesNotFallBack(t *testing.T) {
 // ~/.symphony/cli-session.json file, not only the new
 // project-scoped file. Otherwise an upgraded user's stale
 // legacy token keeps authenticating.
+// TestMutatingOfflineExitsSeven pins the P2 #1 fix: when a mutating
+// command runs without a reachable daemon, the dispatcher must
+// surface the daemon_unavailable envelope and exit code 7 — not
+// the generic internal_error / exit 1 that the raw sentinel
+// would otherwise produce.
+func TestMutatingOfflineExitsSeven(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	st.Close()
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"issue", "create", "--project", dir, "--title", "offline mutating"})
+	})
+	if code != 7 {
+		t.Fatalf("offline mutating exit code = %d, want 7; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "daemon_unavailable") {
+		t.Fatalf("stderr missing daemon_unavailable: %s", stderr)
+	}
+	if !strings.Contains(stderr, "daemon is not running") {
+		t.Fatalf("stderr missing guidance phrase: %s", stderr)
+	}
+}
+
+// TestLoginUnauthenticatedExitsSeven pins the P2 #2 fix: when the
+// CLI bearer is rejected by the daemon, `symphony login` must
+// return non-zero so scripts that depend on it can detect the
+// failure. Previously the command printed `session:
+// unauthenticated` with exit 0, which masked the broken token.
+func TestLoginUnauthenticatedExitsSeven(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":{"authenticated":false,"project_id":"`+projectID+`","bearer":true,"session_kind":"cli"},"meta":{}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "expired"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--project", dir})
+	})
+	if code != 7 {
+		t.Fatalf("login exit code = %d, want 7; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "unauthorized") {
+		t.Fatalf("stderr missing unauthorized code: %s", stderr)
+	}
+	if !strings.Contains(stderr, "symphony serve") {
+		t.Fatalf("stderr missing refresh guidance: %s", stderr)
+	}
+}
+
+// TestRunListOfflineReturnsObjectShape pins the P2 #4 fix: when
+// the daemon is unavailable, `symphony run list` must return
+// the same `{"items":[...]}` object shape as the daemon path
+// — scripts and dashboards must not see different output
+// structures based on daemon availability.
+func TestRunListOfflineReturnsObjectShape(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	st.Close()
+
+	code, stdout, _ := captureCLIOutput(t, func() int {
+		return Main([]string{"run", "list", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("offline run list exit code = %d, want 0", code)
+	}
+	// Must be an object, not a bare array. Decode into a map and
+	// assert that the items key is present (empty slice is fine).
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+		t.Fatalf("decode stdout as map: %v; stdout = %s", err, stdout)
+	}
+	if _, ok := doc["items"]; !ok {
+		t.Fatalf("run list output missing items key: %s", stdout)
+	}
+}
+
+// TestApprovalListOfflineReturnsObjectShape pins P2 #4 for
+// approval list.
+func TestApprovalListOfflineReturnsObjectShape(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	st.Close()
+
+	code, stdout, _ := captureCLIOutput(t, func() int {
+		return Main([]string{"approval", "list", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("offline approval list exit code = %d, want 0", code)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+		t.Fatalf("decode stdout as map: %v; stdout = %s", err, stdout)
+	}
+	if _, ok := doc["items"]; !ok {
+		t.Fatalf("approval list output missing items key: %s", stdout)
+	}
+}
+
+// TestRunEventsOfflineReturnsObjectShape pins P2 #4 for run
+// events. We use a fake-runner-friendly path by writing the
+// run via the store directly (skipping orchestrator) and
+// transitioning the issue; this keeps the test focused on the
+// output shape rather than the dispatch lifecycle.
+func TestRunEventsOfflineReturnsObjectShape(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "events",
+		Description:        "x",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.Identifier, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := st.ClaimRun(issue.Identifier, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	st.Close()
+
+	code, stdout, _ := captureCLIOutput(t, func() int {
+		return Main([]string{"run", "events", run.ID, "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("offline run events exit code = %d, want 0; stdout = %s", code, stdout)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+		t.Fatalf("decode stdout as map: %v; stdout = %s", err, stdout)
+	}
+	if _, ok := doc["items"]; !ok {
+		t.Fatalf("run events output missing items key: %s", stdout)
+	}
+}
+
+// TestLegacyLogoutRemovesLegacySession pins the P2 #3 fix:
+// `symphony login --logout` must also delete the legacy
+// ~/.symphony/cli-session.json file, not only the new
+// project-scoped file. Otherwise an upgraded user's stale
+// legacy token keeps authenticating.
 func TestLegacyLogoutRemovesLegacySession(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
