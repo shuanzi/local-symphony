@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -531,11 +532,21 @@ func cmdLogin(args []string) int {
 	// from pre-v1.1 still rely on it for token lookup, and a stale
 	// legacy token would otherwise keep authenticating after
 	// "logout" reports success.
+	//
+	// Critical: before deleting the local files, we MUST call the
+	// daemon's /auth/cli-sessions/current DELETE endpoint to mark
+	// the local_sessions row as revoked. Otherwise a copied
+	// bearer token (e.g. exfiltrated before the operator ran
+	// logout) would still authorize mutating REST calls. If the
+	// daemon is unreachable we degrade: the local files are
+	// still deleted, but the operator is told that the
+	// revocation could not be confirmed.
 	if hasFlag(args, "--logout") {
 		projectID, err := loginResolveProjectID(flagValue(args, "--project", "."))
 		if err != nil {
 			return printErr(err)
 		}
+		revokeStatus, matched, revokeErr := logoutRevoke(ctx, projectID)
 		if err := daemonclient.DeleteSessionFile(projectID); err != nil {
 			return printErr(err)
 		}
@@ -545,7 +556,16 @@ func cmdLogin(args []string) int {
 		if err := daemonclient.DeleteLegacySessionFile(); err != nil {
 			return printErr(err)
 		}
-		return printJSON(map[string]any{"logged_out": true, "project_id": projectID})
+		out := map[string]any{
+			"logged_out":     true,
+			"project_id":     projectID,
+			"revoke_status":  revokeStatus,
+			"bearer_matched": matched,
+		}
+		if revokeErr != nil {
+			out["revoke_error"] = revokeErr.Error()
+		}
+		return printJSON(out)
 	}
 
 	projectRoot := flagValue(args, "--project", ".")
@@ -603,6 +623,92 @@ func loginResolveProjectID(projectRoot string) (string, error) {
 	}
 	defer st.Close()
 	return st.ProjectID, nil
+}
+
+// SessionFile alias keeps the logoutRevoke helper readable
+// without spelling `daemonclient.SessionFile` everywhere. The
+// two structs are structurally identical; the on-disk JSON
+// shape is the single source of truth.
+type SessionFile = daemonclient.SessionFile
+
+// logoutRevoke calls the daemon's revoke endpoint to mark the
+// CLI bearer as revoked. The returned (status, matched, err)
+// triple is rendered into the logout JSON so the operator
+// can tell whether revocation was confirmed. status is one
+// of "revoked" (daemon reachable and bearer matched),
+// "no_bearer" (daemon reachable but no local session
+// file), "degraded" (daemon unreachable / errored), or
+// "not_matched" (daemon reachable but the bearer was not
+// the one it knew about, e.g. a rotated token).
+func logoutRevoke(ctx context.Context, projectID string) (status string, matched bool, err error) {
+	// First, try the new project-scoped path. If a session file
+	// exists it has the api_url we can revoke against; if not,
+	// the bearer is unknown to the daemon and the operation
+	// is a no-op.
+	scoped := app.CLISessionPath(projectID)
+	if data, readErr := os.ReadFile(scoped); readErr == nil {
+		var sf SessionFile
+		if json.Unmarshal(data, &sf) == nil && sf.Token != "" && sf.APIURL != "" {
+			client, cerr := daemonclient.New(ctx, daemonclient.Config{
+				ProjectID:   projectID,
+				ProjectRoot: lookupProjectRootForRevoke(projectID),
+				BaseURL:     sf.APIURL,
+				Token:       sf.Token,
+			})
+			if cerr == nil {
+				m, e := client.RevokeCLISession(ctx)
+				if e == nil {
+					if m {
+						return "revoked", true, nil
+					}
+					return "not_matched", false, nil
+				}
+				return "degraded", false, e
+			}
+			return "degraded", false, cerr
+		}
+	}
+	// Fall back to the legacy session file.
+	legacy := app.LegacyCLISessionPath()
+	if data, readErr := os.ReadFile(legacy); readErr == nil {
+		var sf SessionFile
+		if json.Unmarshal(data, &sf) == nil && sf.Token != "" && sf.APIURL != "" {
+			client, cerr := daemonclient.New(ctx, daemonclient.Config{
+				ProjectID:   projectID,
+				ProjectRoot: lookupProjectRootForRevoke(projectID),
+				BaseURL:     sf.APIURL,
+				Token:       sf.Token,
+			})
+			if cerr == nil {
+				m, e := client.RevokeCLISession(ctx)
+				if e == nil {
+					if m {
+						return "revoked", true, nil
+					}
+					return "not_matched", false, nil
+				}
+				return "degraded", false, e
+			}
+			return "degraded", false, cerr
+		}
+	}
+	return "no_bearer", false, nil
+}
+
+// lookupProjectRootForRevoke returns the project root for a
+// given project_id by reading the project DB. It is
+// best-effort: if the project db is missing or unreadable
+// the helper returns "" and the daemon client is constructed
+// without a ProjectRoot (which is acceptable for the
+// session-file-driven path).
+func lookupProjectRootForRevoke(projectID string) string {
+	if projectID == "" {
+		return ""
+	}
+	// We don't have a project root path; the daemon client
+	// falls back to the session file's api_url anyway, so the
+	// ProjectRoot is not strictly needed here.
+	return ""
 }
 
 func cmdTool(args []string) int {

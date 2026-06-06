@@ -105,8 +105,19 @@ func daemonUnavailableMessage() string {
 func withDaemonOrStore(ctx context.Context, st *store.Store, args []string, mutating bool, daemonFn func(*daemonclient.Client) (any, error), storeFn func(*store.Store) (any, error)) (any, error) {
 	dc, derr := newDaemonContext(ctx, st)
 	if derr != nil {
-		// Hard auth error: daemon reachable but no session. Do not
-		// fall back. Caller will see the auth error.
+		// The daemon is reachable but the operator has no CLI
+		// bearer (e.g. session file deleted, login --logout just
+		// ran). newDaemonContext returns daemonclient.ErrSessionMissing
+		// in this state; the renderer (printErr → core.AsAPIError)
+		// only knows *core.APIError, so a raw sentinel would
+		// collapse to internal_error/exit 1. Wrap it explicitly
+		// so the operator sees an actionable error and exit 7.
+		if errors.Is(derr, daemonclient.ErrSessionMissing) {
+			if mutating {
+				return nil, core.NewError(core.ErrUnauthorized, "CLI session is required; run 'symphony login' to authenticate", map[string]any{"project_id": st.ProjectID, "mutating": true})
+			}
+			return nil, core.NewError(core.ErrDaemonUnavailable, "CLI session is required; run 'symphony login' to authenticate", map[string]any{"project_id": st.ProjectID, "mutating": false})
+		}
 		return nil, derr
 	}
 	if dc.Available {

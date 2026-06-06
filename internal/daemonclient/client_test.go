@@ -359,6 +359,130 @@ func TestReadAllSessionFilesSkipsInvalidEntries(t *testing.T) {
 	}
 }
 
+func TestDiscoveryRejectsMismatchedProjectID(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(EnvOverride, "")
+
+	// Daemon responds with project_id=other — CLI is looking
+	// for prj_abc. Discovery must reject this URL.
+	other := "prj_other"
+	server := healthServer(other, nil)
+	t.Cleanup(server.Close)
+
+	descPath := db.RuntimeDescriptorPath("prj_abc")
+	if err := os.MkdirAll(filepath.Dir(descPath), 0o700); err != nil {
+		t.Fatalf("mkdir runtime: %v", err)
+	}
+	if err := os.WriteFile(descPath,
+		[]byte(`{"api_url":"`+server.URL+`","project_id":"prj_abc","daemon_pid":1234}`), 0o600); err != nil {
+		t.Fatalf("write runtime: %v", err)
+	}
+
+	_, err := Discover(context.Background(), "prj_abc", t.TempDir())
+	if !errors.Is(err, ErrDaemonUnavailable) {
+		t.Fatalf("Discover error = %v, want ErrDaemonUnavailable", err)
+	}
+}
+
+func TestDiscoveryFallsBackWhenRuntimeDescriptorStale(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(EnvOverride, "")
+
+	// Two endpoints: a stale one (runtime descriptor points
+	// at it but it reports the wrong project_id) and the
+	// correct one (session file api_url). Discovery must
+	// skip the stale one and accept the correct one.
+	staleProject := "prj_stale"
+	stale := healthServer(staleProject, nil)
+	t.Cleanup(stale.Close)
+
+	correctProject := "prj_abc"
+	correct := healthServer(correctProject, nil)
+	t.Cleanup(correct.Close)
+
+	descPath := db.RuntimeDescriptorPath("prj_abc")
+	if err := os.MkdirAll(filepath.Dir(descPath), 0o700); err != nil {
+		t.Fatalf("mkdir runtime: %v", err)
+	}
+	if err := os.WriteFile(descPath,
+		[]byte(`{"api_url":"`+stale.URL+`","project_id":"prj_abc","daemon_pid":1234}`), 0o600); err != nil {
+		t.Fatalf("write runtime: %v", err)
+	}
+	if _, err := WriteSessionFile("prj_abc", SessionFile{ProjectID: "prj_abc", APIURL: correct.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	disc, err := Discover(context.Background(), "prj_abc", t.TempDir())
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if disc.BaseURL != correct.URL {
+		t.Fatalf("BaseURL = %q, want %q (stale=%q skipped)", disc.BaseURL, correct.URL, stale.URL)
+	}
+	if !strings.HasPrefix(disc.Source, "session:") {
+		t.Fatalf("Source = %q, want session: prefix", disc.Source)
+	}
+}
+
+func TestDiscoveryFallsBackWhenSessionURLStale(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(EnvOverride, "")
+
+	// Runtime descriptor is correct; the session file
+	// (last-resort) is stale. Discovery must skip the
+	// session URL and accept the runtime descriptor.
+	correctProject := "prj_abc"
+	correct := healthServer(correctProject, nil)
+	t.Cleanup(correct.Close)
+
+	staleProject := "prj_stale"
+	stale := healthServer(staleProject, nil)
+	t.Cleanup(stale.Close)
+
+	descPath := db.RuntimeDescriptorPath("prj_abc")
+	if err := os.MkdirAll(filepath.Dir(descPath), 0o700); err != nil {
+		t.Fatalf("mkdir runtime: %v", err)
+	}
+	if err := os.WriteFile(descPath,
+		[]byte(`{"api_url":"`+correct.URL+`","project_id":"prj_abc","daemon_pid":1234}`), 0o600); err != nil {
+		t.Fatalf("write runtime: %v", err)
+	}
+	if _, err := WriteSessionFile("prj_abc", SessionFile{ProjectID: "prj_abc", APIURL: stale.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	disc, err := Discover(context.Background(), "prj_abc", t.TempDir())
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if disc.BaseURL != correct.URL {
+		t.Fatalf("BaseURL = %q, want %q (stale session URL skipped)", disc.BaseURL, correct.URL)
+	}
+	if !strings.HasPrefix(disc.Source, "runtime:") {
+		t.Fatalf("Source = %q, want runtime: prefix", disc.Source)
+	}
+}
+
+func TestParseHealthProjectIDEnvelope(t *testing.T) {
+	body := []byte(`{"data":{"ok":true,"project_id":"prj_xyz"},"meta":{"request_id":"req_1"}}`)
+	if got := parseHealthProjectID(body); got != "prj_xyz" {
+		t.Fatalf("parseHealthProjectID(envelope) = %q, want prj_xyz", got)
+	}
+	body = []byte(`{"ok":true,"project_id":"prj_flat"}`)
+	if got := parseHealthProjectID(body); got != "prj_flat" {
+		t.Fatalf("parseHealthProjectID(flat) = %q, want prj_flat", got)
+	}
+	if got := parseHealthProjectID([]byte(`not json`)); got != "" {
+		t.Fatalf("parseHealthProjectID(garbage) = %q, want empty", got)
+	}
+	if got := parseHealthProjectID(nil); got != "" {
+		t.Fatalf("parseHealthProjectID(nil) = %q, want empty", got)
+	}
+}
+
 func TestNormalizeBaseURL(t *testing.T) {
 	cases := map[string]string{
 		"http://127.0.0.1:3777/":   "http://127.0.0.1:3777",
@@ -556,6 +680,33 @@ func TestUnwrapArrayRejectsObjectResponse(t *testing.T) {
 	_, err = c.UnwrapArray(context.Background(), "GET", "/api/v1/runs", nil)
 	if err == nil {
 		t.Fatal("UnwrapArray accepted an object response, want decode error")
+	}
+}
+
+func TestRevokeCLISession(t *testing.T) {
+	var seenDelete bool
+	server := healthServer("prj_x", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/api/v1/auth/cli-sessions/current" {
+			seenDelete = true
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintln(w, `{"data":{"revoked":true,"matched":true},"meta":{}}`)
+			return
+		}
+	})
+	t.Cleanup(server.Close)
+	c, err := New(context.Background(), Config{ProjectID: "prj_x", BaseURL: server.URL, Token: "tok"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	matched, err := c.RevokeCLISession(context.Background())
+	if err != nil {
+		t.Fatalf("RevokeCLISession: %v", err)
+	}
+	if !matched {
+		t.Fatalf("matched = false, want true")
+	}
+	if !seenDelete {
+		t.Fatalf("daemon never saw DELETE")
 	}
 }
 

@@ -1752,6 +1752,209 @@ func TestRunEventsOfflineReturnsObjectShape(t *testing.T) {
 	}
 }
 
+// TestMutatingCommandMissingSessionExitsSeven pins the P2 #2 fix
+// in adversarial review. The operator runs a mutating command
+// while the daemon is reachable but the CLI bearer is
+// missing (e.g. session file deleted). The dispatcher must
+// surface an ErrUnauthorized envelope with exit 7, not
+// collapse to internal_error / exit 1.
+func TestMutatingCommandMissingSessionExitsSeven(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	// Persist a session file with an empty token so the
+	// daemonclient.New call returns ErrSessionMissing. The
+	// daemon is reachable, so discovery succeeds; the bearer
+	// is the missing piece.
+	path := app.CLISessionPath(projectID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir session: %v", err)
+	}
+	raw, _ := json.Marshal(map[string]any{"project_id": projectID, "api_url": server.URL, "token": ""})
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"issue", "create", "--project", dir, "--title", "missing session"})
+	})
+	if code != 7 {
+		t.Fatalf("issue create exit code = %d, want 7; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "unauthorized") {
+		t.Fatalf("stderr missing unauthorized: %s", stderr)
+	}
+	// The exact phrasing differs between the ReadSessionFile
+	// short-circuit ("CLI session token is empty") and the
+	// dispatcher wrap ("run 'symphony login' to
+	// authenticate"). Both are valid operator-actionable
+	// errors; we just want a token-related hint.
+	if !strings.Contains(stderr, "symphony login") && !strings.Contains(stderr, "CLI session") {
+		t.Fatalf("stderr missing operator-actionable guidance: %s", stderr)
+	}
+}
+
+// TestLogoutRevokesBearerOnDaemon pins the adversarial P2 #3
+// fix: `symphony login --logout` calls the daemon's
+// DELETE /api/v1/auth/cli-sessions/current before deleting
+// the local session files, so a copied bearer token can
+// no longer authorize mutating REST calls after logout.
+func TestLogoutRevokesBearerOnDaemon(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	var revokeCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		if r.Method == http.MethodDelete && r.URL.Path == "/api/v1/auth/cli-sessions/current" {
+			revokeCalled = true
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintln(w, `{"data":{"revoked":true,"matched":true},"meta":{}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":{"ok":true},"meta":{}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, stdout, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("logout exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if !revokeCalled {
+		t.Fatalf("daemon revoke endpoint never called")
+	}
+	if !strings.Contains(stdout, "revoked") {
+		t.Fatalf("logout stdout missing revoke status: %s", stdout)
+	}
+
+	// Local session files are gone.
+	if _, err := os.Stat(app.CLISessionPath(projectID)); !os.IsNotExist(err) {
+		t.Fatalf("project session file still present: %v", err)
+	}
+}
+
+// TestLogoutReportsDegradedIfRevocationFails pins the
+// degraded path: when the daemon is unreachable, logout
+// still deletes local files but reports that the
+// daemon-side revocation could not be confirmed.
+func TestLogoutReportsDegradedIfRevocationFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	st.Close()
+
+	// Point the session at an unreachable daemon so the
+	// revoke call fails.
+	if _, err := daemonclient.WriteSessionFile(st.ProjectID, daemonclient.SessionFile{ProjectID: st.ProjectID, APIURL: "http://127.0.0.1:1", Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, stdout, _ := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("logout exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "degraded") {
+		t.Fatalf("logout stdout missing degraded status: %s", stdout)
+	}
+}
+
+
+func TestReadOnlyCommandMissingSessionExitsSeven(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	path := app.CLISessionPath(projectID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir session: %v", err)
+	}
+	raw, _ := json.Marshal(map[string]any{"project_id": projectID, "api_url": server.URL, "token": ""})
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"issue", "list", "--project", dir})
+	})
+	if code != 7 {
+		t.Fatalf("issue list exit code = %d, want 7; stderr = %s", code, stderr)
+	}
+	// The exact code depends on whether the dispatcher sees a
+	// *core.APIError short-circuit (unauthorized) or the raw
+	// ErrSessionMissing sentinel that we wrap. Both are
+	// operator-actionable; this test pins the exit code and
+	// any token-related envelope, not the exact code.
+	if !strings.Contains(stderr, "unauthorized") && !strings.Contains(stderr, "daemon_unavailable") {
+		t.Fatalf("stderr missing session-related code: %s", stderr)
+	}
+}
+
+
+// `symphony workflow validate` is a read-only filesystem
+// inspection. When no daemon is reachable, the dispatcher
 // TestWorkflowValidateOfflineRuns pins the round-4 fix:
 // `symphony workflow validate` is a read-only filesystem
 // inspection. When no daemon is reachable, the dispatcher
