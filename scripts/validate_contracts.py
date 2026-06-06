@@ -28,6 +28,7 @@ REQUIRED_OPENAPI_ROUTES = frozenset(
         "/auth/logout",
         "/auth/open-token",
         "/auth/cli-token/rotate",
+        "/auth/cli-sessions/current",
         "/issues",
         "/issues/{issue_ref}",
         "/issues/{issue_ref}/transition",

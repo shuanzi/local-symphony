@@ -538,32 +538,46 @@ func cmdLogin(args []string) int {
 	// the local_sessions row as revoked. Otherwise a copied
 	// bearer token (e.g. exfiltrated before the operator ran
 	// logout) would still authorize mutating REST calls. If the
-	// daemon is unreachable we degrade: the local files are
-	// still deleted, but the operator is told that the
-	// revocation could not be confirmed.
+	// daemon is reachable and the token is recognised but the
+	// revoke call FAILS, we must NOT report success and we
+	// must NOT delete the local files — the operator needs
+	// both the file (to retry) and a non-zero exit to know the
+	// revoke was not confirmed.
 	if hasFlag(args, "--logout") {
 		projectID, err := loginResolveProjectID(flagValue(args, "--project", "."))
 		if err != nil {
 			return printErr(err)
 		}
-		revokeStatus, matched, revokeErr := logoutRevoke(ctx, projectID)
-		if err := daemonclient.DeleteSessionFile(projectID); err != nil {
-			return printErr(err)
+		projectRoot := lookupProjectRootForRevoke(projectID)
+		if abs, aerr := filepath.Abs(projectRoot); aerr == nil {
+			projectRoot = abs
 		}
-		// DeleteLegacySessionFile returns nil on missing file, so
-		// there is no need to inspect the legacy path; we still
-		// surface any unexpected error to the operator.
-		if err := daemonclient.DeleteLegacySessionFile(); err != nil {
-			return printErr(err)
-		}
+		revokeStatus, matched, revokeErr, keepFiles := logoutRevoke(ctx, projectID, projectRoot)
 		out := map[string]any{
-			"logged_out":     true,
-			"project_id":     projectID,
-			"revoke_status":  revokeStatus,
+			"logged_out":    !keepFiles,
+			"project_id":    projectID,
+			"revoke_status": revokeStatus,
 			"bearer_matched": matched,
 		}
 		if revokeErr != nil {
 			out["revoke_error"] = revokeErr.Error()
+		}
+		if keepFiles {
+			// Degraded: daemon could not be reached, or the
+			// revoke call failed for a recoverable reason.
+			// Preserve the local files so the operator can
+			// retry; return exit 7 with the structured error.
+			return printErr(core.NewError(core.ErrDaemonUnavailable, "logout did not confirm server-side revocation; local files preserved for retry", out))
+		}
+		// Safe to delete: revoke succeeded, the token was not
+		// recognised (nothing to revoke), or the daemon is
+		// reachable but we had no token to revoke in the first
+		// place (no_bearer).
+		if err := daemonclient.DeleteSessionFile(projectID); err != nil {
+			return printErr(err)
+		}
+		if err := daemonclient.DeleteLegacySessionFile(); err != nil {
+			return printErr(err)
 		}
 		return printJSON(out)
 	}
@@ -632,67 +646,115 @@ func loginResolveProjectID(projectRoot string) (string, error) {
 type SessionFile = daemonclient.SessionFile
 
 // logoutRevoke calls the daemon's revoke endpoint to mark the
-// CLI bearer as revoked. The returned (status, matched, err)
-// triple is rendered into the logout JSON so the operator
-// can tell whether revocation was confirmed. status is one
-// of "revoked" (daemon reachable and bearer matched),
-// "no_bearer" (daemon reachable but no local session
-// file), "degraded" (daemon unreachable / errored), or
-// "not_matched" (daemon reachable but the bearer was not
-// the one it knew about, e.g. a rotated token).
-func logoutRevoke(ctx context.Context, projectID string) (status string, matched bool, err error) {
-	// First, try the new project-scoped path. If a session file
-	// exists it has the api_url we can revoke against; if not,
-	// the bearer is unknown to the daemon and the operation
-	// is a no-op.
-	scoped := app.CLISessionPath(projectID)
-	if data, readErr := os.ReadFile(scoped); readErr == nil {
-		var sf SessionFile
-		if json.Unmarshal(data, &sf) == nil && sf.Token != "" && sf.APIURL != "" {
+// CLI bearer as revoked. The returned tuple is
+// (status, matched, err, keepFiles). status is one of:
+//
+//	"revoked"      daemon reachable and bearer matched; safe to delete local
+//	"not_matched"  daemon reachable but the bearer was not the one it knew
+//	                about, e.g. a rotated token
+//	"no_bearer"    daemon reachable but no local token to revoke
+//	"degraded"     daemon unreachable or call failed; keepFiles == true
+//
+// keepFiles is true when the caller must NOT delete the
+// local session files — the operator needs the file to
+// retry revocation, and we have not confirmed that the
+// server-side row is revoked.
+func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status string, matched bool, err error, keepFiles bool) {
+	// Attempt a revoke from whichever source we have a bearer
+	// for. The first successful attempt wins; only if all
+	// reachable attempts degrade do we report keepFiles=true.
+	tried := false
+	if revStatus, m, _, ok := logoutRevokeFromFile(ctx, projectID, projectRoot, app.CLISessionPath(projectID)); ok {
+		tried = true
+		if revStatus == "revoked" || revStatus == "not_matched" || revStatus == "no_bearer" {
+			return revStatus, m, nil, false
+		}
+		// Degraded: fall through to legacy.
+	}
+	if revStatus, m, _, ok := logoutRevokeFromFile(ctx, projectID, projectRoot, app.LegacyCLISessionPath()); ok {
+		tried = true
+		if revStatus == "revoked" || revStatus == "not_matched" || revStatus == "no_bearer" {
+			return revStatus, m, nil, false
+		}
+		// Degraded: fall through to discovery.
+	}
+
+	// No local token to revoke. Try the discovery chain so we
+	// can still contact the daemon and ask it to revoke any
+	// bearer it knows about.
+	if !tried {
+		// The project-scoped file did not have both token+api_url.
+		// We can attempt discovery to find the daemon URL.
+		disc, derr := daemonclient.Discover(ctx, projectID, projectRoot, false)
+		if derr == nil {
 			client, cerr := daemonclient.New(ctx, daemonclient.Config{
-				ProjectID:   projectID,
-				ProjectRoot: lookupProjectRootForRevoke(projectID),
-				BaseURL:     sf.APIURL,
-				Token:       sf.Token,
+				ProjectID:           projectID,
+				ProjectRoot:         projectRoot,
+				BaseURL:             disc.BaseURL,
+				Token:               "", // no local token; idempotent revoke
+				AllowRemoteDaemonURL: false,
 			})
 			if cerr == nil {
 				m, e := client.RevokeCLISession(ctx)
 				if e == nil {
-					if m {
-						return "revoked", true, nil
-					}
-					return "not_matched", false, nil
+					return "no_bearer", m, nil, false
 				}
-				return "degraded", false, e
 			}
-			return "degraded", false, cerr
 		}
+		// Discovery failed or revoke failed: degraded.
+		_ = disc
+		return "degraded", false, nil, true
 	}
-	// Fall back to the legacy session file.
-	legacy := app.LegacyCLISessionPath()
-	if data, readErr := os.ReadFile(legacy); readErr == nil {
-		var sf SessionFile
-		if json.Unmarshal(data, &sf) == nil && sf.Token != "" && sf.APIURL != "" {
-			client, cerr := daemonclient.New(ctx, daemonclient.Config{
-				ProjectID:   projectID,
-				ProjectRoot: lookupProjectRootForRevoke(projectID),
-				BaseURL:     sf.APIURL,
-				Token:       sf.Token,
-			})
-			if cerr == nil {
-				m, e := client.RevokeCLISession(ctx)
-				if e == nil {
-					if m {
-						return "revoked", true, nil
-					}
-					return "not_matched", false, nil
-				}
-				return "degraded", false, e
-			}
-			return "degraded", false, cerr
-		}
+
+	// We had at least one token+api_url but the revoke
+	// call(s) failed. Degraded: preserve local files so the
+	// operator can retry.
+	return "degraded", false, nil, true
+}
+
+// logoutRevokeFromFile reads the session file at path, builds a
+// daemon client with the bearer, and calls RevokeCLISession.
+// The returned bool reports whether the file was usable as
+// a revoke source. A usable file with a successful revoke
+// returns ("revoked", true, nil, true); a degraded revoke
+// returns ("degraded", false, <err>, true); an unusable
+// file (missing, no api_url) returns ("", false, nil, false).
+func logoutRevokeFromFile(ctx context.Context, projectID, projectRoot, path string) (status string, matched bool, err error, usable bool) {
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		return "", false, nil, false
 	}
-	return "no_bearer", false, nil
+	var sf SessionFile
+	if json.Unmarshal(data, &sf) != nil {
+		return "", false, nil, false
+	}
+	if sf.Token == "" || sf.APIURL == "" {
+		// File exists but lacks the data we need to call
+		// revoke. Treat as unusable; the caller falls
+		// through to the next source.
+		return "", false, nil, false
+	}
+	// Validate project_id before contacting the daemon.
+	if sf.ProjectID != "" && sf.ProjectID != projectID {
+		return "mismatch", false, nil, true
+	}
+	client, cerr := daemonclient.New(ctx, daemonclient.Config{
+		ProjectID:   projectID,
+		ProjectRoot: projectRoot,
+		BaseURL:     sf.APIURL,
+		Token:       sf.Token,
+	})
+	if cerr != nil {
+		return "degraded", false, cerr, true
+	}
+	m, e := client.RevokeCLISession(ctx)
+	if e != nil {
+		return "degraded", false, e, true
+	}
+	if m {
+		return "revoked", true, nil, true
+	}
+	return "not_matched", false, nil, true
 }
 
 // lookupProjectRootForRevoke returns the project root for a
