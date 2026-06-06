@@ -86,6 +86,16 @@ func Serve(opts ServeOptions) error {
 	schedulerCtx, stopScheduler := context.WithCancel(context.Background())
 	defer stopScheduler()
 	schedulerDone, schedulerDrained := runSchedulerTickLoopWithDrain(schedulerCtx, schedulerTickInterval(wf, st.RepoRoot), func() error {
+		// Gate dispatch on the current owner nonce. If the row has
+		// been reaped or superseded (e.g. another daemon took over
+		// after we missed a heartbeat), the nonce we hold is no
+		// longer the recorded one. Return early so we do not
+		// dispatch runs concurrently with the new owner; the
+		// heartbeat goroutine will surface the ownership loss to
+		// the main loop and trigger graceful shutdown.
+		if err := verifyOwnerNonceForDispatch(st, nonce); err != nil {
+			return err
+		}
 		return (orchestrator.Orchestrator{Store: st}).Tick()
 	})
 	heartbeatCtx, stopHeartbeat := context.WithCancel(context.Background())
@@ -161,6 +171,26 @@ func Serve(opts ServeOptions) error {
 // of going stale) with the cost of a full table scan.
 func reapInterval() time.Duration {
 	return time.Duration(store.DefaultRuntimeReapIntervalMS) * time.Millisecond
+}
+
+// verifyOwnerNonceForDispatch is the scheduler tick gate. It returns nil
+// if the recorded owner_nonce still matches the nonce the daemon acquired
+// with, ErrDaemonAlreadyRunning otherwise. The check is intentionally
+// cheap (one indexed lookup) so it can run on every tick without
+// measurable overhead; it is the C3 round-3 review P1 fix that closes
+// the window where a stale owner could still dispatch after another
+// daemon has reaped/taken over but before the heartbeat ticker noticed.
+func verifyOwnerNonceForDispatch(st *store.Store, nonce string) error {
+	currentNonce, err := st.GetRuntimeOwnerNonce()
+	if err != nil {
+		return fmt.Errorf("runtime owner nonce lookup: %w", err)
+	}
+	if currentNonce != nonce {
+		return core.NewError(core.ErrDaemonAlreadyRunning, "runtime owner nonce changed before tick; suppressing dispatch", map[string]any{
+			"project_id": st.ProjectID,
+		})
+	}
+	return nil
 }
 
 func runRuntimeReapLoop(ctx context.Context, interval time.Duration, st *store.Store) <-chan struct{} {

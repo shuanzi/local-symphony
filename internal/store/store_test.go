@@ -542,6 +542,67 @@ func TestReapStaleRuntimeDescriptorsWithLivePIDStaleHeartbeat(t *testing.T) {
 	}
 }
 
+// TestReapStaleRuntimeDescriptorsReapsMigratedRowWithEmptyNonce covers
+// the C3 round-3 review P2#1 fix. A v1 app DB that was upgraded by
+// MigrateAppSchema carries a row with owner_nonce = '' and heartbeat_at
+// = 0; if the original daemon crashed and the OS later reuses the same
+// PID for an unrelated process, the legacy compat path used to keep
+// the row live forever. The fix requires a non-empty owner_nonce for
+// the legacy compat branch, so the migrated row is reapable here and
+// the new owner can acquire the lock.
+func TestReapStaleRuntimeDescriptorsReapsMigratedRowWithEmptyNonce(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
+	}
+	// Simulate a row that the schema migration wrote: same daemon PID
+	// (we use os.Getpid() so processExists returns true and the dead
+	// PID check does not preempt the test), but with empty owner_nonce
+	// and heartbeat_at = 0. This is the worst-case migrated DB row:
+	// the recorded PID is alive in the OS (via reuse or coincidence)
+	// AND the row has no real owner_nonce to bind the lock to a
+	// specific daemon. The reap must remove it so the new owner can
+	// acquire the lock.
+	if err := st.App.Exec(`UPDATE runtime_descriptors SET owner_nonce='', heartbeat_at=0, heartbeat_ttl_ms=? WHERE project_id=?`, DefaultRuntimeHeartbeatTTLMS, st.ProjectID); err != nil {
+		t.Fatalf("simulate migrated-row state: %v", err)
+	}
+	count, err := st.ReapStaleRuntimeDescriptors()
+	if err != nil {
+		t.Fatalf("ReapStaleRuntimeDescriptors: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("ReapStaleRuntimeDescriptors reaped = %d, want 1 (migrated row with empty nonce must be reapable)", count)
+	}
+	rows, err := st.App.Query(`SELECT project_id FROM runtime_descriptors WHERE project_id=?`, st.ProjectID)
+	if err != nil {
+		t.Fatalf("query runtime_descriptors: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("runtime_descriptors rows = %d, want 0 after reap", len(rows))
+	}
+	// And a fresh owner can now acquire the lock without conflict.
+	freshNonce, err := NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce (fresh): %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:3", "http://127.0.0.1:4", os.Getpid(), freshNonce, DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce (fresh) after reap: %v", err)
+	}
+	row := runtimeDescriptorRow(t, st)
+	if got := row["owner_nonce"].String(); got != freshNonce {
+		t.Fatalf("runtime descriptor owner_nonce = %q, want fresh %q", got, freshNonce)
+	}
+}
+
 func TestNewOwnerNonceReturnsAtLeast32HexBytes(t *testing.T) {
 	got, err := NewOwnerNonce()
 	if err != nil {

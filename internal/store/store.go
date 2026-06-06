@@ -2472,7 +2472,8 @@ func (s *Store) CreateRuntimeDescriptorWithNonce(apiURL, toolURL string, pid int
 			if existingTTL <= 0 {
 				existingTTL = DefaultRuntimeHeartbeatTTLMS
 			}
-			if runtimeOwnerIsLive(existingPID, existingHB, existingTTL, nowMS) {
+			existingNonce := row["owner_nonce"].String()
+			if runtimeOwnerIsLive(existingPID, existingHB, existingTTL, nowMS, existingNonce) {
 				return core.NewError(core.ErrDaemonAlreadyRunning, "runtime ownership conflict: another daemon still owns this project", map[string]any{
 					"project_id":    s.ProjectID,
 					"daemon_pid":    existingPID,
@@ -2531,6 +2532,24 @@ func (s *Store) UpdateRuntimeHeartbeat(projectID, nonce string, ttlMS int) error
 	return nil
 }
 
+// GetRuntimeOwnerNonce returns the current owner_nonce for the project's
+// runtime descriptor. It returns the empty string when no row exists
+// (i.e. the project has no live owner). The scheduler tick loop uses
+// this to gate dispatch: if the returned nonce does not match the
+// nonce the daemon acquired with, the daemon has been reaped or
+// superseded and must stop dispatching immediately rather than wait
+// for the next heartbeat tick to surface the error.
+func (s *Store) GetRuntimeOwnerNonce() (string, error) {
+	row, err := s.App.QueryOne(`SELECT owner_nonce FROM runtime_descriptors WHERE project_id=?`, s.ProjectID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	return row["owner_nonce"].String(), nil
+}
+
 // ReapStaleRuntimeDescriptors removes all rows whose heartbeat has expired.
 // PID reuse must not affect this judgment — heartbeat staleness is the
 // authoritative signal. Returns the number of rows reaped.
@@ -2546,10 +2565,11 @@ func (s *Store) ReapStaleRuntimeDescriptors() (int, error) {
 		existingPID := r["daemon_pid"].Int()
 		hb := r["heartbeat_at"].Int64()
 		ttl := int64(r["heartbeat_ttl_ms"].Int())
+		nonce := r["owner_nonce"].String()
 		if ttl <= 0 {
 			ttl = DefaultRuntimeHeartbeatTTLMS
 		}
-		if runtimeOwnerIsLive(existingPID, hb, ttl, nowMS) {
+		if runtimeOwnerIsLive(existingPID, hb, ttl, nowMS, nonce) {
 			continue
 		}
 		if err := s.App.WithTx(func(tx *db.Tx) error {
@@ -2613,21 +2633,28 @@ func emitReapEvent(tx *db.Tx, projectID string, pid int, hbMS, ttlMS, nowMS int6
 //     TTL guard is the standard liveness signal; it remains in place so
 //     that PID reuse alone cannot fool a fresh owner into thinking the
 //     lock is held by the previous (gone) daemon.
-//  3. PID alive and no heartbeat recorded (hbMS == 0) → live. This is the
-//     legacy compat path for rows freshly written by the schema migration
-//     that have not yet had their first heartbeat tick.
+//  3. PID alive, heartbeat not yet recorded, AND the row carries a real
+//     owner_nonce → live. This is the legacy compat path for rows
+//     freshly written by a daemon that has not yet sent its first
+//     heartbeat tick. The nonce guard (C3 round-3 review P2#1)
+//     prevents a migrated v1 app DB row with owner_nonce = '' from
+//     pinning the lock to a reused PID forever.
 //  4. Otherwise → stale.
-func runtimeOwnerIsLive(pid int, hbMS, ttlMS, nowMS int64) bool {
+func runtimeOwnerIsLive(pid int, hbMS, ttlMS, nowMS int64, ownerNonce string) bool {
 	if pid <= 0 || !daemonProcessExists(pid) {
 		return false
 	}
 	if hbMS > 0 && ttlMS > 0 && hbMS+ttlMS > nowMS {
 		return true
 	}
-	if hbMS == 0 {
-		// Migrated row with no heartbeat yet: respect the legacy PID-only
-		// check so we never trample a daemon that just started up after
-		// the schema migration.
+	if hbMS == 0 && ownerNonce != "" {
+		// Migrated row with no heartbeat yet: respect the legacy
+		// PID-only check so we never trample a daemon that just
+		// started up after the schema migration, but only when the
+		// row carries a real owner_nonce. An empty nonce marks a
+		// pre-migration row that the schema migration backfilled;
+		// such a row is reapable even if its (stale) PID happens to
+		// be reused by a fresh process.
 		return true
 	}
 	return false

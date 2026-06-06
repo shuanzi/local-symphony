@@ -776,3 +776,55 @@ func TestServeExitsAfterHeartbeatOwnershipLost(t *testing.T) {
 		t.Fatal("Serve did not exit after heartbeat ownership loss")
 	}
 }
+
+// TestVerifyOwnerNonceForDispatchGatesDispatch covers the C3 round-3
+// review P1 fix. The scheduler tick must return ErrDaemonAlreadyRunning
+// (and therefore suppress Orchestrator.Tick) the moment the recorded
+// owner_nonce no longer matches the nonce the daemon acquired with.
+func TestVerifyOwnerNonceForDispatchGatesDispatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.InitProject(t.TempDir(), "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	nonce, err := store.NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce: %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:1", "http://127.0.0.1:2", os.Getpid(), nonce, store.DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce: %v", err)
+	}
+	// Active case: gate returns nil and dispatch is allowed.
+	if err := verifyOwnerNonceForDispatch(st, nonce); err != nil {
+		t.Fatalf("verifyOwnerNonceForDispatch (active) = %v, want nil", err)
+	}
+	// Reaped case: the row is gone. Gate must return the canonical
+	// error and the scheduler must NOT proceed to Orchestrator.Tick.
+	if err := st.App.Exec(`DELETE FROM runtime_descriptors WHERE project_id=?`, st.ProjectID); err != nil {
+		t.Fatalf("simulate reap: %v", err)
+	}
+	gateErr := verifyOwnerNonceForDispatch(st, nonce)
+	if gateErr == nil {
+		t.Fatal("verifyOwnerNonceForDispatch after reap = nil, want ErrDaemonAlreadyRunning")
+	}
+	apiErr := core.AsAPIError(gateErr)
+	if apiErr == nil || apiErr.Code != core.ErrDaemonAlreadyRunning {
+		t.Fatalf("gate error code = %v, want %s", gateErr, core.ErrDaemonAlreadyRunning)
+	}
+	// Superseded case: a new owner has taken over with a different nonce.
+	otherNonce, err := store.NewOwnerNonce()
+	if err != nil {
+		t.Fatalf("NewOwnerNonce (other): %v", err)
+	}
+	if err := st.CreateRuntimeDescriptorWithNonce("http://127.0.0.1:3", "http://127.0.0.1:4", os.Getpid(), otherNonce, store.DefaultRuntimeHeartbeatTTLMS); err != nil {
+		t.Fatalf("CreateRuntimeDescriptorWithNonce (other): %v", err)
+	}
+	gateErr = verifyOwnerNonceForDispatch(st, nonce)
+	if gateErr == nil {
+		t.Fatal("verifyOwnerNonceForDispatch after takeover = nil, want ErrDaemonAlreadyRunning")
+	}
+	if apiErr := core.AsAPIError(gateErr); apiErr == nil || apiErr.Code != core.ErrDaemonAlreadyRunning {
+		t.Fatalf("takeover gate error code = %v, want %s", gateErr, core.ErrDaemonAlreadyRunning)
+	}
+}
