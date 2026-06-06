@@ -771,6 +771,522 @@ func TestIssueCreatePropagatesInvalidRequestFromDaemon(t *testing.T) {
 	}
 }
 
+// TestMutatingCommandSurfacesAuthWhenSessionMissing covers the P1
+// regression: with a running daemon and no CLI bearer, the dispatcher
+// must NOT silently fall back to the local store for mutating
+// commands. The local store path would let `issue create` succeed
+// without daemon-side enforcement. Instead, the CLI should fail with
+// an auth error.
+func TestMutatingCommandSurfacesAuthWhenSessionMissing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	// Daemon is reachable but no session file. The dispatcher must
+	// surface the auth error rather than running the local store path.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintln(w, `{"error":{"code":"unauthorized","message":"session required","details":{}}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	// Persist only an api_url-bearing "session" with an empty token.
+	// newDaemonContext should treat this as ErrSessionMissing and
+	// surface the auth error to the CLI. WriteSessionFile rejects
+	// whitespace-only tokens, so we write the file directly to
+	// simulate the "session file exists but token is invalid" state.
+	{
+		path := app.CLISessionPath(projectID)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir session dir: %v", err)
+		}
+		raw, _ := json.Marshal(map[string]any{"project_id": projectID, "api_url": server.URL, "token": ""})
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatalf("write session file: %v", err)
+		}
+	}
+
+	// Confirm the local store has no issue yet.
+	st2, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	before, _ := st2.ListIssues(store.ListIssueOptions{Limit: 10})
+	st2.Close()
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"issue", "create", "--project", dir, "--title", "P1 test", "--description", "x"})
+	})
+	if code == 0 {
+		t.Fatalf("issue create succeeded while daemon had no session; want auth failure")
+	}
+	if !strings.Contains(stderr, "unauthorized") && !strings.Contains(stderr, "session missing") && !strings.Contains(stderr, "CLI session") {
+		t.Fatalf("stderr missing auth guidance: %s", stderr)
+	}
+
+	// Critical assertion: the local store was NOT mutated. The bug
+	// being fixed would have written a row.
+	st3, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st3.Close()
+	after, _ := st3.ListIssues(store.ListIssueOptions{Limit: 10})
+	if len(after) != len(before) {
+		t.Fatalf("local store was mutated despite auth failure: before=%d after=%d", len(before), len(after))
+	}
+}
+
+// TestOfflineStillFallsBackToLocalStore is the inverse of the P1
+// test: with no daemon reachable, the dispatcher must still run the
+// local store path so offline flows keep working.
+func TestOfflineStillFallsBackToLocalStore(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	st.Close()
+
+	code, stdout, _ := captureCLIOutput(t, func() int {
+		return Main([]string{"issue", "create", "--project", dir, "--title", "offline create"})
+	})
+	if code != 0 {
+		t.Fatalf("offline issue create exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "offline create") {
+		t.Fatalf("offline issue create stdout missing title: %s", stdout)
+	}
+}
+
+// TestReadCommandStillFallsBackToLocalStoreWhenSessionMissing
+// demonstrates that read-only commands keep the offline-fallback
+// safety net: when the daemon is reachable but no session, the
+// dispatcher surfaces an auth error, but the local store fallback is
+// only forbidden for mutating paths. Read-only commands still
+// succeed against the local store because the v1 plan's read paths
+// are intentionally daemon-best-effort.
+//
+// In practice, `issue list` is wired through withDaemonOrStore which
+// treats ErrSessionMissing as a hard error. This test pins that
+// behaviour so a future refactor cannot silently allow mutating
+// paths to fall back. We exercise the read path against a server
+// that returns the data; the local store would have no data.
+func TestReadCommandFailsAuthWhenSessionMissing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	// Write the session file directly to bypass the empty-token
+	// check in WriteSessionFile; the on-disk token is empty so
+	// daemonclient.New returns ErrSessionMissing.
+	{
+		path := app.CLISessionPath(projectID)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir session dir: %v", err)
+		}
+		raw, _ := json.Marshal(map[string]any{"project_id": projectID, "api_url": server.URL, "token": ""})
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatalf("write session file: %v", err)
+		}
+	}
+
+	// issue list with no bearer should fail (not silently fall back
+	// to the local store with empty results — the operator has been
+	// explicit about wanting the daemon path).
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"issue", "list", "--project", dir})
+	})
+	if code == 0 {
+		t.Fatalf("issue list succeeded with no session; want auth failure")
+	}
+	if !strings.Contains(stderr, "unauthorized") && !strings.Contains(stderr, "session") {
+		t.Fatalf("stderr missing auth error: %s", stderr)
+	}
+}
+
+// TestRunListDecodesArrayResponse covers P2 #1: /api/v1/runs returns a
+// JSON array, and UnwrapArray is the right helper. The test pins the
+// regression.
+func TestRunListDecodesArrayResponse(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	var seenMethod, seenPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		seenMethod = r.Method
+		seenPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":[{"id":"run_1","status":"running"},{"id":"run_2","status":"completed"}],"meta":{}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, stdout, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"run", "list", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("run list exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if seenMethod != "GET" || seenPath != "/api/v1/runs" {
+		t.Fatalf("daemon saw method=%s path=%s, want GET /api/v1/runs", seenMethod, seenPath)
+	}
+	if !strings.Contains(stdout, `"items"`) || !strings.Contains(stdout, "run_1") {
+		t.Fatalf("stdout missing run array: %s", stdout)
+	}
+}
+
+// TestApprovalListDecodesArrayResponse covers P2 #1 for approvals.
+func TestApprovalListDecodesArrayResponse(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":[{"id":"apr_1","status":"pending"}],"meta":{}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, stdout, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"approval", "list", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("approval list exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stdout, `"items"`) || !strings.Contains(stdout, "apr_1") {
+		t.Fatalf("stdout missing approval array: %s", stdout)
+	}
+}
+
+// TestRunEventsDecodesArrayResponse covers P2 #1 for run events.
+func TestRunEventsDecodesArrayResponse(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":[{"seq":1,"event_type":"started"},{"seq":2,"event_type":"finished"}],"meta":{}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, stdout, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"run", "events", "run_1", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("run events exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stdout, `"items"`) || !strings.Contains(stdout, "started") {
+		t.Fatalf("stdout missing events array: %s", stdout)
+	}
+}
+
+// TestWorkflowValidateUsesPOST covers P2 #2: workflow validate must use
+// POST against the daemon.
+func TestWorkflowValidateUsesPOST(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	var seenMethod string
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		seenMethod = r.Method
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":{"validation":{"valid":true,"issues":[]}},"meta":{}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"workflow", "validate", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("workflow validate exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if seenMethod != "POST" {
+		t.Fatalf("workflow validate used %s, want POST", seenMethod)
+	}
+	if !strings.Contains(string(seenBody), `"dry_run"`) {
+		t.Fatalf("workflow validate body missing dry_run: %s", string(seenBody))
+	}
+}
+
+// TestWorkflowReloadUsesPOST covers P2 #2 for reload.
+func TestWorkflowReloadUsesPOST(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	var seenMethod string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		seenMethod = r.Method
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":{"reloaded":true,"validation":{"valid":true}},"meta":{}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"workflow", "reload", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("workflow reload exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if seenMethod != "POST" {
+		t.Fatalf("workflow reload used %s, want POST", seenMethod)
+	}
+}
+
+// TestIssueListQueryStringPreserved covers P2 #3: the daemon-side
+// `/api/v1/issues?limit=1` must keep the query string after URL
+// building. url.JoinPath would percent-encode the `?` separator.
+func TestIssueListQueryStringPreserved(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	var seenRawQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		seenRawQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"data":{"items":[],"page":{"limit":1,"next_cursor":null,"has_more":false}},"meta":{}}`)
+	}))
+	t.Cleanup(server.Close)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{ProjectID: projectID, APIURL: server.URL, Token: "tok"}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"issue", "list", "--project", dir, "--limit", "1"})
+	})
+	if code != 0 {
+		t.Fatalf("issue list exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if seenRawQuery == "" {
+		t.Fatalf("daemon saw no query string; want limit=1")
+	}
+	if !strings.Contains(seenRawQuery, "limit=1") {
+		t.Fatalf("daemon query string = %q, want limit=1", seenRawQuery)
+	}
+}
+
+// TestLoginListWithoutProject covers P2 #4: `symphony login --list`
+// must work from a directory that is not a Local Symphony project.
+func TestLoginListWithoutProject(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	notAProject := t.TempDir()
+
+	code, stdout, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--list", "--project", notAProject})
+	})
+	if code != 0 {
+		t.Fatalf("login --list exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stdout, `"sessions"`) {
+		t.Fatalf("login --list stdout missing sessions: %s", stdout)
+	}
+}
+
+// TestLoginLogoutWithoutProjectSession covers P2 #4 for `--logout`:
+// the dispatcher should resolve the project_id from the project root
+// and not require the local store to be open. Even when the
+// project_id cannot be resolved (e.g. uninitialized directory), the
+// command should print a clear error rather than segfault.
+func TestLoginLogoutWithoutProjectSession(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	notAProject := t.TempDir()
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", notAProject})
+	})
+	if code == 0 {
+		t.Fatalf("login --logout succeeded in uninitialized project; want failure")
+	}
+	// The error must be a project-init / store-open error, not a
+	// segfault or a panic.
+	if !strings.Contains(stderr, "init") {
+		t.Fatalf("login --logout stderr missing init guidance: %s", stderr)
+	}
+}
+
+// TestIssueShowFallsBackToLocalStoreWhenSessionMissing ensures that
+// when the daemon is reachable but no session exists, the dispatcher
+// surfaces the auth error to the operator. This is the read-command
+// path that is the inverse of TestMutatingCommandSurfacesAuth.
+func TestIssueShowFailsAuthWhenSessionMissing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	// Write the session file directly to bypass the empty-token
+	// check in WriteSessionFile; the on-disk token is empty so
+	// daemonclient.New returns ErrSessionMissing.
+	{
+		path := app.CLISessionPath(projectID)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir session dir: %v", err)
+		}
+		raw, _ := json.Marshal(map[string]any{"project_id": projectID, "api_url": server.URL, "token": ""})
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatalf("write session file: %v", err)
+		}
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"issue", "show", "APP-1", "--project", dir})
+	})
+	if code == 0 {
+		t.Fatalf("issue show succeeded with no session; want auth failure")
+	}
+	if !strings.Contains(stderr, "session") && !strings.Contains(stderr, "unauthorized") {
+		t.Fatalf("issue show stderr missing auth error: %s", stderr)
+	}
+}
+
 func TestReadCLISessionTokenRejectsInvalidLegacySession(t *testing.T) {
 	tests := []struct {
 		name      string

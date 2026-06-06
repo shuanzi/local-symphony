@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -488,15 +489,14 @@ func cmdDiagnostics(args []string) int {
 // ~/.symphony/cli-sessions/<project>.json. The `symphony login` command is
 // the operator-visible way to ask "am I logged in?" and to surface a
 // helpful, project-aware error when the daemon is not running.
+//
+// --list and --logout do not require a project store; they operate on
+// the local session files only. The default (no flags) probes the
+// daemon and needs a project root to resolve a project_id.
 func cmdLogin(args []string) int {
-	projectRoot := flagValue(args, "--project", ".")
-	st, err := store.Open(projectRoot)
-	if err != nil {
-		return printErr(err)
-	}
-	defer st.Close()
 	ctx := contextWithTimeout()
 
+	// --list does not need a project store; list all saved sessions.
 	if hasFlag(args, "--list") {
 		sessions, err := daemonclient.ReadAllSessionFiles()
 		if err != nil {
@@ -509,15 +509,36 @@ func cmdLogin(args []string) int {
 		return printJSON(map[string]any{"sessions": out})
 	}
 
+	// --logout needs the project_id to delete the right file; resolve
+	// it lazily so the command works as long as the project root
+	// contains a valid project db.
 	if hasFlag(args, "--logout") {
-		if err := daemonclient.DeleteSessionFile(st.ProjectID); err != nil {
+		projectID, err := loginResolveProjectID(flagValue(args, "--project", "."))
+		if err != nil {
 			return printErr(err)
 		}
-		return printJSON(map[string]any{"logged_out": true, "project_id": st.ProjectID})
+		if err := daemonclient.DeleteSessionFile(projectID); err != nil {
+			return printErr(err)
+		}
+		return printJSON(map[string]any{"logged_out": true, "project_id": projectID})
 	}
+
+	projectRoot := flagValue(args, "--project", ".")
+	st, err := store.Open(projectRoot)
+	if err != nil {
+		return printErr(err)
+	}
+	defer st.Close()
 
 	dc, err := newDaemonContext(ctx, st)
 	if err != nil {
+		// Distinguish "no daemon" (offline guidance) from "daemon
+		// reachable but no session" (auth error). The newDaemonContext
+		// contract guarantees any returned err here is auth-related
+		// when a URL is resolvable.
+		if errors.Is(err, daemonclient.ErrSessionMissing) {
+			return printErr(core.NewError(core.ErrUnauthorized, "CLI session missing for this project; run 'symphony serve' to mint a new session", map[string]any{"project_id": st.ProjectID}))
+		}
 		return printErr(err)
 	}
 	if !dc.Available {
@@ -531,17 +552,30 @@ func cmdLogin(args []string) int {
 	}
 	if v, ok := data["authenticated"].(bool); ok && v {
 		return printJSON(map[string]any{
-			"project_id":  st.ProjectID,
-			"repo_root":   st.RepoRoot,
-			"api_url":     dc.Client.BaseURL,
-			"session":     "active",
-			"created_at":  "redacted",
+			"project_id": st.ProjectID,
+			"repo_root":  st.RepoRoot,
+			"api_url":    dc.Client.BaseURL,
+			"session":    "active",
+			"created_at": "redacted",
 		})
 	}
 	return printJSON(map[string]any{
 		"project_id": st.ProjectID,
 		"session":    "unauthenticated",
 	})
+}
+
+// loginResolveProjectID opens the project store at the given root and
+// returns its project_id. It is split out so that the --logout path
+// can resolve a project_id even when the rest of the command would
+// otherwise short-circuit on missing flags.
+func loginResolveProjectID(projectRoot string) (string, error) {
+	st, err := store.Open(projectRoot)
+	if err != nil {
+		return "", err
+	}
+	defer st.Close()
+	return st.ProjectID, nil
 }
 
 func cmdTool(args []string) int {
