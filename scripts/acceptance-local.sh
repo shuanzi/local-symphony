@@ -29,13 +29,40 @@ DAEMON_PID=$!
 # Tear down the daemon on exit regardless of which trap fires.
 cleanup_extended() { kill "$DAEMON_PID" 2>/dev/null || true; cleanup; }
 trap cleanup_extended EXIT
-# Wait for the daemon to bind by polling the runtime descriptor.
-for _ in $(seq 1 50); do
-  if [ -s "$TMP/.symphony/prj_"*".json" ] 2>/dev/null; then
-    break
+# Wait for the daemon to be reachable. The runtime descriptor is
+# written under $HOME/.symphony/runtime/ by db.RuntimeDir(); the
+# project_id is the SHA256-derived prj_<hash> string. We poll the
+# descriptor's existence and a successful /api/v1/health response
+# so the readiness check is correct on every startup latency.
+DAEMON_READY=0
+for _ in $(seq 1 100); do
+  if ls "$HOME/.symphony/runtime"/prj_*.json >/dev/null 2>&1; then
+    # Pick the first descriptor, extract its api_url, and probe.
+    API_URL=$(python3 -c '
+import json, glob, sys
+for p in glob.glob("'"$HOME"'/.symphony/runtime/prj_*.json"):
+    try:
+        with open(p) as f:
+            d = json.load(f)
+        if d.get("api_url"):
+            print(d["api_url"]); break
+    except Exception:
+        pass
+' 2>/dev/null)
+    if [ -n "$API_URL" ]; then
+      if curl -fsS "$API_URL/api/v1/health" >/dev/null 2>&1; then
+        DAEMON_READY=1
+        break
+      fi
+    fi
   fi
   sleep 0.1
 done
+if [ "$DAEMON_READY" -ne 1 ]; then
+  echo "acceptance-local: daemon failed to come up" >&2
+  cat "$SYMPHONY_DAEMON_LOG" >&2 || true
+  exit 1
+fi
 unset SYMPHONY_DAEMON_URL  # ensure discovery falls back to runtime descriptor
 "$BIN" issue create --title "Add greeting" --description "Implement a greeting helper" >/dev/null
 "$BIN" issue transition LOC-1 Ready >/dev/null

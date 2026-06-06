@@ -124,7 +124,13 @@ func withDaemonOrStore(ctx context.Context, st *store.Store, args []string, muta
 	// refuse to fall back so the operator sees the daemon-required
 	// error and re-runs the command once the daemon is back.
 	if mutating {
-		return nil, daemonclient.ErrDaemonUnavailable
+		// Wrap the sentinel as a *core.APIError so the operator-facing
+		// renderer (printErr → core.AsAPIError → core.ExitCodeForError)
+		// can map it to daemon_unavailable/exit 7. The raw sentinel
+		// would otherwise fall through to AsAPIError's default
+		// "internal_error" branch and exit 1, breaking the C4
+		// error-code contract documented in the v1 plan.
+		return nil, core.NewError(core.ErrDaemonUnavailable, "daemon is not running, start with 'symphony serve' or run 'symphony open --help' for project init", map[string]any{"mutating": true})
 	}
 	return storeFn(st)
 }

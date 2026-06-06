@@ -577,10 +577,12 @@ func cmdLogin(args []string) int {
 			"created_at": "redacted",
 		})
 	}
-	return printJSON(map[string]any{
-		"project_id": st.ProjectID,
-		"session":    "unauthenticated",
-	})
+	// Bearer (or cookie) was presented but the daemon did not
+	// recognise it. This branch must NOT exit 0 — operators and
+	// scripts that rely on `symphony login` to confirm session
+	// health expect non-zero when the token is expired or revoked.
+	// Render an explicit error envelope and return exit 7.
+	return printErr(core.NewError(core.ErrUnauthorized, "CLI session is invalid; run 'symphony serve' to refresh", map[string]any{"project_id": st.ProjectID, "session": "unauthenticated"}))
 }
 
 // loginResolveProjectID opens the project store at the given root and
