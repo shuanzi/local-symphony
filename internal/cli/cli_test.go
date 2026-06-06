@@ -1752,6 +1752,60 @@ func TestRunEventsOfflineReturnsObjectShape(t *testing.T) {
 	}
 }
 
+// TestWorkflowValidateOfflineRuns pins the round-4 fix:
+// `symphony workflow validate` is a read-only filesystem
+// inspection. When no daemon is reachable, the dispatcher
+// must run the local workflowData fallback so offline
+// operators can still validate their WORKFLOW.md.
+func TestWorkflowValidateOfflineRuns(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	if _, err := store.InitProject(dir, "APP"); err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+
+	code, stdout, _ := captureCLIOutput(t, func() int {
+		return Main([]string{"workflow", "validate", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("offline workflow validate exit code = %d, want 0", code)
+	}
+	// Local validation returns a "source: current_filesystem"
+	// marker so operators can tell whether the daemon or the
+	// local store produced the payload.
+	if !strings.Contains(stdout, "current_filesystem") {
+		t.Fatalf("offline workflow validate stdout missing local marker: %s", stdout)
+	}
+}
+
+// TestWorkflowReloadOfflineRefuses pins the inverse:
+// `symphony workflow reload` rewrites on-disk workflow
+// state, so it is correctly classified as mutating. The
+// dispatcher must NOT fall back to the local store when the
+// daemon is unreachable; the operator must run `symphony
+// serve` first.
+func TestWorkflowReloadOfflineRefuses(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	if _, err := store.InitProject(dir, "APP"); err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"workflow", "reload", "--project", dir})
+	})
+	if code != 7 {
+		t.Fatalf("offline workflow reload exit code = %d, want 7; stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "daemon_unavailable") {
+		t.Fatalf("offline workflow reload stderr missing daemon_unavailable: %s", stderr)
+	}
+}
+
 // TestLegacyLogoutRemovesLegacySession pins the P2 #3 fix:
 // `symphony login --logout` must also delete the legacy
 // ~/.symphony/cli-session.json file, not only the new

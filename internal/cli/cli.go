@@ -464,7 +464,14 @@ func cmdWorkflow(args []string) int {
 	projectRoot := flagValue(args[1:], "--project", ".")
 	switch args[0] {
 	case "validate":
-		return dispatchWithStore(ctx, projectRoot, args[1:], true,
+		// workflow validate is a read-only filesystem inspection:
+		// it loads the on-disk WORKFLOW.md, runs the validation
+		// pipeline, and returns the result without writing
+		// anything. The daemon endpoint is the authoritative
+		// path when available, but offline operators must still
+		// be able to validate their workflow — that's the whole
+		// point of the local workflowData fallback.
+		return dispatchWithStore(ctx, projectRoot, args[1:], false,
 			workflowDataFromClient("validate"),
 			workflowData)
 	case "reload":
