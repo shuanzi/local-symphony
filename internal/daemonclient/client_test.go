@@ -277,7 +277,7 @@ func TestSessionWriteFileIs0600AndReadable(t *testing.T) {
 	if got := st.Mode().Perm(); got != 0o600 {
 		t.Fatalf("perm = %o, want 0600", got)
 	}
-	sf, err := ReadSessionFile(path, projectID)
+	sf, err := ReadSessionFile(path, projectID, "")
 	if err != nil {
 		t.Fatalf("ReadSessionFile: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestSessionReadRejectsEmptyToken(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"project_id":"`+projectID+`","token":""}`), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, err := ReadSessionFile(path, projectID); err == nil {
+	if _, err := ReadSessionFile(path, projectID, ""); err == nil {
 		t.Fatal("ReadSessionFile accepted empty token")
 	}
 }
@@ -310,7 +310,7 @@ func TestSessionReadRejectsMismatchedProject(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"project_id":"prj_b","token":"x"}`), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, err := ReadSessionFile(path, "prj_a"); err == nil {
+	if _, err := ReadSessionFile(path, "prj_a", ""); err == nil {
 		t.Fatal("ReadSessionFile accepted mismatched project")
 	}
 }
@@ -822,4 +822,87 @@ func TestDeleteLegacySessionFile(t *testing.T) {
 	if err := DeleteLegacySessionFile(); err != nil {
 		t.Fatalf("DeleteLegacySessionFile (idempotent): %v", err)
 	}
+}
+
+// TestReadSessionFileRejectsMismatchedRepoRoot pins the
+// HIGH #1 fix from adversarial round 4: ReadSessionFile
+// must reject a session file whose persisted repo_root does
+// not match the caller's normalised repo_root. A copied
+// project DB that reuses a foreign project_id inherits that
+// project's id from the new location's metadata, but the
+// session file's repo_root records the actual checkout the
+// bearer was minted for. A mismatch proves the bearer
+// belongs to a different repo and must not be honoured.
+func TestReadSessionFileRejectsMismatchedRepoRoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	projectID := "prj_x"
+	foreignRepo := t.TempDir()
+	currentRepo := t.TempDir()
+	sessionPath := app.CLISessionPath(projectID)
+	if err := os.MkdirAll(filepath.Dir(sessionPath), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"project_id": projectID,
+		"repo_root":  foreignRepo,
+		"token":      "tok-foreign",
+	})
+	if err := os.WriteFile(sessionPath, body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := ReadSessionFile(sessionPath, projectID, currentRepo)
+	if err == nil {
+		t.Fatal("ReadSessionFile accepted session file with mismatched repo_root")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrUnauthorized {
+		t.Fatalf("error code = %s, want %s", got, core.ErrUnauthorized)
+	}
+}
+
+// TestReadSessionFileAcceptsMatchingRepoRoot pins the
+// happy path: when the session file's persisted repo_root
+// matches the caller's normalised repo_root, the session
+// is accepted. Also covers the legacy no-repo_root fallback
+// (empty persisted RepoRoot) so older session files that
+// predate the repo_root field keep working.
+func TestReadSessionFileAcceptsMatchingRepoRoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	projectID := "prj_match"
+	repoRoot := t.TempDir()
+
+	t.Run("matching repo_root", func(t *testing.T) {
+		sessionPath := app.CLISessionPath(projectID)
+		if err := os.MkdirAll(filepath.Dir(sessionPath), 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		body, _ := json.Marshal(map[string]any{
+			"project_id": projectID,
+			"repo_root":  repoRoot,
+			"token":      "tok-match",
+		})
+		if err := os.WriteFile(sessionPath, body, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		sf, err := ReadSessionFile(sessionPath, projectID, repoRoot)
+		if err != nil {
+			t.Fatalf("ReadSessionFile rejected matching repo_root: %v", err)
+		}
+		if sf.Token != "tok-match" {
+			t.Fatalf("token = %q, want tok-match", sf.Token)
+		}
+	})
+
+	t.Run("empty persisted repo_root is accepted", func(t *testing.T) {
+		sessionPath := app.CLISessionPath(projectID)
+		body, _ := json.Marshal(map[string]any{
+			"project_id": projectID,
+			"token":      "tok-no-root",
+		})
+		if err := os.WriteFile(sessionPath, body, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if _, err := ReadSessionFile(sessionPath, projectID, repoRoot); err != nil {
+			t.Fatalf("ReadSessionFile rejected session with empty persisted repo_root: %v", err)
+		}
+	})
 }

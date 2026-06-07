@@ -179,6 +179,11 @@ func discoverCandidates(projectID, projectRoot, baseURLHint string) []discoverCa
 // a project-scoped bearer session from disk before returning. The caller
 // should treat an ErrSessionMissing return as "user must run `symphony serve`
 // first"; the CLI is not allowed to mint its own CLI session.
+//
+// ProjectRoot is propagated to the on-disk session lookup so a session
+// file whose persisted repo_root does not match the running project is
+// rejected: a copied project DB that reuses a foreign project_id must
+// not be able to load that other project's CLI bearer.
 func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.ProjectID == "" {
 		return nil, fmt.Errorf("daemonclient: projectID is required")
@@ -197,7 +202,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	token := strings.TrimSpace(cfg.Token)
 	if token == "" {
-		token, err = loadCLISessionToken(cfg.ProjectID)
+		token, err = loadCLISessionToken(cfg.ProjectID, cfg.ProjectRoot)
 		if err != nil {
 			return nil, err
 		}

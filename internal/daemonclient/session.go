@@ -28,9 +28,15 @@ type SessionFile struct {
 // falls back to the legacy ~/.symphony/cli-session.json file. An empty
 // project mismatch or empty token is reported as ErrSessionMissing so the
 // caller can render a single, action-oriented error.
-func loadCLISessionToken(projectID string) (string, error) {
+//
+// repoRoot is the absolute path of the project whose CLI session we are
+// loading. A non-empty repoRoot is matched against the session file's
+// persisted repo_root and any mismatch is treated as a hard error: a copied
+// project DB that reuses a foreign project_id must not be able to load and
+// send that other project's CLI bearer through this process.
+func loadCLISessionToken(projectID, repoRoot string) (string, error) {
 	path := app.CLISessionPath(projectID)
-	tok, err := readSessionToken(path, projectID)
+	tok, err := readSessionToken(path, projectID, repoRoot)
 	if err == nil {
 		return tok, nil
 	}
@@ -38,7 +44,7 @@ func loadCLISessionToken(projectID string) (string, error) {
 		// Permission / parse errors are not recoverable via fallback.
 		return "", err
 	}
-	tok, legacyErr := readSessionToken(app.LegacyCLISessionPath(), projectID)
+	tok, legacyErr := readSessionToken(app.LegacyCLISessionPath(), projectID, repoRoot)
 	if legacyErr == nil {
 		return tok, nil
 	}
@@ -51,7 +57,15 @@ func loadCLISessionToken(projectID string) (string, error) {
 // ReadSessionFile loads and validates the session file at path. It is
 // exported because CLI tests and the `symphony login` flow both need to
 // inspect the persisted credentials.
-func ReadSessionFile(path, projectID string) (SessionFile, error) {
+//
+// projectID must match the persisted project_id; repoRoot, when non-empty,
+// must also match the persisted repo_root. The repo_root guard prevents a
+// copied project DB from loading the wrong repo's CLI bearer: the copied
+// DB inherits a foreign project_id, but the session file's repo_root
+// records the actual checkout the bearer was minted for. A mismatch is
+// reported as ErrSessionMissing so the caller renders a single,
+// action-oriented error instead of silently routing the foreign bearer.
+func ReadSessionFile(path, projectID, repoRoot string) (SessionFile, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return SessionFile{}, err
@@ -66,11 +80,60 @@ func ReadSessionFile(path, projectID string) (SessionFile, error) {
 	if strings.TrimSpace(sf.Token) == "" {
 		return SessionFile{}, core.NewError(core.ErrUnauthorized, "CLI session token is empty", nil)
 	}
+	if err := checkSessionRepoRoot(sf, repoRoot); err != nil {
+		return SessionFile{}, err
+	}
 	return sf, nil
 }
 
-func readSessionToken(path, projectID string) (string, error) {
-	sf, err := ReadSessionFile(path, projectID)
+// checkSessionRepoRoot enforces the repo_root trust boundary. A session
+// file with a non-empty RepoRoot that does not match the caller's
+// normalised repoRoot is rejected. Sessions persisted before the
+// repo_root field was added carry an empty RepoRoot, and callers that
+// don't have a repoRoot (legacy paths) pass an empty string; both
+// continue to be accepted so the new check is strictly additive.
+func checkSessionRepoRoot(sf SessionFile, repoRoot string) error {
+	if repoRoot == "" {
+		return nil
+	}
+	if strings.TrimSpace(sf.RepoRoot) == "" {
+		return nil
+	}
+	want, err := normaliseRepoRootForCompare(repoRoot)
+	if err != nil {
+		return nil // can't normalise; don't block on a host-side issue
+	}
+	got, err := normaliseRepoRootForCompare(sf.RepoRoot)
+	if err != nil {
+		return nil
+	}
+	if want != got {
+		return core.NewError(core.ErrUnauthorized, "CLI session is not valid for this project repository", nil)
+	}
+	return nil
+}
+
+// normaliseRepoRootForCompare resolves symlinks and cleans the path so
+// "/a" and "/a/." and a symlink pointing at "/a" all compare equal. It
+// returns an error for paths the OS cannot resolve; the caller treats
+// resolution errors as "skip the check" rather than rejecting the
+// session, because the cost of false negatives is high (operator locked
+// out) and the cost of false positives is mitigated by the project_id
+// and api_url checks that run first.
+func normaliseRepoRootForCompare(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func readSessionToken(path, projectID, repoRoot string) (string, error) {
+	sf, err := ReadSessionFile(path, projectID, repoRoot)
 	if err != nil {
 		return "", err
 	}

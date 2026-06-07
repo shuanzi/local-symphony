@@ -134,7 +134,7 @@ func openDescriptor(project string) (map[string]any, error) {
 		return nil, err
 	}
 	apiURL, _ := desc["api_url"].(string)
-	token, err := readCLISessionToken(st.ProjectID)
+	token, err := readCLISessionToken(st.ProjectID, st.RepoRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -146,21 +146,22 @@ func openDescriptor(project string) (map[string]any, error) {
 	return desc, nil
 }
 
-func readCLISessionToken(projectID string) (string, error) {
-	token, err := readCLISessionTokenFromPath(app.CLISessionPath(projectID), projectID)
+func readCLISessionToken(projectID, repoRoot string) (string, error) {
+	token, err := readCLISessionTokenFromPath(app.CLISessionPath(projectID), projectID, repoRoot)
 	if err == nil || !os.IsNotExist(err) {
 		return token, err
 	}
-	return readCLISessionTokenFromPath(app.LegacyCLISessionPath(), projectID)
+	return readCLISessionTokenFromPath(app.LegacyCLISessionPath(), projectID, repoRoot)
 }
 
-func readCLISessionTokenFromPath(path, projectID string) (string, error) {
+func readCLISessionTokenFromPath(path, projectID, repoRoot string) (string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
 	var session struct {
 		ProjectID string `json:"project_id"`
+		RepoRoot  string `json:"repo_root,omitempty"`
 		Token     string `json:"token"`
 	}
 	if err := json.Unmarshal(b, &session); err != nil {
@@ -169,7 +170,48 @@ func readCLISessionTokenFromPath(path, projectID string) (string, error) {
 	if session.ProjectID != projectID || strings.TrimSpace(session.Token) == "" {
 		return "", core.NewError(core.ErrUnauthorized, "CLI session is not valid for this project", nil)
 	}
+	if err := checkCLISessionRepoRoot(session.RepoRoot, repoRoot); err != nil {
+		return "", err
+	}
 	return session.Token, nil
+}
+
+// checkCLISessionRepoRoot mirrors daemonclient's repo_root guard. A
+// session file with a non-empty RepoRoot that does not match the
+// caller's normalised repoRoot is rejected. Pre-repo_root sessions
+// (empty RepoRoot) and callers without a repoRoot (legacy paths) are
+// both accepted so the new check is strictly additive.
+func checkCLISessionRepoRoot(persisted, caller string) error {
+	if caller == "" {
+		return nil
+	}
+	if strings.TrimSpace(persisted) == "" {
+		return nil
+	}
+	want, err := normaliseRepoRootForCompare(caller)
+	if err != nil {
+		return nil
+	}
+	got, err := normaliseRepoRootForCompare(persisted)
+	if err != nil {
+		return nil
+	}
+	if want != got {
+		return core.NewError(core.ErrUnauthorized, "CLI session is not valid for this project repository", nil)
+	}
+	return nil
+}
+
+func normaliseRepoRootForCompare(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(resolved), nil
 }
 
 func requestOpenToken(apiURL, token string) (string, error) {
@@ -573,11 +615,34 @@ func cmdLogin(args []string) int {
 		// recognised (nothing to revoke), or the daemon is
 		// reachable but we had no token to revoke in the first
 		// place (no_bearer).
+		//
+		// The legacy ~/.symphony/cli-session.json file is only
+		// deleted when its persisted project_id matches the
+		// project we are logging out of. A residual legacy file
+		// owned by a DIFFERENT project is preserved and
+		// reported in the operator output. The fix is required
+		// because the legacy file is single-instance (not
+		// per-project): a multi-project operator who upgraded
+		// from pre-v1.1 keeps ONE legacy file whose project_id
+		// is whichever project they last logged into. An
+		// unconditional delete would silently wipe the other
+		// project's legacy bearer record while leaving its
+		// server-side row still valid. We must not auto-revoke
+		// the other project (chained side-effects); we
+		// preserve and report.
 		if err := daemonclient.DeleteSessionFile(projectID); err != nil {
 			return printErr(err)
 		}
-		if err := daemonclient.DeleteLegacySessionFile(); err != nil {
-			return printErr(err)
+		legacyResidual, legacyPath, legacyErr := deleteLegacySessionIfOwnedBy(projectID)
+		if legacyErr != nil {
+			return printErr(legacyErr)
+		}
+		if legacyResidual != "" {
+			out["legacy_preserved"] = map[string]any{
+				"reason": "residual legacy session belongs to a different project",
+				"project_id": legacyResidual,
+				"path": legacyPath,
+			}
 		}
 		return printJSON(out)
 	}
@@ -779,6 +844,59 @@ func logoutRevokeFromFile(ctx context.Context, projectID, projectRoot, path stri
 		return "revoked", true, nil, true
 	}
 	return "not_matched", false, nil, true
+}
+
+// deleteLegacySessionIfOwnedBy removes the legacy
+// ~/.symphony/cli-session.json file ONLY when its persisted
+// project_id matches the project we are logging out of. The
+// returned residualProjectID is non-empty when the legacy
+// file exists, parses, and belongs to a different project —
+// the caller surfaces this in the operator-visible output so
+// the operator knows to clean it up out-of-band.
+//
+// Resolution rules:
+//   - missing file   → delete (no-op), residual ""
+//   - unreadable     → preserve, residual "" (we cannot tell
+//                       ownership; deleting might remove a
+//                       foreign project's record)
+//   - empty / unset
+//     project_id     → delete (no ownership claim means it
+//                       cannot be foreign); residual ""
+//   - same project   → delete, residual ""
+//   - foreign project → preserve, residual "<project_id>"
+//
+// The path is returned so the operator knows exactly where the
+// preserved residual lives. It is the responsibility of the
+// calling test or operator to clean it up out-of-band; we do
+// not auto-revoke foreign projects (chained side effects).
+func deleteLegacySessionIfOwnedBy(currentProjectID string) (residualProjectID, residualPath string, err error) {
+	path := app.LegacyCLISessionPath()
+	residualPath = path
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		if os.IsNotExist(readErr) {
+			return "", "", nil
+		}
+		// Unreadable: cannot prove ownership. Preserve so a
+		// foreign project is not silently wiped.
+		return "", path, nil
+	}
+	var probe struct {
+		ProjectID string `json:"project_id"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		// Unparseable: same as unreadable — preserve rather
+		// than delete a record we cannot attribute.
+		return "", path, nil
+	}
+	owned := probe.ProjectID == "" || probe.ProjectID == currentProjectID
+	if !owned {
+		return probe.ProjectID, path, nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return "", "", err
+	}
+	return "", "", nil
 }
 
 // lookupProjectRootForRevoke returns the project root for a
