@@ -92,6 +92,18 @@ func ReadSessionFile(path, projectID, repoRoot string) (SessionFile, error) {
 // repo_root field was added carry an empty RepoRoot, and callers that
 // don't have a repoRoot (legacy paths) pass an empty string; both
 // continue to be accepted so the new check is strictly additive.
+//
+// Round 6 HIGH #1 fix: EvalSymlinks failures no longer fall through
+// silently. Previously, if either the caller's repoRoot or the
+// session file's persisted RepoRoot could not be resolved (e.g. the
+// original checkout was moved or deleted after the session was
+// minted), the guard returned nil and the foreign bearer was
+// accepted. The trust boundary must be fail-closed: when we cannot
+// positively confirm the session belongs to this checkout we must
+// reject it as unauthorized. The cost of false negatives (operator
+// re-runs `symphony serve` to mint a new session) is bounded; the
+// cost of false positives (a foreign project DB silently authenticates
+// against this checkout's session) is data exfiltration.
 func checkSessionRepoRoot(sf SessionFile, repoRoot string) error {
 	if repoRoot == "" {
 		return nil
@@ -101,11 +113,11 @@ func checkSessionRepoRoot(sf SessionFile, repoRoot string) error {
 	}
 	want, err := normaliseRepoRootForCompare(repoRoot)
 	if err != nil {
-		return nil // can't normalise; don't block on a host-side issue
+		return core.NewError(core.ErrUnauthorized, "CLI session is not valid for this project repository", nil)
 	}
 	got, err := normaliseRepoRootForCompare(sf.RepoRoot)
 	if err != nil {
-		return nil
+		return core.NewError(core.ErrUnauthorized, "CLI session is not valid for this project repository", nil)
 	}
 	if want != got {
 		return core.NewError(core.ErrUnauthorized, "CLI session is not valid for this project repository", nil)
@@ -116,10 +128,10 @@ func checkSessionRepoRoot(sf SessionFile, repoRoot string) error {
 // normaliseRepoRootForCompare resolves symlinks and cleans the path so
 // "/a" and "/a/." and a symlink pointing at "/a" all compare equal. It
 // returns an error for paths the OS cannot resolve; the caller treats
-// resolution errors as "skip the check" rather than rejecting the
-// session, because the cost of false negatives is high (operator locked
-// out) and the cost of false positives is mitigated by the project_id
-// and api_url checks that run first.
+// resolution errors as an authorization failure (see
+// checkSessionRepoRoot). Fail-closed here is what prevents a copied
+// project DB whose original checkout was deleted from inheriting an
+// attacker-controlled session file.
 func normaliseRepoRootForCompare(p string) (string, error) {
 	abs, err := filepath.Abs(p)
 	if err != nil {

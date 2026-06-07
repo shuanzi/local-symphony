@@ -223,6 +223,14 @@ func readCLISessionTokenFromPath(path, projectID, repoRoot string) (string, erro
 // caller's normalised repoRoot is rejected. Pre-repo_root sessions
 // (empty RepoRoot) and callers without a repoRoot (legacy paths) are
 // both accepted so the new check is strictly additive.
+//
+// Round 6 HIGH #1 fix: EvalSymlinks failures no longer fall through
+// silently. When the original checkout referenced by a persisted
+// repo_root is gone (move, delete, container restart) the path
+// resolution fails; the previous code treated that as "skip the
+// check", which let a foreign bearer be accepted. The trust
+// boundary must be fail-closed: an unresolvable path is a
+// authorization failure, not a skip.
 func checkCLISessionRepoRoot(persisted, caller string) error {
 	if caller == "" {
 		return nil
@@ -232,11 +240,11 @@ func checkCLISessionRepoRoot(persisted, caller string) error {
 	}
 	want, err := normaliseRepoRootForCompare(caller)
 	if err != nil {
-		return nil
+		return core.NewError(core.ErrUnauthorized, "CLI session is not valid for this project repository", nil)
 	}
 	got, err := normaliseRepoRootForCompare(persisted)
 	if err != nil {
-		return nil
+		return core.NewError(core.ErrUnauthorized, "CLI session is not valid for this project repository", nil)
 	}
 	if want != got {
 		return core.NewError(core.ErrUnauthorized, "CLI session is not valid for this project repository", nil)
@@ -782,6 +790,22 @@ func loginResolveProject(projectRoot string) (string, string, error) {
 // authoritative revoke (the project-scoped file whose
 // api_url was used to mint the bearer) cannot be cleared
 // by a non-authoritative source's terminal reply.
+//
+// Round 6 HIGH #2 (project-scoped validation failure is
+// sticky): when the project-scoped session file EXISTS but
+// fails validation (project_id mismatch, repo_root guard,
+// EvalSymlinks failure, or any error ReadSessionFile raises
+// for content reasons), the file is unusable as a revoke
+// source. It is also not safe to delete: an unvalidated
+// project-scoped file is a foreign bearer record (copied
+// project DB, deleted checkout, or an unresolvable
+// repo_root). Deleting it would report `logged_out: true`
+// while the daemon-side local_sessions row stays active and
+// the bearer remains usable. The fix treats a project-scoped
+// validation failure the same way as a degraded revoke: it
+// is sticky across the fallback chain, the legacy file's
+// terminal reply cannot clear it, and the caller keeps the
+// file (and exits degraded).
 func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status string, matched bool, err error, keepFiles bool) {
 	// Per-source tracking. `degraded` is sticky across the
 	// fallback chain: once any reachable source fails to
@@ -791,26 +815,54 @@ func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status st
 	// bearer is the one whose server-side row is unverified.
 	degraded := false
 	tried := false
+	// projectScopedValidationFailed captures the case where
+	// the project-scoped file exists but its content failed
+	// validation (project_id mismatch, repo_root guard, etc.).
+	// We do NOT treat that file as a usable revoke source AND
+	// we do NOT let the caller delete it: a foreign project
+	// DB whose session file failed validation has a bearer we
+	// have not (and cannot) confirm revoked server-side.
+	projectScopedValidationFailed := false
 
 	// Authoritative source: the project-scoped session file
 	// (api_url + token). This is the one the bearer was
 	// minted for; a degraded call here is the only one that
 	// is truly unrecoverable for the current token.
-	if revStatus, m, _, ok := logoutRevokeFromFile(ctx, projectID, projectRoot, app.CLISessionPath(projectID)); ok {
+	//
+	// Round 6 HIGH #2: when the project-scoped file EXISTS
+	// but fails validation, the result tuple carries
+	// validationFailed=true AND usable=true. The caller
+	// branch below treats this as sticky degraded: the
+	// file is not deleted, the legacy file's terminal
+	// reply cannot clear the failure, and the discovery
+	// fallback chain is not consulted.
+	//
+	// usable=false is reserved for the missing-file case,
+	// which is the only outcome where the project-scoped
+	// source is genuinely absent and we should fall
+	// through to the legacy source and (if needed) the
+	// discovery chain.
+	if revStatus, m, _, ok, valFailed := logoutRevokeFromFile(ctx, projectID, projectRoot, app.CLISessionPath(projectID)); ok {
 		tried = true
-		switch revStatus {
-		case "revoked", "not_matched", "no_bearer":
-			// not_matched still clears degraded: a
-			// reachable daemon explicitly told us
-			// "I do not know this token", which is
-			// a positive terminal result for the
-			// current source. The local file can
-			// safely be deleted because there is
-			// nothing to revoke server-side.
-			return revStatus, m, nil, false
-		case "degraded":
+		if valFailed {
+			projectScopedValidationFailed = true
 			degraded = true
 			// fall through to legacy
+		} else {
+			switch revStatus {
+			case "revoked", "not_matched", "no_bearer":
+				// not_matched still clears degraded: a
+				// reachable daemon explicitly told us
+				// "I do not know this token", which is
+				// a positive terminal result for the
+				// current source. The local file can
+				// safely be deleted because there is
+				// nothing to revoke server-side.
+				return revStatus, m, nil, false
+			case "degraded":
+				degraded = true
+				// fall through to legacy
+			}
 		}
 	}
 	// Legacy source: pre-v1.1 single-file session. A
@@ -819,7 +871,7 @@ func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status st
 	// project-scoped source, because the operator's
 	// CURRENT bearer (the one the project-scoped file
 	// holds) is still unverified server-side.
-	if revStatus, m, _, ok := logoutRevokeFromFile(ctx, projectID, projectRoot, app.LegacyCLISessionPath()); ok {
+	if revStatus, m, _, ok, _ := logoutRevokeFromFile(ctx, projectID, projectRoot, app.LegacyCLISessionPath()); ok {
 		tried = true
 		switch revStatus {
 		case "revoked", "not_matched", "no_bearer":
@@ -835,6 +887,20 @@ func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status st
 		case "degraded":
 			degraded = true
 		}
+	}
+
+	if projectScopedValidationFailed {
+		// Round 6 HIGH #2: the project-scoped file exists
+		// but failed validation. We must NOT have let a
+		// legacy file's terminal reply clear the sticky
+		// degraded state above; reaching this point
+		// means the legacy path also ended in a way that
+		// did not revoke the current bearer. Report
+		// degraded so the caller keeps the project-scoped
+		// file. (If we returned earlier via the legacy
+		// branch, degraded was already set and keepFiles
+		// is already true.)
+		return "degraded", false, nil, true
 	}
 
 	// No local token to revoke. Try the discovery chain so we
@@ -872,12 +938,22 @@ func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status st
 
 // logoutRevokeFromFile reads the session file at path, builds a
 // daemon client with the bearer, and calls RevokeCLISession.
-// The returned bool reports whether the file was usable as
-// a revoke source. A usable file with a successful revoke
-// returns ("revoked", true, nil, true); a degraded revoke
-// returns ("degraded", false, <err>, true); an unusable
-// file (missing, no api_url, or repo_root mismatch) returns
-// ("", false, nil, false).
+// The returned tuple is (status, matched, err, usable, validationFailed).
+// A usable file with a successful revoke returns
+// ("revoked", true, nil, true, false); a degraded revoke
+// returns ("degraded", false, <err>, true, false); an unusable
+// file because it does not exist returns
+// ("", false, nil, false, false); an unusable file that
+// exists but failed validation (project_id mismatch,
+// repo_root guard, EvalSymlinks failure, parse error, or
+// empty token/api_url) returns ("", false, nil, false, true).
+//
+// validationFailed is sticky: when the project-scoped file
+// fails validation the caller must NOT delete it and must
+// NOT let any other source's terminal reply override that
+// decision. An unvalidated project-scoped file is a foreign
+// bearer record; deleting it would report `logged_out:true`
+// while the daemon-side local_sessions row stays active.
 //
 // Trust boundary: the saved session's api_url is the URL the
 // bearer was minted for. We MUST verify that the daemon at
@@ -896,37 +972,48 @@ func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status st
 // repo_root guard: the session file is loaded through
 // daemonclient.ReadSessionFile with the caller's actual
 // project root. A file whose persisted repo_root does not
-// match the caller's checkout is treated as unusable
+// match the caller's checkout is treated as validationFailed
 // (matching the `loadCLISessionToken` and project-scoped
 // session lookup paths) so a copied project DB cannot
 // trigger an outbound bearer revoke for a different repo's
-// session. This closes the round-5 HIGH #2 finding: prior
-// versions of this function bypassed the repo_root guard
-// by reading the JSON directly, leaving a window where a
-// copied DB's logout would still call
-// DELETE /api/v1/auth/cli-sessions/current against the
-// foreign project daemon with the foreign bearer.
-func logoutRevokeFromFile(ctx context.Context, projectID, projectRoot, path string) (status string, matched bool, err error, usable bool) {
+// session. Round 6 HIGH #2: the caller (logoutRevoke) does
+// NOT delete the project-scoped file when validationFailed
+// is true, regardless of any other source's terminal reply.
+func logoutRevokeFromFile(ctx context.Context, projectID, projectRoot, path string) (status string, matched bool, err error, usable bool, validationFailed bool) {
 	sf, readErr := daemonclient.ReadSessionFile(path, projectID, projectRoot)
 	if readErr != nil {
-		// A repo_root mismatch surfaces as ErrSessionMissing
-		// from ReadSessionFile. Treat that as an UNUSABLE
-		// file (not a degraded one) so the caller does not
-		// fall through to legacy and silently re-try with a
-		// token we have already proven is foreign to this
-		// checkout. Other errors (parse / permission) get
-		// the same treatment — the caller will not delete a
-		// file it could not validate.
 		if os.IsNotExist(readErr) {
-			return "", false, nil, false
+			// File is genuinely absent; fall through
+			// to the next source without preserving.
+			// usable=false signals "this source is
+			// not present" so the caller can try the
+			// next source (or the discovery chain).
+			return "", false, nil, false, false
 		}
-		return "", false, nil, false
+		// File exists but failed validation
+		// (project_id mismatch, repo_root guard, parse
+		// error, EvalSymlinks failure, etc.). The
+		// caller must not delete this file and must
+		// treat the failure as sticky degraded.
+		// usable=true + validationFailed=true tells
+		// the caller "we DID find a project-scoped
+		// file, it failed validation, and the file
+		// is preserved". This is the round-6 HIGH #2
+		// fix: the project-scoped file is not
+		// silently dropped, and the caller does not
+		// let a legacy file's terminal reply
+		// authorise its deletion.
+		return "", false, nil, true, true
 	}
 	if sf.Token == "" || sf.APIURL == "" {
-		// File exists but lacks the data we need to call
-		// revoke. Treat as unusable; the caller falls
-		// through to the next source.
-		return "", false, nil, false
+		// File exists but lacks the data we need to
+		// call revoke. This is also a validation-style
+		// failure: the file is not safe to use as a
+		// revoke source, and deleting it locally would
+		// lose the project_id binding we need to
+		// re-issue or rotate. Treat as
+		// validationFailed so the caller preserves it.
+		return "", false, nil, true, true
 	}
 	// Discover (with the saved api_url as a hint) runs the
 	// /health project_id guard. If the saved URL points at
@@ -936,7 +1023,7 @@ func logoutRevokeFromFile(ctx context.Context, projectID, projectRoot, path stri
 	// intact for the operator to retry.
 	disc, derr := daemonclient.Discover(ctx, projectID, projectRoot, false, sf.APIURL)
 	if derr != nil {
-		return "degraded", false, derr, true
+		return "degraded", false, derr, true, false
 	}
 	client, cerr := daemonclient.New(ctx, daemonclient.Config{
 		ProjectID:   projectID,
@@ -945,16 +1032,16 @@ func logoutRevokeFromFile(ctx context.Context, projectID, projectRoot, path stri
 		Token:       sf.Token,
 	})
 	if cerr != nil {
-		return "degraded", false, cerr, true
+		return "degraded", false, cerr, true, false
 	}
 	m, e := client.RevokeCLISession(ctx)
 	if e != nil {
-		return "degraded", false, e, true
+		return "degraded", false, e, true, false
 	}
 	if m {
-		return "revoked", true, nil, true
+		return "revoked", true, nil, true, false
 	}
-	return "not_matched", false, nil, true
+	return "not_matched", false, nil, true, false
 }
 
 // deleteLegacySessionIfOwnedBy removes the legacy
