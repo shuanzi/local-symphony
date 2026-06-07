@@ -452,7 +452,7 @@ func TestReadCLISessionTokenReadsProjectScopedSession(t *testing.T) {
 		t.Fatalf("write cli session: %v", err)
 	}
 
-	token, err := readCLISessionToken(projectID)
+	token, err := readCLISessionToken(projectID, "")
 	if err != nil {
 		t.Fatalf("readCLISessionToken: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestReadCLISessionTokenReadsSanitizedProjectScopedSession(t *testing.T) {
 		t.Fatalf("write cli session: %v", err)
 	}
 
-	token, err := readCLISessionToken(projectID)
+	token, err := readCLISessionToken(projectID, "")
 	if err != nil {
 		t.Fatalf("readCLISessionToken: %v", err)
 	}
@@ -496,7 +496,7 @@ func TestReadCLISessionTokenFallsBackToLegacySession(t *testing.T) {
 		t.Fatalf("write legacy cli session: %v", err)
 	}
 
-	token, err := readCLISessionToken(projectID)
+	token, err := readCLISessionToken(projectID, "")
 	if err != nil {
 		t.Fatalf("readCLISessionToken: %v", err)
 	}
@@ -518,7 +518,7 @@ func TestReadCLISessionTokenRejectsWrongProject(t *testing.T) {
 		t.Fatalf("write cli session: %v", err)
 	}
 
-	_, err := readCLISessionToken(projectID)
+	_, err := readCLISessionToken(projectID, "")
 	if err == nil {
 		t.Fatal("readCLISessionToken succeeded, want invalid project error")
 	}
@@ -540,7 +540,7 @@ func TestReadCLISessionTokenRejectsEmptyToken(t *testing.T) {
 		t.Fatalf("write cli session: %v", err)
 	}
 
-	_, err := readCLISessionToken(projectID)
+	_, err := readCLISessionToken(projectID, "")
 	if err == nil {
 		t.Fatal("readCLISessionToken succeeded, want empty token error")
 	}
@@ -1400,7 +1400,7 @@ func TestReadCLISessionTokenRejectsInvalidLegacySession(t *testing.T) {
 				t.Fatalf("write legacy cli session: %v", err)
 			}
 
-			_, err := readCLISessionToken("project_a")
+			_, err := readCLISessionToken("project_a", "")
 			if err == nil {
 				t.Fatal("readCLISessionToken succeeded, want invalid legacy session error")
 			}
@@ -2279,5 +2279,189 @@ func TestLogoutFromFileFallsBackToDiscoveryOnNoAPIURL(t *testing.T) {
 	}
 	if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
 		t.Fatalf("session file should be preserved when discovery cannot find a daemon, got: %v", err)
+	}
+}
+
+// TestLogoutDoesNotDeleteLegacyFromDifferentProject pins
+// the HIGH #2 fix from adversarial round 4: `symphony
+// login --logout` used to delete the legacy
+// ~/.symphony/cli-session.json file unconditionally, which
+// would silently wipe a residual legacy record owned by a
+// different project (e.g. a multi-project operator upgrading
+// from pre-v1.1). The other project's copied legacy bearer
+// stayed valid server-side while the operator got a
+// misleading "logged_out:true" status. The fix inspects
+// the legacy file's persisted project_id and only deletes
+// it when that id matches the current logout target; a
+// foreign legacy file is preserved and reported in the
+// operator output so the operator can clean it up out-of-band.
+//
+// Behavior:
+//   - exit code 0
+//   - project-scoped session file for current project is deleted
+//   - legacy file (owned by a different project) is PRESERVED
+//   - stdout contains a legacy_preserved block identifying
+//     the foreign project_id and the residual path
+func TestLogoutDoesNotDeleteLegacyFromDifferentProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	// Build a matching daemon that returns matched=true so
+	// the revoke path completes cleanly.
+	matchingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		if r.Method == http.MethodDelete && r.URL.Path == "/api/v1/auth/cli-sessions/current" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintln(w, `{"data":{"revoked":true,"matched":true},"meta":{}}`)
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	t.Cleanup(matchingServer.Close)
+
+	// Project-scoped session file for the current project.
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{
+		ProjectID: projectID,
+		APIURL:    matchingServer.URL,
+		Token:     "tok-current",
+	}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	// Legacy file owned by a DIFFERENT project. This simulates
+	// a multi-project operator who upgraded from pre-v1.1
+	// keeping a single legacy record for whichever project
+	// they last logged into.
+	foreignProjectID := "prj_foreign"
+	legacyPath := app.LegacyCLISessionPath()
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	legacyBody, _ := json.Marshal(map[string]any{
+		"project_id": foreignProjectID,
+		"token":      "tok-foreign-legacy",
+	})
+	if err := os.WriteFile(legacyPath, legacyBody, 0o600); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+
+	stdout := ""
+	code, captured, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", dir})
+	})
+	stdout = captured
+	if code != 0 {
+		t.Fatalf("logout exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	// Project-scoped file is deleted.
+	if _, err := os.Stat(app.CLISessionPath(projectID)); !os.IsNotExist(err) {
+		t.Fatalf("project-scoped session file should be deleted on success, got: %v", err)
+	}
+	// Legacy file is preserved (foreign project).
+	if _, err := os.Stat(legacyPath); os.IsNotExist(err) {
+		t.Fatalf("legacy session file from foreign project must be preserved, got: %v", err)
+	}
+	// stdout reports the residual.
+	if !strings.Contains(stdout, "legacy_preserved") {
+		t.Fatalf("logout stdout missing legacy_preserved block: %s", stdout)
+	}
+	if !strings.Contains(stdout, foreignProjectID) {
+		t.Fatalf("logout stdout should name the foreign project_id %q: %s", foreignProjectID, stdout)
+	}
+	if !strings.Contains(stdout, legacyPath) {
+		t.Fatalf("logout stdout should name the residual path %q: %s", legacyPath, stdout)
+	}
+}
+
+// TestLogoutDeletesLegacyFromSameProject pins the
+// same-project happy path: when the legacy file's persisted
+// project_id matches the logout target, the legacy file IS
+// deleted. This guards against an over-broad fix that would
+// always preserve the legacy file.
+//
+// Behavior:
+//   - exit code 0
+//   - project-scoped session file is deleted
+//   - legacy file (same project_id) is deleted
+//   - stdout does NOT carry a legacy_preserved block
+func TestLogoutDeletesLegacyFromSameProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	matchingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		if r.Method == http.MethodDelete && r.URL.Path == "/api/v1/auth/cli-sessions/current" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintln(w, `{"data":{"revoked":true,"matched":true},"meta":{}}`)
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	t.Cleanup(matchingServer.Close)
+
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{
+		ProjectID: projectID,
+		APIURL:    matchingServer.URL,
+		Token:     "tok-current",
+	}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	// Legacy file owned by the SAME project: should be
+	// deleted by logout.
+	legacyPath := app.LegacyCLISessionPath()
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	legacyBody, _ := json.Marshal(map[string]any{
+		"project_id": projectID,
+		"token":      "tok-legacy-same",
+	})
+	if err := os.WriteFile(legacyPath, legacyBody, 0o600); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+
+	stdout := ""
+	code, captured, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", dir})
+	})
+	stdout = captured
+	if code != 0 {
+		t.Fatalf("logout exit code = %d, want 0; stderr = %s", code, stderr)
+	}
+	if _, err := os.Stat(app.CLISessionPath(projectID)); !os.IsNotExist(err) {
+		t.Fatalf("project-scoped session file should be deleted on success, got: %v", err)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy session file from same project should be deleted, got: %v", err)
+	}
+	if strings.Contains(stdout, "legacy_preserved") {
+		t.Fatalf("logout stdout should not carry legacy_preserved when legacy matches current project: %s", stdout)
 	}
 }
