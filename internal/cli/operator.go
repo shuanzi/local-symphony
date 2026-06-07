@@ -49,7 +49,7 @@ func newDaemonContext(ctx context.Context, project *store.Store) (daemonContext,
 	// never starts a daemon; it only inspects env / user config / runtime
 	// descriptor / session file. If no URL resolves, the operator is
 	// offline and local fallback is the only path that can succeed.
-	disc, err := daemonclient.Discover(ctx, project.ProjectID, project.RepoRoot, false)
+	disc, err := daemonclient.Discover(ctx, project.ProjectID, project.RepoRoot, false, "")
 	if err != nil {
 		if errors.Is(err, daemonclient.ErrDaemonUnavailable) {
 			return dc, nil

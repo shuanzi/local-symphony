@@ -685,7 +685,7 @@ func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status st
 	if !tried {
 		// The project-scoped file did not have both token+api_url.
 		// We can attempt discovery to find the daemon URL.
-		disc, derr := daemonclient.Discover(ctx, projectID, projectRoot, false)
+		disc, derr := daemonclient.Discover(ctx, projectID, projectRoot, false, "")
 		if derr == nil {
 			client, cerr := daemonclient.New(ctx, daemonclient.Config{
 				ProjectID:           projectID,
@@ -719,6 +719,20 @@ func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status st
 // returns ("revoked", true, nil, true); a degraded revoke
 // returns ("degraded", false, <err>, true); an unusable
 // file (missing, no api_url) returns ("", false, nil, false).
+//
+// Trust boundary: the saved session's api_url is the URL the
+// bearer was minted for. We MUST verify that the daemon at
+// that URL advertises the project_id we are logging out of
+// before sending the bearer — otherwise a stale api_url
+// pointing at a different project's daemon (loopback host
+// collision, leftover from a prior dev session) would
+// receive a CLI bearer it has no business seeing, and the
+// "matched=false" response would otherwise map to
+// "not_matched" → caller deletes local files. By routing
+// the saved api_url through Discover's /health project_id
+// check we either get a clean revoke on the right daemon
+// or a degraded result that preserves the local files for
+// the operator to retry.
 func logoutRevokeFromFile(ctx context.Context, projectID, projectRoot, path string) (status string, matched bool, err error, usable bool) {
 	data, readErr := os.ReadFile(path)
 	if readErr != nil {
@@ -738,10 +752,20 @@ func logoutRevokeFromFile(ctx context.Context, projectID, projectRoot, path stri
 	if sf.ProjectID != "" && sf.ProjectID != projectID {
 		return "mismatch", false, nil, true
 	}
+	// Discover (with the saved api_url as a hint) runs the
+	// /health project_id guard. If the saved URL points at
+	// the wrong project's daemon, is unreachable, or is
+	// otherwise unusable, Discover returns
+	// ErrDaemonUnavailable and we keep the local files
+	// intact for the operator to retry.
+	disc, derr := daemonclient.Discover(ctx, projectID, projectRoot, false, sf.APIURL)
+	if derr != nil {
+		return "degraded", false, derr, true
+	}
 	client, cerr := daemonclient.New(ctx, daemonclient.Config{
 		ProjectID:   projectID,
 		ProjectRoot: projectRoot,
-		BaseURL:     sf.APIURL,
+		BaseURL:     disc.BaseURL,
 		Token:       sf.Token,
 	})
 	if cerr != nil {
