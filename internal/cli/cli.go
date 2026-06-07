@@ -123,6 +123,29 @@ func cmdOpen(args []string) int {
 	return printJSON(desc)
 }
 
+// openDescriptor reads the project's runtime descriptor, mints a
+// dashboard `?open_token=...` URL, and returns the descriptor with
+// the dashboard_url field appended.
+//
+// Trust boundary: the runtime descriptor's api_url is a value
+// persisted on disk; a poisoned or stale descriptor could point at
+// any host. We MUST NOT send a CLI bearer to that URL until we have
+// independently confirmed it advertises our project_id — otherwise
+// a copied, rotated, or attacker-controlled descriptor would
+// exfiltrate the bearer to the wrong daemon. We route the
+// descriptor's api_url through daemonclient.Discover (with the
+// api_url as a hint), which runs the loopback + /health
+// project_id guard before any token is dispatched. A descriptor
+// pointing at a non-loopback host, an unreachable endpoint, or a
+// wrong-project daemon is rejected with ErrDaemonUnavailable so
+// the operator gets a single, action-oriented error pointing at
+// `symphony serve`.
+//
+// Context plumbing: the project store's ProjectID is the trust
+// anchor. The bearer itself is loaded from the project-scoped
+// session file with the same repo_root check the rest of the
+// command tree uses, so a copied project DB cannot re-use a
+// foreign checkout's CLI session for the open-token mint.
 func openDescriptor(project string) (map[string]any, error) {
 	st, err := store.Open(project)
 	if err != nil {
@@ -133,16 +156,35 @@ func openDescriptor(project string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	apiURL, _ := desc["api_url"].(string)
+	runtimeURL, _ := desc["api_url"].(string)
+	runtimeURL = strings.TrimSpace(runtimeURL)
+	if runtimeURL == "" {
+		return nil, core.NewError(core.ErrInvalidRequest, "runtime descriptor is missing api_url", nil)
+	}
 	token, err := readCLISessionToken(st.ProjectID, st.RepoRoot)
 	if err != nil {
 		return nil, err
 	}
-	openToken, err := requestOpenToken(apiURL, token)
+	ctx := contextWithTimeout()
+	// Discover (with runtimeURL as a hint) runs the loopback
+	// guard + /health project_id check. The runtimeURL is the
+	// ONLY candidate tried; a poisoned or stale descriptor
+	// pointing at the wrong project's daemon (or a non-loopback
+	// host) is rejected before the bearer leaves this process.
+	disc, derr := daemonclient.Discover(ctx, st.ProjectID, st.RepoRoot, false, runtimeURL)
+	if derr != nil {
+		// Wrap the discovery error so the operator gets the
+		// standardized daemon_unavailable envelope pointing
+		// them at `symphony serve` / `symphony open --help`.
+		return nil, core.NewError(core.ErrDaemonUnavailable,
+			"runtime descriptor points at an unreachable or wrong-project daemon; restart with 'symphony serve'",
+			map[string]any{"project_id": st.ProjectID, "cause": derr.Error()})
+	}
+	openToken, err := requestOpenToken(disc.BaseURL, token)
 	if err != nil {
 		return nil, err
 	}
-	desc["dashboard_url"] = strings.TrimRight(apiURL, "/") + "/?open_token=" + url.QueryEscape(openToken)
+	desc["dashboard_url"] = strings.TrimRight(disc.BaseURL, "/") + "/?open_token=" + url.QueryEscape(openToken)
 	return desc, nil
 }
 
@@ -586,15 +628,12 @@ func cmdLogin(args []string) int {
 	// both the file (to retry) and a non-zero exit to know the
 	// revoke was not confirmed.
 	if hasFlag(args, "--logout") {
-		projectID, err := loginResolveProjectID(flagValue(args, "--project", "."))
+		projectRoot := flagValue(args, "--project", ".")
+		projectID, repoRoot, err := loginResolveProject(projectRoot)
 		if err != nil {
 			return printErr(err)
 		}
-		projectRoot := lookupProjectRootForRevoke(projectID)
-		if abs, aerr := filepath.Abs(projectRoot); aerr == nil {
-			projectRoot = abs
-		}
-		revokeStatus, matched, revokeErr, keepFiles := logoutRevoke(ctx, projectID, projectRoot)
+		revokeStatus, matched, revokeErr, keepFiles := logoutRevoke(ctx, projectID, repoRoot)
 		out := map[string]any{
 			"logged_out":    !keepFiles,
 			"project_id":    projectID,
@@ -691,24 +730,27 @@ func cmdLogin(args []string) int {
 	return printErr(core.NewError(core.ErrUnauthorized, "CLI session is invalid; run 'symphony serve' to refresh", map[string]any{"project_id": st.ProjectID, "session": "unauthenticated"}))
 }
 
-// loginResolveProjectID opens the project store at the given root and
-// returns its project_id. It is split out so that the --logout path
-// can resolve a project_id even when the rest of the command would
-// otherwise short-circuit on missing flags.
-func loginResolveProjectID(projectRoot string) (string, error) {
+// loginResolveProject opens the project store at the given root and
+// returns its (project_id, repo_root). The repo_root is the absolute,
+// symlink-resolved path the store recorded on init; propagating it
+// into logoutRevoke means the repo_root guard in
+// daemonclient.ReadSessionFile compares against the ACTUAL checkout
+// the operator is running from. A copied project DB inherits the
+// foreign project_id but its session file's repo_root will not match
+// the new checkout, and the guard rejects it before the bearer is
+// sent. This closes the round-5 HIGH #2 finding: prior versions
+// passed an empty project_root to logoutRevoke (the
+// lookupProjectRootForRevoke stub), which silently skipped the
+// repo_root check and let a copied DB call DELETE on the foreign
+// project daemon.
+func loginResolveProject(projectRoot string) (string, string, error) {
 	st, err := store.Open(projectRoot)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer st.Close()
-	return st.ProjectID, nil
+	return st.ProjectID, st.RepoRoot, nil
 }
-
-// SessionFile alias keeps the logoutRevoke helper readable
-// without spelling `daemonclient.SessionFile` everywhere. The
-// two structs are structurally identical; the on-disk JSON
-// shape is the single source of truth.
-type SessionFile = daemonclient.SessionFile
 
 // logoutRevoke calls the daemon's revoke endpoint to mark the
 // CLI bearer as revoked. The returned tuple is
@@ -724,24 +766,75 @@ type SessionFile = daemonclient.SessionFile
 // local session files — the operator needs the file to
 // retry revocation, and we have not confirmed that the
 // server-side row is revoked.
+//
+// Per-source degraded tracking (round-5 HIGH #3): when the
+// project-scoped session file's revoke call DEGRADES
+// (daemon unreachable, network error, etc.) we MUST NOT
+// treat a subsequent legacy-file `not_matched` as success.
+// Prior versions of this function short-circuited on the
+// first non-degraded reply, so a degraded project-scoped
+// revoke followed by a legacy file the daemon no longer
+// recognises (e.g. an old token) would report
+// revoke_status=not_matched, the caller would then delete
+// the project-scoped session file, and the operator's
+// current bearer would stay valid server-side. The fix
+// tracks degraded state across sources: a degraded
+// authoritative revoke (the project-scoped file whose
+// api_url was used to mint the bearer) cannot be cleared
+// by a non-authoritative source's terminal reply.
 func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status string, matched bool, err error, keepFiles bool) {
-	// Attempt a revoke from whichever source we have a bearer
-	// for. The first successful attempt wins; only if all
-	// reachable attempts degrade do we report keepFiles=true.
+	// Per-source tracking. `degraded` is sticky across the
+	// fallback chain: once any reachable source fails to
+	// confirm server-side revocation we must not let a
+	// different source's not_matched / no_bearer silently
+	// clear that failure, because the operator's CURRENT
+	// bearer is the one whose server-side row is unverified.
+	degraded := false
 	tried := false
+
+	// Authoritative source: the project-scoped session file
+	// (api_url + token). This is the one the bearer was
+	// minted for; a degraded call here is the only one that
+	// is truly unrecoverable for the current token.
 	if revStatus, m, _, ok := logoutRevokeFromFile(ctx, projectID, projectRoot, app.CLISessionPath(projectID)); ok {
 		tried = true
-		if revStatus == "revoked" || revStatus == "not_matched" || revStatus == "no_bearer" {
+		switch revStatus {
+		case "revoked", "not_matched", "no_bearer":
+			// not_matched still clears degraded: a
+			// reachable daemon explicitly told us
+			// "I do not know this token", which is
+			// a positive terminal result for the
+			// current source. The local file can
+			// safely be deleted because there is
+			// nothing to revoke server-side.
 			return revStatus, m, nil, false
+		case "degraded":
+			degraded = true
+			// fall through to legacy
 		}
-		// Degraded: fall through to legacy.
 	}
+	// Legacy source: pre-v1.1 single-file session. A
+	// not_matched / no_bearer reply from the legacy file
+	// MUST NOT clear a degraded state from the
+	// project-scoped source, because the operator's
+	// CURRENT bearer (the one the project-scoped file
+	// holds) is still unverified server-side.
 	if revStatus, m, _, ok := logoutRevokeFromFile(ctx, projectID, projectRoot, app.LegacyCLISessionPath()); ok {
 		tried = true
-		if revStatus == "revoked" || revStatus == "not_matched" || revStatus == "no_bearer" {
+		switch revStatus {
+		case "revoked", "not_matched", "no_bearer":
+			if degraded {
+				// The current-token revoke never
+				// confirmed; do not let a stale
+				// legacy token's terminal reply
+				// delete the file we still need
+				// to retry with.
+				return "degraded", false, nil, true
+			}
 			return revStatus, m, nil, false
+		case "degraded":
+			degraded = true
 		}
-		// Degraded: fall through to discovery.
 	}
 
 	// No local token to revoke. Try the discovery chain so we
@@ -783,7 +876,8 @@ func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status st
 // a revoke source. A usable file with a successful revoke
 // returns ("revoked", true, nil, true); a degraded revoke
 // returns ("degraded", false, <err>, true); an unusable
-// file (missing, no api_url) returns ("", false, nil, false).
+// file (missing, no api_url, or repo_root mismatch) returns
+// ("", false, nil, false).
 //
 // Trust boundary: the saved session's api_url is the URL the
 // bearer was minted for. We MUST verify that the daemon at
@@ -798,13 +892,34 @@ func logoutRevoke(ctx context.Context, projectID, projectRoot string) (status st
 // check we either get a clean revoke on the right daemon
 // or a degraded result that preserves the local files for
 // the operator to retry.
+//
+// repo_root guard: the session file is loaded through
+// daemonclient.ReadSessionFile with the caller's actual
+// project root. A file whose persisted repo_root does not
+// match the caller's checkout is treated as unusable
+// (matching the `loadCLISessionToken` and project-scoped
+// session lookup paths) so a copied project DB cannot
+// trigger an outbound bearer revoke for a different repo's
+// session. This closes the round-5 HIGH #2 finding: prior
+// versions of this function bypassed the repo_root guard
+// by reading the JSON directly, leaving a window where a
+// copied DB's logout would still call
+// DELETE /api/v1/auth/cli-sessions/current against the
+// foreign project daemon with the foreign bearer.
 func logoutRevokeFromFile(ctx context.Context, projectID, projectRoot, path string) (status string, matched bool, err error, usable bool) {
-	data, readErr := os.ReadFile(path)
+	sf, readErr := daemonclient.ReadSessionFile(path, projectID, projectRoot)
 	if readErr != nil {
-		return "", false, nil, false
-	}
-	var sf SessionFile
-	if json.Unmarshal(data, &sf) != nil {
+		// A repo_root mismatch surfaces as ErrSessionMissing
+		// from ReadSessionFile. Treat that as an UNUSABLE
+		// file (not a degraded one) so the caller does not
+		// fall through to legacy and silently re-try with a
+		// token we have already proven is foreign to this
+		// checkout. Other errors (parse / permission) get
+		// the same treatment — the caller will not delete a
+		// file it could not validate.
+		if os.IsNotExist(readErr) {
+			return "", false, nil, false
+		}
 		return "", false, nil, false
 	}
 	if sf.Token == "" || sf.APIURL == "" {
@@ -812,10 +927,6 @@ func logoutRevokeFromFile(ctx context.Context, projectID, projectRoot, path stri
 		// revoke. Treat as unusable; the caller falls
 		// through to the next source.
 		return "", false, nil, false
-	}
-	// Validate project_id before contacting the daemon.
-	if sf.ProjectID != "" && sf.ProjectID != projectID {
-		return "mismatch", false, nil, true
 	}
 	// Discover (with the saved api_url as a hint) runs the
 	// /health project_id guard. If the saved URL points at
@@ -897,22 +1008,6 @@ func deleteLegacySessionIfOwnedBy(currentProjectID string) (residualProjectID, r
 		return "", "", err
 	}
 	return "", "", nil
-}
-
-// lookupProjectRootForRevoke returns the project root for a
-// given project_id by reading the project DB. It is
-// best-effort: if the project db is missing or unreadable
-// the helper returns "" and the daemon client is constructed
-// without a ProjectRoot (which is acceptable for the
-// session-file-driven path).
-func lookupProjectRootForRevoke(projectID string) string {
-	if projectID == "" {
-		return ""
-	}
-	// We don't have a project root path; the daemon client
-	// falls back to the session file's api_url anyway, so the
-	// ProjectRoot is not strictly needed here.
-	return ""
 }
 
 func cmdTool(args []string) int {

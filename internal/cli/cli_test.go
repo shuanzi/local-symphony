@@ -388,6 +388,18 @@ func TestOpenDescriptorMintsDashboardOpenToken(t *testing.T) {
 	}
 	seenAuth := ""
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Round-5 CRITICAL fix: openDescriptor now probes
+		// /api/v1/health first to verify the runtime
+		// descriptor's api_url advertises the project_id
+		// before the bearer is dispatched. The handler
+		// answers /health with the project's id and only
+		// then the bearer-carrying /open-token request
+		// succeeds.
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", st.ProjectID)
+			return
+		}
 		if r.URL.Path != "/api/v1/auth/open-token" {
 			t.Fatalf("path = %s, want /api/v1/auth/open-token", r.URL.Path)
 		}
@@ -2464,4 +2476,350 @@ func TestLogoutDeletesLegacyFromSameProject(t *testing.T) {
 	if strings.Contains(stdout, "legacy_preserved") {
 		t.Fatalf("logout stdout should not carry legacy_preserved when legacy matches current project: %s", stdout)
 	}
+}
+
+// TestOpenDescriptorRejectsNonLoopbackRuntimeURL pins the
+// CRITICAL finding from adversarial round 5: the runtime
+// descriptor's api_url is a value persisted on disk; a
+// poisoned or stale descriptor could point at any host.
+// `openDescriptor` used to send the CLI bearer directly to
+// the descriptor's api_url, bypassing Discover's loopback
+// guard. The fix routes the descriptor's api_url through
+// Discover with the api_url as a hint, which rejects
+// non-loopback hosts BEFORE the bearer is dispatched. A
+// descriptor pointing at evil.example.com must NOT cause
+// the bearer to leave the loopback boundary.
+//
+// Behavior:
+//   - openDescriptor returns an error
+//   - the daemon_unavailable envelope is rendered
+//   - the bearer is never sent to a remote host
+func TestOpenDescriptorRejectsNonLoopbackRuntimeURL(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+
+	// Persist a runtime descriptor whose api_url points at a
+	// non-loopback host. Discover's loopback guard must
+	// reject this BEFORE the bearer is sent.
+	const remoteURL = "http://evil.example.com:8080"
+	if err := st.CreateRuntimeDescriptor(remoteURL, remoteURL, 1234); err != nil {
+		t.Fatalf("CreateRuntimeDescriptor: %v", err)
+	}
+	// Persist a session file so the bearer is available.
+	// The host check happens BEFORE the bearer is sent, so
+	// the token does not matter here.
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{
+		ProjectID: projectID,
+		APIURL:    remoteURL,
+		Token:     "tok-should-never-leave",
+	}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+	st.Close()
+
+	_, err = openDescriptor(dir)
+	if err == nil {
+		t.Fatal("openDescriptor succeeded, want daemon_unavailable error")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrDaemonUnavailable {
+		t.Fatalf("error code = %s, want %s; err = %v", got, core.ErrDaemonUnavailable, err)
+	}
+	if !strings.Contains(err.Error(), "non-loopback") && !strings.Contains(err.Error(), "daemon_unavailable") {
+		t.Fatalf("error message should mention loopback rejection or daemon_unavailable: %v", err)
+	}
+}
+
+// TestOpenDescriptorRejectsMismatchedProjectID pins the
+// second half of the CRITICAL round-5 fix: even when the
+// runtime descriptor points at a reachable loopback
+// daemon, that daemon must advertise the project_id we are
+// opening — otherwise the CLI bearer for project A is
+// delivered to a daemon hosting project B (loopback host
+// collision, leftover from a prior dev session).
+//
+// Behavior:
+//   - openDescriptor returns a daemon_unavailable error
+//   - the bearer is never sent to the wrong-project daemon
+func TestOpenDescriptorRejectsMismatchedProjectID(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+
+	// A loopback daemon advertising a DIFFERENT project_id.
+	// Discover's /health project_id guard must reject this
+	// before the bearer leaves this process.
+	var sawBearer bool
+	wrongProject := "prj_foreign"
+	wrongProjectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			sawBearer = true
+		}
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", wrongProject)
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	t.Cleanup(wrongProjectServer.Close)
+
+	if err := st.CreateRuntimeDescriptor(wrongProjectServer.URL, wrongProjectServer.URL, 1234); err != nil {
+		t.Fatalf("CreateRuntimeDescriptor: %v", err)
+	}
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{
+		ProjectID: projectID,
+		APIURL:    wrongProjectServer.URL,
+		Token:     "tok-should-never-leave",
+	}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+	st.Close()
+
+	_, err = openDescriptor(dir)
+	if err == nil {
+		t.Fatal("openDescriptor succeeded, want daemon_unavailable error")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrDaemonUnavailable {
+		t.Fatalf("error code = %s, want %s; err = %v", got, core.ErrDaemonUnavailable, err)
+	}
+	if sawBearer {
+		t.Fatal("bearer was sent to a wrong-project daemon; project_id guard did not fire")
+	}
+}
+
+// TestLogoutFromFileRejectsCopiedDB pins the HIGH #2
+// finding from adversarial round 5: logoutRevokeFromFile
+// used to read the session JSON directly, bypassing
+// daemonclient.ReadSessionFile's repo_root guard. A
+// copied project DB that reuses a foreign project_id
+// inherits that project's id, but the session file's
+// repo_root records the actual checkout the bearer was
+// minted for. Without the guard, the copied-DB operator's
+// `symphony login --logout` would still call
+// DELETE /api/v1/auth/cli-sessions/current on the foreign
+// project daemon with the foreign bearer, deleting
+// another operator's active session. The fix routes
+// logout through ReadSessionFile so the repo_root mismatch
+// surfaces as an unusable file and the bearer is never
+// sent.
+//
+// Behavior:
+//   - exit code is 7 (degraded: no usable file matched the
+//     caller's repo)
+//   - project-scoped session file is preserved
+//   - the foreign daemon never sees the bearer
+func TestLogoutFromFileRejectsCopiedDB(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	// Initialise project at /a (the original checkout the
+	// session file was minted for). The session file's
+	// repo_root points at /a. We will run `symphony login
+	// --logout --project /b` so the caller's repo_root
+	// (/b) does NOT match the persisted repo_root (/a).
+	// This is the copied-DB scenario.
+	dirA := t.TempDir()
+	st, err := store.InitProject(dirA, "APP")
+	if err != nil {
+		t.Fatalf("InitProject /a: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	dirB := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dirB, ".symphony"), 0o755); err != nil {
+		t.Fatalf("mkdir dirB: %v", err)
+	}
+	// Copy /a/.symphony/project.db into /b so /b surfaces
+	// the same project_id when opened. The session file's
+	// repo_root will still point at /a (mismatch).
+	if err := copyFile(filepath.Join(dirA, ".symphony", "project.db"), filepath.Join(dirB, ".symphony", "project.db")); err != nil {
+		t.Fatalf("copy project db: %v", err)
+	}
+
+	// Track whether the foreign daemon ever sees the bearer.
+	// It MUST NOT — ReadSessionFile's repo_root guard must
+	// reject the file before any daemonclient.New is built.
+	var sawBearer bool
+	foreignDaemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			sawBearer = true
+		}
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	t.Cleanup(foreignDaemon.Close)
+
+	// Write the session file. Its repo_root is /a; the
+	// api_url points at the live foreign daemon. With
+	// ReadSessionFile's guard, the file is rejected BEFORE
+	// the bearer is dispatched to the daemon.
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{
+		ProjectID: projectID,
+		RepoRoot:  dirA,
+		APIURL:    foreignDaemon.URL,
+		Token:     "tok-foreign",
+	}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	sessionPath := app.CLISessionPath(projectID)
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", dirB})
+	})
+	if code != 7 {
+		t.Fatalf("logout exit code = %d, want 7 (degraded: repo_root mismatch); stderr = %s", code, stderr)
+	}
+	if sawBearer {
+		t.Fatal("bearer was sent to foreign daemon despite repo_root mismatch; ReadSessionFile guard did not fire")
+	}
+	if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
+		t.Fatalf("session file should be preserved when repo_root mismatches caller, got: %v", err)
+	}
+}
+
+// TestLogoutTracksPerSourceDegrade pins the HIGH #3
+// finding from adversarial round 5: logoutRevoke used to
+// short-circuit on the first non-degraded reply. A
+// project-scoped session pointing at an UNREACHABLE
+// daemon would degrade, but a legacy file the daemon no
+// longer recognises would reply `not_matched` — and the
+// old code happily reported success and let the caller
+// delete the project-scoped file. The operator's current
+// bearer (the one the project-scoped file holds) stayed
+// valid server-side while the operator got a misleading
+// "logged_out:true". The fix tracks degraded state across
+// sources: a degraded authoritative revoke is not
+// cleared by a non-authoritative source's terminal reply.
+//
+// Behavior:
+//   - exit code is 7 (degraded, keepFiles)
+//   - the project-scoped session file is preserved
+//   - revoke_status is "degraded", not "not_matched"
+func TestLogoutTracksPerSourceDegrade(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	// Project-scoped session file: points at an UNREACHABLE
+	// daemon. Revoke will degrade here. The token is the
+	// operator's CURRENT bearer; this is the one whose
+	// server-side row is unverified.
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{
+		ProjectID: projectID,
+		APIURL:    "http://127.0.0.1:1",
+		Token:     "tok-current",
+	}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	// Legacy file: a reachable daemon that returns
+	// `matched:false` (not_matched) for the legacy token.
+	// The legacy token is an OLD bearer; the daemon does
+	// not recognise it any more. The legacy reply is
+	// "not_matched" — terminal for the legacy source — but
+	// it MUST NOT clear the project-scoped source's
+	// degraded state.
+	legacyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		if r.Method == http.MethodDelete && r.URL.Path == "/api/v1/auth/cli-sessions/current" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintln(w, `{"data":{"revoked":true,"matched":false},"meta":{}}`)
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	t.Cleanup(legacyServer.Close)
+
+	// The legacy session file must include repo_root=<dir>
+	// so ReadSessionFile's repo_root guard passes. The
+	// legacy token is "tok-legacy", which the legacy
+	// daemon does not recognise.
+	legacyPath := app.LegacyCLISessionPath()
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	legacyBody, _ := json.Marshal(map[string]any{
+		"project_id": projectID,
+		"repo_root":  dir,
+		"api_url":    legacyServer.URL,
+		"token":      "tok-legacy",
+	})
+	if err := os.WriteFile(legacyPath, legacyBody, 0o600); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+
+	sessionPath := app.CLISessionPath(projectID)
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", dir})
+	})
+	if code != 7 {
+		t.Fatalf("logout exit code = %d, want 7 (degraded); stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "degraded") {
+		t.Fatalf("logout stderr missing degraded status: %s", stderr)
+	}
+	// Critical: the stderr MUST NOT claim not_matched. The
+	// project-scoped revoke was the authoritative one and
+	// it degraded. The legacy not_matched is a secondary
+	// signal that the operator's CURRENT token is still
+	// unverified server-side.
+	if strings.Contains(stderr, "not_matched") {
+		t.Fatalf("logout stderr leaks not_matched from legacy source despite project-scoped degrade: %s", stderr)
+	}
+	if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
+		t.Fatalf("project-scoped session file should be preserved when project-scoped revoke degraded, got: %v", err)
+	}
+}
+
+// copyFile copies src to dst, creating dst's parent
+// directory if needed. Test helper for the copied-DB
+// scenario.
+func copyFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return nil
 }
