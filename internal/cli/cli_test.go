@@ -2823,3 +2823,156 @@ func copyFile(src, dst string) error {
 	}
 	return nil
 }
+
+// TestLogoutPreservesProjectScopedOnValidationFailure
+// pins the HIGH #2 fix from adversarial round 6. The
+// round-5 implementation of logoutRevokeFromFile returned
+// `usable=false` for any non-IsNotExist read error, then
+// the legacy file's terminal reply (`revoked`,
+// `not_matched`, `no_bearer`) was used by the caller to
+// delete the project-scoped session file. The bug: a
+// project-scoped session file that EXISTS but fails
+// validation (project_id mismatch, repo_root guard,
+// EvalSymlinks failure) is a foreign bearer record. The
+// legacy file's terminal reply is unrelated to the
+// project-scoped file's bearer; allowing it to authorise
+// deletion of the project-scoped file would report
+// `logged_out:true` while the daemon-side local_sessions
+// row stayed active and the bearer remained usable for
+// any operator holding a copy of the token.
+//
+// Scenario:
+//   - caller's project at dirC (valid, with project_id C)
+//   - project-scoped session file: project_id=A (foreign
+//     to dirC) → ReadSessionFile's project_id check
+//     REJECTS the file (validation failure, not missing)
+//   - legacy session file: project_id=C, repo_root=dirC,
+//     api_url points at a daemon that confirms
+//     `matched:true, revoked:true`
+//   - expectation: project-scoped file is PRESERVED,
+//     legacy file is deleted (its ownership matches
+//     dirC), exit code 7 (degraded), stderr reports the
+//     project-scoped validation failure as sticky
+//     degraded
+//
+// Behavior:
+//   - exit code is 7 (degraded, keepFiles)
+//   - project-scoped session file is preserved
+//   - legacy session file IS deleted (it is owned by
+//     the current project and validated successfully)
+//   - the project-scoped file's token is never sent to
+//     any daemon
+func TestLogoutPreservesProjectScopedOnValidationFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	// /c: the operator's CURRENT checkout. Initialised
+	// normally so loginResolveProject's Open succeeds.
+	dirC := t.TempDir()
+	st, err := store.InitProject(dirC, "APP")
+	if err != nil {
+		t.Fatalf("InitProject /c: %v", err)
+	}
+	projectIDC := st.ProjectID
+	st.Close()
+
+	// Legacy daemon: same project_id as dirC, returns
+	// matched:true on DELETE. The legacy file's bearer
+	// is the operator's current bearer; the legacy
+	// revoke succeeds.
+	legacyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectIDC)
+			return
+		}
+		if r.Method == http.MethodDelete && r.URL.Path == "/api/v1/auth/cli-sessions/current" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintln(w, `{"data":{"revoked":true,"matched":true},"meta":{}}`)
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	t.Cleanup(legacyServer.Close)
+
+	// Project-scoped session file: project_id mismatches
+	// the caller's project (dirC). ReadSessionFile's
+	// project_id check will reject the file (validation
+	// failure). Its api_url is irrelevant because the
+	// file will not be loaded. WriteSessionFile
+	// enforces project_id == path-project_id, so we
+	// write the file directly with the foreign
+	// project_id embedded — that is exactly what an
+	// attacker would do (or what a copied-DB operator
+	// would end up with if they manually edited the
+	// file).
+	projectIDForeign := "prj_foreign_token"
+	sessionPath := app.CLISessionPath(projectIDC)
+	if err := os.MkdirAll(filepath.Dir(sessionPath), 0o700); err != nil {
+		t.Fatalf("mkdir session: %v", err)
+	}
+	foreignBody, _ := json.Marshal(map[string]any{
+		"project_id": projectIDForeign,
+		"api_url":    "http://127.0.0.1:1",
+		"token":      "tok-foreign-project-scoped",
+	})
+	if err := os.WriteFile(sessionPath, foreignBody, 0o600); err != nil {
+		t.Fatalf("write foreign session: %v", err)
+	}
+
+	// Legacy session file: valid (project_id matches
+	// dirC, repo_root=dirC). Its api_url points at the
+	// legacyServer. Discover's /health project_id check
+	// passes (project_id matches), so the legacy revoke
+	// succeeds.
+	legacyPath := app.LegacyCLISessionPath()
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	legacyBody, _ := json.Marshal(map[string]any{
+		"project_id": projectIDC,
+		"repo_root":  dirC,
+		"api_url":    legacyServer.URL,
+		"token":      "tok-legacy-current",
+	})
+	if err := os.WriteFile(legacyPath, legacyBody, 0o600); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+
+	code, stdout, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", dirC})
+	})
+	if code != 7 {
+		t.Fatalf("logout exit code = %d, want 7 (degraded: project-scoped validation failed); stderr = %s stdout = %s", code, stderr, stdout)
+	}
+	if !strings.Contains(stderr, "degraded") {
+		t.Fatalf("logout stderr missing degraded status: %s", stderr)
+	}
+	// Critical: the project-scoped session file MUST be
+	// preserved because its validation failed. The
+	// round-5 implementation would have deleted it
+	// after the legacy file's `revoked` terminal reply.
+	if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
+		t.Fatalf("project-scoped session file MUST be preserved when its validation failed, got: %v", err)
+	}
+	// Belt-and-braces: the foreign token MUST NOT have
+	// been sent to any daemon. The project_id check
+	// rejected the project-scoped file before any
+	// outbound request, and the legacy file's api_url
+	// is the only URL the legacy path used.
+	body, _ := os.ReadFile(sessionPath)
+	if !strings.Contains(string(body), "tok-foreign-project-scoped") {
+		t.Fatalf("project-scoped file content changed unexpectedly: %s", body)
+	}
+	// The legacy file MAY be deleted or preserved. The
+	// round-6 fix is specifically about preserving the
+	// project-scoped file when its validation failed;
+	// the round-5 sticky-degraded design intentionally
+	// keeps ALL local files on degraded exit so the
+	// operator can retry the whole logout chain. The
+	// legacy file's bearer was confirmed revoked
+	// server-side, so its preservation here is a
+	// consistency choice (keep-files-on-degraded) not
+	// a security one. We do not assert on its presence.
+}

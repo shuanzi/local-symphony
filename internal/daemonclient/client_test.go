@@ -906,3 +906,88 @@ func TestReadSessionFileAcceptsMatchingRepoRoot(t *testing.T) {
 		}
 	})
 }
+
+// TestReadSessionFileRejectsOnEvalSymlinksFailure pins the
+// HIGH #1 fix from adversarial round 6: when the persisted
+// repo_root points at a directory the OS can no longer
+// resolve (the original checkout was moved or deleted after
+// the session was minted), filepath.EvalSymlinks returns an
+// error. The round-4 implementation of checkSessionRepoRoot
+// treated that as "skip the check" (fail-open) and let a
+// foreign bearer be accepted — the trust boundary must be
+// fail-closed, so an unresolvable path is an authorization
+// failure rather than a bypass.
+//
+// The scenario:
+//   - we are operating from currentRepo (a real temp dir)
+//   - the session file's persisted repo_root points at a
+//     DELETED directory (goneRepo)
+//   - the caller's repoRoot does not match the (now
+//     unresolvable) persisted repo_root, but the round-4
+//     code would have skipped the comparison and accepted
+//     the foreign bearer
+//
+// The fix: ReadSessionFile must return ErrUnauthorized, not
+// nil, when either side of the comparison cannot be
+// normalised. The fail-closed behavior protects against the
+// copied-DB scenario where the operator copies a project
+// DB after its original checkout has been cleaned up.
+func TestReadSessionFileRejectsOnEvalSymlinksFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	projectID := "prj_evalsym"
+	// goneRepo: a temp dir we create and then delete so
+	// filepath.EvalSymlinks cannot resolve it.
+	goneRepo := t.TempDir()
+	if err := os.RemoveAll(goneRepo); err != nil {
+		t.Fatalf("remove goneRepo: %v", err)
+	}
+	currentRepo := t.TempDir()
+	sessionPath := app.CLISessionPath(projectID)
+	if err := os.MkdirAll(filepath.Dir(sessionPath), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"project_id": projectID,
+		"repo_root":  goneRepo,
+		"token":      "tok-foreign-gone",
+	})
+	if err := os.WriteFile(sessionPath, body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Sanity: EvalSymlinks on a deleted path must fail.
+	if _, err := filepath.EvalSymlinks(goneRepo); err == nil {
+		t.Fatalf("expected EvalSymlinks(%s) to fail on a deleted dir", goneRepo)
+	}
+	_, err := ReadSessionFile(sessionPath, projectID, currentRepo)
+	if err == nil {
+		t.Fatal("ReadSessionFile accepted session file whose persisted repo_root cannot be resolved; fail-open regression")
+	}
+	if got := core.AsAPIError(err).Code; got != core.ErrUnauthorized {
+		t.Fatalf("error code = %s, want %s; err = %v", got, core.ErrUnauthorized, err)
+	}
+	// Belt-and-braces: the same fail-closed guard must also
+	// fire when the CALLER's repoRoot cannot be resolved
+	// (e.g. the operator's checkout disappeared mid-flight).
+	// We mirror that case by writing a session file whose
+	// repo_root is the resolvable currentRepo, then calling
+	// ReadSessionFile with the unresolvable goneRepo. The
+	// symmetry is required: any EvalSymlinks failure on
+	// either side must reject, not pass.
+	t.Run("caller repo_root unresolvable", func(t *testing.T) {
+		body2, _ := json.Marshal(map[string]any{
+			"project_id": projectID,
+			"repo_root":  currentRepo,
+			"token":      "tok-foreign-gone-2",
+		})
+		if err := os.WriteFile(sessionPath, body2, 0o600); err != nil {
+			t.Fatalf("write 2: %v", err)
+		}
+		_, err := ReadSessionFile(sessionPath, projectID, goneRepo)
+		if err == nil {
+			t.Fatal("ReadSessionFile accepted session file when caller repo_root is unresolvable; fail-open regression")
+		}
+		if got := core.AsAPIError(err).Code; got != core.ErrUnauthorized {
+			t.Fatalf("error code = %s, want %s; err = %v", got, core.ErrUnauthorized, err)
+		}
+	})
+}
