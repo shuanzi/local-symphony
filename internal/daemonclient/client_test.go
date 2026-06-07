@@ -54,7 +54,7 @@ func TestDiscoverPrefersEnvOverride(t *testing.T) {
 	t.Cleanup(server.Close)
 	t.Setenv(EnvOverride, server.URL)
 
-	disc, err := Discover(context.Background(), "prj_x", t.TempDir(), true)
+	disc, err := Discover(context.Background(), "prj_x", t.TempDir(), true, "")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestDiscoverFallsBackToUserConfig(t *testing.T) {
 		t.Fatalf("write daemon config: %v", err)
 	}
 
-	disc, err := Discover(context.Background(), "prj_x", t.TempDir(), true)
+	disc, err := Discover(context.Background(), "prj_x", t.TempDir(), true, "")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestDiscoverFallsBackToRuntimeDescriptor(t *testing.T) {
 		t.Fatalf("write runtime descriptor: %v", err)
 	}
 
-	disc, err := Discover(context.Background(), projectID, projectRoot, true)
+	disc, err := Discover(context.Background(), projectID, projectRoot, true, "")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestDiscoverFallsBackToRuntimeDescriptor(t *testing.T) {
 func TestDiscoverReturnsErrDaemonUnavailableWhenNothingConfigured(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv(EnvOverride, "")
-	_, err := Discover(context.Background(), "prj_x", t.TempDir(), true)
+	_, err := Discover(context.Background(), "prj_x", t.TempDir(), true, "")
 	if !errors.Is(err, ErrDaemonUnavailable) {
 		t.Fatalf("Discover error = %v, want ErrDaemonUnavailable", err)
 	}
@@ -379,7 +379,7 @@ func TestDiscoveryRejectsMismatchedProjectID(t *testing.T) {
 		t.Fatalf("write runtime: %v", err)
 	}
 
-	_, err := Discover(context.Background(), "prj_abc", t.TempDir(), true)
+	_, err := Discover(context.Background(), "prj_abc", t.TempDir(), true, "")
 	if !errors.Is(err, ErrDaemonUnavailable) {
 		t.Fatalf("Discover error = %v, want ErrDaemonUnavailable", err)
 	}
@@ -414,7 +414,7 @@ func TestDiscoveryFallsBackWhenRuntimeDescriptorStale(t *testing.T) {
 		t.Fatalf("WriteSessionFile: %v", err)
 	}
 
-	disc, err := Discover(context.Background(), "prj_abc", t.TempDir(), true)
+	disc, err := Discover(context.Background(), "prj_abc", t.TempDir(), true, "")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -454,7 +454,7 @@ func TestDiscoveryFallsBackWhenSessionURLStale(t *testing.T) {
 		t.Fatalf("WriteSessionFile: %v", err)
 	}
 
-	disc, err := Discover(context.Background(), "prj_abc", t.TempDir(), true)
+	disc, err := Discover(context.Background(), "prj_abc", t.TempDir(), true, "")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -463,6 +463,87 @@ func TestDiscoveryFallsBackWhenSessionURLStale(t *testing.T) {
 	}
 	if !strings.HasPrefix(disc.Source, "runtime:") {
 		t.Fatalf("Source = %q, want runtime: prefix", disc.Source)
+	}
+}
+
+// TestDiscoverWithHintAcceptsMatchingProject pins the
+// happy path of the round-3 fix: when the saved api_url
+// is reachable AND its daemon advertises the expected
+// project_id, Discover returns that exact URL.
+func TestDiscoverWithHintAcceptsMatchingProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(EnvOverride, "")
+
+	projectID := "prj_abc"
+	server := healthServer(projectID, nil)
+	t.Cleanup(server.Close)
+
+	disc, err := Discover(context.Background(), projectID, t.TempDir(), true, server.URL)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if disc.BaseURL != server.URL {
+		t.Fatalf("BaseURL = %q, want %q (hint accepted)", disc.BaseURL, server.URL)
+	}
+	if !strings.HasPrefix(disc.Source, "hint:") {
+		t.Fatalf("Source = %q, want hint: prefix", disc.Source)
+	}
+}
+
+// TestDiscoverWithHintRejectsMismatchedProject pins the
+// HIGH finding from adversarial round 3: when the saved
+// api_url points at a different project's daemon, Discover
+// must reject it. The hint is the ONLY candidate (no
+// fallback to env / config / runtime) so a CLI bearer for
+// project A is never sent to a daemon hosting project B.
+func TestDiscoverWithHintRejectsMismatchedProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(EnvOverride, "")
+
+	// Daemon responds with project_id=other — CLI is looking
+	// for prj_abc. Discover (with this URL as the hint) must
+	// reject and return ErrDaemonUnavailable even though a
+	// runtime descriptor pointing at a correct daemon could
+	// otherwise resolve the call.
+	other := "prj_foreign"
+	wrongServer := healthServer(other, nil)
+	t.Cleanup(wrongServer.Close)
+
+	correctServer := healthServer("prj_abc", nil)
+	t.Cleanup(correctServer.Close)
+	descPath := db.RuntimeDescriptorPath("prj_abc")
+	if err := os.MkdirAll(filepath.Dir(descPath), 0o700); err != nil {
+		t.Fatalf("mkdir runtime: %v", err)
+	}
+	if err := os.WriteFile(descPath,
+		[]byte(`{"api_url":"`+correctServer.URL+`","project_id":"prj_abc","daemon_pid":1234}`), 0o600); err != nil {
+		t.Fatalf("write runtime: %v", err)
+	}
+
+	_, err := Discover(context.Background(), "prj_abc", t.TempDir(), true, wrongServer.URL)
+	if !errors.Is(err, ErrDaemonUnavailable) {
+		t.Fatalf("Discover error = %v, want ErrDaemonUnavailable (hint rejected, fallback disabled)", err)
+	}
+}
+
+// TestDiscoverWithHintRejectsUnreachableURL pins the
+// unreachable case of the round-3 fix: a saved api_url
+// whose daemon is offline still degrades gracefully. The
+// hint is rejected by the reachability probe and Discover
+// returns ErrDaemonUnavailable.
+func TestDiscoverWithHintRejectsUnreachableURL(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(EnvOverride, "")
+
+	// 127.0.0.1:1 is a port that should never accept
+	// connections on a healthy host. The 50ms timeout in
+	// reachable() keeps the test bounded.
+	_, err := Discover(context.Background(), "prj_abc", t.TempDir(), true, "http://127.0.0.1:1")
+	if !errors.Is(err, ErrDaemonUnavailable) {
+		t.Fatalf("Discover error = %v, want ErrDaemonUnavailable (unreachable hint rejected)", err)
 	}
 }
 

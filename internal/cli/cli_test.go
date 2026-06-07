@@ -2093,3 +2093,191 @@ func TestLegacyLogoutRemovesLegacySession(t *testing.T) {
 		t.Fatalf("project-scoped session file should be preserved on degraded logout, got: %v", err)
 	}
 }
+
+// TestLogoutFromFileRejectsStaleAPIURL pins the HIGH finding
+// from adversarial round 3: logoutRevokeFromFile used to
+// construct a daemon client with the saved api_url directly,
+// bypassing Discover's /health project_id guard. A saved
+// session whose api_url points at a different project's
+// daemon (loopback host collision, leftover from a prior dev
+// session) would receive the CLI bearer, return matched=false,
+// and the local files would be deleted. The bearer for project
+// A is now required to flow through the project_id check on
+// the saved api_url, and any rejection preserves the local
+// files so the operator can retry.
+//
+// Behavior:
+//   - exit code is 7 (degraded, keepFiles)
+//   - project-scoped session file is preserved
+//   - the wrong-project daemon never sees the bearer
+func TestLogoutFromFileRejectsStaleAPIURL(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	// Saved session api_url points at a daemon advertising
+	// a DIFFERENT project_id. Discovery's /health project_id
+	// guard must reject this so the bearer is not sent to
+	// the wrong daemon and the local files are preserved.
+	foreign := "prj_foreign"
+	wrongProjectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", foreign)
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	t.Cleanup(wrongProjectServer.Close)
+
+	sessionPath := app.CLISessionPath(projectID)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{
+		ProjectID: projectID,
+		APIURL:    wrongProjectServer.URL,
+		Token:     "tok-stale",
+	}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", dir})
+	})
+	if code != 7 {
+		t.Fatalf("logout exit code = %d, want 7 (degraded preserves files on stale api_url); stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "degraded") {
+		t.Fatalf("logout stderr missing degraded status: %s", stderr)
+	}
+	if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
+		t.Fatalf("session file should be preserved when saved api_url points at wrong-project daemon, got: %v", err)
+	}
+}
+
+// TestLogoutFromFileAcceptsMatchingAPIURL pins the happy
+// path of the round-3 fix: when the saved session's api_url
+// is reachable AND its daemon advertises the expected
+// project_id, the bearer is sent to THAT endpoint and the
+// daemon confirms matched=true. Local files are removed.
+//
+// Behavior:
+//   - exit code is 0 (revoked)
+//   - project-scoped session file is deleted
+//   - the matching daemon sees DELETE /api/v1/auth/cli-sessions/current
+//     with the saved bearer
+func TestLogoutFromFileAcceptsMatchingAPIURL(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	var sawDelete bool
+	var sawBearer string
+	matchingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data":{"ok":true,"project_id":"%s"},"meta":{}}`+"\n", projectID)
+			return
+		}
+		if r.Method == http.MethodDelete && r.URL.Path == "/api/v1/auth/cli-sessions/current" {
+			sawDelete = true
+			sawBearer = r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintln(w, `{"data":{"revoked":true,"matched":true},"meta":{}}`)
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	t.Cleanup(matchingServer.Close)
+
+	sessionPath := app.CLISessionPath(projectID)
+	if _, err := daemonclient.WriteSessionFile(projectID, daemonclient.SessionFile{
+		ProjectID: projectID,
+		APIURL:    matchingServer.URL,
+		Token:     "tok-good",
+	}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("logout exit code = %d, want 0 (revoked); stderr = %s", code, stderr)
+	}
+	if !sawDelete {
+		t.Fatalf("daemon never saw DELETE /api/v1/auth/cli-sessions/current; stderr = %s", stderr)
+	}
+	if sawBearer != "Bearer tok-good" {
+		t.Fatalf("daemon saw Authorization = %q, want %q", sawBearer, "Bearer tok-good")
+	}
+	if _, err := os.Stat(sessionPath); !os.IsNotExist(err) {
+		t.Fatalf("session file should be deleted on successful revoke, got: %v", err)
+	}
+}
+
+// TestLogoutFromFileFallsBackToDiscoveryOnNoAPIURL ensures
+// the round-3 fix does not regress the no-api-url fallback:
+// when the saved session lacks an api_url, logoutRevoke is
+// still allowed to fall through to the discovery chain
+// (env / config / runtime descriptor). A session file with
+// only a token must remain "unusable" so the caller can try
+// the next source.
+//
+// Behavior:
+//   - the unreachable api_url is preserved on degraded logout
+//   - an unusable file (token only, no api_url) does not
+//     pollute the degraded path
+func TestLogoutFromFileFallsBackToDiscoveryOnNoAPIURL(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(daemonclient.EnvOverride, "")
+
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectID := st.ProjectID
+	st.Close()
+
+	// Session file with no api_url: should be treated as
+	// unusable and fall through to the discovery chain.
+	// No candidate in env / config / runtime exists, so the
+	// call degrades. This is the existing behavior and the
+	// fix must not change it.
+	sessionPath := app.CLISessionPath(projectID)
+	if err := os.MkdirAll(filepath.Dir(sessionPath), 0o700); err != nil {
+		t.Fatalf("mkdir session: %v", err)
+	}
+	if err := os.WriteFile(sessionPath, []byte(fmt.Sprintf(`{"project_id":%q,"token":"tok"}`, projectID)), 0o600); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	code, _, stderr := captureCLIOutput(t, func() int {
+		return Main([]string{"login", "--logout", "--project", dir})
+	})
+	if code != 7 {
+		t.Fatalf("logout exit code = %d, want 7 (degraded); stderr = %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "degraded") {
+		t.Fatalf("logout stderr missing degraded status: %s", stderr)
+	}
+	if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
+		t.Fatalf("session file should be preserved when discovery cannot find a daemon, got: %v", err)
+	}
+}

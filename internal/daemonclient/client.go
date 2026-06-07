@@ -90,6 +90,16 @@ func (e *NetworkError) Unwrap() error { return e.Err }
 // usable daemon URL. It never starts a daemon; an operator must
 // launch it out-of-band.
 //
+// baseURLHint, when non-empty, is prepended to the candidate
+// list. Callers that already hold a daemon URL — e.g. the
+// api_url persisted in a session file — pass it here so the
+// reachability / project_id check runs against that exact
+// endpoint before any fallback. The hint is the FIRST candidate
+// tried so a saved api_url pointing at the wrong project's
+// daemon is rejected (or any subsequent candidate wins) instead
+// of being silently honored. A stale or cross-project api_url
+// MUST NOT carry a CLI bearer to a foreign daemon.
+//
 // Project trust boundary: every candidate URL is reachable-tested,
 // and the daemon's /api/v1/health response must report
 // `data.project_id` equal to the requested projectID. A stale
@@ -98,11 +108,11 @@ func (e *NetworkError) Unwrap() error { return e.Err }
 // bearer for project A is never sent to a daemon hosting
 // project B. Discovery returns ErrDaemonUnavailable when no
 // candidate matches.
-func Discover(ctx context.Context, projectID, projectRoot string, allowRemote bool) (Discovery, error) {
+func Discover(ctx context.Context, projectID, projectRoot string, allowRemote bool, baseURLHint string) (Discovery, error) {
 	if projectID == "" {
 		return Discovery{}, fmt.Errorf("daemonclient: projectID is required")
 	}
-	candidates := discoverCandidates(projectID, projectRoot)
+	candidates := discoverCandidates(projectID, projectRoot, baseURLHint)
 	for _, c := range candidates {
 		base, err := normalizeBaseURL(c.URL, allowRemote)
 		if err != nil {
@@ -130,7 +140,19 @@ type discoverCandidate struct {
 // discoverCandidates enumerates every daemon URL the discovery
 // process knows about, in precedence order. The slice is
 // deterministic so tests can assert which source won the race.
-func discoverCandidates(projectID, projectRoot string) []discoverCandidate {
+//
+// baseURLHint, when non-empty, REPLACES the candidate list with
+// just the hint. This is the only way a caller can short-circuit
+// discovery to a specific URL while still routing through the
+// project_id trust check. Saved session files use it so a stale
+// or cross-project api_url is rejected before any CLI bearer is
+// sent to that endpoint; the bearer for project A is never
+// delivered to a daemon hosting project B by falling back to
+// some other configured URL.
+func discoverCandidates(projectID, projectRoot, baseURLHint string) []discoverCandidate {
+	if hint := strings.TrimSpace(baseURLHint); hint != "" {
+		return []discoverCandidate{{URL: hint, Source: "hint:base_url"}}
+	}
 	out := []discoverCandidate{}
 	if raw := strings.TrimSpace(os.Getenv(EnvOverride)); raw != "" {
 		out = append(out, discoverCandidate{URL: raw, Source: "env:" + EnvOverride})
@@ -163,7 +185,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	baseURL := strings.TrimSpace(cfg.BaseURL)
 	if baseURL == "" {
-		disc, err := Discover(ctx, cfg.ProjectID, cfg.ProjectRoot, cfg.AllowRemoteDaemonURL)
+		disc, err := Discover(ctx, cfg.ProjectID, cfg.ProjectRoot, cfg.AllowRemoteDaemonURL, "")
 		if err != nil {
 			return nil, err
 		}
