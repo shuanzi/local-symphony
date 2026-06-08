@@ -1,8 +1,17 @@
 # 阶段 C 验收记录
 
-**状态**：进行中
-**更新日期**：2026-06-07
+**状态**：阶段 C v1.1 WIP 收口（**C1+C2 完成 + C3 v1.1 WIP + C4 v1.1 WIP**），等待 PR 合并
+**更新日期**：2026-06-08
 **覆盖阶段**：C（Daemon 产品行为补齐）
+
+## 阶段 C 收口 PR
+
+| 子包 | PR | 分支 | 状态 |
+|---|---|---|---|
+| C3 owner nonce/heartbeat v1.1 WIP | **[#19](https://github.com/shuanzi/local-symphony/pull/19)** | `pr/c3-owner-nonce-v1-1-wip` | open, waiting review |
+| C4 CLI over REST v1.1 WIP | **[#20](https://github.com/shuanzi/local-symphony/pull/20)** | `pr/c4-cli-rest-v1-1-wip` | open, waiting review |
+
+两个 PR **不可相互依赖**——C3 与 C4 改动无交叉文件冲突。
 
 ## 整体进度
 
@@ -10,8 +19,8 @@
 
 - [x] **C1 hook lifecycle**：hook adapter 接 lifecycle event，codex_review 已合并。
 - [x] **C2 scheduler tick loop**：scheduler tick + 串行 in-flight dispatch，codex_review 已合并。
-- [~] **C3 single daemon ownership / runtime lock**：app DB `runtime_descriptors` owner guard 已实现并合并；**owner nonce/heartbeat stale recovery 待收口**（PID 复用场景）。
-- [~] **C4 CLI over REST 与 daemon session 对齐**：9 轮 codex review + 6 轮 adversarial review 已合并；**v1.1 WIP**：trust 边界专项（fail-open 模式反复在 `repo_root` guard 路径重犯 + validation failure vs missing file 区分不足）作为 v1.1 收口工作。
+- [~] **C3 single daemon ownership / runtime lock**：app DB `runtime_descriptors` owner guard 已实现并合并；**v1.1 WIP**：owner nonce/heartbeat 数据层完整 + 5 轮 codex review 充分；协调层 1 P1 留作 C5 daemon lifecycle design problem。**PR #19 open**。
+- [~] **C4 CLI over REST 与 daemon session 对齐**：12 commits（含 5 轮 codex review + 6 轮 adversarial review + 1 docs）实施完整；**v1.1 WIP**：trust 边界专项（fail-open 模式反复在 `repo_root` guard 路径重犯 + validation failure vs missing file 区分不足）作为 v1.1 收口后续。**PR #20 open**。
 
 ## C4 v1.1 WIP
 
