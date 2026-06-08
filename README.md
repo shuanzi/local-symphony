@@ -175,21 +175,6 @@ curl http://127.0.0.1:7331/api/v1/health
 /path/to/local-symphony/bin/symphony open --project .
 ```
 
-CLI bearer session 由 `symphony serve` 自动 mint 并落到 `~/.symphony/cli-sessions/<project>.json`（权限 `0600`）。`symphony login` 用来验证当前 session 是否被 daemon 识别：
-
-```bash
-# 探测当前项目的 session 是否有效
-/path/to/local-symphony/bin/symphony login --project .
-
-# 列出本机所有已存 session（多项目场景）
-/path/to/local-symphony/bin/symphony login --list
-
-# 登出当前项目（删除本地 session 文件；不撤销 daemon 端 session）
-/path/to/local-symphony/bin/symphony login --logout
-```
-
-`login` 不创建新 session。新 session 必须在 `symphony serve` 启动时由 daemon 端通过 open-token 流程签发。`symphony tool` 命令走独立的 Tool Gateway token 路径，不会被 `login`/`logout` 触发。
-
 当前 `web/` 是 React/Vite dashboard MVP 和动作合同检查。`symphony serve` 的 `/api/v1/*` 与 `/tool/v1/call` 路由优先于 dashboard 静态资源。根路径只会从可信 dashboard dist 位置读取静态资源：优先使用 `SYMPHONY_DASHBOARD_DIST` 指向的构建产物目录；未设置时从 `symphony` 可执行文件所在目录推导 `web/dist`、`../web/dist`、`../share/local-symphony/web/dist` 等安装位置。被管理项目根目录下的 `web/dist` 不会作为默认候选。
 
 ## 7. 本地 issue 主流程

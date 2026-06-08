@@ -10,7 +10,6 @@
       "/auth/logout",
       "/auth/open-token",
       "/auth/cli-token/rotate",
-      "/auth/cli-sessions/current",
       "/issues",
       "/issues/{issue_ref}",
       "/issues/{issue_ref}/transition",
@@ -207,7 +206,6 @@
       "symphony init",
       "symphony serve",
       "symphony open",
-      "symphony login",
       "symphony status",
       "symphony issue create",
       "symphony issue list",
@@ -247,9 +245,7 @@
       "approve-for-session",
       "cancel-run",
       "send-to-rework",
-      "mark-done",
-      "daemon is not running",
-      "symphony serve"
+      "mark-done"
     ],
     "forbidden_commands": [
       "symphony publish",

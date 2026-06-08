@@ -5,10 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
-	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -516,51 +513,6 @@ func ContainedPath(root, rel string) (string, error) {
 		return "", errors.New("protected path denied")
 	}
 	return target, nil
-}
-
-// IsLoopbackHost reports whether host (already lowercased,
-// without brackets for IPv6) is a loopback address. It accepts
-// `127.0.0.1` (and the full 127.0.0.0/8 block), `::1`, and
-// `localhost`. Any other host — including LAN addresses —
-// returns false. The v1 plan binds the daemon to a loopback
-// address; allowing any other host would expose the CLI
-// bearer to a remote endpoint that mimics project_id.
-func IsLoopbackHost(host string) bool {
-	host = strings.TrimSpace(strings.ToLower(host))
-	// Strip IPv6 brackets (the caller may pass "[::1]" intact).
-	host = strings.TrimPrefix(host, "[")
-	host = strings.TrimSuffix(host, "]")
-	switch host {
-	case "localhost":
-		return true
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	return false
-}
-
-// RequireLoopbackURL returns an error when the supplied URL
-// does not point at a loopback host. The opt-in flag exists
-// so tests and explicit-development-against-remote fixtures
-// can override the v1 default; production CLI invocations
-// should never set it.
-func RequireLoopbackURL(raw string, allowRemote bool) error {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("security: parse %q: %w", raw, err)
-	}
-	host := u.Hostname()
-	if host == "" {
-		return fmt.Errorf("security: daemon URL %q has no host", raw)
-	}
-	if allowRemote {
-		return nil
-	}
-	if !IsLoopbackHost(host) {
-		return fmt.Errorf("security: non-loopback daemon URL rejected: %s (set allow_remote=true to override)", host)
-	}
-	return nil
 }
 
 func RedactString(s string) string {
