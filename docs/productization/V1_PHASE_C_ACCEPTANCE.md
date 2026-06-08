@@ -1,9 +1,16 @@
 # v1 真实产品化阶段 C 验收记录
 
-**日期**：2026-06-06（最后更新）
+**日期**：2026-06-08（最后更新）
 **对应计划**：`docs/productization/V1_REAL_PRODUCTIZATION_EXECUTION_PLAN.md` 阶段 C
-**阶段状态**：**v1.1 WIP** —— 数据层完整、5 轮 codex 滚动 review 收敛 8/9 finding；协调层 1 P1 未修，留作 C5 daemon lifecycle design problem
+**阶段状态**：**v1.1 WIP** —— C1+C2 完成；C3 数据层完整、5 轮 codex 滚动 review 收敛 8/9 finding；C4 12 commits（含 5 轮 codex review + 6 轮 adversarial review）实施完整；C3 + C4 都已 v1.1 WIP 路线收口
 **阶段目标**：把 daemon 包装成本地产品行为：单 owner project DB、CLI over REST、scheduler tick loop、可恢复的 runtime lock。
+
+## 阶段 C 收口 PR
+
+| 子包 | PR | 状态 |
+|---|---|---|
+| C3 owner nonce/heartbeat v1.1 WIP | **[#19](https://github.com/shuanzi/local-symphony/pull/19)** | open, waiting review |
+| C4 CLI over REST v1.1 WIP | **[#20](https://github.com/shuanzi/local-symphony/pull/20)** | open, waiting review |
 
 ## 1. 验收结论
 
