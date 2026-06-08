@@ -84,6 +84,16 @@ paths:
       responses:
         "200": { description: Rotated CLI token, content: { application/json: { schema: { $ref: '#/components/schemas/CliTokenEnvelope' } } } }
         "401": { $ref: '#/components/responses/Error' }
+  /auth/cli-sessions/current:
+    delete:
+      operationId: revokeCliSession
+      description: "Revokes the bearer CLI credential presented on this request. Idempotent: a no-bearer request, an already-revoked token, and an unrecognized token all return 200 with revoked=true. The matched field reports whether the daemon actually had a row for the presented token. This is the server-side half of `symphony login --logout` so a copied bearer token cannot continue to authorize mutating REST calls after the operator believes they are logged out."
+      security:
+        - bearerAuth: []
+        - {}
+      responses:
+        "200": { description: Revoked, content: { application/json: { schema: { $ref: '#/components/schemas/CliSessionRevokeEnvelope' } } } }
+        "401": { $ref: '#/components/responses/Error' }
   /issues:
     get:
       operationId: listIssues
@@ -413,7 +423,7 @@ components:
             request_id: { type: string }
     ApiErrorCode:
       type: string
-      enum: [unauthorized, forbidden, csrf_required, invalid_request, not_found, unsupported_db_version, workflow_invalid, workflow_validation_failed, prompt_render_failed, invalid_state_transition, issue_blocked, issue_dispatch_paused, issue_already_running, concurrency_limit_reached, workspace_conflict, workspace_prepare_failed, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_not_pending, approval_timeout, review_packet_required, review_packet_failed, tool_token_invalid, tool_gateway_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted, command_denied, network_denied, protected_path_denied, raw_log_access_not_supported, internal_error]
+      enum: [unauthorized, forbidden, csrf_required, invalid_request, not_found, unsupported_db_version, workflow_invalid, workflow_validation_failed, prompt_render_failed, prompt_blocked, policy_denied, command_denied, invalid_state_transition, issue_blocked, issue_dispatch_paused, issue_already_running, concurrency_limit_reached, workspace_conflict, workspace_prepare_failed, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_not_pending, approval_timeout, not_owner, daemon_unavailable, review_packet_required, review_packet_failed, tool_token_invalid, tool_gateway_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted, network_denied, protected_path_denied, raw_log_access_not_supported, internal_error]
     FailureCode:
       type: string
       enum: [workflow_invalid, workflow_validation_failed, prompt_render_failed, workspace_prepare_failed, workspace_conflict, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_timeout, command_denied, network_denied, protected_path_denied, tool_gateway_failed, missing_handoff, review_packet_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted]
@@ -503,6 +513,15 @@ components:
         expires_at: { type: [string, 'null'], format: date-time }
     CliTokenEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/CliToken' } } } ]
+    CliSessionRevokeResult:
+      type: object
+      required: [revoked, matched]
+      additionalProperties: false
+      properties:
+        revoked: { type: boolean, description: "True when the call has been processed (idempotent). False is reserved for future use and never returned today." }
+        matched: { type: boolean, description: "True when the daemon had a row for the presented bearer; false on no-bearer, rotated, or unknown tokens. " }
+    CliSessionRevokeEnvelope:
+      allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/CliSessionRevokeResult' } } } ]
     IssueState:
       type: string
       enum: [Inbox, Ready, Working, Rework, Blocked, Human Review, Done, Cancelled, Duplicate]
