@@ -78,6 +78,9 @@ const (
 	ErrWorkflowInvalid          APIErrorCode = "workflow_invalid"
 	ErrWorkflowValidationFailed APIErrorCode = "workflow_validation_failed"
 	ErrPromptRenderFailed       APIErrorCode = "prompt_render_failed"
+	ErrPromptBlocked            APIErrorCode = "prompt_blocked"
+	ErrPolicyDenied             APIErrorCode = "policy_denied"
+	ErrCommandDenied            APIErrorCode = "command_denied"
 	ErrInvalidStateTransition   APIErrorCode = "invalid_state_transition"
 	ErrIssueBlocked             APIErrorCode = "issue_blocked"
 	ErrIssueDispatchPaused      APIErrorCode = "issue_dispatch_paused"
@@ -91,6 +94,9 @@ const (
 	ErrToolTokenInvalid         APIErrorCode = "tool_token_invalid"
 	ErrToolGatewayFailed        APIErrorCode = "tool_gateway_failed"
 	ErrApprovalNotPending       APIErrorCode = "approval_not_pending"
+	ErrApprovalTimeout          APIErrorCode = "approval_timeout"
+	ErrNotOwner                 APIErrorCode = "not_owner"
+	ErrDaemonUnavailable        APIErrorCode = "daemon_unavailable"
 	ErrRawLogAccessUnsupported  APIErrorCode = "raw_log_access_not_supported"
 	ErrInternal                 APIErrorCode = "internal_error"
 )
@@ -123,12 +129,29 @@ func AsAPIError(err error) *APIError {
 	return NewError(ErrInternal, err.Error(), nil)
 }
 
+// ExitCodeForError maps an API error code to the CLI exit code spelled
+// out in the v1 productization plan:
+//
+//	invalid_request                            -> 2
+//	workflow / prompt failures                 -> 9
+//	other operator-actionable conflicts        -> 7
+//	everything else (e.g. internal_error,
+//	         unclassified Go errors)           -> 1
+//
+// Successful runs always return 0.
 func ExitCodeForError(code APIErrorCode) int {
 	switch code {
 	case ErrInvalidRequest:
 		return 2
-	case ErrWorkflowInvalid, ErrWorkflowValidationFailed, ErrPromptRenderFailed:
+	case ErrWorkflowInvalid,
+		ErrWorkflowValidationFailed,
+		ErrPromptRenderFailed,
+		ErrPromptBlocked,
+		ErrPolicyDenied,
+		ErrCommandDenied:
 		return 9
+	case ErrInternal:
+		return 1
 	default:
 		return 7
 	}
