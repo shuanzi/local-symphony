@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -273,5 +274,57 @@ func TestPolicyProtectedPathUsesConfiguredPatterns(t *testing.T) {
 
 	if got.Outcome != PolicyDeny {
 		t.Fatalf("configured protected path outcome = %s, want %s", got.Outcome, PolicyDeny)
+	}
+}
+
+func TestIsLoopbackHost(t *testing.T) {
+	yes := []string{
+		"localhost",
+		"LOCALHOST",
+		"  localhost  ",
+		"127.0.0.1",
+		"127.0.0.5",
+		"::1",
+		"[::1]",
+		"0:0:0:0:0:0:0:1",
+	}
+	no := []string{
+		"evil.example.com",
+		"example.com",
+		"127.0.0.1.evil.example.com",
+		"8.8.8.8",
+		"2001:db8::1",
+		"",
+		"user@evil.example.com",
+	}
+	for _, h := range yes {
+		if !IsLoopbackHost(h) {
+			t.Errorf("IsLoopbackHost(%q) = false, want true", h)
+		}
+	}
+	for _, h := range no {
+		if IsLoopbackHost(h) {
+			t.Errorf("IsLoopbackHost(%q) = true, want false", h)
+		}
+	}
+}
+
+func TestRequireLoopbackURL(t *testing.T) {
+	if err := RequireLoopbackURL("http://127.0.0.1:3777/", false); err != nil {
+		t.Fatalf("loopback URL rejected: %v", err)
+	}
+	if err := RequireLoopbackURL("http://localhost:9000", false); err != nil {
+		t.Fatalf("localhost URL rejected: %v", err)
+	}
+	err := RequireLoopbackURL("http://evil.example.com/", false)
+	if err == nil {
+		t.Fatal("non-loopback URL accepted in v1-default mode")
+	}
+	if !strings.Contains(err.Error(), "evil.example.com") {
+		t.Fatalf("error does not name the offending host: %v", err)
+	}
+	// allowRemote override is test-only and must accept.
+	if err := RequireLoopbackURL("http://evil.example.com/", true); err != nil {
+		t.Fatalf("allowRemote=true should override loopback guard: %v", err)
 	}
 }
