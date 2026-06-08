@@ -246,7 +246,11 @@
       "required": [
         "api_url",
         "tool_gateway_endpoint",
-        "daemon_pid"
+        "daemon_pid",
+        "acquired_at",
+        "heartbeat_at",
+        "heartbeat_ttl_ms",
+        "owner_nonce_fingerprint"
       ],
       "properties": {
         "api_url": {
@@ -261,6 +265,30 @@
             "null"
           ],
           "minimum": 1
+        },
+        "acquired_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "heartbeat_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "heartbeat_ttl_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "owner_nonce_fingerprint": {
+          "$ref": "#/$defs/nullableString"
         }
       }
     },

@@ -413,7 +413,7 @@ components:
             request_id: { type: string }
     ApiErrorCode:
       type: string
-      enum: [unauthorized, forbidden, csrf_required, invalid_request, not_found, unsupported_db_version, workflow_invalid, workflow_validation_failed, prompt_render_failed, invalid_state_transition, issue_blocked, issue_dispatch_paused, issue_already_running, concurrency_limit_reached, workspace_conflict, workspace_prepare_failed, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_not_pending, approval_timeout, review_packet_required, review_packet_failed, tool_token_invalid, tool_gateway_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted, command_denied, network_denied, protected_path_denied, raw_log_access_not_supported, internal_error]
+      enum: [unauthorized, forbidden, csrf_required, invalid_request, not_found, unsupported_db_version, workflow_invalid, workflow_validation_failed, prompt_render_failed, invalid_state_transition, issue_blocked, issue_dispatch_paused, issue_already_running, concurrency_limit_reached, workspace_conflict, workspace_prepare_failed, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_not_pending, approval_timeout, review_packet_required, review_packet_failed, tool_token_invalid, tool_gateway_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted, command_denied, network_denied, protected_path_denied, raw_log_access_not_supported, daemon_already_running, internal_error]
     FailureCode:
       type: string
       enum: [workflow_invalid, workflow_validation_failed, prompt_render_failed, workspace_prepare_failed, workspace_conflict, after_create_failed, before_run_failed, codex_startup_failed, unsupported_codex_version, codex_protocol_error, turn_timeout, stall_timeout, approval_timeout, command_denied, network_denied, protected_path_denied, tool_gateway_failed, missing_handoff, review_packet_failed, operator_cancelled, agent_blocked, issue_state_changed, canceled_by_reconciliation, daemon_restarted_run_interrupted]
@@ -1031,11 +1031,15 @@ components:
     DiagnosticsRuntimeDescriptor:
       type: object
       additionalProperties: false
-      required: [api_url, tool_gateway_endpoint, daemon_pid]
+      required: [api_url, tool_gateway_endpoint, daemon_pid, acquired_at, heartbeat_at, heartbeat_ttl_ms, owner_nonce_fingerprint]
       properties:
         api_url: { type: [string, 'null'] }
         tool_gateway_endpoint: { type: [string, 'null'] }
         daemon_pid: { type: [integer, 'null'], minimum: 1 }
+        acquired_at: { type: [integer, 'null'], minimum: 0, description: 'Unix ms timestamp when the current runtime owner acquired the lock.' }
+        heartbeat_at: { type: [integer, 'null'], minimum: 0, description: 'Unix ms timestamp of the most recent runtime owner heartbeat.' }
+        heartbeat_ttl_ms: { type: [integer, 'null'], minimum: 0, description: 'Time-to-live in milliseconds for the runtime owner heartbeat.' }
+        owner_nonce_fingerprint: { type: [string, 'null'], minLength: 0, maxLength: 64, description: '8-character hex prefix of the owner nonce. The full nonce is never exposed via diagnostics.' }
     DiagnosticsCodex:
       type: object
       additionalProperties: false

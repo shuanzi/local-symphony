@@ -379,7 +379,72 @@
       "artifact.attach protected path denied failed tool_call without approval row",
       "artifact path traversal and symlink escape",
       "redaction golden fixtures",
-      "raw prompt raw Codex log raw secret API refusal"
+      "raw prompt raw Codex log raw secret API refusal",
+      "runtime owner nonce fingerprint only via diagnostics",
+      "runtime owner heartbeat stale recovery on PID reuse"
+    ]
+  },
+  "runtime_ownership": {
+    "owner_lock_table": "runtime_descriptors",
+    "owner_lock_columns": [
+      "project_id",
+      "api_url",
+      "tool_gateway_endpoint",
+      "daemon_pid",
+      "owner_nonce",
+      "heartbeat_at",
+      "heartbeat_ttl_ms",
+      "acquired_at",
+      "started_at",
+      "updated_at"
+    ],
+    "owner_event_table": "runtime_owner_events",
+    "owner_event_columns": [
+      "id",
+      "project_id",
+      "event_type",
+      "actor_type",
+      "data_json",
+      "redacted",
+      "created_at"
+    ],
+    "owner_event_types": [
+      "runtime_owner_reaped"
+    ],
+    "owner_nonce": {
+      "min_length_bytes": 32,
+      "source": "crypto/rand",
+      "diagnostics_exposure": "8-char hex fingerprint only; full nonce never leaves store",
+      "surface": [
+        "app DB runtime_descriptors.owner_nonce",
+        "internal runtime descriptor file (.symphony/...)"
+      ],
+      "forbidden_surfaces": [
+        "openapi",
+        "diagnostics api",
+        "diagnostics export",
+        "dashboard",
+        "log lines"
+      ]
+    },
+    "heartbeat": {
+      "default_interval_ms": 5000,
+      "default_ttl_ms": 30000,
+      "reap_interval_ms": 60000,
+      "staleness_signal": "now - heartbeat_at > heartbeat_ttl_ms OR owner_nonce missing on migrated rows",
+      "pid_reuse_tolerance": "PID alive + heartbeat stale is still treated as recoverable owner; PID reuse alone never blocks takeover"
+    },
+    "diagnostics_required_fields": [
+      "api_url",
+      "tool_gateway_endpoint",
+      "daemon_pid",
+      "acquired_at",
+      "heartbeat_at",
+      "heartbeat_ttl_ms",
+      "owner_nonce_fingerprint"
+    ],
+    "diagnostics_forbidden_fields": [
+      "owner_nonce"
     ]
   }
 }

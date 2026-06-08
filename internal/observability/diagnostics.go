@@ -29,7 +29,15 @@ func Diagnostics(st *store.Store) map[string]any {
 	for _, i := range paused {
 		pausedRefs = append(pausedRefs, i.Identifier)
 	}
-	runtimeDescriptor := map[string]any{"api_url": nil, "tool_gateway_endpoint": nil, "daemon_pid": nil}
+	runtimeDescriptor := map[string]any{
+		"api_url":                 nil,
+		"tool_gateway_endpoint":   nil,
+		"daemon_pid":              nil,
+		"acquired_at":             nil,
+		"heartbeat_at":            nil,
+		"heartbeat_ttl_ms":        nil,
+		"owner_nonce_fingerprint": nil,
+	}
 	if desc, err := st.RuntimeDescriptorSnapshot(); err == nil && desc != nil {
 		runtimeDescriptor = desc
 	}

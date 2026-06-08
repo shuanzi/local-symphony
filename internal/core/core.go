@@ -82,6 +82,7 @@ const (
 	ErrIssueBlocked             APIErrorCode = "issue_blocked"
 	ErrIssueDispatchPaused      APIErrorCode = "issue_dispatch_paused"
 	ErrIssueAlreadyRunning      APIErrorCode = "issue_already_running"
+	ErrDaemonAlreadyRunning     APIErrorCode = "daemon_already_running"
 	ErrConcurrencyLimitReached  APIErrorCode = "concurrency_limit_reached"
 	ErrWorkspaceConflict        APIErrorCode = "workspace_conflict"
 	ErrWorkspacePrepareFailed   APIErrorCode = "workspace_prepare_failed"

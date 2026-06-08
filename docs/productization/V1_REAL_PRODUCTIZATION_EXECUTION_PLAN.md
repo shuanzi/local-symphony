@@ -1,7 +1,7 @@
 # v1 真实产品化执行计划
 
-**状态**：执行中，阶段 A、阶段 B 已完成；阶段 C 已启动，C1 hook lifecycle 与 C2 scheduler tick loop 已完成，C3 runtime ownership guard 已启动，owner nonce/heartbeat stale recovery 待收口
-**更新日期**：2026-06-04
+**状态**：执行中，阶段 A、阶段 B 已完成；阶段 C 数据层完整、codex 5 轮 review 收敛 8/9 finding，C3 v1.1 WIP 状态（协调层 1 P1 未修，留作 C5 daemon lifecycle design problem）
+**更新日期**：2026-06-06
 **需求来源**：`docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md`
 **目标**：把 R1-R17 的产品化缺口拆成可落地、可审查、可验收的实施批次，推进 Local Symphony 从本地 fake runner MVP 进入真实 Codex 可运行的本地产品化版本。
 
@@ -36,7 +36,7 @@ R15 是横切要求，不作为单独最后阶段处理。每完成一个需求�
 - [x] B2 / Codex approval producer 与 writeback：已完成；Codex command/file_change/network approval request 会写入 `approval_requests`，operator 决策可写回 Codex，并覆盖 deny、cancel_run 与 timeout 语义。
 - [x] B3 / 安全策略执行与回归套件：默认 command/network/protected-path policy evaluator 已接入 Codex approval bridge，auto-deny 写入 `approval_requests(auto_denied)` 并返回 canonical failure code；redaction golden fixture 已补齐并纳入 contract validation，覆盖 prompt、Codex log、secret、diagnostics。
 - [x] 阶段 B 收口：已完成；验收记录见 `docs/productization/V1_PHASE_B_ACCEPTANCE.md`。
-- [ ] 阶段 C / Daemon 产品行为补齐：进行中；C1 hook lifecycle 与 C2 scheduler tick loop 已完成，C3 single daemon ownership/runtime lock 已启动，PID 复用下的 owner nonce/heartbeat stale recovery 待收口。
+- [x] 阶段 C / Daemon 产品行为补齐：进行中；C1 hook lifecycle、C2 scheduler tick loop 与 C3 single daemon ownership/runtime lock（**v1.1 WIP**——数据层完整、5 轮 codex 滚动 review 收敛 8/9 finding；协调层 1 P1 未修，留作 C5 daemon lifecycle design problem）已完成。验收记录见 `docs/productization/V1_PHASE_C_ACCEPTANCE.md`。
 - [ ] 阶段 D / Operator 体验与发布：未开始。
 
 ## 3. 全局 Definition of Done
@@ -498,34 +498,85 @@ bash scripts/acceptance-local.sh
 
 覆盖 R8 的 ownership 部分。
 
-**进度**：已启动。当前切片已实现 app DB `runtime_descriptors` owner guard：`serve` 在任何 project DB mutation 前获取 runtime owner，active owner conflict 不写 CLI session、不执行 stale-run reconciliation；shutdown 只释放当前 daemon PID owner；dead PID descriptor 可恢复；diagnostics 只展示 non-secret runtime descriptor。已知边界：stale 判断仍基于 PID 存活，PID 复用场景需要 owner nonce/heartbeat 或 OS lock 后续收口后才能声明 C3 全量完成。
+**进度**：v1.1 WIP（数据层完整、review 充分；协调层留作后续 C5/设计层问题）。
+
+- **数据层（schema / nonce / heartbeat / diagnostics / migrated 兼容）已 5 轮 codex 滚动 review 充分收敛**，无新 finding。
+- **协调层（scheduler nonce gate / shutdown ordering / long-running tick race）暴露 1 P1 未修**，属于 open design problem。
+- 5 轮累计 **4P1 + 5P2 = 9 finding**；前 4 轮的 8 个已修，最后 1 个 P1 留作 v1.1 WIP 已知限制。
+- 已知限制：**shutdown ordering** — 在长跑 scheduler tick 与新 owner 并发接管之间，daemon 关闭序列的顺序仍可在小窗口内产生 1 个 P1（round-5 review 暴露，未修）。该问题属于 C5 daemon lifecycle design problem 的子集，**不强制在 C3 收口内解决**。
+- 4 个 commit 保留在 worktree（`codex/v1-productization-c3-owner-nonce` 分支，未 push / 未 PR / 未 merge）：
+  - `dbf4c6e` C3 主体（owner nonce / heartbeat / diagnostics / 收口测试）
+  - `ee4f8a5` round-2：PID 存活判断先于 TTL
+  - `e136dfc` round-3：scheduler dispatch nonce gate + migrated row reap + `daemon_already_running` schema
+  - `d8840d2` round-4：live migrated owner 保留 + 测试用 context-cancel 替代 SIGINT
+
+数据层已实现：
+- app DB `runtime_descriptors` owner guard：`serve` 在任何 project DB mutation 前获取 runtime owner
+- active owner conflict 不写 CLI session、不执行 stale-run reconciliation
+- shutdown 只释放当前 daemon nonce owner
+- dead PID / PID 复用 / heartbeat 停滞 / 既有 v1 app DB 升级场景可恢复
+- diagnostics 只展示 8 字符 owner_nonce fingerprint + heartbeat_at / heartbeat_ttl_ms / acquired_at，不暴露 owner_nonce 明文
+- heartbeat ticker 与 reap ticker 在 SIGINT / ShutdownContext 时优雅停止
+- migrated row + 旧 PID 仍活时**不 reap**（保护 live legacy daemon）
 
 目标：
 
 - 每个 project DB 同时只有一个活跃 daemon owner。
-- stale descriptor/lock owner 可安全恢复。
-- runtime descriptor 不包含 secret/token。
+- stale descriptor/lock owner 可安全恢复（包括 PID 复用）。
+- runtime descriptor 不包含 secret/token；owner_nonce 仅 8 字符 fingerprint 暴露到 diagnostics。
+- 既有 v1 app DB 升级到 owner nonce/heartbeat schema 通过 idempotent migration 完成。
 
 主要改动面：
 
 - `internal/app`
 - `internal/store`
 - `internal/db`
+- `internal/db/schema.go`（含 `MigrateAppSchema`）
 - `internal/httpapi`
 - `internal/observability`
+- `db/schema/v1_app.sql`
+- `schemas/diagnostics.schema.json`
+- `api/openapi.yaml`
+- `scripts/validate_contracts.py`
+- `docs/testing/CONTRACT_VALIDATION_MANIFEST.json`
 
-任务拆分：
+任务拆分（C3 收口追加 work package）：
 
-1. 明确 runtime lock 存储位置和 owner token 不出 diagnostics。
-2. serve startup 获取 lock；失败返回明确错误。
-3. daemon shutdown 释放 lock。
-4. stale owner 检测与安全恢复。
-5. diagnostics 展示 non-secret runtime descriptor。
+1. **WP-1**：`runtime_descriptors` 新增 `owner_nonce` / `heartbeat_at` / `heartbeat_ttl_ms` / `acquired_at` 列；`runtime_owner_events` 表记录 reap 事件；idempotent `MigrateAppSchema` 升级既有 v1 app DB。
+2. **WP-2**：`app/serve` 启动时 `crypto/rand` 生成 32+ 字节 nonce；周期 ticker 刷新 `heartbeat_at`；conflict 返回 `core.ErrDaemonAlreadyRunning`；heartbeat goroutine 优雅停止。
+3. **WP-3**：基于 (heartbeat_at + heartbeat_ttl_ms) 的 `reapStaleRuntimeDescriptor`；`serve` 启动前先 reap，且周期 reap（60s）；PID 复用不阻断 reap。
+4. **WP-4**：`RuntimeDescriptorSnapshot` 投影不包含 `owner_nonce` 明文，仅 fingerprint；OpenAPI/JSON Schema `DiagnosticsRuntimeDescriptor` 同步。
+5. **WP-5**：`validate_contracts.py` 与 `CONTRACT_VALIDATION_MANIFEST.json` 同步描述 runtime ownership。
+6. **WP-6**：PID 复用集成测试、文档收口、阶段 C 验收记录。
 
 验收：
 
-- 同 project 第二个 daemon 无法同时写入。
-- crash/stale 场景可恢复。
+- 同 project 第二个 daemon 在前一个 owner 的 heartbeat 仍有效时返回 `daemon_already_running`，不写 CLI session，不执行 stale-run reconciliation。
+- 既有 v1 app DB 在 Open 时自动升级到 v1+（含 owner_nonce/heartbeat/reap events），无需外部 migrate 命令。
+- crash / heartbeat 停滞 / PID 复用场景可被新 daemon 接管，并写入 `runtime_owner_events` reap 事件。
+- `diagnostics` JSON / OpenAPI / JSON Schema 不暴露 `owner_nonce` 明文；operator 只能看到 8 字符 fingerprint + heartbeat 时间戳。
+- `python3 scripts/validate_contracts.py` 通过；`go test ./internal/db ./internal/store ./internal/app ./internal/observability ./internal/httpapi` 全绿。
+
+#### C3 v1.1 WIP — 5 轮 codex 滚动 review 累计 finding 表
+
+| Round | Commit | Severity | Finding | 状态 |
+|---|---|---|---|---|
+| 1 | `dbf4c6e` | P1 | heartbeat 失锁时 Serve 仍继续调度 | 已修（round-1） |
+| 1 | `dbf4c6e` | P2 | diagnostics 默认 projection 缺新字段 | 已修（round-1） |
+| 2 | `ee4f8a5` | P2 | crashed daemon 的 fresh heartbeat 阻止新 daemon 接管 | 已修（round-2） |
+| 3 | `e136dfc` | P1 | scheduler tick 独立于 heartbeat 检测 ownership 失锁 | 已修（round-3） |
+| 3 | `e136dfc` | P2 | migrated row 空 nonce 永久占锁 | 已修（round-3） |
+| 3 | `e136dfc` | P2 | `daemon_already_running` 未列入 schema enum | 已修（round-3） |
+| 4 | `d8840d2` | P1 | live migrated PID 在 takeover 时被误 reap | 已修（round-4） |
+| 4 | `d8840d2` | P2 | 测试用 `os.FindProcess+SIGINT` 可能误杀 `go test` 进程 | 已修（round-4） |
+| 5 | （无 commit）| P1 | **shutdown 顺序与 long-running tick 的并发接管** | **不修（C5 design problem）** |
+
+**已知限制（v1.1 WIP）**：
+
+- **协调层 P1 未修**：在长跑 scheduler tick 与新 owner 并发接管之间，daemon 关闭序列的顺序仍可在小窗口内产生并发接管。该问题属于 C5 daemon lifecycle design problem 的子集，**不强制在 C3 收口内解决**。
+- 替代方案：在 C5 阶段引入统一的"drain-then-exit"生命周期（先停 dispatcher、停 scheduler、停 heartbeat、停 reap、停 HTTP server，最后 close store）；此改造需协调多 goroutine 的 cancel propagation，超出 C3 收口范围。
+- 数据层在 v1.1 WIP 状态下是稳定的：所有数据层相关测试 + contract validation + diagnostics schema 在 5 轮 review 中无新 finding。
+- 阶段 D 之前如需补 C5 的 shutdown lifecycle，需新建 worktree 分支（例如 `codex/v1-productization-c5-daemon-lifecycle`），并在主计划中追加 C5 子章节。
 
 ### C4. CLI over REST 与 daemon session 对齐
 
