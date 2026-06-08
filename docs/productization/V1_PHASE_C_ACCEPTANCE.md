@@ -12,7 +12,14 @@
 | C3 owner nonce/heartbeat v1.1 WIP | **[#19](https://github.com/shuanzi/local-symphony/pull/19)** | merged |
 | C4 CLI over REST v1.1 WIP | **[#22](https://github.com/shuanzi/local-symphony/pull/22)** | open, waiting review |
 
+两个 PR **不可相互依赖**——C3 与 C4 改动无交叉文件冲突。
+
 ## 1. 验收结论
+
+- [x] **C1 hook lifecycle**：hook adapter 接 lifecycle event，codex_review 已合并。
+- [x] **C2 scheduler tick loop**：scheduler tick + 串行 in-flight dispatch，codex_review 已合并。
+- [~] **C3 single daemon ownership / runtime lock**：app DB `runtime_descriptors` owner guard 已实现并合并；**v1.1 WIP**：owner nonce/heartbeat 数据层完整 + 5 轮 codex review 充分；协调层 1 P1 留作 C5 daemon lifecycle design problem。**PR #19 merged**。
+- [~] **C4 CLI over REST 与 daemon session 对齐**：12 commits（含 5 轮 codex review + 6 轮 adversarial review + 1 docs）实施完整；**v1.1 WIP**：trust 边界专项（fail-open 模式反复在 `repo_root` guard 路径重犯 + validation failure vs missing file 区分不足）作为 v1.1 收口后续。**PR #22 open**。
 
 阶段 C 范围内 C1 hook lifecycle、C2 scheduler tick loop 与 C3 runtime ownership guard（v1.1 WIP 状态）已完成：
 
