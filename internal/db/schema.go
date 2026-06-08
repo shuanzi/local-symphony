@@ -1,6 +1,8 @@
 package db
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -13,7 +15,9 @@ CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, re
 CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS local_sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('cli','browser','desktop')), token_hash TEXT NOT NULL UNIQUE, csrf_hash TEXT, user_label TEXT, created_at TEXT NOT NULL, last_seen_at TEXT, expires_at TEXT, revoked_at TEXT);
 CREATE TABLE IF NOT EXISTS open_tokens (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL, consumed_at TEXT, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS runtime_descriptors (project_id TEXT PRIMARY KEY, api_url TEXT NOT NULL, tool_gateway_endpoint TEXT NOT NULL, daemon_pid INTEGER NOT NULL, started_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS runtime_descriptors (project_id TEXT PRIMARY KEY, api_url TEXT NOT NULL, tool_gateway_endpoint TEXT NOT NULL, daemon_pid INTEGER NOT NULL, owner_nonce TEXT NOT NULL, heartbeat_at INTEGER NOT NULL, heartbeat_ttl_ms INTEGER NOT NULL DEFAULT 30000, acquired_at INTEGER NOT NULL, started_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS runtime_owner_events (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, event_type TEXT NOT NULL, actor_type TEXT NOT NULL, data_json TEXT NOT NULL, redacted INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS idx_runtime_owner_events_project ON runtime_owner_events(project_id, created_at);
 `
 
 const fallbackProjectSchema = `PRAGMA foreign_keys = ON;
@@ -76,4 +80,94 @@ func findModuleRoot(start string) string {
 		}
 		cur = next
 	}
+}
+
+// runtimeOwnerNonceColumns is the schema version "2" upgrade for runtime_descriptors.
+// Each ALTER is idempotent because ALTER TABLE ADD COLUMN fails fast if the column
+// already exists; the migration helper only attempts columns that PRAGMA table_info
+// reports missing.
+var runtimeOwnerNonceColumns = []struct {
+	Name    string
+	DDL     string
+	Default string
+}{
+	{Name: "owner_nonce", DDL: "ALTER TABLE runtime_descriptors ADD COLUMN owner_nonce TEXT NOT NULL DEFAULT ''", Default: "''"},
+	{Name: "heartbeat_at", DDL: "ALTER TABLE runtime_descriptors ADD COLUMN heartbeat_at INTEGER NOT NULL DEFAULT 0", Default: "0"},
+	{Name: "heartbeat_ttl_ms", DDL: "ALTER TABLE runtime_descriptors ADD COLUMN heartbeat_ttl_ms INTEGER NOT NULL DEFAULT 30000", Default: "30000"},
+	{Name: "acquired_at", DDL: "ALTER TABLE runtime_descriptors ADD COLUMN acquired_at INTEGER NOT NULL DEFAULT 0", Default: "0"},
+}
+
+// MigrateAppSchema brings an existing v1 app DB up to the current runtime_descriptors
+// schema. It is idempotent and only inspects runtime_descriptors because the only
+// in-place schema evolution is the owner nonce / heartbeat columns. New app DBs
+// are created with the full schema from fallbackAppSchema / v1_app.sql and do not
+// need to call this.
+func MigrateAppSchema(database *DB) error {
+	hasTable, err := tableExists(database, "runtime_descriptors")
+	if err != nil {
+		return err
+	}
+	if hasTable {
+		cols, err := tableColumnSet(database, "runtime_descriptors")
+		if err != nil {
+			return err
+		}
+		for _, col := range runtimeOwnerNonceColumns {
+			if _, ok := cols[col.Name]; ok {
+				continue
+			}
+			if err := database.Exec(col.DDL); err != nil {
+				return fmt.Errorf("add column %s: %w", col.Name, err)
+			}
+		}
+	}
+	if err := ensureRuntimeOwnerEventsTable(database); err != nil {
+		return err
+	}
+	return nil
+}
+
+const runtimeOwnerEventsDDL = `CREATE TABLE IF NOT EXISTS runtime_owner_events (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, event_type TEXT NOT NULL, actor_type TEXT NOT NULL, data_json TEXT NOT NULL, redacted INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS idx_runtime_owner_events_project ON runtime_owner_events(project_id, created_at);
+`
+
+func ensureRuntimeOwnerEventsTable(database *DB) error {
+	exists, err := tableExists(database, "runtime_owner_events")
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return database.ExecScript(runtimeOwnerEventsDDL)
+}
+
+func tableExists(database *DB, name string) (bool, error) {
+	row, err := database.QueryOne(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, name)
+	if err != nil {
+		if isMissingRow(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if row == nil {
+		return false, nil
+	}
+	return row["name"].String() == name, nil
+}
+
+func tableColumnSet(database *DB, name string) (map[string]struct{}, error) {
+	rows, err := database.Query(`PRAGMA table_info(` + name + `)`)
+	if err != nil {
+		return nil, err
+	}
+	cols := map[string]struct{}{}
+	for _, r := range rows {
+		cols[r["name"].String()] = struct{}{}
+	}
+	return cols, nil
+}
+
+func isMissingRow(err error) bool {
+	return errors.Is(err, os.ErrNotExist)
 }

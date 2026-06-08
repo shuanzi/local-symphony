@@ -86,6 +86,7 @@
         "network_denied",
         "protected_path_denied",
         "raw_log_access_not_supported",
+        "daemon_already_running",
         "internal_error"
       ]
     }
