@@ -1044,3 +1044,123 @@ func TestRunPreflightHonorsWrapperPATHForClassification(t *testing.T) {
 		t.Fatalf("FailureReason = %q, want %q (PATH-augmented lookup must surface the wrapped codex binary)", summary.FailureReason, ReasonMalformedVersion)
 	}
 }
+
+// TestVerifyPanicTeamLeadRepro is the team-lead repro of the
+// round-3 P3 panic finding. The exact 'env "" codex' input
+// that triggered runtime panic in isWrapperFlagToken must
+// now return a deterministic result without panicking. The
+// pre-flight path (RunPreflight end-to-end) must also not
+// crash. Each sub-case recovers from panic so a future
+// regression that re-introduces the index-out-of-range
+// crash is caught even if the test runs in a process that
+// would otherwise abort the suite.
+func TestVerifyPanicTeamLeadRepro(t *testing.T) {
+	t.Run("env_empty_quoted_arg_codex", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("TEAM-LEAD REPRO: unwrapCodexBinaryToken panicked on 'env \"\" codex': %v", r)
+			}
+		}()
+		if got := unwrapCodexBinaryTokenForTest(`env "" codex`); got != "codex" {
+			t.Fatalf("unwrapCodexBinaryToken(`env \"\" codex`) = %q, want %q", got, "codex")
+		}
+	})
+	t.Run("isWrapperFlagToken_empty", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("TEAM-LEAD REPRO: isWrapperFlagToken(\"\") panicked: %v", r)
+			}
+		}()
+		if isWrapperFlagToken("") {
+			t.Fatalf("isWrapperFlagToken(\"\") = true, want false (empty token is not a flag)")
+		}
+	})
+	t.Run("RunPreflight_end_to_end_no_panic", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("TEAM-LEAD REPRO: RunPreflight panicked on 'env \"\" codex': %v", r)
+			}
+		}()
+		summary := RunPreflight(PreflightOptions{
+			Command:       `env "" codex`,
+			VersionOutput: "",
+			Now:           fixedNow,
+		})
+		if summary.Available {
+			t.Fatalf("RunPreflight(`env \"\" codex`) returned Available=true, want false")
+		}
+		if summary.FailureReason == "" {
+			t.Fatalf("RunPreflight(`env \"\" codex`) returned empty FailureReason")
+		}
+	})
+}
+
+// TestVerifyEmbeddedSentinelTeamLeadRepro is the team-lead
+// repro of the round-3 P1 embedded-sentinel finding. The
+// detector must agree with the Python contract validator
+// regex 'r"\bSYNTHETIC_[A-Z0-9_]+\b"' on every case
+// team-lead independently verified: embedded sentinels
+// (with '-' on either side) match; bare 'vSYNTHETIC_OWNER_NONCE'
+// does not (because 'v' and '_' are both word characters
+// and there is no boundary between them); plain versions
+// do not.
+func TestVerifyEmbeddedSentinelTeamLeadRepro(t *testing.T) {
+	cases := []struct {
+		value    string
+		sentinel bool
+	}{
+		{value: "protocol-SYNTHETIC_PROMPT_BODY-v1", sentinel: true},
+		{value: "schema-SYNTHETIC_LOG", sentinel: true},
+		{value: "vSYNTHETIC_OWNER_NONCE", sentinel: false},
+		{value: "protocol-test-v1", sentinel: false},
+		{value: "1.2.3", sentinel: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.value, func(t *testing.T) {
+			if got := isSyntheticSentinelStringForTest(tc.value); got != tc.sentinel {
+				t.Fatalf("isSyntheticSentinelString(%q) = %v, want %v", tc.value, got, tc.sentinel)
+			}
+		})
+	}
+}
+
+// TestVerifyWrapperPATHOverrideTeamLeadRepro is the
+// team-lead repro of the round-3 P2 PATH-augmentation
+// finding. The stub is in t.TempDir() which is NOT on
+// the process's PATH. The preflight must use the wrapped
+// PATH to find the binary, classify it as
+// ReasonMalformedVersion (because the stub returns empty
+// --version), and not report ReasonCodexNotInstalled.
+func TestVerifyWrapperPATHOverrideTeamLeadRepro(t *testing.T) {
+	stubDir := t.TempDir()
+	stubPath := stubDir + "/codex-stub"
+	stubScript := "#!/bin/sh\n# Pretend to be codex. Empty --version\n# output to force the malformed_version branch.\nexit 0\n"
+	if err := os.WriteFile(stubPath, []byte(stubScript), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	summary := RunPreflight(PreflightOptions{
+		Command:       "env PATH=" + stubDir + " codex-stub",
+		VersionOutput: "",
+		Now:           fixedNow,
+	})
+	if summary.Available {
+		t.Fatalf("RunPreflight returned Available=true, want false")
+	}
+	if summary.FailureReason != ReasonMalformedVersion {
+		t.Fatalf("FailureReason = %q, want %q (PATH-augmented lookup must surface wrapped codex)", summary.FailureReason, ReasonMalformedVersion)
+	}
+	// Sanity: the failure message must NOT contain any
+	// synthetic-sentinel-shaped substring; the augmented
+	// PATH is a classification input, not a diagnostics
+	// value.
+	for _, sentinel := range []string{
+		"SYNTHETIC_PROMPT_BODY",
+		"SYNTHETIC_CODEX_LOG",
+		"SYNTHETIC_OWNER_NONCE",
+		"SYNTHETIC_API_SECRET",
+	} {
+		if strings.Contains(summary.FailureMessage, sentinel) {
+			t.Fatalf("FailureMessage leaks sentinel %q: %q", sentinel, summary.FailureMessage)
+		}
+	}
+}
