@@ -454,7 +454,8 @@ func TestBuildReleaseLockfileEnginesCompatibleWithNode18(t *testing.T) {
 //   - `">=18"` / `">=18.0.0"` (Node 18 is the floor)
 //   - `"^18.0.0"` / `"^18"` (Node 18 major only)
 //   - `">=16"` / `">=14"` / etc. (Node 18 is above the floor)
-//   - `">=18 || ..."` multi-clause where every clause allows Node 18
+//   - `"^18 || >=20"` multi-clause where AT LEAST ONE clause
+//     allows Node 18 (npm honours the first matching clause)
 //   - `""` (empty) — treated as no constraint
 //
 // It returns false (incompatible) for shapes that hard-exclude
@@ -465,15 +466,18 @@ func node18Compatible(constraint string) bool {
 	if trimmed == "" {
 		return true
 	}
-	// Split on `||` for multi-clause constraints. Every clause
-	// must be Node-18-compatible for the whole constraint to be.
+	// Split on `||` for multi-clause constraints. AT LEAST ONE
+	// clause must be Node-18-compatible for the whole constraint
+	// to be (npm applies the first matching clause; a package
+	// advertising "^18 || >=20" is installable on Node 18 via the
+	// first clause).
 	for _, clause := range strings.Split(trimmed, "||") {
 		clause = strings.TrimSpace(clause)
-		if !node18CompatibleClause(clause) {
-			return false
+		if node18CompatibleClause(clause) {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 func node18CompatibleClause(clause string) bool {
