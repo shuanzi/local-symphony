@@ -384,6 +384,10 @@
       "artifact path traversal and symlink escape",
       "redaction golden fixtures",
       "raw prompt raw Codex log raw secret API refusal",
+      "rework prompt includes latest review reason and safe summary",
+      "rework prompt excludes raw prompt log secret artifact markers",
+      "rework prompt snapshot records review_packet_id base_sha cumulative_diff_sha prompt_hash",
+      "cumulative diff base sha preserved across rework iterations",
       "runtime owner nonce fingerprint only via diagnostics",
       "runtime owner heartbeat stale recovery on PID reuse"
     ]

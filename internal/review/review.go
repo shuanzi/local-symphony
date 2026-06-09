@@ -138,9 +138,24 @@ func (g Generator) Generate(runID string) (string, error) {
 	var finalID string
 	if err := g.Store.WithProjectTx(func(tx store.TxRunner) error {
 		if run.WorkflowSnapshotID != nil {
-			pid, err := g.Store.CreatePromptSnapshotTx(tx, runID, *run.WorkflowSnapshotID, promptContextHash, promptRenderedHash, root)
-			if err != nil {
-				return reviewPacketError("create prompt snapshot", err)
+			// D4 / R16: if the orchestrator already created a prompt
+			// snapshot for this run (the case for Rework dispatches
+			// where the snapshot is stamped with the post-injection
+			// prompt hash), preserve that hash instead of
+			// overwriting it with the synthetic "redacted" hash.
+			existing, lookupErr := tx.QueryOne(`SELECT id FROM prompt_snapshots WHERE run_id=?`, runID)
+			var pid string
+			if lookupErr == nil {
+				pid = existing["id"].String()
+				if err := tx.Exec(`UPDATE prompt_snapshots SET workflow_snapshot_id=COALESCE(workflow_snapshot_id, ?), runtime_envelope_version=?, tool_manifest_version=?, context_hash=COALESCE(context_hash, ?), context_json_path=?, redacted_prompt_path=?, prompt_meta_json_path=?, tool_manifest_path=? WHERE id=?`, *run.WorkflowSnapshotID, "v1", "v1", promptContextHash, filepath.Join(root, "prompt/context.json"), filepath.Join(root, "prompt/rendered_prompt.redacted.md"), filepath.Join(root, "prompt/prompt_meta.json"), filepath.Join(root, "prompt/tool_manifest.md"), pid); err != nil {
+					return reviewPacketError("update prompt snapshot", err)
+				}
+			} else {
+				var err error
+				pid, err = g.Store.CreatePromptSnapshotTx(tx, runID, *run.WorkflowSnapshotID, promptContextHash, promptRenderedHash, root)
+				if err != nil {
+					return reviewPacketError("create prompt snapshot", err)
+				}
 			}
 			promptID = pid
 		}
@@ -197,6 +212,23 @@ func (g Generator) Generate(runID string) (string, error) {
 		return nil
 	}); err != nil {
 		return "", err
+	}
+	// D4 / R16: post-transaction, embed the safe summary into
+	// review.json so follow-on Rework dispatches can read it from
+	// the persisted packet instead of recomputing from disk
+	// artifacts. We rebuild the safe summary with the final packet
+	// id and re-marshal review.json.
+	if safe, safeErr := BuildSafeSummaryFromIssue(g.Store, issue, run); safeErr == nil && safe != nil {
+		safe.ReviewPacketID = finalID
+		if data, rerr := os.ReadFile(reviewJSONPath); rerr == nil {
+			var packet map[string]any
+			if uerr := json.Unmarshal(data, &packet); uerr == nil {
+				packet["safe_summary"] = safe
+				if jb, merr := json.MarshalIndent(packet, "", "  "); merr == nil {
+					_ = os.WriteFile(reviewJSONPath, jb, 0o644)
+				}
+			}
+		}
 	}
 	return finalID, nil
 }

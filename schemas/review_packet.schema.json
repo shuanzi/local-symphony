@@ -320,6 +320,46 @@
         }
       }
     },
+    "safe_summary": {
+      "type": "object",
+      "description": "D4 / R16 redacted projection of this packet that the orchestrator may surface into a follow-on Rework prompt. The safe summary MUST NOT contain raw prompt / raw Codex log / secret artifact bytes; consumers MUST reject payloads that embed refusal-kind markers (codex_log, codex_events, prompt_snapshot, prompt_rendered, prompt_context, secret_artifact, secrets, raw_prompt, raw_prompt_log, raw_codex_log, codex_final_dump).",
+      "additionalProperties": false,
+      "required": [
+        "review_packet_id",
+        "packet_no",
+        "run_id",
+        "source_issue_state",
+        "status",
+        "safe_summary_sha256"
+      ],
+      "properties": {
+        "review_packet_id": { "type": "string", "pattern": "^rp_" },
+        "packet_no": { "type": "integer", "minimum": 1 },
+        "run_id": { "type": "string", "pattern": "^run_" },
+        "source_issue_state": { "enum": ["Ready", "Rework"] },
+        "status": { "enum": ["generated", "partial", "failed"] },
+        "created_at": { "type": "string", "format": "date-time" },
+        "branch_name": { "type": "string" },
+        "base_ref": { "type": "string" },
+        "base_ref_config": { "type": "string" },
+        "base_sha": { "type": "string" },
+        "head_sha": { "type": ["string", "null"] },
+        "summary": { "type": "string" },
+        "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+        "tests": { "type": "array", "items": { "type": "string" } },
+        "risks": { "type": "array", "items": { "type": "string" } },
+        "verification": { "type": "array", "items": { "type": "string" } },
+        "followups": { "type": "array", "items": { "type": "string" } },
+        "changed_files": { "type": "array", "items": { "type": "string" } },
+        "diffstat": { "type": "string" },
+        "tool_call_count": { "type": "integer", "minimum": 0 },
+        "approval_count": { "type": "integer", "minimum": 0 },
+        "failure_code": { "type": ["string", "null"] },
+        "failure_message": { "type": ["string", "null"] },
+        "how_to_continue": { "type": "string" },
+        "safe_summary_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
     "failure_code": {
       "enum": [
         "workflow_invalid",

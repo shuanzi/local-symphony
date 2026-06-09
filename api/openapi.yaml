@@ -876,6 +876,66 @@ components:
         created_at: { type: string, format: date-time }
     ReviewPacketEnvelope:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ReviewPacketSummary' } } } ]
+    ReviewPacketSafeSummary:
+      type: object
+      additionalProperties: false
+      required: [review_packet_id, packet_no, run_id, source_issue_state, status, safe_summary_sha256]
+      properties:
+        review_packet_id: { type: string, pattern: "^rp_" }
+        packet_no: { type: integer, minimum: 1 }
+        run_id: { type: string, pattern: "^run_" }
+        source_issue_state: { type: string, enum: [Ready, Rework] }
+        status: { type: string, enum: [generated, partial, failed] }
+        created_at: { type: string, format: date-time }
+        branch_name: { type: string }
+        base_ref: { type: string }
+        base_ref_config: { type: string }
+        base_sha: { type: string }
+        head_sha: { type: [string, 'null'] }
+        summary: { type: string }
+        acceptance_criteria:
+          type: array
+          items: { type: string }
+        tests:
+          type: array
+          items: { type: string }
+        risks:
+          type: array
+          items: { type: string }
+        verification:
+          type: array
+          items: { type: string }
+        followups:
+          type: array
+          items: { type: string }
+        changed_files:
+          type: array
+          items: { type: string }
+        diffstat: { type: string }
+        tool_call_count: { type: integer, minimum: 0 }
+        approval_count: { type: integer, minimum: 0 }
+        failure_code: { type: [string, 'null'] }
+        failure_message: { type: [string, 'null'] }
+        how_to_continue: { type: string }
+        safe_summary_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+    ReworkSnapshot:
+      type: object
+      additionalProperties: false
+      required: [id, run_id, issue_id, prompt_hash, review_reason, created_at]
+      properties:
+        id: { type: string, pattern: "^rs_" }
+        run_id: { type: string, pattern: "^run_" }
+        issue_id: { type: string, pattern: "^iss_" }
+        prompt_snapshot_id: { type: [string, 'null'], pattern: "^ps_" }
+        previous_run_id: { type: [string, 'null'], pattern: "^run_" }
+        review_packet_id: { type: [string, 'null'], pattern: "^rp_" }
+        base_ref: { type: [string, 'null'] }
+        base_sha: { type: [string, 'null'] }
+        cumulative_diff_sha: { type: [string, 'null'] }
+        prompt_hash: { type: string, pattern: "^[0-9a-f]{64}$" }
+        review_reason: { type: string }
+        safe_summary_sha256: { type: [string, 'null'], pattern: "^[0-9a-f]{64}$" }
+        created_at: { type: string, format: date-time }
     Artifact:
       type: object
       required: [id, kind, path, redacted, created_at]

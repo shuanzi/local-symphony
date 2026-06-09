@@ -158,9 +158,49 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, err.Error(), core.RunFailed)
 		return nil
 	}
-	ph := sha256.Sum256([]byte(prompt))
-	ch := sha256.Sum256([]byte(issue.ID + runID))
-	_, _ = o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), filepath.Join(o.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, runID))
+	promptRoot := filepath.Join(o.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, runID)
+	promptDir := filepath.Join(promptRoot, "prompt")
+	if err := os.MkdirAll(promptDir, 0o755); err != nil {
+		_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("create prompt dir: %v", err), core.RunFailed)
+		return nil
+	}
+	// D4 / R16: when this run was dispatched as a Rework, fetch the
+	// previous review reason and safe summary, and stamp them into
+	// the rendered prompt + a rework_snapshots row. The prompt
+	// snapshot hash reflects the *post-injection* prompt so
+	// diagnostics can correlate what was actually sent to the agent
+	// with the prior review packet.
+	if run.SourceIssueState == core.StateRework {
+		prompt, promptHash, reworkRec, reworkErr := o.injectReworkContext(issue, run, prompt)
+		if reworkErr != nil {
+			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("rework context: %v", reworkErr), core.RunFailed)
+			return nil
+		}
+		// Write the redacted prompt + meta so diagnostics and tests
+		// can introspect what the agent received. We use a dedicated
+		// `rework_prompt.redacted.md` filename so the review packet
+		// generator (which overwrites rendered_prompt.redacted.md)
+		// does not clobber this artifact.
+		if err := os.WriteFile(filepath.Join(promptDir, "rework_prompt.redacted.md"), []byte("[redacted]\n"+prompt), 0o644); err != nil {
+			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("write redacted rework prompt: %v", err), core.RunFailed)
+			return nil
+		}
+		// ph now refers to the hash of the prompt *with* rework
+		// injection; this is what the agent will actually see.
+		ph := sha256.Sum256([]byte(prompt))
+		ch := sha256.Sum256([]byte(issue.ID + runID))
+		psID, psErr := o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), promptRoot)
+		if psErr == nil && psID != "" {
+			reworkRec.PromptSnapshotID = psID
+			reworkRec.PromptHash = promptHash
+			_, _ = o.Store.CreateReworkSnapshot(reworkRec)
+		}
+	} else {
+		_ = os.WriteFile(filepath.Join(promptDir, "rendered_prompt.redacted.md"), []byte("[redacted]\n"+prompt), 0o644)
+		ph := sha256.Sum256([]byte(prompt))
+		ch := sha256.Sum256([]byte(issue.ID + runID))
+		_, _ = o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), promptRoot)
+	}
 	active, activeErr = o.runIsActive(runID)
 	if activeErr != nil || !active {
 		return nil
@@ -263,6 +303,103 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		return nil
 	}
 	return o.Store.CompleteRunWithReview(runID, rpID)
+}
+
+// injectReworkContext implements D4 / R16: given a Rework-dispatched
+// run, locate the previous review packet, build a safe summary, and
+// append a deterministic rework envelope (latest review reason + safe
+// summary markdown) to the rendered prompt. It also returns a
+// half-populated ReworkSnapshotRecord (without PromptSnapshotID /
+// final PromptHash) that the caller stamps after CreatePromptSnapshot
+// so the prompt hash matches the post-injection prompt.
+//
+// Cumulative diff semantic: we keep the issue's BaseSHA stable across
+// iterations and re-derive CumulativeDiffSHA from the workspace's
+// current HEAD vs. BaseSHA. If the workspace cannot be resolved, the
+// cumulative diff SHA is left empty and the safe summary reflects
+// only the previous review packet.
+func (o Orchestrator) injectReworkContext(issue *core.Issue, run *core.RunAttempt, basePrompt string) (string, string, store.ReworkSnapshotRecord, error) {
+	emptyRec := store.ReworkSnapshotRecord{RunID: run.ID, IssueID: run.IssueID, ReviewReason: ""}
+	if issue == nil || run == nil {
+		return "", "", emptyRec, fmt.Errorf("issue/run is nil")
+	}
+	// Locate the previous run for the issue. The most recent
+	// non-active, completed run is the one whose review packet is
+	// the previous review packet.
+	prev, err := o.Store.LatestCompletedRunForIssue(issue.ID, run.ID)
+	if err != nil {
+		return "", "", emptyRec, fmt.Errorf("locate previous run: %w", err)
+	}
+	reviewPacketID := ""
+	var prevRun *core.RunAttempt
+	if prev != nil {
+		prevRun = prev
+		if rp, err := o.Store.LatestReviewPacketIDForRun(prev.ID); err == nil {
+			reviewPacketID = rp
+		}
+	}
+	reason := o.Store.LatestReviewReasonForIssue(issue.ID, reviewPacketID)
+	if strings.TrimSpace(reason) == "" {
+		reason = run.DispatchReason
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "manual_rework"
+	}
+	summary, err := review.BuildSafeSummaryFromRun(o.Store, run.ID)
+	if err != nil {
+		// Fallback: try the previous run.
+		if prev != nil {
+			summary, err = review.BuildSafeSummaryFromRun(o.Store, prev.ID)
+		}
+		if err != nil {
+			return "", "", emptyRec, fmt.Errorf("build safe summary: %w", err)
+		}
+	}
+	if reviewPacketID == "" {
+		reviewPacketID = summary.ReviewPacketID
+	}
+	baseSHA := ""
+	if issue.BaseSHA != nil {
+		baseSHA = *issue.BaseSHA
+	}
+	cumulativeDiffSHA := o.computeCumulativeDiffSHA(issue, run, baseSHA)
+	in := codex.ReworkContextInput{
+		Issue:             issue,
+		Run:               run,
+		PreviousRun:       prevRun,
+		ReviewPacketID:    reviewPacketID,
+		ReviewReason:      reason,
+		SafeSummary:       summary,
+		BaseSHA:           baseSHA,
+		CumulativeDiffSHA: cumulativeDiffSHA,
+	}
+	if issue.Workspace != nil {
+		in.WorkspacePath = issue.Workspace.Path
+	}
+	newPrompt, promptHash, err := codex.BuildReworkPrompt(basePrompt, in)
+	if err != nil {
+		return "", "", emptyRec, fmt.Errorf("build rework prompt: %w", err)
+	}
+	rec := codex.BuildReworkSnapshotRecord(promptHash, in, "")
+	return newPrompt, promptHash, rec, nil
+}
+
+func (o Orchestrator) computeCumulativeDiffSHA(issue *core.Issue, run *core.RunAttempt, baseSHA string) string {
+	if issue == nil || issue.Workspace == nil || strings.TrimSpace(issue.Workspace.Path) == "" {
+		return ""
+	}
+	root := issue.Workspace.Path
+	cmd := exec.Command("git", "-C", root, "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	head := strings.TrimSpace(string(out))
+	if head == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(baseSHA + "\x00" + head))
+	return hex.EncodeToString(h[:])
 }
 
 func runnerForRun(run *core.RunAttempt, wf *config.Workflow) agentrunner.Runner {
