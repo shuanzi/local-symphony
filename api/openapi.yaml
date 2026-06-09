@@ -838,7 +838,7 @@ components:
       required: [kind, path, artifact_id, redacted, content_url, raw_prompt_exposed, raw_codex_log_exposed, raw_secret_exposed]
       additionalProperties: false
       properties:
-        kind: { type: string, enum: [review_packet, review_md, review_json, patch, changed_files, untracked_files, diffstat, test_output, agent_final_message, commands, tool_calls, approvals, codex_events, prompt_context, prompt_rendered, prompt_meta, prompt_tool_manifest, other] }
+        kind: { type: string, enum: [test_output, patch, changed_files, untracked_files, diffstat, prompt_snapshot, prompt_rendered, prompt_context, prompt_meta, prompt_tool_manifest, codex_log, codex_events, secret_artifact, secrets, review_packet, review_md, review_json, agent_final_message, commands, tool_calls, approvals, agent_file, diagnostic, other] }
         path: { type: string }
         artifact_id: { type: string, pattern: "^art_" }
         redacted: { type: boolean }

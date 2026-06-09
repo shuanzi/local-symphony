@@ -2,6 +2,7 @@ package review
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,15 @@ import (
 )
 
 const testMaxUntrackedPatchBytes int64 = 1024 * 1024
+
+// originalHome captures the HOME directory before any test has
+// a chance to override it via t.Setenv. Several helpers in this
+// package rely on HOME to redirect project DB paths; that
+// redirecting also breaks python3's site.getusersitepackages()
+// inside the schema-validator subprocess. We freeze the value
+// at process start and use it for the validator subprocess
+// regardless of the test's later HOME mutation.
+var originalHome = os.Getenv("HOME")
 
 func TestGenerateReturnsErrorAndDoesNotInsertPacketWhenReviewArtifactWriteFails(t *testing.T) {
 	st := newReviewTestStore(t)
@@ -706,4 +716,156 @@ func readUntrackedArtifact(t *testing.T, st *store.Store, issue *core.Issue, run
 		out[item.Path] = item
 	}
 	return out
+}
+
+// TestReviewPacketFileSchemaValidatesAgainstGeneratedPacket pins
+// the contract that the review.json artifact written by
+// Generator.Generate actually validates against
+// schemas/review_packet.schema.json. If a future schema change
+// (or a Generator regression) breaks the round-trip, the
+// jsonschema validator surfaces it directly so we catch it
+// before the file ships to operators.
+//
+// The test calls the same Draft202012Validator that
+// scripts/validate_contracts.py uses. We shell out to python3
+// because the project intentionally keeps the in-Go test
+// dependency surface narrow (no jsonschema-go module is
+// imported elsewhere).
+func TestReviewPacketFileSchemaValidatesAgainstGeneratedPacket(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	writeFile(t, workspace, "app.txt", "new\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"app.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	reviewPath := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID, "review.json")
+	if _, err := os.Stat(reviewPath); err != nil {
+		t.Fatalf("review.json missing: %v", err)
+	}
+	schemaPath := filepath.Join(repoRootForReviewTest(t), "schemas", "review_packet.schema.json")
+	validateJSONAgainstSchema(t, schemaPath, reviewPath)
+}
+
+// repoRootForReviewTest walks up from the current working
+// directory until it finds go.mod so the test can locate the
+// schemas/ directory regardless of the test runner's CWD.
+func repoRootForReviewTest(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	dir := wd
+	for i := 0; i < 6; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	t.Fatalf("could not find repo root from %s", wd)
+	return ""
+}
+
+// validateJSONAgainstSchema shells out to python3 and runs the
+// jsonschema Draft202012Validator against the supplied JSON file.
+// The validator is the same one scripts/validate_contracts.py
+// uses, so test failures mirror contract-validation failures.
+//
+// We explicitly prepend the user site-packages directory (where
+// `pip3 install --user jsonschema` lands it) onto sys.path inside
+// the subprocess. The system Python on macOS often does not
+// enable the user site by default when launched without a TTY
+// (site.ENABLE_USER_SITE is false), so the import would otherwise
+// fail even when `pip3 install --user jsonschema` succeeded.
+//
+// The test process may have HOME overridden (e.g. by the
+// review-test helper that uses t.Setenv to isolate state). We
+// pass the original HOME captured at process start to the
+// subprocess so site.getusersitepackages returns the install
+// location rather than a temp directory.
+func validateJSONAgainstSchema(t *testing.T, schemaPath, jsonPath string) {
+	t.Helper()
+	pythonBin, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skipf("python3 not on PATH: %v", err)
+	}
+	if originalHome == "" {
+		t.Skipf("HOME was empty at process start; cannot resolve python user site-packages")
+	}
+	cmd := envWithRealHome(t, pythonBin, originalHome)
+	cmd.Args = append(cmd.Args, "-c", schemaValidatorScript(userSiteForHome(t, pythonBin, originalHome)), schemaPath, jsonPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "__SCHEMA_SKIP__") {
+			t.Skipf("jsonschema unavailable in python3 %q; install with `pip3 install --user jsonschema`:\n%s", pythonBin, string(out))
+		}
+		if strings.Contains(string(out), "__SCHEMA_FAIL__") {
+			t.Fatalf("schema validation failed for %s against %s:\n%s", jsonPath, schemaPath, string(out))
+		}
+		t.Fatalf("schema validation crashed for %s against %s:\n%s", jsonPath, schemaPath, string(out))
+	}
+	if !strings.Contains(string(out), "__SCHEMA_OK__") {
+		t.Fatalf("schema validation did not report OK for %s:\n%s", jsonPath, string(out))
+	}
+}
+
+// schemaValidatorScript returns the python source that loads
+// the schema + data files from argv and runs the jsonschema
+// Draft202012Validator. userSite is prepended to sys.path so
+// the import succeeds even when the subprocess is launched
+// without user-site enabled.
+func schemaValidatorScript(userSite string) string {
+	return fmt.Sprintf(`import json, sys
+sys.path.insert(0, %q)
+try:
+    from jsonschema import Draft202012Validator
+except ImportError as e:
+    print("__SCHEMA_SKIP__:" + str(e))
+    sys.exit(0)
+schema = json.load(open(sys.argv[1]))
+data = json.load(open(sys.argv[2]))
+errors = list(Draft202012Validator(schema).iter_errors(data))
+if errors:
+    lines = []
+    for e in errors[:10]:
+        path = "/".join(str(p) for p in e.absolute_path) or "(root)"
+        lines.append(f"{path}: {e.message}")
+    print("__SCHEMA_FAIL__")
+    print("\n".join(lines))
+    sys.exit(1)
+print("__SCHEMA_OK__")
+`, userSite)
+}
+
+// envWithRealHome returns an *exec.Cmd prepopulated with the
+// parent process's environment plus HOME set to realHome (so the
+// subprocess's site.getusersitepackages() resolves to the
+// real user site rather than a test-isolated temp dir).
+func envWithRealHome(t *testing.T, pythonBin, realHome string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(pythonBin)
+	cmd.Env = append(os.Environ(), "HOME="+realHome)
+	return cmd
+}
+
+// userSiteForHome asks python where its user site lives when
+// HOME is overridden. Returned as a clean path string.
+func userSiteForHome(t *testing.T, pythonBin, realHome string) string {
+	t.Helper()
+	cmd := exec.Command(pythonBin, "-c", "import site; print(site.getusersitepackages())")
+	cmd.Env = append(os.Environ(), "HOME="+realHome)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("query python user site-packages: %v\n%s", err, string(out))
+	}
+	return strings.TrimSpace(string(out))
 }

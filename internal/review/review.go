@@ -169,8 +169,10 @@ func (g Generator) Generate(runID string) (string, error) {
 			"raw_prompt_exposed":    false,
 			"raw_codex_log_exposed": false,
 			"raw_secret_exposed":    false,
-			"prompt_snapshot":       map[string]any{"id": promptID, "rendered_prompt_hash": "redacted", "tool_manifest_path": "prompt/tool_manifest.md"},
 			"failure_code":          nil, "failure_message": nil, "created_at": core.Now(),
+		}
+		if promptID != "" {
+			packet["prompt_snapshot"] = map[string]any{"id": promptID, "rendered_prompt_hash": "redacted", "tool_manifest_path": "prompt/tool_manifest.md"}
 		}
 		jb, err := json.MarshalIndent(packet, "", "  ")
 		if err != nil {

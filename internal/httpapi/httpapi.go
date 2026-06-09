@@ -864,7 +864,7 @@ func (s *Server) reviewRoutes(w http.ResponseWriter, r *http.Request, rest strin
 				"redacted": a.Redacted, "content_url": cu,
 				"raw_prompt_exposed":    a.Kind == "prompt_rendered" || a.Kind == "prompt_context",
 				"raw_codex_log_exposed": a.Kind == "codex_log" || a.Kind == "codex_events",
-				"raw_secret_exposed":    false,
+				"raw_secret_exposed":    a.Kind == "secret_artifact" || a.Kind == "secrets",
 			})
 		}
 		// Load the structured projection from the on-disk review.json
