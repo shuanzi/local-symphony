@@ -209,3 +209,101 @@ func mapKeys(m map[string]any) []string {
 	}
 	return keys
 }
+
+func TestDiagnosticsCodexAvailabilityShapeIsContract(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.InitProject(t.TempDir(), "LOC")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	diag := Diagnostics(st)
+	codexField, ok := diag["codex"].(map[string]any)
+	if !ok {
+		t.Fatalf("diag[codex] is %T, want map[string]any", diag["codex"])
+	}
+	assertDiagnosticsFieldShape(t, codexField)
+}
+
+func TestDiagnosticsCodexAvailabilityDoesNotLeakSentinels(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.InitProject(t.TempDir(), "LOC")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	diag := Diagnostics(st)
+	// The Diagnostics payload itself must never carry synthetic
+	// sentinels. The redactedFailureDetails scrubber in the
+	// adapter layer handles the source path; the diagnostics
+	// layer is the second line of defence and must not
+	// re-introduce a leak surface.
+	assertNoSentinelsInDiagnostics(t, diag)
+}
+
+func TestDiagnosticsExportDoesNotLeakCodexSentinels(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.InitProject(t.TempDir(), "LOC")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	path, err := Export(st)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read export: %v", err)
+	}
+	body := string(data)
+	for _, sentinel := range AllRedactionSentinels() {
+		if strings.Contains(body, sentinel) {
+			t.Fatalf("diagnostics export %q leaks sentinel %q: %s", path, sentinel, body)
+		}
+	}
+}
+
+func TestDiagnosticsCodexAvailabilityRedactsPoisonedFixture(t *testing.T) {
+	// Build a poisoned fixture under SYMPHONY_CODEX_FIXTURE_ROOT
+	// whose compatibility.json's supported_notifications list
+	// contains a synthetic-prompt sentinel. The diagnostics
+	// envelope must scrub the sentinel from any field that
+	// surfaces the value (last_preflight.failure_message,
+	// last_preflight.failure_details, metadata, etc.).
+	poisonRoot := t.TempDir()
+	t.Setenv("SYMPHONY_CODEX_FIXTURE_ROOT", poisonRoot)
+	version := "9.9.9-poison"
+	schemaDir := filepath.Join(poisonRoot, "schema", version)
+	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(poisonRoot, "transcripts", version), 0o755); err != nil {
+		t.Fatalf("mkdir transcripts: %v", err)
+	}
+	poisoned := `{
+  "codex_version": "9.9.9-poison",
+  "protocol_version": "protocol-poison-v1",
+  "schema_version": "schema-poison-v1",
+  "supported_notifications": ["` + RedactionSentinelPromptBody + `"],
+  "supported_requests": ["` + RedactionSentinelCodexLog + `"],
+  "experimental_api": false
+}`
+	if err := os.WriteFile(filepath.Join(schemaDir, "compatibility.json"), []byte(poisoned), 0o600); err != nil {
+		t.Fatalf("write poisoned metadata: %v", err)
+	}
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.InitProject(t.TempDir(), "LOC")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	diag := Diagnostics(st)
+	b, _ := json.Marshal(diag)
+	body := string(b)
+	for _, sentinel := range AllRedactionSentinels() {
+		if strings.Contains(body, sentinel) {
+			t.Fatalf("diagnostics envelope leaks sentinel %q: %s", sentinel, body)
+		}
+	}
+}
