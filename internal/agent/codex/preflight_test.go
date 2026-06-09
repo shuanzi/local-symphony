@@ -551,3 +551,249 @@ func testdataFixtureRoot(t *testing.T) string {
 	}
 	return root
 }
+
+// TestIsSyntheticSentinelStringDistinguishesVersionAndSentinel is
+// the round-2 P1 #1 negative-coverage regression: legitimate
+// version / protocol / schema identifiers must not be flagged
+// as sentinel-shaped, and synthetic-sentinel-shaped values must
+// be flagged.
+func TestIsSyntheticSentinelStringDistinguishesVersionAndSentinel(t *testing.T) {
+	cases := []struct {
+		value    string
+		sentinel bool
+	}{
+		// Plain version / protocol / schema identifiers —
+		// must not be flagged.
+		{value: "1.2.3", sentinel: false},
+		{value: "v1.2.3", sentinel: false},
+		{value: "protocol-test-v1", sentinel: false},
+		{value: "schema-2024-01", sentinel: false},
+		{value: "0.0.0-test", sentinel: false},
+		// Synthetic-sentinel-shaped values — must be flagged.
+		{value: "SYNTHETIC_FOO", sentinel: true},
+		{value: "SYNTHETIC_PROMPT_BODY", sentinel: true},
+		{value: "SYNTHETIC_OWNER_NONCE_XYZ", sentinel: true},
+		{value: "SYNTHETIC_API_SECRET_KEY", sentinel: true},
+		// Bare prefix is not a sentinel.
+		{value: "SYNTHETIC_", sentinel: false},
+		// Lowercase prefix is not a sentinel.
+		{value: "synthetic_foo", sentinel: false},
+		// Mixed-case trailing suffix is not a sentinel —
+		// the detector requires the UPPER_SNAKE_CASE shape
+		// because the contract validator's
+		// SYNTHETIC_SENTINEL_RE uses the same shape, and
+		// the redaction scrubber in
+		// observability/assertNoSentinelsInDiagnostics
+		// relies on the same boundary.
+		{value: "SYNTHETIC_PROMPT_BODY_do_not_leak", sentinel: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.value, func(t *testing.T) {
+			if got := isSyntheticSentinelStringForTest(tc.value); got != tc.sentinel {
+				t.Fatalf("isSyntheticSentinelString(%q) = %v, want %v", tc.value, got, tc.sentinel)
+			}
+		})
+	}
+}
+
+// TestRunPreflightRejectsSentinelShapedProtocolVersion is the
+// round-2 P1 #1 regression: a poisoned compatibility.json that
+// keeps `codex_version` matching the detected version but
+// plants a synthetic-sentinel-shaped value in `protocol_version`
+// (the field the round-1 scrubber did NOT cover) must be
+// rejected at the validateCompatibilityMetadata gate. The
+// preflight must surface
+// `ReasonMetadataProtoSentinel`, and the diagnostics envelope
+// must never see the sentinel.
+func TestRunPreflightRejectsSentinelShapedProtocolVersion(t *testing.T) {
+	root := t.TempDir()
+	version := "9.9.9-poison"
+	schemaDir := filepath.Join(root, "schema", version)
+	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
+		t.Fatalf("mkdir schema: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "transcripts", version), 0o755); err != nil {
+		t.Fatalf("mkdir transcripts: %v", err)
+	}
+	// Structurally valid compatibility.json: codex_version
+	// matches the detected version, supported_notifications /
+	// supported_requests carry only conventional entries,
+	// experimental_api is false — but protocol_version is
+	// poisoned with a synthetic-sentinel-shaped value. The
+	// gate must reject the metadata before reaching the
+	// happy-path branches. We also provide a schema.json +
+	// happy-path.jsonl stub so the validator progresses
+	// past the missing_schema_fixture / missing_transcript
+	// checks and reaches validateCompatibilityMetadata.
+	poisoned := `{
+  "codex_version": "9.9.9-poison",
+  "protocol_version": "SYNTHETIC_PROMPT_BODY_LEAK",
+  "schema_version": "schema-poison-v1",
+  "supported_notifications": ["handoff"],
+  "supported_requests": ["initialize"],
+  "experimental_api": false
+}`
+	if err := os.WriteFile(filepath.Join(schemaDir, compatibilityMetadataFile), []byte(poisoned), 0o600); err != nil {
+		t.Fatalf("write poisoned metadata: %v", err)
+	}
+	schemaStub := `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}`
+	if err := os.WriteFile(filepath.Join(schemaDir, "schema.json"), []byte(schemaStub), 0o600); err != nil {
+		t.Fatalf("write schema stub: %v", err)
+	}
+	transcript := `{"type":"handshake","codex_version":"9.9.9-poison","protocol_version":"SYNTHETIC_PROMPT_BODY_LEAK","schema_version":"schema-poison-v1","experimental_api":false}
+{"type":"turn_completed"}
+`
+	if err := os.WriteFile(filepath.Join(root, "transcripts", version, "happy-path.jsonl"), []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	summary := RunPreflight(PreflightOptions{
+		Command:       "codex",
+		VersionOutput: "codex 9.9.9-poison",
+		FixtureRoot:   root,
+		Now:           fixedNow,
+	})
+	if summary.Available {
+		t.Fatalf("Available = true, want false (sentinel-shaped protocol_version must be rejected)")
+	}
+	if summary.FailureReason != ReasonMetadataProtoSentinel {
+		t.Fatalf("FailureReason = %q, want %q", summary.FailureReason, ReasonMetadataProtoSentinel)
+	}
+	// No field of the summary may carry the sentinel.
+	b, _ := json.Marshal(summary)
+	body := string(b)
+	if strings.Contains(body, "SYNTHETIC_PROMPT_BODY_LEAK") {
+		t.Fatalf("summary leaks poisoned protocol_version sentinel: %s", body)
+	}
+}
+
+// TestRunPreflightRejectsSentinelShapedSchemaVersion mirrors
+// the protocol_version case for the schema_version field. The
+// two fields go through independent codex-version reasons in
+// the round-2 patch, so we assert them separately.
+func TestRunPreflightRejectsSentinelShapedSchemaVersion(t *testing.T) {
+	root := t.TempDir()
+	version := "9.9.9-sentinel-schema"
+	schemaDir := filepath.Join(root, "schema", version)
+	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "transcripts", version), 0o755); err != nil {
+		t.Fatalf("mkdir transcripts: %v", err)
+	}
+	poisoned := `{
+  "codex_version": "9.9.9-sentinel-schema",
+  "protocol_version": "protocol-poison-v1",
+  "schema_version": "SYNTHETIC_CODEX_LOG_LEAK",
+  "supported_notifications": ["handoff"],
+  "supported_requests": ["initialize"],
+  "experimental_api": false
+}`
+	if err := os.WriteFile(filepath.Join(schemaDir, compatibilityMetadataFile), []byte(poisoned), 0o600); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+	schemaStub := `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}`
+	if err := os.WriteFile(filepath.Join(schemaDir, "schema.json"), []byte(schemaStub), 0o600); err != nil {
+		t.Fatalf("write schema stub: %v", err)
+	}
+	transcript := `{"type":"handshake","codex_version":"9.9.9-sentinel-schema","protocol_version":"protocol-poison-v1","schema_version":"SYNTHETIC_CODEX_LOG_LEAK","experimental_api":false}
+{"type":"turn_completed"}
+`
+	if err := os.WriteFile(filepath.Join(root, "transcripts", version, "happy-path.jsonl"), []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	summary := RunPreflight(PreflightOptions{
+		Command:       "codex",
+		VersionOutput: "codex 9.9.9-sentinel-schema",
+		FixtureRoot:   root,
+		Now:           fixedNow,
+	})
+	if summary.Available {
+		t.Fatalf("Available = true, want false (sentinel-shaped schema_version must be rejected)")
+	}
+	if summary.FailureReason != ReasonMetadataSchemaSentinel {
+		t.Fatalf("FailureReason = %q, want %q", summary.FailureReason, ReasonMetadataSchemaSentinel)
+	}
+}
+
+// TestUnwrapCodexBinaryTokenSkipsKnownWrappers is the round-2
+// P2 #2 unwrap-regression. It exercises each recognized wrapper
+// (env / sudo / nohup / command / time / xargs -I{}) plus the
+// KEY=VALUE env-var prefix and asserts the unwrap returns the
+// actual codex binary, not the wrapper name. It also asserts
+// the conservative-fallback behaviour: an unrecognized leading
+// token is returned as-is so the round-1 first-token tests stay
+// green.
+func TestUnwrapCodexBinaryTokenSkipsKnownWrappers(t *testing.T) {
+	cases := []struct {
+		command string
+		want    string
+	}{
+		{command: "codex", want: "codex"},
+		{command: "codex app-server", want: "codex"},
+		{command: "env CODEX_API_KEY=x codex", want: "codex"},
+		{command: "env CODEX_API_KEY=x codex app-server", want: "codex"},
+		{command: "sudo -E codex", want: "codex"},
+		{command: "nohup codex", want: "codex"},
+		{command: "command codex", want: "codex"},
+		{command: "time codex", want: "codex"},
+		{command: "xargs -I{} codex", want: "codex"},
+		{command: "PATH=/opt/bin codex", want: "codex"},
+		{command: "PATH=/opt/bin env X=y codex", want: "codex"},
+		{command: "/usr/local/bin/codex", want: "/usr/local/bin/codex"},
+		// Unknown wrapper: fall back to first-token behavior
+		// (the round-1 classifier treats the unknown wrapper
+		// as the binary; this is the safe behavior because
+		// a new wrapper that exists on PATH could still
+		// invoke the real codex successfully).
+		{command: "my-custom-runner codex", want: "my-custom-runner"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.command, func(t *testing.T) {
+			if got := unwrapCodexBinaryTokenForTest(tc.command); got != tc.want {
+				t.Fatalf("unwrapCodexBinaryToken(%q) = %q, want %q", tc.command, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunPreflightClassifiesWrappedMissingBinaryAsNotInstalled
+// is the round-2 P2 #2 end-to-end regression: a wrapped
+// invocation whose wrapped binary is missing must surface
+// `ReasonCodexNotInstalled`, not `ReasonMalformedVersion`. The
+// pre-2 classifier would have looked up `env` (which exists on
+// PATH) and reported `malformed_version`.
+func TestRunPreflightClassifiesWrappedMissingBinaryAsNotInstalled(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+	}{
+		{
+			name:    "env with missing codex",
+			command: "env CODEX_API_KEY=SYNTHETIC_OWNER_NONCE_x codex-not-on-path-zzzz-12345",
+		},
+		{
+			name:    "sudo with missing codex",
+			command: "sudo -E codex-not-on-path-zzzz-12345",
+		},
+		{
+			name:    "PATH prefix with missing codex",
+			command: "PATH=/opt/bin codex-not-on-path-zzzz-12345",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			summary := RunPreflight(PreflightOptions{
+				Command:       tc.command,
+				VersionOutput: "",
+				Now:           fixedNow,
+			})
+			if summary.Available {
+				t.Fatalf("Available = true, want false")
+			}
+			if summary.FailureReason != ReasonCodexNotInstalled {
+				t.Fatalf("FailureReason = %q, want %q (wrapped invocation with missing wrapped binary must be reported as not-installed, not malformed)", summary.FailureReason, ReasonCodexNotInstalled)
+			}
+		})
+	}
+}

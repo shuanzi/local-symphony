@@ -1111,7 +1111,7 @@ components:
         available: { type: boolean }
         failure_code: { type: [string, 'null'] }
         failure_reason:
-          enum: [malformed_version, missing_fixture, missing_metadata, malformed_metadata, metadata_codex_version_mismatch, experimental_api_not_supported, metadata_missing_codex_version, metadata_missing_protocol_version, metadata_missing_schema_version, metadata_missing_supported_notifications, metadata_missing_supported_requests, missing_schema_fixture, missing_transcript_fixture, invalid_transcript_fixture, codex_not_installed, unknown]
+          enum: [malformed_version, missing_fixture, missing_metadata, malformed_metadata, metadata_codex_version_mismatch, experimental_api_not_supported, metadata_missing_codex_version, metadata_missing_protocol_version, metadata_missing_schema_version, metadata_protocol_version_sentinel, metadata_schema_version_sentinel, metadata_codex_version_sentinel, metadata_missing_supported_notifications, metadata_missing_supported_requests, missing_schema_fixture, missing_transcript_fixture, invalid_transcript_fixture, codex_not_installed, unknown]
         failure_message: { type: [string, 'null'] }
     DiagnosticsSupportStatus:
       enum: [supported, unsupported, unknown]

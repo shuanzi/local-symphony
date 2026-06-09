@@ -1848,6 +1848,12 @@ func validateCompatibilityMetadata(version string, metadata CompatibilityMetadat
 		return unsupportedCodexVersion("metadata_missing_protocol_version", map[string]any{"codex_version": version})
 	case metadata.SchemaVersion == "":
 		return unsupportedCodexVersion("metadata_missing_schema_version", map[string]any{"codex_version": version})
+	case isSyntheticSentinelString(metadata.ProtocolVersion):
+		return unsupportedCodexVersion("metadata_protocol_version_sentinel", map[string]any{"codex_version": version})
+	case isSyntheticSentinelString(metadata.SchemaVersion):
+		return unsupportedCodexVersion("metadata_schema_version_sentinel", map[string]any{"codex_version": version})
+	case isSyntheticSentinelString(metadata.CodexVersion):
+		return unsupportedCodexVersion("metadata_codex_version_sentinel", map[string]any{"codex_version": version})
 	case len(metadata.SupportedNotifications) == 0:
 		return unsupportedCodexVersion("metadata_missing_supported_notifications", map[string]any{"codex_version": version})
 	case len(metadata.SupportedRequests) == 0:
@@ -1855,6 +1861,51 @@ func validateCompatibilityMetadata(version string, metadata CompatibilityMetadat
 	default:
 		return nil
 	}
+}
+
+// isSyntheticSentinelString reports whether s carries the
+// synthetic-sentinel shape (an UPPER_SNAKE_CASE token prefixed
+// with `SYNTHETIC_`). The shape detector runs at the
+// compatibility-metadata gate so a poisoned fixture that plants
+// raw prompt / raw Codex log / raw secret content into a
+// version identifier (protocol_version / schema_version /
+// codex_version) is rejected before the preflight success path
+// could echo it back through diagnostics / `symphony status`.
+//
+// This complements the `scrubbedForDiagnostics` family that the
+// diagnostics layer uses: that helper masks the value in the
+// envelope, this helper rejects the value at the source. The
+// gate path wins for fixture-controlled scalars because the
+// success-path copy of `selected.Metadata` would otherwise
+// publish a poisoned identifier verbatim — and unlike
+// SupportedNotifications (a list of protocol method names) the
+// scalar fields are operator-visible strings that surface in
+// the dashboard's "Codex" card.
+//
+// The detector is intentionally narrow: a string is a sentinel
+// only when it has the `SYNTHETIC_` prefix and the remainder
+// consists entirely of uppercase letters, digits, or
+// underscores. Plain version strings ("1.2.3", "v1.2.3",
+// "protocol-test-v1", "schema-2024-01") never match.
+func isSyntheticSentinelString(s string) bool {
+	const sentinel = "SYNTHETIC_"
+	if !strings.HasPrefix(s, sentinel) {
+		return false
+	}
+	if len(s) == len(sentinel) {
+		return false
+	}
+	// The remainder must be entirely [A-Z0-9_]. The Python
+	// sentinel contract uses underscores freely
+	// (SYNTHETIC_PROMPT_BODY, SYNTHETIC_OWNER_NONCE_x, etc.)
+	// and the same shape is what we want to reject in
+	// identifier slots.
+	for _, r := range s[len(sentinel):] {
+		if r != '_' && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func defaultFixtureRoot() string {
