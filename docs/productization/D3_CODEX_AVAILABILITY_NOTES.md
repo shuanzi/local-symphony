@@ -147,13 +147,15 @@ ea2a130 schemas/openapi/contract: extend codex diagnostics with metadata/fixture
 7b5cb64 web: tighten Codex types and link Overview → Diagnostics
 4b37cb5 internal/agent/codex: round-1 review fixes (4 findings)
 293985c docs/productization: D3 Codex availability notes
+6073a15 internal/agent/codex: round-2 review fixes (2 findings)
 ```
 
 提交 hash（`git log` 输出）：
 
 ```
 $ git log --oneline codex/v1-productization-d3-codex-availability ^main
-293985c (HEAD -> codex/v1-productization-d3-codex-availability) docs/productization: D3 Codex availability notes
+6073a15 (HEAD -> codex/v1-productization-d3-codex-availability) internal/agent/codex: round-2 review fixes (2 findings)
+293985c docs/productization: D3 Codex availability notes
 4b37cb5 internal/agent/codex: round-1 review fixes (4 findings)
 7b5cb64 web: tighten Codex types and link Overview → Diagnostics
 ea2a130 schemas/openapi/contract: extend codex diagnostics with metadata/fixture_support/last_preflight
@@ -162,7 +164,7 @@ a05a0eb internal/cli+httpapi: expose codex availability in status and /state
 90f0ded internal/agent/codex: add preflight summary and tests
 ```
 
-6 个 commit，按计划顺序 1→5 落地后，codex review round 1 触发了第 6 个 commit（4b37cb5）修补 3 × P1 + 1 × P2 finding。Doc 笔记（本文）跟随最后一个 commit。
+7 个 commit，按计划顺序 1→5 落地后，codex review round 1 触发了第 6 个 commit（4b37cb5）修补 3 × P1 + 1 × P2 finding，codex review round 2 触发了第 7 个 commit（6073a15）修补 1 × P1 + 1 × P2 finding。Doc 笔记（本文）跟随最后一个 commit。
 
 ### 4.1 Round-1 review 修复
 
@@ -189,6 +191,41 @@ contract validation passed
 
 $ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
 ok  	local-symphony/internal/agent/codex	1.075s
+```
+
+### 4.2 Round-2 review 修复
+
+codex review round 2 对 commit 4b37cb5 给出 2 个 finding（1 × P1，1 × P2）：
+
+| # | Sev | 修复 |
+|---|-----|------|
+| 1 | P1 | `validateCompatibilityMetadata` 新增 `isSyntheticSentinelString()` 检测 `CodexVersion` / `ProtocolVersion` / `SchemaVersion` 三个标量；命中 sentinel 形状直接 reject 并报告 `metadata_protocol_version_sentinel` / `metadata_schema_version_sentinel` / `metadata_codex_version_sentinel`。成功路径在 source 处就阻断了 leak，不再依赖事后 scrub。 |
+| 2 | P2 | `classifyEmptyOrMalformedVersion` 改用 `unwrapCodexBinaryToken`，按 `commandParts` 走 argv 跳过 `env` / `sudo` / `nohup` / `command` / `time` / `xargs` 等已知 wrapper，连带消耗 `-E` / `-I{}` 等 flag-形状参数；`KEY=VALUE` env-var 前缀也按 shell 语义跳过。未知 wrapper 退回到 round-1 first-token 行为，保持向后兼容。 |
+
+`failure_reason` enum 由 16 扩到 19（增加 `metadata_protocol_version_sentinel` / `metadata_schema_version_sentinel` / `metadata_codex_version_sentinel`），`schemas/diagnostics.schema.json` / `api/openapi.yaml` / `scripts/validate_contracts.py::DIAGNOSTICS_CODEX_FAILURE_REASON_ENUM` 三处同步。
+
+新增 5 个 R2 回归测试（24 个 sub-case）：
+
+- `TestIsSyntheticSentinelStringDistinguishesVersionAndSentinel`（10 sub-case）
+- `TestRunPreflightRejectsSentinelShapedProtocolVersion`
+- `TestRunPreflightRejectsSentinelShapedSchemaVersion`
+- `TestUnwrapCodexBinaryTokenSkipsKnownWrappers`（13 sub-case）
+- `TestRunPreflightClassifiesWrappedMissingBinaryAsNotInstalled`（3 sub-case）
+
+修复后：
+
+```
+$ go test -count=1 ./internal/agent/codex ./internal/observability ./internal/cli ./internal/httpapi
+ok  	local-symphony/internal/agent/codex	28.532s
+ok  	local-symphony/internal/observability	3.176s
+ok  	local-symphony/internal/cli	2.928s
+ok  	local-symphony/internal/httpapi	12.279s
+
+$ python3 scripts/validate_contracts.py
+contract validation passed
+
+$ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
+ok  	local-symphony/internal/agent/codex	1.020s
 ```
 
 ## 5. 范围合规
