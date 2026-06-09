@@ -3,6 +3,7 @@ package codex
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -160,11 +161,76 @@ func TestRunPreflightExperimentalRequired(t *testing.T) {
 	}
 }
 
-func TestRunPreflightRedactsSyntheticSentinelsFromDetails(t *testing.T) {
+// TestRunPreflightRedactsCommandBeforeStorage is the round-1 P1
+// #1 regression: the stored Command must be the binary basename
+// only; arguments that may carry --api-key / wrapper flags /
+// tokens must be dropped. A command that contains a synthetic
+// secret-shaped token must not let the token survive the
+// redaction step (defense in depth).
+func TestRunPreflightRedactsCommandBeforeStorage(t *testing.T) {
+	cases := []struct {
+		name        string
+		command     string
+		wantCommand string
+	}{
+		{
+			name:        "codex with no args",
+			command:     "codex",
+			wantCommand: "codex",
+		},
+		{
+			name:        "codex app-server with sentinel flag",
+			command:     "codex --api-key=SYNTHETIC_OWNER_NONCE_do_not_leak",
+			wantCommand: "codex",
+		},
+		{
+			name:        "absolute path with sentinel arg",
+			command:     "/opt/codex/bin/codex --token=SYNTHETIC_API_SECRET_abc",
+			wantCommand: "codex",
+		},
+		{
+			name:        "wrapper invocation stores wrapper basename",
+			command:     "env CODEX_API_KEY=SYNTHETIC_OWNER_NONCE_x /usr/local/bin/codex-app-server",
+			wantCommand: "env",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactedCommandForTest(tc.command)
+			if got != tc.wantCommand {
+				t.Fatalf("redactedCommandForTest(%q) = %q, want %q", tc.command, got, tc.wantCommand)
+			}
+			for _, sentinel := range []string{"SYNTHETIC_OWNER_NONCE", "SYNTHETIC_API_SECRET", "SYNTHETIC_PROMPT_BODY", "SYNTHETIC_CODEX_LOG"} {
+				if strings.Contains(got, sentinel) {
+					t.Fatalf("redacted command leaks sentinel %q: %q", sentinel, got)
+				}
+			}
+		})
+	}
+	// Also assert the value that ends up in the live summary.
+	summary := RunPreflight(PreflightOptions{
+		Command:       "codex --api-key=SYNTHETIC_OWNER_NONCE_secret_value",
+		VersionOutput: "codex 0.0.0-test",
+		FixtureRoot:   testdataFixtureRoot(t),
+		Now:           fixedNow,
+	})
+	if got := summary.Command; got != "codex" {
+		t.Fatalf("summary.Command = %q, want %q", got, "codex")
+	}
+	if strings.Contains(summary.Command, "SYNTHETIC_OWNER_NONCE") {
+		t.Fatalf("summary.Command leaks sentinel: %q", summary.Command)
+	}
+}
+
+// TestRunPreflightScrubsSuccessPathMetadata is the round-1 P1
+// #2 regression: a poisoned compatibility.json whose
+// SupportedNotifications / SupportedRequests carry synthetic
+// sentinels must not let those sentinels survive the success
+// path. The metadata block on the summary must contain
+// "[REDACTED]" in the affected slots but preserve length and
+// the rest of the metadata.
+func TestRunPreflightScrubsSuccessPathMetadata(t *testing.T) {
 	root := t.TempDir()
-	// Inject a poisoned compatibility.json whose SupportedNotifications
-	// carries a raw-prompt sentinel. The redaction policy must strip
-	// it from the FailureDetails map before diagnostics export.
 	version := "9.9.9-poison"
 	schemaDir := filepath.Join(root, "schema", version)
 	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
@@ -173,42 +239,217 @@ func TestRunPreflightRedactsSyntheticSentinelsFromDetails(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "transcripts", version), 0o755); err != nil {
 		t.Fatalf("mkdir transcripts: %v", err)
 	}
+	// Construct a compatibility.json that is structurally valid
+	// (matching codex_version, schema.json + happy-path.jsonl in
+	// place, no extra unsupported fields the validator rejects)
+	// but whose SupportedNotifications / SupportedRequests
+	// contain synthetic sentinels. The success path must scrub
+	// them before assignment.
 	poisoned := `{
   "codex_version": "9.9.9-poison",
   "protocol_version": "protocol-poison-v1",
   "schema_version": "schema-poison-v1",
-  "supported_notifications": ["` + syntheticPromptBody + `", "handoff"],
-  "supported_requests": ["` + syntheticCodexLog + `"],
+  "supported_notifications": [
+    "handoff",
+    "SYNTHETIC_PROMPT_BODY_leak_in_metadata",
+    "turn/started"
+  ],
+  "supported_requests": [
+    "SYNTHETIC_CODEX_LOG_leak_in_metadata",
+    "initialize"
+  ],
   "experimental_api": false
 }`
 	if err := os.WriteFile(filepath.Join(schemaDir, compatibilityMetadataFile), []byte(poisoned), 0o600); err != nil {
 		t.Fatalf("write poisoned metadata: %v", err)
 	}
+	// Provide a minimal schema.json so the schema_available check
+	// passes and SelectFixtureMetadata does not bail on
+	// missing_schema_fixture.
+	schemaStub := `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}`
+	if err := os.WriteFile(filepath.Join(schemaDir, "schema.json"), []byte(schemaStub), 0o600); err != nil {
+		t.Fatalf("write schema stub: %v", err)
+	}
+	// And a transcript stub that satisfies the validator (must
+	// contain a handshake and a terminal turn message; matching
+	// the compatibility metadata). The pre-existing
+	// ValidateTranscriptFixture in codex.go is strict, so use a
+	// transcript that matches the poison fixture's protocol.
+	transcript := `{"type":"handshake","codex_version":"9.9.9-poison","protocol_version":"protocol-poison-v1","schema_version":"schema-poison-v1","experimental_api":false}
+{"type":"turn_completed"}
+`
+	if err := os.WriteFile(filepath.Join(root, "transcripts", version, "happy-path.jsonl"), []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
 	summary := RunPreflight(PreflightOptions{
-		Command:       "codex-fake",
+		Command:       "codex",
 		VersionOutput: "codex 9.9.9-poison",
 		FixtureRoot:   root,
 		Now:           fixedNow,
 	})
-	if summary.Available {
-		t.Fatalf("Available = true, want false (poisoned metadata should fail validation)")
+	if !summary.Available {
+		t.Fatalf("Available = false, want true (the poisoned metadata should still pass the structural gate); failure_reason=%q failure_message=%q", summary.FailureReason, summary.FailureMessage)
 	}
-	// The poisoned compatibility.json will trip malformed_metadata
-	// (the SupportedNotifications now contains a non-conventional
-	// value but actually... it's still a string array; it will
-	// proceed to the schema check and we should expect
-	// missing_schema_fixture because we did not create schema.json).
-	// Either way, the failure details must not contain the sentinel.
-	b, _ := json.Marshal(summary.FailureDetails)
+	if summary.Metadata == nil {
+		t.Fatalf("Metadata is nil on success")
+	}
+	b, _ := json.Marshal(summary.Metadata)
 	body := string(b)
-	for _, sentinel := range []string{syntheticPromptBody, syntheticCodexLog, syntheticSecret} {
+	for _, sentinel := range []string{
+		"SYNTHETIC_PROMPT_BODY_leak_in_metadata",
+		"SYNTHETIC_CODEX_LOG_leak_in_metadata",
+	} {
 		if strings.Contains(body, sentinel) {
-			t.Fatalf("FailureDetails leaks sentinel %q in: %s", sentinel, body)
+			t.Fatalf("summary.Metadata leaks sentinel %q: %s", sentinel, body)
 		}
 	}
-	if summary.FailureMessage != "" && strings.Contains(summary.FailureMessage, syntheticPromptBody) {
-		t.Fatalf("FailureMessage leaks sentinel: %q", summary.FailureMessage)
+	if !strings.Contains(body, "[REDACTED]") {
+		t.Fatalf("summary.Metadata should contain [REDACTED], got: %s", body)
 	}
+	// Length and ordering must be preserved.
+	if len(summary.Metadata.SupportedNotifications) != 3 {
+		t.Fatalf("SupportedNotifications length = %d, want 3 (no scrubbing of array length)", len(summary.Metadata.SupportedNotifications))
+	}
+	if len(summary.Metadata.SupportedRequests) != 2 {
+		t.Fatalf("SupportedRequests length = %d, want 2", len(summary.Metadata.SupportedRequests))
+	}
+}
+
+// TestRunPreflightScrubsFailureMessage is the round-1 P1 #3
+// regression: when fixture validation fails with attacker-
+// controlled detail text (a poisoned metadata_version or a
+// transcript-validation error containing a sentinel), the
+// FailureMessage must not leak the sentinel. The FailureDetails
+// is already redacted; the message string is the residual path.
+func TestRunPreflightScrubsFailureMessage(t *testing.T) {
+	root := t.TempDir()
+	version := "9.9.9-leak"
+	schemaDir := filepath.Join(root, "schema", version)
+	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "transcripts", version), 0o755); err != nil {
+		t.Fatalf("mkdir transcripts: %v", err)
+	}
+	// Construct a compatibility.json whose metadata_version
+	// contains a synthetic prompt sentinel. The validator will
+	// produce an invalid_transcript_fixture error if anything
+	// downstream trips, but the simpler attack is a transcript
+	// whose handshake includes a poisoned metadata_version —
+	// the validator passes it through into details["error"].
+	poisoned := `{
+  "codex_version": "9.9.9-leak",
+  "protocol_version": "protocol-leak-v1",
+  "schema_version": "schema-leak-v1",
+  "supported_notifications": ["handoff"],
+  "supported_requests": ["initialize"],
+  "experimental_api": false
+}`
+	if err := os.WriteFile(filepath.Join(schemaDir, compatibilityMetadataFile), []byte(poisoned), 0o600); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+	schemaStub := `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}`
+	if err := os.WriteFile(filepath.Join(schemaDir, "schema.json"), []byte(schemaStub), 0o600); err != nil {
+		t.Fatalf("write schema stub: %v", err)
+	}
+	// Transcript with a poisoned error field in the handshake
+	// validator path: the validator reports details["error"] for
+	// invalid transcripts. We push a transcript whose first
+	// message type is unsupported, which makes the validator
+	// fail with "unsupported message type" — we then expect the
+	// preflight to surface invalid_transcript_fixture and the
+	// FailureMessage must be redacted of any sentinel that
+	// appears in the actual line.
+	transcript := `{"type":"SYNTHETIC_PROMPT_BODY_actual_firmware_leak_in_transcript","note":"raw prompt body"}
+`
+	if err := os.WriteFile(filepath.Join(root, "transcripts", version, "happy-path.jsonl"), []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	summary := RunPreflight(PreflightOptions{
+		Command:       "codex",
+		VersionOutput: "codex 9.9.9-leak",
+		FixtureRoot:   root,
+		Now:           fixedNow,
+	})
+	if summary.Available {
+		t.Fatalf("Available = true, want false (transcript should fail validation)")
+	}
+	for _, sentinel := range []string{"SYNTHETIC_PROMPT_BODY_actual_firmware_leak_in_transcript"} {
+		if strings.Contains(summary.FailureMessage, sentinel) {
+			t.Fatalf("FailureMessage leaks sentinel %q: %q", sentinel, summary.FailureMessage)
+		}
+	}
+}
+
+// TestRunPreflightDistinguishesMalformedFromNotInstalled is the
+// round-1 P2 #4 regression: an installed codex binary that emits
+// a malformed --version line must surface malformed_version, not
+// codex_not_installed. The classifier uses exec.LookPath on the
+// binary's first token to break the tie when the version probe
+// returns empty output.
+func TestRunPreflightDistinguishesMalformedFromNotInstalled(t *testing.T) {
+	t.Run("installed binary with malformed --version line", func(t *testing.T) {
+		// "go" is always present in the test environment. We
+		// pass an explicit --version output string that is
+		// non-empty but unparseable. The override path skips
+		// DetectVersionForCommand entirely, so the only way
+		// the classifier runs is via the empty-output branch.
+		// To exercise the LookPath branch we use a binary
+		// known to be on PATH ("go") with a blank probe
+		// output: the classifier sees empty probe + LookPath
+		// success -> malformed_version.
+		binary, lookErr := exec.LookPath("go")
+		if lookErr != nil {
+			t.Skipf("go binary not on PATH, cannot test LookPath branch: %v", lookErr)
+		}
+		_ = binary
+		summary := RunPreflight(PreflightOptions{
+			Command:       "go",
+			VersionOutput: "", // empty -> LookPath branch
+			Now:           fixedNow,
+		})
+		if summary.Available {
+			t.Fatalf("Available = true, want false")
+		}
+		if summary.FailureReason != ReasonMalformedVersion {
+			t.Fatalf("FailureReason = %q, want %q (installed binary with empty probe output must NOT be misreported as not-installed)", summary.FailureReason, ReasonMalformedVersion)
+		}
+	})
+	t.Run("truly missing binary", func(t *testing.T) {
+		// A name that is guaranteed not to be on PATH (very
+		// long random string). LookPath fails -> not_installed.
+		binary, err := exec.LookPath("definitely-not-installed-binary-zzzzzz-9k3x")
+		if err == nil {
+			t.Skipf("unrelated binary on PATH at %q, cannot test missing-binary branch", binary)
+		}
+		summary := RunPreflight(PreflightOptions{
+			Command:       "definitely-not-installed-binary-zzzzzz-9k3x",
+			VersionOutput: "",
+			Now:           fixedNow,
+		})
+		if summary.Available {
+			t.Fatalf("Available = true, want false")
+		}
+		if summary.FailureReason != ReasonCodexNotInstalled {
+			t.Fatalf("FailureReason = %q, want %q", summary.FailureReason, ReasonCodexNotInstalled)
+		}
+	})
+	t.Run("non-empty unparseable output", func(t *testing.T) {
+		// Non-empty garbage output -> malformed_version
+		// regardless of whether the binary exists on PATH.
+		summary := RunPreflight(PreflightOptions{
+			Command:       "codex",
+			VersionOutput: "completely unparseable garbage output",
+			Now:           fixedNow,
+		})
+		if summary.Available {
+			t.Fatalf("Available = true, want false")
+		}
+		if summary.FailureReason != ReasonMalformedVersion {
+			t.Fatalf("FailureReason = %q, want %q", summary.FailureReason, ReasonMalformedVersion)
+		}
+	})
 }
 
 func TestRunPreflightScrubberStripsSentinels(t *testing.T) {

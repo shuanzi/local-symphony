@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -139,6 +140,24 @@ type PreflightSummary struct {
 // fixture content. FailureDetails carries structured fields
 // (codex_version / detected_version / metadata_version) but is
 // redacted of raw codex log / raw prompt / raw secret content.
+//
+// Redaction invariants (P1 round-1 review):
+//   - The stored `Command` is the binary basename only; arguments
+//     (which may carry `--api-key=...` / wrapper flags / tokens) are
+//     dropped before assignment. The basename is also passed through
+//     `scrubbedForDiagnostics` as defense in depth.
+//   - The stored `Metadata.SupportedNotifications` / `SupportedRequests`
+//     are scrubbed of synthetic-sentinel-shaped values so a poisoned
+//     compatibility.json cannot leak raw prompt / raw Codex log /
+//     raw secret content via the success path.
+//   - `FailureMessage` is scrubbed before assignment so attacker-
+//     controlled detail text (e.g. a poisoned metadata_version or
+//     a transcript-validation error message) cannot leak through the
+//     human-readable string.
+//   - When the version probe returns empty output the preflight
+//     uses `exec.LookPath` to distinguish `codex_not_installed` from
+//     `malformed_version`; previously, an installed-but-malformed
+//     codex binary was misreported as not-installed.
 func RunPreflight(opts PreflightOptions) PreflightSummary {
 	now := opts.Now
 	if now == nil {
@@ -164,7 +183,7 @@ func RunPreflight(opts PreflightOptions) PreflightSummary {
 	ranAt := now().UTC().Format(time.RFC3339)
 	summary := PreflightSummary{
 		RanAt:   ranAt,
-		Command: command,
+		Command: redactedCommandForDiagnostics(command),
 		Version: "",
 		Support: CodexSupport{CLI: SupportStatusUnknown, Model: SupportStatusUnknown, Sandbox: SupportStatusUnknown},
 		FixtureSupport: FixtureSupport{
@@ -175,18 +194,20 @@ func RunPreflight(opts PreflightOptions) PreflightSummary {
 	}
 	parsedVersion, parseErr := ParseCodexVersionOutput(versionOutput)
 	if parseErr != nil {
-		// Two sub-cases: the binary was probed but produced something
-		// we couldn't parse (malformed_version) OR the binary is not
-		// installed and DetectVersionForCommand returned "" (which
-		// ParseCodexVersionOutput treats as malformed).
-		reason := ReasonMalformedVersion
-		if strings.TrimSpace(versionOutput) == "" {
-			reason = ReasonCodexNotInstalled
-		}
+		// P2 round-1 fix: distinguish "binary not installed" from
+		// "binary ran but emitted a malformed --version line". The
+		// previous version conflated the two cases and misreported
+		// installed-but-malformed codex binaries as missing. The
+		// version probe result is "" only when `DetectVersionForCommand`
+		// could not find or invoke the binary; in that case we trust
+		// the absence as the not-installed signal. When the override
+		// env var is set (test-only) and still empty, fall back to
+		// exec.LookPath for a stable signal.
+		reason := classifyEmptyOrMalformedVersion(versionOutput, command)
 		summary.Support = CodexSupport{CLI: SupportStatusUnsupported, Model: SupportStatusUnknown, Sandbox: SupportStatusUnknown}
 		summary.FailureCode = string(core.FailureUnsupportedCodexVersion)
 		summary.FailureReason = reason
-		summary.FailureMessage = humanMessageForReason(reason, versionOutput, nil)
+		summary.FailureMessage = scrubbedForDiagnostics(humanMessageForReason(reason, versionOutput, nil))
 		summary.FailureDetails = redactedFailureDetails(map[string]any{
 			"reason":         string(reason),
 			"version_output": scrubbedForDiagnostics(versionOutput),
@@ -211,14 +232,127 @@ func RunPreflight(opts PreflightOptions) PreflightSummary {
 		summary.Support = CodexSupport{CLI: SupportStatusUnsupported, Model: SupportStatusUnknown, Sandbox: SupportStatusUnknown}
 		summary.FailureCode = code
 		summary.FailureReason = reason
-		summary.FailureMessage = humanMessageForReason(reason, parsedVersion, details)
+		summary.FailureMessage = scrubbedForDiagnostics(humanMessageForReason(reason, parsedVersion, details))
 		summary.FailureDetails = redactedFailureDetails(details)
 		return summary
 	}
 	summary.Available = true
 	summary.Support = CodexSupport{CLI: SupportStatusSupported, Model: SupportStatusSupported, Sandbox: SupportStatusSupported}
-	summary.Metadata = &selected.Metadata
+	// P1 round-1 fix: scrub the success-path metadata so a
+	// poisoned compatibility.json whose SupportedNotifications /
+	// SupportedRequests carry a synthetic-sentinel-shaped string
+	// cannot leak raw prompt / raw Codex log / raw secret content
+	// via the diagnostics envelope. The other metadata fields are
+	// version / protocol / schema identifiers and a boolean
+	// (experimental_api) and do not carry user-supplied content,
+	// so they bypass the scrubber.
+	summary.Metadata = scrubbedMetadata(&selected.Metadata)
 	return summary
+}
+
+// classifyEmptyOrMalformedVersion decides between
+// ReasonCodexNotInstalled (the binary is not on PATH) and
+// ReasonMalformedVersion (the binary ran but its --version line
+// could not be parsed). The classification matters because the
+// operator remediation is different in the two cases
+// (install-the-binary vs upgrade-the-binary).
+//
+// Algorithm:
+//  1. If the version probe produced non-empty output, the binary
+//     ran and emitted a parseable-but-malformed line. Surface
+//     ReasonMalformedVersion.
+//  2. If the probe produced empty output AND the binary cannot be
+//     found via exec.LookPath, surface ReasonCodexNotInstalled.
+//  3. If the probe produced empty output AND exec.LookPath finds
+//     the binary (so it should have been able to run), surface
+//     ReasonMalformedVersion. This protects against the
+//     DetectVersionForCommand implementation losing malformed
+//     output by returning "" for a real parse failure.
+//
+// Tests assert the three branches independently.
+func classifyEmptyOrMalformedVersion(probeOutput, command string) PreflightReason {
+	if strings.TrimSpace(probeOutput) != "" {
+		return ReasonMalformedVersion
+	}
+	binary := firstTokenOfCommand(command)
+	if binary == "" {
+		return ReasonCodexNotInstalled
+	}
+	if _, err := exec.LookPath(binary); err != nil {
+		return ReasonCodexNotInstalled
+	}
+	return ReasonMalformedVersion
+}
+
+// firstTokenOfCommand returns the leading binary token of a
+// shell-style command string, mirroring the parser used by
+// commandParts. Empty input yields "".
+func firstTokenOfCommand(command string) string {
+	parts := commandParts(command)
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[0]
+}
+
+// redactedCommandForDiagnostics returns the binary basename of
+// the configured Codex command, with arguments (which may carry
+// --api-key / --token / wrapper flags) dropped. The result is
+// also passed through scrubbedForDiagnostics as defense in depth
+// against a synthetic-sentinel-shaped value sneaking in via a
+// caller-provided command string.
+//
+// This mirrors the pattern agent.process_started events use: the
+// stored event reports "command": "redacted" and the run logs
+// only the basename. Without this redaction the diagnostics
+// surface can reintroduce a raw secret-leak path that the
+// process_started event already closed.
+func redactedCommandForDiagnostics(command string) string {
+	parts := commandParts(command)
+	if len(parts) == 0 {
+		return scrubbedForDiagnostics(strings.TrimSpace(command))
+	}
+	binary := filepath.Base(parts[0])
+	if binary == "" || binary == "." || binary == ".." {
+		return scrubbedForDiagnostics(parts[0])
+	}
+	return scrubbedForDiagnostics(binary)
+}
+
+// scrubbedMetadata returns a copy of the CompatibilityMetadata
+// with SupportedNotifications and SupportedRequests scrubbed of
+// any synthetic-sentinel-shaped value. The other fields
+// (codex_version / protocol_version / schema_version /
+// experimental_api) are version / protocol identifiers and a
+// boolean; they do not carry operator-supplied content and
+// bypass the scrubber. The scrubber preserves the slice length
+// and ordering so the diagnostics envelope's shape is stable.
+//
+// A poisoned compatibility.json whose SupportedNotifications
+// still parses as a []string but contains e.g.
+// ["SYNTHETIC_PROMPT_BODY_do_not_leak", "handoff"] will be
+// normalized to ["[REDACTED]", "handoff"] before export, so the
+// success path is no longer a leak surface.
+func scrubbedMetadata(m *CompatibilityMetadata) *CompatibilityMetadata {
+	if m == nil {
+		return nil
+	}
+	notes := make([]string, 0, len(m.SupportedNotifications))
+	for _, s := range m.SupportedNotifications {
+		notes = append(notes, scrubbedForDiagnostics(s))
+	}
+	reqs := make([]string, 0, len(m.SupportedRequests))
+	for _, s := range m.SupportedRequests {
+		reqs = append(reqs, scrubbedForDiagnostics(s))
+	}
+	return &CompatibilityMetadata{
+		CodexVersion:           m.CodexVersion,
+		ProtocolVersion:        m.ProtocolVersion,
+		SchemaVersion:          m.SchemaVersion,
+		ExperimentalAPI:        m.ExperimentalAPI,
+		SupportedNotifications: notes,
+		SupportedRequests:      reqs,
+	}
 }
 
 func inspectFixtureSupport(root, version string) FixtureSupport {
@@ -407,6 +541,21 @@ func PreflightSummaryToJSON(s PreflightSummary) (string, error) {
 // without depending on unexported helpers from outside the package.
 func failureDetailsForTest(details map[string]any) map[string]any {
 	return redactedFailureDetails(details)
+}
+
+// scrubbedMetadataForTest exposes the success-path metadata
+// scrubber so the package-internal `*_test.go` can assert that
+// a poisoned compatibility.json cannot leak sentinels via the
+// Metadata block.
+func scrubbedMetadataForTest(m *CompatibilityMetadata) *CompatibilityMetadata {
+	return scrubbedMetadata(m)
+}
+
+// redactedCommandForTest exposes the command basename scrubber
+// so the package-internal `*_test.go` can assert that a
+// caller-provided command does not leak its arguments.
+func redactedCommandForTest(command string) string {
+	return redactedCommandForDiagnostics(command)
 }
 
 // scratchDirIsEmpty reports whether the path is either missing or
