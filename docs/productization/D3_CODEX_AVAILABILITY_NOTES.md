@@ -150,13 +150,19 @@ ea2a130 schemas/openapi/contract: extend codex diagnostics with metadata/fixture
 6073a15 internal/agent/codex: round-2 review fixes (2 findings)
 69dedc6 docs/productization: note round-2 review fixes in D3 notes
 5003070 internal/agent/codex: round-3 review fixes (3 findings)
+fceae8d docs/productization: note round-3 review fixes in D3 notes
+62709b0 internal/agent/codex: add team-lead repro tests as permanent regression
+5e76253 internal/agent/codex: round-4 review fix (1 P2: path-qualified binary)
 ```
 
 提交 hash（`git log` 输出）：
 
 ```
 $ git log --oneline codex/v1-productization-d3-codex-availability ^main
-5003070 (HEAD -> codex/v1-productization-d3-codex-availability) internal/agent/codex: round-3 review fixes (3 findings)
+5e76253 (HEAD -> codex/v1-productization-d3-codex-availability) internal/agent/codex: round-4 review fix (1 P2: path-qualified binary)
+62709b0 internal/agent/codex: add team-lead repro tests as permanent regression
+fceae8d docs/productization: note round-3 review fixes in D3 notes
+5003070 internal/agent/codex: round-3 review fixes (3 findings)
 69dedc6 docs/productization: note round-2 review fixes in D3 notes
 6073a15 internal/agent/codex: round-2 review fixes (2 findings)
 293985c docs/productization: D3 Codex availability notes
@@ -168,7 +174,7 @@ a05a0eb internal/cli+httpapi: expose codex availability in status and /state
 90f0ded internal/agent/codex: add preflight summary and tests
 ```
 
-8 个 commit + 1 个笔记更新，按计划顺序 1→5 落地后，三轮 codex review 触发了 3 个修复 commit。Doc 笔记（本文）跟随最后一个 commit。
+9 个 commit + 2 个笔记更新。R1（4 findings）/R2（2 findings）/R3（3 findings）/R4（1 P2）四个 review 轮次，每个 finding 都对应一个修复 commit；R3 之后多加一个 commit 把 team-lead 的 repro 测试加入永久回归套件（带 `defer recover()` panic 兜底，避免 R2 漏 panic 的复现）。
 
 ### 4.1 Round-1 review 修复
 
@@ -264,6 +270,46 @@ contract validation passed
 
 $ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
 ok  	local-symphony/internal/agent/codex	1.046s
+```
+
+### 4.4 Round-4 review 修复
+
+codex review round 4 对 commit 5003070 给出 1 个 P2 finding：path-qualified binary（`/opt/codex/bin/codex` 这种）必须 short-circuit 到 `exec.LookPath`，不能走 PATH 搜索循环。round-3 的 `lookPathWithWrapperPATH` helper 在「`PATH=<value>` prefix + absolute binary」组合下，错误地把绝对路径和 PATH entry 拼起来（`<dir>//opt/...`），永远不命中。
+
+修复是 3 行 guard（`preflight.go:332-334`）：
+
+```go
+if strings.ContainsRune(binary, os.PathSeparator) {
+    return exec.LookPath(binary)
+}
+```
+
+单职责 commit `5e76253`。新增 3 个 R4 回归测试：
+
+- `TestLookPathWithWrapperPATHHandlesAbsoluteBinary`（pre-fix FAIL: `executable file not found in $PATH`；post-fix PASS）
+- `TestLookPathWithWrapperPATHHandlesRelativeBinary`（chdir 到 stub 目录，`./codex-rel` 走 verbatim stat）
+- `TestRunPreflightClassifiesAbsoluteBinaryAsMalformedNotNotInstalled`（end-to-end：absolute binary 真实存在 + 走 wrapper PATH augmentation → 期望 `ReasonMalformedVersion`）
+
+修复后：
+
+```
+$ go test -count=1 -race -timeout 90s ./internal/agent/codex
+ok  	local-symphony/internal/agent/codex	31.218s
+
+$ go test -count=1 -timeout 60s ./internal/agent/codex ./internal/observability ./internal/cli ./internal/httpapi
+ok  	local-symphony/internal/agent/codex	21.471s
+ok  	local-symphony/internal/observability	2.750s
+ok  	local-symphony/internal/cli	2.464s
+ok  	local-symphony/internal/httpapi	10.962s
+
+$ go vet ./internal/agent/codex/...
+(clean)
+
+$ python3 scripts/validate_contracts.py
+contract validation passed
+
+$ SYMPHONY_TEST_CODEX=1 go test -timeout 30s ./internal/agent/codex -run Integration
+ok  	local-symphony/internal/agent/codex	1.036s
 ```
 
 ## 5. 范围合规
