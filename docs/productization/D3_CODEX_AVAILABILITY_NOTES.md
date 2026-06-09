@@ -141,24 +141,55 @@ web dependencies not installed; static frontend checks passed.
 
 ```
 90f0ded internal/agent/codex: add preflight summary and tests
-??     internal/observability: surface codex availability in diagnostics
-??     internal/cli+httpapi: expose codex availability in status and /state
+9f48b1c internal/observability: surface codex availability in diagnostics
+a05a0eb internal/cli+httpapi: expose codex availability in status and /state
 ea2a130 schemas/openapi/contract: extend codex diagnostics with metadata/fixture_support/last_preflight
 7b5cb64 web: tighten Codex types and link Overview → Diagnostics
+4b37cb5 internal/agent/codex: round-1 review fixes (4 findings)
+293985c docs/productization: D3 Codex availability notes
 ```
 
 提交 hash（`git log` 输出）：
 
 ```
 $ git log --oneline codex/v1-productization-d3-codex-availability ^main
-7b5cb64 (HEAD -> codex/v1-productization-d3-codex-availability) web: tighten Codex types and link Overview → Diagnostics
+293985c (HEAD -> codex/v1-productization-d3-codex-availability) docs/productization: D3 Codex availability notes
+4b37cb5 internal/agent/codex: round-1 review fixes (4 findings)
+7b5cb64 web: tighten Codex types and link Overview → Diagnostics
 ea2a130 schemas/openapi/contract: extend codex diagnostics with metadata/fixture_support/last_preflight
 a05a0eb internal/cli+httpapi: expose codex availability in status and /state
 9f48b1c internal/observability: surface codex availability in diagnostics
 90f0ded internal/agent/codex: add preflight summary and tests
 ```
 
-5 个 commit，按计划顺序 1→5 落地。Doc 笔记（本文）尚未 commit，留在 working tree 跟随最后一个 commit。
+6 个 commit，按计划顺序 1→5 落地后，codex review round 1 触发了第 6 个 commit（4b37cb5）修补 3 × P1 + 1 × P2 finding。Doc 笔记（本文）跟随最后一个 commit。
+
+### 4.1 Round-1 review 修复
+
+codex review 对 commit 90f0ded 给出 4 个 finding（3 × P1，1 × P2），全部针对 `internal/agent/codex/preflight.go`：
+
+| # | Sev | 修复 |
+|---|-----|------|
+| 1 | P1 | `summary.Command` 只保留 binary basename（`filepath.Base(commandParts(command)[0])`），参数被丢弃。basename 再过一次 `scrubbedForDiagnostics` 作为 defense in depth。 |
+| 2 | P1 | 新增 `scrubbedMetadata` 包装 `selected.Metadata`，把 `SupportedNotifications` / `SupportedRequests` 走 `scrubbedForDiagnostics`；成功路径的 metadata 不再是 leak 路径。 |
+| 3 | P1 | `humanMessageForReason` 输出在两个失败分支都被 `scrubbedForDiagnostics` 包裹，attacker-controlled detail text 不再外泄。 |
+| 4 | P2 | 新增 `classifyEmptyOrMalformedVersion`，用 `exec.LookPath(firstTokenOfCommand(command))` 区分 binary-真的没装（`codex_not_installed`）vs binary-装了但 --version 行解析失败（`malformed_version`）。 |
+
+测试新增 4 个（9 个 sub-case），覆盖 redaction / scrub / classifier 三个分支。修复后：
+
+```
+$ go test -count=1 ./internal/agent/codex ./internal/observability ./internal/cli ./internal/httpapi
+ok  	local-symphony/internal/agent/codex	19.207s
+ok  	local-symphony/internal/observability	2.929s
+ok  	local-symphony/internal/cli	2.851s
+ok  	local-symphony/internal/httpapi	11.484s
+
+$ python3 scripts/validate_contracts.py
+contract validation passed
+
+$ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
+ok  	local-symphony/internal/agent/codex	1.075s
+```
 
 ## 5. 范围合规
 
