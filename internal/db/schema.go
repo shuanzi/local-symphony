@@ -171,3 +171,88 @@ func tableColumnSet(database *DB, name string) (map[string]struct{}, error) {
 func isMissingRow(err error) bool {
 	return errors.Is(err, os.ErrNotExist)
 }
+
+// MigrateProjectSchema brings an existing v1 project DB up to the
+// current artifacts.kind CHECK enum. It is idempotent: a fresh
+// project DB is created with the full CHECK from v1_project.sql /
+// fallbackProjectSchema, so a no-op call must remain safe. The
+// in-place evolution is the artifacts CHECK widening performed by
+// D1's review packet work — new kinds (codex_events, prompt_rendered,
+// prompt_context, prompt_meta, prompt_tool_manifest, secret_artifact,
+// secrets) are appended to the enum so the dashboard's refusal flow
+// (content_url=null) can be exercised end to end.
+//
+// SQLite has no ALTER TABLE … ALTER CONSTRAINT, so a widened CHECK
+// requires rebuilding the artifacts table. The migration copies all
+// rows from the old artifacts table into a freshly-declared
+// artifacts table that uses the new CHECK, then drops the old
+// table. Foreign keys on issue_id / run_id / review_packet_id are
+// rewritten as nullable (ON DELETE SET NULL), matching the v1
+// production schema. The legacy_kind_probe insert is used as the
+// idempotency sentinel: if it already succeeds, the CHECK is
+// already wide enough and the migration returns early.
+func MigrateProjectSchema(database *DB) error {
+	hasArtifacts, err := tableExists(database, "artifacts")
+	if err != nil {
+		return err
+	}
+	if !hasArtifacts {
+		return nil
+	}
+	if artifactsKindProbe(database) == nil {
+		return nil
+	}
+
+	rebuild := `
+PRAGMA foreign_keys = OFF;
+BEGIN TRANSACTION;
+CREATE TABLE artifacts_new (
+  id TEXT PRIMARY KEY,
+  issue_id TEXT,
+  run_id TEXT,
+  review_packet_id TEXT,
+  kind TEXT NOT NULL CHECK (kind IN ('test_output','patch','changed_files','untracked_files','diffstat','prompt_snapshot','prompt_rendered','prompt_context','prompt_meta','prompt_tool_manifest','codex_log','codex_events','secret_artifact','secrets','review_packet','agent_file','diagnostic','other')),
+  path TEXT NOT NULL,
+  mime_type TEXT,
+  size_bytes INTEGER CHECK (size_bytes IS NULL OR size_bytes >= 0),
+  sha256 TEXT,
+  redacted INTEGER NOT NULL DEFAULT 1 CHECK (redacted IN (0,1)),
+  description TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE SET NULL,
+  FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE SET NULL,
+  FOREIGN KEY(review_packet_id) REFERENCES review_packets(id) ON DELETE SET NULL
+);
+INSERT INTO artifacts_new(id,issue_id,run_id,review_packet_id,kind,path,mime_type,size_bytes,sha256,redacted,description,created_at)
+  SELECT id,issue_id,run_id,review_packet_id,kind,path,mime_type,size_bytes,sha256,redacted,description,created_at FROM artifacts;
+DROP TABLE artifacts;
+ALTER TABLE artifacts_new RENAME TO artifacts;
+CREATE INDEX IF NOT EXISTS idx_artifacts_run_kind ON artifacts(run_id, kind);
+CREATE INDEX IF NOT EXISTS idx_artifacts_issue_kind ON artifacts(issue_id, kind);
+COMMIT;
+PRAGMA foreign_keys = ON;
+`
+	if err := database.ExecScript(rebuild); err != nil {
+		return fmt.Errorf("rebuild artifacts with widened kind CHECK: %w", err)
+	}
+	if artifactsKindProbe(database) != nil {
+		return fmt.Errorf("rebuild succeeded but artifacts.kind CHECK still rejects new kinds")
+	}
+	return nil
+}
+
+// artifactsKindProbe attempts to insert a sentinel row with one of
+// the new artifact kinds. If the insert succeeds the CHECK already
+// permits the new kinds and the migration is a no-op. The sentinel
+// row is rolled back inside the same transaction so callers do not
+// observe it.
+func artifactsKindProbe(database *DB) error {
+	return database.WithTx(func(tx *Tx) error {
+		if err := tx.Exec(
+			`INSERT INTO artifacts(id, kind, path, redacted, created_at) VALUES('art_kind_probe','codex_events','probe',1,'2026-06-09T00:00:00Z')`,
+		); err != nil {
+			return err
+		}
+		return tx.Exec(`DELETE FROM artifacts WHERE id='art_kind_probe'`)
+	})
+}

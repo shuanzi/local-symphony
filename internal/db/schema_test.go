@@ -3,6 +3,7 @@ package db
 import (
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -123,5 +124,130 @@ func assertExecFails(t *testing.T, d *DB, sql string) {
 	t.Helper()
 	if err := d.Exec(sql); err == nil {
 		t.Fatalf("Exec succeeded, want constraint failure for %s", sql)
+	}
+}
+
+// TestProjectSchemaArtifactsKindCheckAcceptsNewKinds pins the
+// production v1_project.sql CHECK constraint on artifacts.kind to the
+// full enum surfaced by the API and the tool gateway. The fallback
+// schema in fallbackProjectSchema intentionally omits the CHECK so
+// that older code paths cannot regress, but the production schema
+// file ships with the strict CHECK and must be kept in sync with
+// allowedArtifactKind in internal/toolgateway. The kinds added by
+// D1's review packet work — codex_events, prompt_rendered,
+// prompt_context, prompt_meta, prompt_tool_manifest, secret_artifact,
+// secrets — must be accepted by the CHECK on a freshly applied
+// project schema so the dashboard's refusal_box (content_url=null)
+// can be exercised end to end.
+func TestProjectSchemaArtifactsKindCheckAcceptsNewKinds(t *testing.T) {
+	schema, err := ReadSchema(".", "db/schema/v1_project.sql")
+	if err != nil {
+		t.Fatalf("ReadSchema v1_project.sql: %v", err)
+	}
+	if strings.Contains(schema, "fallbackProjectSchema") {
+		t.Fatal("ReadSchema returned the fallback constant; expected the production v1_project.sql file on disk")
+	}
+	if !strings.Contains(schema, "CREATE TABLE IF NOT EXISTS artifacts") {
+		t.Fatalf("v1_project.sql does not define the artifacts table; cannot validate CHECK")
+	}
+
+	d, err := Open(filepath.Join(t.TempDir(), "project.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	if err := d.ExecScript(schema); err != nil {
+		t.Fatalf("exec v1_project.sql: %v", err)
+	}
+
+	newKinds := []string{
+		"codex_events",
+		"prompt_rendered",
+		"prompt_context",
+		"prompt_meta",
+		"prompt_tool_manifest",
+		"secret_artifact",
+		"secrets",
+	}
+	for _, kind := range newKinds {
+		t.Run(kind, func(t *testing.T) {
+			err := d.Exec(
+				`INSERT INTO artifacts(id, kind, path, redacted, created_at) VALUES(?, ?, ?, 1, ?)`,
+				"art_"+kind, kind, "raw/"+kind+".bin", "2026-06-09T00:00:00Z",
+			)
+			if err != nil {
+				t.Fatalf("InsertArtifact kind=%s rejected by production v1_project.sql CHECK: %v", kind, err)
+			}
+		})
+	}
+}
+
+// TestMigrateProjectSchemaWidenArtifactsKindCheck installs the
+// legacy (pre-D1) v1_project.sql artifacts.kind CHECK on a fresh
+// project database, then asserts that MigrateProjectSchema rebuilds
+// the artifacts table with the widened CHECK so the new kinds are
+// accepted without dropping rows. The migration must be idempotent:
+// re-running it on an already-migrated database must be a no-op.
+func TestMigrateProjectSchemaWidenArtifactsKindCheck(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "project.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	const legacySchema = `PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_name', 'v1_project');
+INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');
+CREATE TABLE IF NOT EXISTS issues (id TEXT PRIMARY KEY, sequence_no INTEGER NOT NULL UNIQUE CHECK (sequence_no > 0), identifier TEXT NOT NULL UNIQUE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', acceptance_criteria_json TEXT NOT NULL DEFAULT '[]', state TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 3, dispatch_paused INTEGER NOT NULL DEFAULT 0, dispatch_pause_reason TEXT, dispatch_paused_at TEXT, latest_run_id TEXT, latest_review_packet_id TEXT, created_by_type TEXT NOT NULL DEFAULT 'operator', created_by_run_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, archived_at TEXT);
+CREATE TABLE IF NOT EXISTS run_attempts (id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, attempt_no INTEGER NOT NULL CHECK(attempt_no>0), status TEXT NOT NULL, dispatch_reason TEXT NOT NULL DEFAULT 'manual', source_issue_state TEXT NOT NULL, runner_kind TEXT NOT NULL, base_ref_config TEXT, base_ref TEXT, base_sha TEXT, branch_name TEXT, failure_code TEXT, failure_message TEXT, started_at TEXT, ended_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(issue_id, attempt_no), FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS review_packets (id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, run_id TEXT NOT NULL UNIQUE, handoff_id TEXT NOT NULL, packet_no INTEGER NOT NULL CHECK(packet_no>0), status TEXT NOT NULL, root_path TEXT NOT NULL, review_md_path TEXT, review_json_path TEXT, patch_path TEXT, changed_files_path TEXT, untracked_files_path TEXT, diffstat_path TEXT, prompt_snapshot_id TEXT, failure_code TEXT, failure_message TEXT, created_at TEXT NOT NULL, FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE, FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE CASCADE, UNIQUE(issue_id, packet_no));
+CREATE TABLE IF NOT EXISTS artifacts (
+  id TEXT PRIMARY KEY,
+  issue_id TEXT,
+  run_id TEXT,
+  review_packet_id TEXT,
+  kind TEXT NOT NULL CHECK (kind IN ('test_output','patch','changed_files','untracked_files','diffstat','prompt_snapshot','codex_log','review_packet','agent_file','diagnostic','other')),
+  path TEXT NOT NULL,
+  mime_type TEXT,
+  size_bytes INTEGER CHECK (size_bytes IS NULL OR size_bytes >= 0),
+  sha256 TEXT,
+  redacted INTEGER NOT NULL DEFAULT 1 CHECK (redacted IN (0,1)),
+  description TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE SET NULL,
+  FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE SET NULL,
+  FOREIGN KEY(review_packet_id) REFERENCES review_packets(id) ON DELETE SET NULL
+);`
+	if err := d.ExecScript(legacySchema); err != nil {
+		t.Fatalf("exec legacy schema: %v", err)
+	}
+	if err := d.Exec(`INSERT INTO artifacts(id, kind, path, redacted, created_at) VALUES('art_legacy','codex_log','raw/codex_log.bin',1,'2026-06-09T00:00:00Z')`); err != nil {
+		t.Fatalf("insert legacy artifact: %v", err)
+	}
+
+	if err := MigrateProjectSchema(d); err != nil {
+		t.Fatalf("MigrateProjectSchema: %v", err)
+	}
+	// Idempotent: re-running must not fail.
+	if err := MigrateProjectSchema(d); err != nil {
+		t.Fatalf("MigrateProjectSchema idempotent: %v", err)
+	}
+
+	// Legacy row preserved.
+	row, err := d.QueryOne(`SELECT kind FROM artifacts WHERE id='art_legacy'`)
+	if err != nil {
+		t.Fatalf("query legacy artifact: %v", err)
+	}
+	if got := row["kind"].String(); got != "codex_log" {
+		t.Fatalf("legacy artifact kind = %q, want codex_log", got)
+	}
+
+	// New kinds now accepted.
+	for _, kind := range []string{"codex_events", "prompt_rendered", "prompt_context", "prompt_meta", "prompt_tool_manifest", "secret_artifact", "secrets"} {
+		if err := d.Exec(`INSERT INTO artifacts(id, kind, path, redacted, created_at) VALUES(?, ?, ?, 1, ?)`,
+			"art_"+kind, kind, "raw/"+kind+".bin", "2026-06-09T00:00:00Z"); err != nil {
+			t.Fatalf("MigrateProjectSchema: new kind %q still rejected: %v", kind, err)
+		}
 	}
 }
