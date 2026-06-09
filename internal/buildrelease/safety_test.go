@@ -36,6 +36,18 @@
 //                    packaged into the release. `npm ci` must run
 //                    unconditionally.
 //
+//   PR23-P2-1 [P2]   The pre-guard `mkdir -p "$OUT_DIR"` runs
+//                    BEFORE the overlap check. When the caller
+//                    points OUT_DIR at a rejected path
+//                    (e.g. $ROOT/web/forbidden), the directory
+//                    is created on disk before the guard
+//                    rejects the run. The guard is supposed
+//                    to be fail-closed; creating rejected
+//                    paths is a side effect that violates
+//                    that contract. Fix: defer `mkdir -p`
+//                    until after the overlap check accepts
+//                    the target.
+//
 // Tests in this package exercise the script in two modes:
 //
 //   * **In-isolated-tempdir tests (F1-r0)**: the script is COPIED
@@ -185,6 +197,75 @@ func TestBuildReleaseRejectsOUTDirUnderRoot(t *testing.T) {
 		t.Fatalf("rejection error missing. Output:\n%s", out)
 	}
 	assertWebSourceTreeIntact(t, root, out)
+}
+
+// PR23-P2-1 — fail-closed guard must not leave filesystem traces
+// behind. The R1 guard rejects OUT_DIR that overlaps a source
+// subdirectory of $ROOT, but the script's pre-guard
+// `mkdir -p "$OUT_DIR"` (used so `cd "$OUT_DIR" && pwd -P` can
+// resolve the path) created the rejected directory on disk BEFORE
+// the rejection ran. A fail-closed guard that mutates the
+// filesystem as a side effect of being invoked is not actually
+// fail-closed. This test asserts that pointing OUT_DIR at
+// $ROOT/web/<forbidden-subdir> leaves NO trace of `<forbidden-subdir>`
+// under $ROOT/web after the script exits with the rejection error.
+func TestBuildReleaseMkdirDoesNotCreateRejectedOutDir(t *testing.T) {
+	root := t.TempDir()
+	copyMinimumWebTree(t, root)
+	copyMinimumGoModule(t, root)
+	forbidden := filepath.Join(root, "web", "forbidden-subdir")
+
+	// Sanity check: the forbidden path must NOT exist before the run.
+	if _, err := os.Stat(forbidden); err == nil {
+		t.Fatalf("precondition violated: %s already exists", forbidden)
+	}
+
+	out, exit := runIsolatedScriptWithRoot(t, root, forbidden)
+	if exit == 0 {
+		t.Fatalf("OUT_DIR=$ROOT/web/forbidden-subdir was accepted (exit 0). Output:\n%s", out)
+	}
+	if !strings.Contains(out, "refusing to run") {
+		t.Fatalf("rejection error missing. Output:\n%s", out)
+	}
+
+	// The whole point of the fix: the rejected target path must
+	// NOT have been created on disk as a side effect of the
+	// guard's `mkdir -p` line running before the overlap check.
+	if _, err := os.Stat(forbidden); err == nil {
+		t.Fatalf("fail-closed guard is not actually fail-closed: %s was created on disk by the pre-guard `mkdir -p` BEFORE the overlap check rejected the path. Script output:\n%s", forbidden, out)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("unexpected stat error on %s: %v", forbidden, err)
+	}
+
+	// And the parent ($ROOT/web) must also NOT have grown a
+	// forbidden-subdir entry.
+	entries, err := os.ReadDir(filepath.Join(root, "web"))
+	if err != nil {
+		t.Fatalf("readdir $ROOT/web: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name() == "forbidden-subdir" {
+			t.Fatalf("$ROOT/web contains a `forbidden-subdir` entry after the rejected run. ls -la output:\n%s", strings.Join(dirListing(t, filepath.Join(root, "web")), "\n"))
+		}
+	}
+}
+
+// dirListing returns a human-readable listing of dir for failure
+// messages. Uses `ls -la` when available; falls back to ReadDir
+// names if not.
+func dirListing(t *testing.T, dir string) []string {
+	t.Helper()
+	cmd := exec.Command("ls", "-la", dir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		es, _ := os.ReadDir(dir)
+		names := []string{}
+		for _, e := range es {
+			names = append(names, e.Name())
+		}
+		return names
+	}
+	return strings.Split(strings.TrimRight(string(out), "\n"), "\n")
 }
 
 // F1 — third protection layer: even when OUT_DIR is a safe sibling,

@@ -44,7 +44,25 @@ BIN_PATH="$OUT_DIR/${BIN_NAME}${EXT}"
 # (web/, scripts/, internal/, cmd/, docs/, schemas/, api/, examples/,
 # tests/, db/) or to $ROOT itself.
 ROOT_RESOLVED=$(cd "$ROOT" && pwd -P)
-OUT_DIR_RESOLVED=$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd -P)
+# Resolve OUT_DIR to an absolute path WITHOUT creating it. We do this by
+# resolving OUT_DIR's parent and then appending the leaf, so the
+# `cd ... && pwd -P` only chdirs into an existing directory. Without
+# this, a pre-guard `mkdir -p "$OUT_DIR"` would create the rejected
+# path on disk before the overlap check below runs, breaking the
+# fail-closed contract. (D5 codex review PR23-P2-1.)
+if [ -d "$OUT_DIR" ]; then
+  OUT_DIR_RESOLVED=$(cd "$OUT_DIR" && pwd -P)
+else
+  OUT_DIR_PARENT=$(dirname -- "$OUT_DIR")
+  OUT_DIR_LEAF=$(basename -- "$OUT_DIR")
+  if [ ! -d "$OUT_DIR_PARENT" ]; then
+    echo "[build-release] refusing to run: OUT_DIR=$OUT_DIR has no resolvable parent directory ($OUT_DIR_PARENT does not exist)" >&2
+    echo "[build-release] create the parent first, or pass OUT_DIR=\$ROOT/dist (the documented default)." >&2
+    exit 2
+  fi
+  OUT_DIR_PARENT_RESOLVED=$(cd "$OUT_DIR_PARENT" && pwd -P)
+  OUT_DIR_RESOLVED="$OUT_DIR_PARENT_RESOLVED/$OUT_DIR_LEAF"
+fi
 if [ "$OUT_DIR_RESOLVED" = "$ROOT_RESOLVED" ]; then
   echo "[build-release] refusing to run: OUT_DIR=$OUT_DIR_RESOLVED equals source ROOT=$ROOT_RESOLVED" >&2
   echo "[build-release] use the documented default (\$ROOT/dist) or pick a sibling path (e.g. /tmp/release)." >&2
@@ -72,6 +90,8 @@ else
   esac
 fi
 
+# The overlap guard has accepted OUT_DIR. Only NOW is it safe to
+# create the directory on disk. (D5 codex review PR23-P2-1.)
 mkdir -p "$OUT_DIR"
 
 echo "[build-release] target=${GOOS_VALUE}/${GOARCH_VALUE}"
