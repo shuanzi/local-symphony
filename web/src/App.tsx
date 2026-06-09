@@ -741,7 +741,20 @@ function OverviewPage({ data }: { data: DashboardData }) {
   const pendingApprovals = data.approvals.filter((approval) => approval.status === 'pending');
   const humanReview = data.issues.filter((issue) => issue.state === 'Human Review');
   const paused = data.issues.filter((issue) => issue.dispatch_paused);
-  const codexAvailable = Boolean(data.diagnostics?.codex?.available);
+  const codex = data.diagnostics?.codex;
+  const codexAvailable = Boolean(codex?.available);
+  const codexHelper = codex?.warning
+    ? codex.warning
+    : codex?.last_preflight?.failure_reason
+      ? `preflight: ${codex.last_preflight.failure_reason}`
+      : codex?.version
+        ? `codex ${codex.version} · ${codex.metadata?.protocol_version ?? 'no fixture'}`
+        : 'Reported by diagnostics';
+  const codexTone: 'good' | 'warning' | 'danger' | 'muted' = codexAvailable
+    ? 'good'
+    : codex?.warning
+      ? 'danger'
+      : 'muted';
 
   return (
     <>
@@ -752,7 +765,7 @@ function OverviewPage({ data }: { data: DashboardData }) {
         <MetricCard label="Failed runs" value={failed.length} tone={failed.length ? 'danger' : 'neutral'} helper="Recent run failures" />
         <MetricCard label="Human Review" value={humanReview.length} tone={humanReview.length ? 'warning' : 'neutral'} helper="Issues awaiting operator review" />
         <MetricCard label="Paused issues" value={paused.length} tone={paused.length ? 'warning' : 'neutral'} helper="Dispatch paused by failure or operator" />
-        <MetricCard label="Codex" value={codexAvailable ? 'Available' : 'Unavailable'} tone={codexAvailable ? 'good' : 'muted'} helper="Reported by diagnostics" />
+        <MetricCard label="Codex" value={codexAvailable ? 'Available' : 'Unavailable'} tone={codexTone} helper={codexHelper} action={<button type="button" onClick={() => navigate({ page: 'diagnostics' })}>Open Diagnostics</button>} />
       </section>
       <Section title="Recent events">
         {data.events.length === 0 ? (
@@ -1147,12 +1160,13 @@ function ActionRail({ issue, data, runMutation }: {
   );
 }
 
-function MetricCard({ label, value, helper, tone }: { label: string; value: ReactNode; helper: string; tone: 'neutral' | 'good' | 'warning' | 'danger' | 'muted' }) {
+function MetricCard({ label, value, helper, tone, action }: { label: string; value: ReactNode; helper: string; tone: 'neutral' | 'good' | 'warning' | 'danger' | 'muted'; action?: ReactNode }) {
   return (
     <article className={`metric metric-${tone}`}>
       <span>{label}</span>
       <strong>{value}</strong>
       <small>{helper}</small>
+      {action ? <div className="metric-action">{action}</div> : null}
     </article>
   );
 }
