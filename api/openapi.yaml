@@ -835,7 +835,7 @@ components:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/ApprovalRequest' } } } } ]
     ReviewPacketArtifact:
       type: object
-      required: [kind, path, artifact_id, redacted, content_url]
+      required: [kind, path, artifact_id, redacted, content_url, raw_prompt_exposed, raw_codex_log_exposed, raw_secret_exposed]
       additionalProperties: false
       properties:
         kind: { type: string, enum: [review_packet, review_md, review_json, patch, changed_files, untracked_files, diffstat, test_output, agent_final_message, commands, tool_calls, approvals, codex_events, prompt_context, prompt_rendered, prompt_meta, prompt_tool_manifest, other] }
@@ -843,9 +843,17 @@ components:
         artifact_id: { type: string, pattern: "^art_" }
         redacted: { type: boolean }
         content_url: { type: [string, 'null'], format: uri-reference }
+        # Per-artifact refusal boundary flags. The server emits
+        # these on every entry so the dashboard and strict
+        # OpenAPI clients can render the redaction pill
+        # consistently. The HTTP layer also returns
+        # `content_url: null` when any of these is true.
+        raw_prompt_exposed: { type: boolean, description: "True iff this artifact is a raw rendered prompt (prompt_rendered or prompt_context kind). The HTTP layer refuses /artifacts/{id}/content for these." }
+        raw_codex_log_exposed: { type: boolean, description: "True iff this artifact is a raw Codex log (codex_log or codex_events kind). The HTTP layer refuses /artifacts/{id}/content for these." }
+        raw_secret_exposed: { type: boolean, description: "True iff this artifact contains a raw secret (secret_artifact or secrets kind). The HTTP layer refuses /artifacts/{id}/content for these." }
     ReviewPacketSummary:
       type: object
-      required: [id, issue_id, run_id, packet_no, status, root_path, summary, acceptance_criteria, handoff, changed_files, diff, tests, risks, verification, approvals, tool_calls, how_to_continue, raw_prompt_exposed, raw_codex_log_exposed, raw_secret_exposed, artifacts, failure_code, failure_message, created_at]
+      required: [id, issue_id, run_id, packet_no, status, root_path, summary, acceptance_criteria, handoff, changed_files, diff, tests, risks, verification, approvals, tool_calls, how_to_continue, raw_prompt_exposed, raw_codex_log_exposed, raw_secret_exposed, git, artifacts, failure_code, failure_message, created_at]
       additionalProperties: true
       properties:
         id: { type: string, pattern: "^rp_" }
@@ -854,6 +862,17 @@ components:
         packet_no: { type: integer, minimum: 1 }
         status: { type: string, enum: [generated, partial, failed] }
         root_path: { type: string }
+        git:
+          type: object
+          additionalProperties: true
+          description: "Git metadata for the review packet: branch_name, base_ref, base_ref_config, base_sha, head_sha, dirty. Always present (defaults to {} when not yet populated)."
+          properties:
+            branch_name: { type: string }
+            base_ref: { type: string }
+            base_ref_config: { type: string }
+            base_sha: { type: string }
+            head_sha: { type: [string, 'null'] }
+            dirty: { type: boolean }
         summary: { type: string, description: "Handoff summary surfaced as a top-level review packet field. Mirrors handoff.summary." }
         acceptance_criteria:
           type: array

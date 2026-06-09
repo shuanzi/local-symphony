@@ -1943,6 +1943,14 @@ func (s *Store) ReviewPacketProjection(issueRef string) (map[string]any, error) 
 			"path":        a.Path,
 			"redacted":    a.Redacted,
 			"content_url": cu,
+			// Per-artifact refusal boundary flags, kept in lockstep
+			// with the daemon-side projection so a strict OpenAPI
+			// client sees the same shape regardless of whether the
+			// CLI went through the daemon or fell back to the
+			// local store.
+			"raw_prompt_exposed":    a.Kind == "prompt_rendered" || a.Kind == "prompt_context",
+			"raw_codex_log_exposed": a.Kind == "codex_log" || a.Kind == "codex_events",
+			"raw_secret_exposed":    a.Kind == "secret_artifact" || a.Kind == "secrets",
 		})
 	}
 	out := map[string]any{
@@ -2024,24 +2032,44 @@ func isRawArtifactRefusalKindLocal(kind string) bool {
 	return false
 }
 
-// safeContainedPath returns (p, true) when p resolves to a real
-// filesystem path contained inside root. A missing file is allowed
-// when the unresolved path is contained; otherwise the second return
-// is false. This is the local-store equivalent of the httpapi
-// sandbox helper.
+// safeContainedPath returns (resolved, true) when p is contained
+// inside root. Containment is checked twice: once against the
+// lexical (un-resolved) path so missing files are tolerated
+// (review.json may not have been written yet) and once against
+// EvalSymlinks of both sides so a symlink planted under the
+// artifact root cannot escape into an outside directory.
+//
+// The HTTP-side helper (safeContainedFilePathAllowMissing in
+// internal/httpapi/httpapi.go) does the same dance. Keep the two
+// implementations in lockstep when modifying the rules.
 func safeContainedPath(p, root string) (string, bool) {
 	cleanP := filepath.Clean(p)
 	cleanRoot := filepath.Clean(root)
 	if !filepath.HasPrefix(cleanP, cleanRoot+string(filepath.Separator)) && cleanP != cleanRoot {
 		return "", false
 	}
-	if _, err := os.Stat(cleanP); err != nil {
+	// EvalSymlinks on the root. If the root itself does not exist
+	// yet (e.g. operators without an artifacts directory), allow
+	// the lexical path through so the caller can still return
+	// metadata-only projection.
+	realRoot, err := filepath.EvalSymlinks(cleanRoot)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return cleanP, true
 		}
 		return "", false
 	}
-	return cleanP, true
+	realP, err := filepath.EvalSymlinks(cleanP)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cleanP, true
+		}
+		return "", false
+	}
+	if !filepath.HasPrefix(realP, realRoot+string(filepath.Separator)) && realP != realRoot {
+		return "", false
+	}
+	return realP, true
 }
 
 func (s *Store) MarkDone(issueRef, reason string) (*core.Issue, error) {

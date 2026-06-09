@@ -4,6 +4,54 @@
   "title": "Review Packet File",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "ReviewPacketArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path",
+        "artifact_id",
+        "redacted",
+        "content_url",
+        "raw_prompt_exposed",
+        "raw_codex_log_exposed",
+        "raw_secret_exposed"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "review_packet",
+            "review_md",
+            "review_json",
+            "patch",
+            "changed_files",
+            "untracked_files",
+            "diffstat",
+            "test_output",
+            "agent_final_message",
+            "commands",
+            "tool_calls",
+            "approvals",
+            "codex_events",
+            "prompt_context",
+            "prompt_rendered",
+            "prompt_meta",
+            "prompt_tool_manifest",
+            "other"
+          ]
+        },
+        "path": { "type": "string" },
+        "artifact_id": { "type": "string", "pattern": "^art_" },
+        "redacted": { "type": "boolean" },
+        "content_url": { "type": ["string", "null"] },
+        "raw_prompt_exposed": { "type": "boolean" },
+        "raw_codex_log_exposed": { "type": "boolean" },
+        "raw_secret_exposed": { "type": "boolean" }
+      }
+    }
+  },
   "required": [
     "id",
     "packet_no",
@@ -23,6 +71,7 @@
     "verification",
     "approvals",
     "tool_calls",
+    "artifacts",
     "how_to_continue",
     "raw_prompt_exposed",
     "raw_codex_log_exposed",
@@ -310,6 +359,10 @@
         "type": "object",
         "additionalProperties": true
       }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ReviewPacketArtifact" }
     },
     "tool_calls": {
       "type": "array",

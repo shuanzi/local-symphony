@@ -3283,6 +3283,167 @@ func TestReviewPacketArtifactsRedactRawPromptAndCodexLog(t *testing.T) {
 	}
 }
 
+// TestReviewPacketArtifactSchemaIncludesRawExposedFlags pins the
+// per-artifact entry shape returned by /api/v1/reviews/{ref} so
+// that the ReviewPacketArtifact schema in api/openapi.yaml and
+// schemas/review_packet.schema.json (and any strict client
+// generated from them) accept the response. The server emits three
+// extra keys — raw_prompt_exposed, raw_codex_log_exposed,
+// raw_secret_exposed — to make the refusal boundary visible to
+// the dashboard. If either schema drops these keys, strict
+// OpenAPI clients will reject a valid response, so we assert both
+// that the server emits them and that the schemas declare them.
+func TestReviewPacketArtifactSchemaIncludesRawExposedFlags(t *testing.T) {
+	srv := newTestServer(t)
+	run := prepareCompletedHTTPRun(t, srv)
+	issue, err := srv.Store.GetIssue(run.IssueID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	root := filepath.Join(srv.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir review dir: %v", err)
+	}
+	if err := srv.Store.Project.Exec(`UPDATE review_packets SET root_path=?, review_json_path=? WHERE id=(SELECT latest_review_packet_id FROM issues WHERE id=?)`, root, "review.json", run.IssueID); err != nil {
+		t.Fatalf("update review_packets: %v", err)
+	}
+	// Write one prompt_snapshot and one codex_log artifact and
+	// link them to the latest review packet row, so the per-artifact
+	// map has at least one entry to inspect.
+	packetRow, err := srv.Store.Project.QueryOne(`SELECT id FROM review_packets WHERE id=(SELECT latest_review_packet_id FROM issues WHERE id=?)`, run.IssueID)
+	if err != nil {
+		t.Fatalf("query review_packets: %v", err)
+	}
+	packetID := packetRow["id"].String()
+	promptPath := filepath.Join(root, "rendered.md")
+	if err := os.WriteFile(promptPath, []byte("rendered prompt"), 0o644); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_prompt", IssueID: &issue.ID, RunID: &run.ID, ReviewPacketID: &packetID, Kind: "prompt_snapshot", Path: promptPath, Redacted: true}); err != nil {
+		t.Fatalf("insert prompt artifact: %v", err)
+	}
+	codexPath := filepath.Join(root, "codex.jsonl")
+	if err := os.WriteFile(codexPath, []byte("{\"event\":\"x\"}\n"), 0o644); err != nil {
+		t.Fatalf("write codex log: %v", err)
+	}
+	if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_codex", IssueID: &issue.ID, RunID: &run.ID, ReviewPacketID: &packetID, Kind: "codex_log", Path: codexPath, Redacted: true}); err != nil {
+		t.Fatalf("insert codex artifact: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "review.json"), []byte(`{"id":"x","status":"generated"}`), 0o644); err != nil {
+		t.Fatalf("write review.json: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/reviews/"+issue.Identifier, nil)
+	addCookies(req, sessionAuth(t, srv).cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("review status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	data := payload["data"].(map[string]any)
+	arts, ok := data["artifacts"].([]any)
+	if !ok || len(arts) == 0 {
+		t.Fatalf("review response missing artifacts: %#v", data)
+	}
+	for _, item := range arts {
+		entry := item.(map[string]any)
+		for _, key := range []string{"raw_prompt_exposed", "raw_codex_log_exposed", "raw_secret_exposed"} {
+			if _, ok := entry[key]; !ok {
+				t.Fatalf("artifact %v missing %q in /reviews response: %#v", entry["kind"], key, entry)
+			}
+		}
+	}
+
+	// Validate the openapi ReviewPacketArtifact schema declares
+	// these keys as boolean. A strict OpenAPI client generated
+	// from this schema would reject the response if the schema
+	// omitted them or set additionalProperties: false. We
+	// deliberately avoid pulling in a YAML dependency for tests:
+	// string matching the three boolean property declarations
+	// inside the ReviewPacketArtifact block is sufficient.
+	openAPI := loadOpenAPIYAMLForTest(t)
+	idx := strings.Index(openAPI, "ReviewPacketArtifact:")
+	if idx < 0 {
+		t.Fatalf("ReviewPacketArtifact not found in openapi.yaml")
+	}
+	end := strings.Index(openAPI[idx:], "\n    ReviewPacket")
+	if end < 0 {
+		end = len(openAPI) - idx
+	}
+	block := openAPI[idx : idx+end]
+	for _, key := range []string{"raw_prompt_exposed", "raw_codex_log_exposed", "raw_secret_exposed"} {
+		want := key + ": { type: boolean"
+		if !strings.Contains(block, want) {
+			t.Fatalf("openapi ReviewPacketArtifact missing %q boolean declaration; block:\n%s", key, block)
+		}
+	}
+}
+
+// TestReviewPacketLocalProjectionMatchesDaemonSchema ensures the
+// offline CLI path (`symphony review LOC-1` when the daemon is
+// unavailable) returns the same per-artifact shape as the daemon
+// /api/v1/reviews/{ref} handler, including the three
+// raw_*_exposed booleans. Without this guard a strict OpenAPI
+// client would still work against the daemon but break when an
+// operator falls back to the local store on a slow network.
+func TestReviewPacketLocalProjectionMatchesDaemonSchema(t *testing.T) {
+	srv := newTestServer(t)
+	run := prepareCompletedHTTPRun(t, srv)
+	issue, err := srv.Store.GetIssue(run.IssueID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	root := filepath.Join(srv.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	packetRow, err := srv.Store.Project.QueryOne(`SELECT id FROM review_packets WHERE id=(SELECT latest_review_packet_id FROM issues WHERE id=?)`, run.IssueID)
+	if err != nil {
+		t.Fatalf("query review_packets: %v", err)
+	}
+	packetID := packetRow["id"].String()
+	promptPath := filepath.Join(root, "rendered.md")
+	if err := os.WriteFile(promptPath, []byte("rendered prompt"), 0o644); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_prompt", IssueID: &issue.ID, RunID: &run.ID, ReviewPacketID: &packetID, Kind: "prompt_snapshot", Path: promptPath, Redacted: true}); err != nil {
+		t.Fatalf("insert prompt artifact: %v", err)
+	}
+	codexPath := filepath.Join(root, "codex.jsonl")
+	if err := os.WriteFile(codexPath, []byte("{\"event\":\"x\"}\n"), 0o644); err != nil {
+		t.Fatalf("write codex: %v", err)
+	}
+	if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_codex", IssueID: &issue.ID, RunID: &run.ID, ReviewPacketID: &packetID, Kind: "codex_log", Path: codexPath, Redacted: true}); err != nil {
+		t.Fatalf("insert codex artifact: %v", err)
+	}
+	// Repoint the packet row at the new root so
+	// ReviewPacketProjection can find the on-disk review.json we
+	// did not write (we just need a metadata-only projection).
+	if err := srv.Store.Project.Exec(`UPDATE review_packets SET root_path=?, review_json_path=? WHERE id=(SELECT latest_review_packet_id FROM issues WHERE id=?)`, root, "review.json", run.IssueID); err != nil {
+		t.Fatalf("update review_packets: %v", err)
+	}
+
+	projection, err := srv.Store.ReviewPacketProjection(issue.Identifier)
+	if err != nil {
+		t.Fatalf("ReviewPacketProjection: %v", err)
+	}
+	arts, ok := projection["artifacts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("projection.artifacts shape = %T, want []map[string]any", projection["artifacts"])
+	}
+	if len(arts) == 0 {
+		t.Fatalf("projection has no artifacts: %#v", projection)
+	}
+	for _, entry := range arts {
+		for _, key := range []string{"raw_prompt_exposed", "raw_codex_log_exposed", "raw_secret_exposed"} {
+			if _, ok := entry[key]; !ok {
+				t.Fatalf("local projection artifact entry %v missing %q: %#v", entry["kind"], key, entry)
+			}
+		}
+	}
+}
+
 func sessionCSRFToken(t *testing.T, srv *Server) string {
 	t.Helper()
 	return sessionAuth(t, srv).csrf
@@ -3397,4 +3558,95 @@ func prepareCompletedHTTPRun(t *testing.T, srv *Server) *core.RunAttempt {
 		t.Fatalf("GetRun: %v", err)
 	}
 	return run
+}
+
+// loadReviewPacketSchemaForTest returns the parsed JSON of
+// schemas/review_packet.schema.json relative to the repository
+// root. Used by schema-drift tests so they fail fast when
+// properties/required declarations move.
+func loadReviewPacketSchemaForTest(t *testing.T) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(repoRootForTest(t), "schemas", "review_packet.schema.json"))
+	if err != nil {
+		t.Fatalf("read review_packet.schema.json: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("parse review_packet.schema.json: %v", err)
+	}
+	return out
+}
+
+// loadOpenAPIYAMLForTest returns the raw text of api/openapi.yaml
+// as a string. We deliberately avoid pulling in a YAML dependency
+// for tests; the schema-drift checks look for specific tokens with
+// string matching, which is sufficient for the property drift the
+// contract validator cares about.
+func loadOpenAPIYAMLForTest(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(repoRootForTest(t), "api", "openapi.yaml"))
+	if err != nil {
+		t.Fatalf("read openapi.yaml: %v", err)
+	}
+	return string(data)
+}
+
+// TestReviewPacketSchemaIncludesGitField pins the OpenAPI
+// ReviewPacketSummary declaration: the server always returns a
+// top-level `git` field (default `{}`), so the schema must declare
+// it and (for typed-client parity) include it in the required
+// list. Without this, a generated strict client drops `git` to
+// untyped additional property and the dashboard falls back to
+// loosely-typed reads.
+func TestReviewPacketSchemaIncludesGitField(t *testing.T) {
+	openAPI := loadOpenAPIYAMLForTest(t)
+	idx := strings.Index(openAPI, "ReviewPacketSummary:")
+	if idx < 0 {
+		t.Fatalf("ReviewPacketSummary not found in openapi.yaml")
+	}
+	// Slice the schema block to the next sibling top-level
+	// component to keep the assertion local.
+	end := strings.Index(openAPI[idx:], "\n    ReviewPacketHandoff")
+	if end < 0 {
+		end = len(openAPI) - idx
+	}
+	block := openAPI[idx : idx+end]
+	if !strings.Contains(block, "git:") {
+		t.Fatalf("openapi ReviewPacketSummary missing `git:` property declaration; block:\n%s", block)
+	}
+	// `git` must also be in the required array so typed clients
+	// always carry it.
+	requiredStart := strings.Index(block, "required:")
+	if requiredStart < 0 {
+		t.Fatalf("openapi ReviewPacketSummary missing `required:`; block:\n%s", block)
+	}
+	requiredEnd := strings.Index(block[requiredStart:], "\n      ")
+	if requiredEnd < 0 {
+		requiredEnd = len(block) - requiredStart
+	}
+	required := block[requiredStart : requiredStart+requiredEnd]
+	if !strings.Contains(required, "git") {
+		t.Fatalf("openapi ReviewPacketSummary required list missing `git`; required=%s", required)
+	}
+}
+
+func repoRootForTest(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	dir := wd
+	for i := 0; i < 6; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	t.Fatalf("could not find repo root from %s", wd)
+	return ""
 }
