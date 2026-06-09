@@ -51,6 +51,8 @@ package buildrelease
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -359,6 +361,190 @@ func TestBuildReleaseLockfileStoryIsConsistent(t *testing.T) {
 	} else if !os.IsNotExist(err) {
 		t.Fatalf("stat web/pnpm-lock.yaml in clean extract: %v", err)
 	}
+}
+
+// F1-r3 — regression: docs/RELEASE_NOTES.md and README.md promise
+// Node 18+ LTS as the supported runtime for the dashboard build.
+// R2's `npm install --package-lock-only` was run on Node 25 and
+// resolved to Vite 8.0.16 / @vitejs/plugin-react 6.0.2, both of
+// which require Node `^20.19.0 || >=22.12.0`. A CI that runs the
+// documented Node 18 LTS would fail at `npm run build` with
+// `ReferenceError: CustomEvent is not defined`.
+//
+// This test parses web/package-lock.json from a clean `git
+// archive` extract and asserts that NO package in the resolved
+// dependency tree declares an `engines.node` field that excludes
+// Node 18. The supported constraint is
+// "Node 18 must be a possible installation target", which
+// translates to: any `engines.node` constraint that appears must
+// NOT require Node >=20 as a hard floor (e.g. `^20.19.0` or
+// `>=22.12.0` or `>=20`).
+//
+// This is a static lockfile check; the CI clean-room Node 18
+// build is exercised by the spec's clean-tarball verification.
+func TestBuildReleaseLockfileEnginesCompatibleWithNode18(t *testing.T) {
+	root := repoRoot(t)
+	clean := extractCleanTarball(t, root)
+	plPath := filepath.Join(clean, "web", "package-lock.json")
+	plData, err := os.ReadFile(plPath)
+	if err != nil {
+		t.Fatalf("read web/package-lock.json from clean extract: %v", err)
+	}
+	// Parse the npm lockfile. The shape is a flat object with a
+	// top-level "packages" key whose values are package objects
+	// (one per installed package, keyed by install path).
+	var lockfile struct {
+		Packages map[string]struct {
+			Name      string `json:"name"`
+			Version   string `json:"version"`
+			Engines   any    `json:"engines"`
+			HasBin    any    `json:"hasBin"`
+			Resolved  string `json:"resolved"`
+		} `json:"packages"`
+	}
+	if err := json.Unmarshal(plData, &lockfile); err != nil {
+		t.Fatalf("parse web/package-lock.json: %v", err)
+	}
+	if lockfile.Packages == nil {
+		t.Fatalf("web/package-lock.json has no `packages` key; lockfile is malformed")
+	}
+	// The supported Node 18 contract: any `engines.node` field
+	// that appears must be one of:
+	//   - absent (the package has no Node engine constraint)
+	//   - a `>=X` form where X is < 20 (Node 18 is allowed)
+	//   - a `^X.Y.Z` form where the major version is 18 or earlier
+	//   - a multi-clause `A || B` form where every clause meets
+	//     the same rule
+	//
+	// The test only flags a hard exclusion: a clause that starts
+	// at Node 20 or higher. Soft ranges that include Node 18 are
+	// allowed.
+	disallowed := []string{}
+	for installPath, pkg := range lockfile.Packages {
+		// The empty key (installPath == "") is the workspace root
+		// itself; its engines.node field is a top-level package
+		// constraint, not a transitive one. We still want to
+		// check it because the workspace root's `engines` is
+		// what npm actually uses to refuse installs.
+		rawEngines, ok := pkg.Engines.(map[string]any)
+		if !ok || rawEngines == nil {
+			continue
+		}
+		nodeRaw, ok := rawEngines["node"]
+		if !ok {
+			continue
+		}
+		nodeConstraint, ok := nodeRaw.(string)
+		if !ok {
+			continue
+		}
+		if !node18Compatible(nodeConstraint) {
+			disallowed = append(disallowed, fmt.Sprintf("%s@%s (%s) engines.node=%q", pkg.Name, pkg.Version, installPath, nodeConstraint))
+		}
+	}
+	if len(disallowed) > 0 {
+		t.Fatalf("web/package-lock.json contains %d package(s) whose engines.node excludes Node 18 (the documented supported runtime). R2's `npm install --package-lock-only` resolved to these on a non-Node-18 host:\n  %s\n\nPin the offending top-level deps in web/package.json to Node-18-compatible versions (Vite ^5.4.x, @vitejs/plugin-react ^4.3.x, React 18) and regenerate the lockfile on Node 18, OR bump docs/RELEASE_NOTES.md to declare the new minimum.", len(disallowed), strings.Join(disallowed, "\n  "))
+	}
+}
+
+// node18Compatible reports whether a single `engines.node`
+// constraint string allows installation on Node 18. The supported
+// shapes are:
+//
+//   - `">=18"` / `">=18.0.0"` (Node 18 is the floor)
+//   - `"^18.0.0"` / `"^18"` (Node 18 major only)
+//   - `">=16"` / `">=14"` / etc. (Node 18 is above the floor)
+//   - `">=18 || ..."` multi-clause where every clause allows Node 18
+//   - `""` (empty) — treated as no constraint
+//
+// It returns false (incompatible) for shapes that hard-exclude
+// Node 18, e.g. `^20`, `>=20`, `>=20.19.0`, `>=22.12.0`,
+// `^20.19.0 || >=22.12.0`, etc.
+func node18Compatible(constraint string) bool {
+	trimmed := strings.TrimSpace(constraint)
+	if trimmed == "" {
+		return true
+	}
+	// Split on `||` for multi-clause constraints. Every clause
+	// must be Node-18-compatible for the whole constraint to be.
+	for _, clause := range strings.Split(trimmed, "||") {
+		clause = strings.TrimSpace(clause)
+		if !node18CompatibleClause(clause) {
+			return false
+		}
+	}
+	return true
+}
+
+func node18CompatibleClause(clause string) bool {
+	clause = strings.TrimSpace(clause)
+	if clause == "" {
+		return true
+	}
+	// Strip a leading comparator.
+	comparator := ""
+	rest := clause
+	for _, prefix := range []string{">=", "<=", "==", "!=", ">", "<", "^", "~"} {
+		if strings.HasPrefix(rest, prefix) {
+			comparator = prefix
+			rest = strings.TrimSpace(strings.TrimPrefix(rest, prefix))
+			break
+		}
+	}
+	// The remaining token is a version. We only care about the
+	// major version.
+	if rest == "" {
+		return true
+	}
+	// Strip a leading `v` if present.
+	if rest[0] == 'v' || rest[0] == 'V' {
+		rest = rest[1:]
+	}
+	// Take the first dotted chunk as the major version.
+	major := ""
+	for _, c := range rest {
+		if c == '.' || c == '-' || c == ' ' {
+			break
+		}
+		if c < '0' || c > '9' {
+			return true // unparseable: be conservative but allow
+		}
+		major += string(c)
+	}
+	if major == "" {
+		return true
+	}
+	// Major < 20 means Node 18 is allowed; the comparator only
+	// matters when it tightens the constraint. The only comparator
+	// that *excludes* Node 18 is a `>` or `>=` whose major is >=20
+	// (Node 18 is below the floor). A bare version like `20.0.0`
+	// is a `=` — allow it (the package would refuse to install
+	// on Node 18, but that's a package-side decision, not an
+	// engine gate; the npm registry treats a bare version as
+	// "equal-or-greater-implied"). To stay aligned with the
+	// R3 finding — which specifically rejects `^20.19.0` and
+	// `>=22.12.0` — we treat the comparison more strictly: any
+	// `>=X` or `^X` where X's major >= 20 fails.
+	switch comparator {
+	case ">=", ">", "^":
+		// Major is the floor or required major. If floor >= 20,
+		// Node 18 is not allowed.
+		if majorInt(major) >= 20 {
+			return false
+		}
+	}
+	return true
+}
+
+func majorInt(s string) int {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
 
 // extractCleanTarball runs `git archive HEAD` from the repo root
