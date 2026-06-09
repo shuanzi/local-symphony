@@ -179,6 +179,82 @@ func TestReviewReturnsErrorWhenArtifactMetadataQueryFails(t *testing.T) {
 	}
 }
 
+func TestReviewPathSurfacesOnlyMetadataAndPathDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.InitProject(dir, "APP")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Review path metadata only",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	handoff, err := st.InsertHandoff(issue.ID, run.ID, "payload-hash", map[string]any{
+		"summary":      "ready for review",
+		"target_state": "Human Review",
+	})
+	if err != nil {
+		t.Fatalf("InsertHandoff: %v", err)
+	}
+	root := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir review dir: %v", err)
+	}
+	// Drop a sentinel "raw secret" file under the artifact dir. The
+	// CLI must never inline its content into stdout for `review path`.
+	rawSentinel := filepath.Join(root, "raw_secret.txt")
+	if err := os.WriteFile(rawSentinel, []byte("RAW-SECRET-CONTENT-DO-NOT-LEAK"), 0o644); err != nil {
+		t.Fatalf("write raw sentinel: %v", err)
+	}
+	if _, err := st.InsertReviewPacket(issue.ID, run.ID, handoff.ID, root, "review.md", "review.json", "changes.patch", "changed-files.txt", "untracked-files.json", "diffstat.txt", ""); err != nil {
+		t.Fatalf("InsertReviewPacket: %v", err)
+	}
+	st.Close()
+
+	code, stdout, _ := captureCLIOutput(t, func() int {
+		return Main([]string{"review", "path", issue.Identifier, "--project", dir})
+	})
+	if code != 0 {
+		t.Fatalf("review path exit code = %d, want 0; stdout = %s", code, stdout)
+	}
+	// Invariant: review path must never inline raw prompt / codex log
+	// / secret content into stdout. The only raw content we leaked
+	// into the artifact directory was the secret string, so checking
+	// for its absence is sufficient.
+	if strings.Contains(stdout, "RAW-SECRET-CONTENT-DO-NOT-LEAK") {
+		t.Fatalf("review path leaked raw secret bytes: %s", stdout)
+	}
+	// Metadata fields (status, root_path) must be present so
+	// operators can copy-paste the path into another tool.
+	if !strings.Contains(stdout, "\"status\":") {
+		t.Fatalf("review path stdout missing status field: %s", stdout)
+	}
+	if !strings.Contains(stdout, "\"root_path\":") {
+		t.Fatalf("review path stdout missing root_path field: %s", stdout)
+	}
+	// And the stdout must NOT be a "review" packet projection
+	// (which would inline summary / diff / handoff). The path
+	// command is local-store only and is the strict-metadata
+	// surface; the full structured projection is reachable via
+	// `symphony review LOC-1` (or the dashboard) which goes through
+	// the Review API.
+	if strings.Contains(stdout, "\"diff\":") || strings.Contains(stdout, "\"summary\":") {
+		t.Fatalf("review path inlined review packet content; want strict metadata only: %s", stdout)
+	}
+}
+
 func TestIssueCreateRejectsInvalidPriority(t *testing.T) {
 	tests := []struct {
 		name string

@@ -738,6 +738,107 @@ func (s *Server) approvalRoutes(w http.ResponseWriter, r *http.Request, rest str
 	}
 	apiErr(w, core.NewError(core.ErrNotFound, "approval route not found", nil))
 }
+// isRawArtifactRefusalKind returns true for artifact kinds whose
+// content the Review/Artifact API must never serve: raw rendered
+// prompts, raw Codex event logs, raw prompt contexts, and secret
+// artifacts. The dashboard must learn this from content_url=null and
+// a refusal_box rather than from filesystem reads.
+func isRawArtifactRefusalKind(kind string) bool {
+	switch kind {
+	case "codex_log", "codex_events",
+		"prompt_snapshot", "prompt_rendered", "prompt_context",
+		"secret_artifact", "secrets":
+		return true
+	}
+	return false
+}
+
+// reviewStructuredProjection merges the persisted review_packets row
+// with the structured projection persisted alongside it in
+// review.json. The structured projection is the authoritative source
+// of summary, acceptance criteria, handoff, diff, tests, risks,
+// verification, approvals, tool calls, git, and "how to continue".
+// When the on-disk artifact is missing or unparseable the handler
+// falls back to a minimal metadata-only projection that still
+// preserves refusal semantics for raw artifact kinds.
+func (s *Server) reviewStructuredProjection(row map[string]db.Value, files []map[string]any) map[string]any {
+	out := map[string]any{
+		"id":              row["id"].String(),
+		"issue_id":        row["issue_id"].String(),
+		"run_id":          row["run_id"].String(),
+		"packet_no":       row["packet_no"].Int(),
+		"status":          row["status"].String(),
+		"root_path":       row["root_path"].String(),
+		"artifacts":       files,
+		"files":           files,
+		"created_at":      row["created_at"].String(),
+		"failure_code":    nil,
+		"failure_message": nil,
+		// Structured projection defaults. These are always present;
+		// non-raw values are populated below from the on-disk
+		// review.json artifact when available.
+		"summary":               "",
+		"acceptance_criteria":   []any{},
+		"handoff":               map[string]any{"summary": "", "tests": []any{}, "risks": []any{}, "verification": []any{}, "followups": []any{}, "target_state": "Human Review"},
+		"changed_files":         []any{},
+		"diff":                  "",
+		"tests":                 []any{},
+		"risks":                 []any{},
+		"verification":          []any{},
+		"approvals":             []any{},
+		"tool_calls":            []any{},
+		"git":                   map[string]any{},
+		"how_to_continue":       "Use Send to Rework with a reason, or Mark Done with an acceptance reason.",
+		"raw_prompt_exposed":    false,
+		"raw_codex_log_exposed": false,
+		"raw_secret_exposed":    false,
+	}
+	reviewJSONPath := row["review_json_path"].String()
+	rootPath := row["root_path"].String()
+	if reviewJSONPath == "" {
+		return out
+	}
+	// review_json_path is stored as a relative path (e.g.
+	// "review.json") under the per-run root_path (the artifact
+	// directory for this run). Resolve the full path and make sure
+	// the result is contained inside the trusted .symphony roots so
+	// we never follow a path that escaped the artifact sandbox.
+	candidate := reviewJSONPath
+	if rootPath != "" && !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(rootPath, candidate)
+	}
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(s.Store.RepoRoot, ".symphony", "artifacts", candidate)
+	}
+	root1 := filepath.Join(s.Store.RepoRoot, ".symphony", "artifacts")
+	root2 := filepath.Join(s.Store.RepoRoot, ".symphony", "exports")
+	safePath, ok := safeContainedFilePathAllowMissing(candidate, root1)
+	if !ok {
+		safePath, ok = safeContainedFilePathAllowMissing(candidate, root2)
+	}
+	if !ok {
+		return out
+	}
+	data, err := os.ReadFile(safePath)
+	if err != nil {
+		return out
+	}
+	var projection map[string]any
+	if err := json.Unmarshal(data, &projection); err != nil {
+		return out
+	}
+	for _, key := range []string{
+		"summary", "acceptance_criteria", "handoff", "changed_files", "diff",
+		"tests", "risks", "verification", "approvals", "tool_calls", "git",
+		"how_to_continue", "raw_prompt_exposed", "raw_codex_log_exposed", "raw_secret_exposed",
+	} {
+		if v, ok := projection[key]; ok {
+			out[key] = v
+		}
+	}
+	return out
+}
+
 func (s *Server) reviewRoutes(w http.ResponseWriter, r *http.Request, rest string) {
 	parts := strings.Split(rest, "/")
 	ref := parts[0]
@@ -755,24 +856,27 @@ func (s *Server) reviewRoutes(w http.ResponseWriter, r *http.Request, rest strin
 		files := []map[string]any{}
 		for _, a := range arts {
 			cu := any(nil)
-			if a.Kind != "prompt_snapshot" {
+			if !isRawArtifactRefusalKind(a.Kind) {
 				cu = "/api/v1/artifacts/" + a.ID + "/content"
 			}
-			files = append(files, map[string]any{"kind": a.Kind, "artifact_id": a.ID, "path": a.Path, "redacted": a.Redacted, "content_url": cu})
+			files = append(files, map[string]any{
+				"kind": a.Kind, "artifact_id": a.ID, "path": a.Path,
+				"redacted": a.Redacted, "content_url": cu,
+				"raw_prompt_exposed":    a.Kind == "prompt_rendered" || a.Kind == "prompt_context",
+				"raw_codex_log_exposed": a.Kind == "codex_log" || a.Kind == "codex_events",
+				"raw_secret_exposed":    false,
+			})
 		}
-		ok(w, map[string]any{
-			"id":              row["id"].String(),
-			"issue_id":        row["issue_id"].String(),
-			"run_id":          row["run_id"].String(),
-			"packet_no":       row["packet_no"].Int(),
-			"status":          row["status"].String(),
-			"root_path":       row["root_path"].String(),
-			"artifacts":       files,
-			"files":           files,
-			"created_at":      row["created_at"].String(),
-			"failure_code":    nil,
-			"failure_message": nil,
-		})
+		// Load the structured projection from the on-disk review.json
+		// artifact written by the review packet generator. This is the
+		// single authoritative source of truth for summary, acceptance
+		// criteria, handoff, diff, tests, risks, verification, approvals,
+		// tool calls, git, and "how to continue". If the artifact is
+		// missing or unparseable, fall back to minimal metadata only —
+		// raw prompt / codex log / secret content is never derived from
+		// the database in this handler.
+		projection := s.reviewStructuredProjection(row, files)
+		ok(w, projection)
 		return
 	}
 	if len(parts) == 2 && r.Method == "POST" {
@@ -819,8 +923,8 @@ func (s *Server) artifactRoutes(w http.ResponseWriter, r *http.Request, rest str
 		return
 	}
 	if len(parts) == 2 && parts[1] == "content" {
-		if art.Kind == "codex_log" || art.Kind == "prompt_snapshot" {
-			apiErrWithStatus(w, http.StatusForbidden, core.NewError(core.ErrRawLogAccessUnsupported, "raw prompt/log access is not supported", nil))
+		if isRawArtifactRefusalKind(art.Kind) {
+			apiErrWithStatus(w, http.StatusForbidden, core.NewError(core.ErrRawLogAccessUnsupported, "raw prompt/log/secret artifact content is not supported", nil))
 			return
 		}
 		root1 := filepath.Join(s.Store.RepoRoot, ".symphony", "artifacts")

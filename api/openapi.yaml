@@ -295,8 +295,9 @@ paths:
   /artifacts/{artifact_id}/content:
     get:
       operationId: getArtifactContent
+      description: Serves artifact content for non-raw kinds. Raw prompt snapshots, raw Codex event logs, raw prompt contexts, and secret artifacts return 403 with code raw_log_access_not_supported so the dashboard must learn refusal from the Review/Artifact API rather than reading the filesystem.
       parameters: [ { $ref: '#/components/parameters/ArtifactId' } ]
-      responses: { "200": { description: Artifact content, content: { application/octet-stream: { schema: { type: string, format: binary } } } }, "403": { $ref: '#/components/responses/Error' } }
+      responses: { "200": { description: Artifact content, content: { application/octet-stream: { schema: { type: string, format: binary } } } }, "403": { $ref: '#/components/responses/Error', description: "raw_log_access_not_supported when the artifact kind is raw prompt / codex log / secret." } }
   /workflow:
     get:
       operationId: getWorkflow
@@ -844,7 +845,8 @@ components:
         content_url: { type: [string, 'null'], format: uri-reference }
     ReviewPacketSummary:
       type: object
-      required: [id, issue_id, run_id, packet_no, status, root_path, artifacts, failure_code, failure_message, created_at]
+      required: [id, issue_id, run_id, packet_no, status, root_path, summary, acceptance_criteria, handoff, changed_files, diff, tests, risks, verification, approvals, tool_calls, how_to_continue, raw_prompt_exposed, raw_codex_log_exposed, raw_secret_exposed, artifacts, failure_code, failure_message, created_at]
+      additionalProperties: true
       properties:
         id: { type: string, pattern: "^rp_" }
         issue_id: { type: string }
@@ -852,6 +854,39 @@ components:
         packet_no: { type: integer, minimum: 1 }
         status: { type: string, enum: [generated, partial, failed] }
         root_path: { type: string }
+        summary: { type: string, description: "Handoff summary surfaced as a top-level review packet field. Mirrors handoff.summary." }
+        acceptance_criteria:
+          type: array
+          items: { type: string }
+          description: "Issue acceptance criteria copied from the issue row."
+        handoff: { $ref: '#/components/schemas/ReviewPacketHandoff' }
+        changed_files:
+          type: array
+          items: { type: string }
+        diff:
+          type: string
+          description: "Full diff body for the packet (truncated allowed paths only; protected paths are omitted)."
+        tests:
+          type: array
+          items: { type: string }
+        risks:
+          type: array
+          items: { type: string }
+        verification:
+          type: array
+          items: { type: string }
+        approvals:
+          type: array
+          items: { type: object, additionalProperties: true }
+        tool_calls:
+          type: array
+          items: { type: object, additionalProperties: true }
+        how_to_continue:
+          type: string
+          description: "Operator guidance: 'Use Send to Rework with a reason, or Mark Done with an acceptance reason.'"
+        raw_prompt_exposed: { type: boolean, description: "Always false; the API never surfaces raw prompt content." }
+        raw_codex_log_exposed: { type: boolean, description: "Always false; the API never surfaces raw Codex log content." }
+        raw_secret_exposed: { type: boolean, description: "Always false; the API never surfaces raw secret artifact content." }
         review_md_path: { type: [string, 'null'] }
         review_json_path: { type: [string, 'null'] }
         patch_path: { type: [string, 'null'] }
@@ -864,6 +899,25 @@ components:
         failure_code: { anyOf: [ { $ref: '#/components/schemas/FailureCode' }, { type: 'null' } ] }
         failure_message: { type: [string, 'null'] }
         created_at: { type: string, format: date-time }
+    ReviewPacketHandoff:
+      type: object
+      additionalProperties: true
+      required: [summary, tests, risks, verification, followups, target_state]
+      properties:
+        summary: { type: string }
+        tests:
+          type: array
+          items: { type: string }
+        risks:
+          type: array
+          items: { type: string }
+        verification:
+          type: array
+          items: { type: string }
+        followups:
+          type: array
+          items: { type: string }
+        target_state: { type: string, const: "Human Review" }
     IssueReviewPacketSummary:
       type: object
       required: [id, run_id, packet_no, status, created_at]
@@ -884,7 +938,7 @@ components:
         issue_id: { type: [string, 'null'] }
         run_id: { type: [string, 'null'] }
         review_packet_id: { type: [string, 'null'] }
-        kind: { type: string, enum: [test_output, patch, changed_files, untracked_files, diffstat, prompt_snapshot, codex_log, review_packet, agent_file, diagnostic, other] }
+        kind: { type: string, enum: [test_output, patch, changed_files, untracked_files, diffstat, prompt_snapshot, prompt_rendered, prompt_context, prompt_meta, prompt_tool_manifest, codex_log, codex_events, secret_artifact, secrets, review_packet, agent_file, diagnostic, other] }
         path: { type: string }
         mime_type: { type: [string, 'null'] }
         size_bytes: { type: [integer, 'null'], minimum: 0 }

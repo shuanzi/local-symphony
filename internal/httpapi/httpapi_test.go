@@ -3136,6 +3136,153 @@ func TestReviewPacketReturns409WhenPacketIsMissing(t *testing.T) {
 	}
 }
 
+func TestReviewPacketReturnsStructuredFieldsFromReviewJSON(t *testing.T) {
+	srv := newTestServer(t)
+	run := prepareCompletedHTTPRun(t, srv)
+	issue, err := srv.Store.GetIssue(run.IssueID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	// Point the review_packets row at the production-style artifact
+	// directory (.symphony/artifacts/<identifier>/<run>) so the
+	// handler's sandbox resolution succeeds. Then write a complete
+	// structured review.json there for it to surface.
+	root := filepath.Join(srv.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir review dir: %v", err)
+	}
+	if err := srv.Store.Project.Exec(`UPDATE review_packets SET root_path=?, review_json_path=? WHERE id=(SELECT latest_review_packet_id FROM issues WHERE id=?)`, root, "review.json", run.IssueID); err != nil {
+		t.Fatalf("update review_packets: %v", err)
+	}
+	reviewJSON := `{
+  "id": "` + "rp_test" + `",
+  "packet_no": 1,
+  "status": "generated",
+  "summary": "ready for review",
+  "acceptance_criteria": ["done"],
+  "handoff": {"summary": "ready for review", "tests": ["go test"], "risks": [], "verification": [], "followups": [], "target_state": "Human Review"},
+  "changed_files": ["app.txt"],
+  "diff": "diff --git a/app.txt b/app.txt",
+  "tests": ["go test"],
+  "risks": [],
+  "verification": [],
+  "approvals": [],
+  "tool_calls": [],
+  "git": {"branch_name": "main", "base_sha": "abc"},
+  "how_to_continue": "Use Send to Rework with a reason, or Mark Done with an acceptance reason.",
+  "raw_prompt_exposed": false,
+  "raw_codex_log_exposed": false,
+  "raw_secret_exposed": false
+}`
+	if err := os.WriteFile(filepath.Join(root, "review.json"), []byte(reviewJSON), 0o644); err != nil {
+		t.Fatalf("write review.json: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/reviews/"+issue.Identifier, nil)
+	addCookies(req, sessionAuth(t, srv).cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("review status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	data, ok := payload["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("review response missing data envelope: %#v", payload)
+	}
+	for _, key := range []string{
+		"summary", "acceptance_criteria", "handoff", "changed_files", "diff",
+		"tests", "risks", "verification", "approvals", "tool_calls", "git",
+		"how_to_continue", "raw_prompt_exposed", "raw_codex_log_exposed", "raw_secret_exposed",
+	} {
+		if _, ok := data[key]; !ok {
+			t.Fatalf("review response missing structured field %q: %#v", key, data)
+		}
+	}
+	if got, _ := data["summary"].(string); got != "ready for review" {
+		t.Fatalf("summary = %q, want ready for review", got)
+	}
+	if got, _ := data["raw_prompt_exposed"].(bool); got {
+		t.Fatalf("raw_prompt_exposed should be false, got true")
+	}
+	if got, _ := data["how_to_continue"].(string); !strings.Contains(got, "Send to Rework") {
+		t.Fatalf("how_to_continue = %q, want operator guidance", got)
+	}
+}
+
+func TestReviewPacketArtifactsRedactRawPromptAndCodexLog(t *testing.T) {
+	srv := newTestServer(t)
+	run := prepareCompletedHTTPRun(t, srv)
+	issue, err := srv.Store.GetIssue(run.IssueID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	artifactsDir := filepath.Join(srv.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID)
+	if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for _, kind := range []string{"prompt_rendered", "codex_log", "codex_events", "secret_artifact"} {
+		p := filepath.Join(artifactsDir, kind+".bin")
+		if err := os.WriteFile(p, []byte("raw "+kind+" content"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", kind, err)
+		}
+		if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_" + kind, Kind: kind, Path: p, Redacted: true}); err != nil {
+			t.Fatalf("InsertArtifact %s: %v", kind, err)
+		}
+	}
+	if err := srv.Store.Project.Exec(`UPDATE review_packets SET root_path=?, review_json_path=? WHERE id=(SELECT latest_review_packet_id FROM issues WHERE id=?)`, artifactsDir, "review.json", issue.ID); err != nil {
+		t.Fatalf("point review_json_path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(artifactsDir, "review.json"), []byte(`{"id":"x","status":"generated"}`), 0o644); err != nil {
+		t.Fatalf("write stub review.json: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/reviews/"+issue.Identifier, nil)
+	addCookies(req, sessionAuth(t, srv).cookies)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("review status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+	data := payload["data"].(map[string]any)
+	arts, ok := data["artifacts"].([]any)
+	if !ok {
+		t.Fatalf("artifacts not array: %#v", data["artifacts"])
+	}
+	for _, item := range arts {
+		entry := item.(map[string]any)
+		kind, _ := entry["kind"].(string)
+		cu, hasCU := entry["content_url"]
+		if cu != nil {
+			t.Fatalf("artifact %s returned content_url %v; want null for raw refusal kind", kind, cu)
+		}
+		if hasCU && cu != nil {
+			t.Fatalf("artifact %s exposed content_url for raw kind", kind)
+		}
+	}
+
+	// And every raw kind should refuse content with 403, not leak bytes.
+	for _, kind := range []string{"prompt_rendered", "codex_log", "secret_artifact"} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/art_"+kind+"/content", nil)
+		addCookies(req, sessionAuth(t, srv).cookies)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s content status = %d, want 403; body = %s", kind, rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "raw "+kind+" content") {
+			t.Fatalf("%s content response leaked bytes: %s", kind, rec.Body.String())
+		}
+		payload := decodeEnvelope(t, strings.NewReader(rec.Body.String()))
+		errData := payload["error"].(map[string]any)
+		if errData["code"] != string(core.ErrRawLogAccessUnsupported) {
+			t.Fatalf("%s error code = %v, want raw_log_access_not_supported", kind, errData["code"])
+		}
+	}
+}
+
 func sessionCSRFToken(t *testing.T, srv *Server) string {
 	t.Helper()
 	return sessionAuth(t, srv).csrf

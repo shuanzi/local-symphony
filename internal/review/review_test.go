@@ -484,6 +484,97 @@ func TestGenerateOmitsUntrackedSymlinkTargetsFromPatch(t *testing.T) {
 	}
 }
 
+func TestGenerateWritesStructuredFieldsToReviewJSONArtifact(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	writeFile(t, workspace, "app.txt", "new\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"app.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	var packet map[string]any
+	if err := json.Unmarshal([]byte(readReviewArtifact(t, st, issue, run, "review.json")), &packet); err != nil {
+		t.Fatalf("unmarshal review.json: %v", err)
+	}
+	required := []string{
+		"summary",
+		"acceptance_criteria",
+		"handoff",
+		"changed_files",
+		"diff",
+		"tests",
+		"risks",
+		"verification",
+		"approvals",
+		"tool_calls",
+		"git",
+		"how_to_continue",
+	}
+	for _, key := range required {
+		if _, ok := packet[key]; !ok {
+			t.Fatalf("review.json missing required structured field %q: %#v", key, packet)
+		}
+	}
+	if got, _ := packet["summary"].(string); got != "ready for review" {
+		t.Fatalf("summary = %q, want %q", got, "ready for review")
+	}
+	ac, ok := packet["acceptance_criteria"].([]any)
+	if !ok || len(ac) == 0 || ac[0] != "done" {
+		t.Fatalf("acceptance_criteria = %#v, want at least [done]", packet["acceptance_criteria"])
+	}
+	ht, ok := packet["handoff"].(map[string]any)
+	if !ok {
+		t.Fatalf("handoff field not object: %#v", packet["handoff"])
+	}
+	if ts, _ := ht["target_state"].(string); ts != "Human Review" {
+		t.Fatalf("handoff.target_state = %q, want Human Review", ts)
+	}
+	if diff, _ := packet["diff"].(string); !strings.Contains(diff, "diff --git a/app.txt b/app.txt") {
+		t.Fatalf("diff field missing tracked diff: %q", diff)
+	}
+	if raw, _ := packet["raw_prompt_exposed"].(bool); raw {
+		t.Fatalf("raw_prompt_exposed should be false; got %#v", packet["raw_prompt_exposed"])
+	}
+	if hc, _ := packet["how_to_continue"].(string); !strings.Contains(hc, "Send to Rework") || !strings.Contains(hc, "Mark Done") {
+		t.Fatalf("how_to_continue = %q, want operator guidance mentioning Send to Rework / Mark Done", hc)
+	}
+}
+
+func TestReviewFailureDoesNotTransitionIssueToHumanReview(t *testing.T) {
+	st := newReviewTestStore(t)
+	issue, run := prepareReviewRun(t, st)
+	conflictPath := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID, "review.md")
+	if err := os.MkdirAll(conflictPath, 0o755); err != nil {
+		t.Fatalf("create conflicting review.md directory: %v", err)
+	}
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err == nil {
+		t.Fatal("Generate succeeded, want review_packet_failed")
+	}
+	// Simulate the orchestrator's behavior: a review_packet_failed run
+	// is reported through FailRun, not CompleteRunWithReview. Verify
+	// the issue is not advanced to Human Review.
+	if err := st.FailRun(run.ID, core.FailureReviewPacketFailed, err.Error(), core.RunFailed); err != nil {
+		t.Fatalf("FailRun: %v", err)
+	}
+	got, err := st.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.State == core.StateHumanReview {
+		t.Fatalf("issue state = %s after review packet failure, want not Human Review", got.State)
+	}
+	if !got.DispatchPaused {
+		t.Fatalf("issue dispatch_paused = false after review packet failure, want true")
+	}
+	// No review packet row should be associated with the failed run.
+	assertReviewPacketCount(t, st, run.ID, 0)
+}
+
 func newReviewTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())

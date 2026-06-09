@@ -8,6 +8,8 @@
     "id",
     "packet_no",
     "status",
+    "summary",
+    "acceptance_criteria",
     "issue",
     "run",
     "git",
@@ -15,8 +17,16 @@
     "handoff",
     "changed_files",
     "untracked_files",
+    "diff",
+    "tests",
+    "risks",
+    "verification",
     "approvals",
     "tool_calls",
+    "how_to_continue",
+    "raw_prompt_exposed",
+    "raw_codex_log_exposed",
+    "raw_secret_exposed",
     "prompt_snapshot",
     "failure_code",
     "failure_message",
@@ -37,6 +47,15 @@
         "partial",
         "failed"
       ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "issue": {
       "type": "object",
@@ -298,6 +317,39 @@
         "type": "object",
         "additionalProperties": true
       }
+    },
+    "diff": {
+      "type": "string"
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "verification": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "how_to_continue": {
+      "type": "string"
+    },
+    "raw_prompt_exposed": {
+      "type": "boolean"
+    },
+    "raw_codex_log_exposed": {
+      "type": "boolean"
+    },
+    "raw_secret_exposed": {
+      "type": "boolean"
     },
     "prompt_snapshot": {
       "type": "object",
