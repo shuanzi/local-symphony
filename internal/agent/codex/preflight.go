@@ -308,12 +308,38 @@ func classifyEmptyOrMalformedVersion(probeOutput, command string) PreflightReaso
 // absolute path; if it does not exist, exec.LookPath fails
 // and the classifier reports ReasonCodexNotInstalled.
 //
-// When the command does not carry a PATH-prefix, the
-// function falls through to exec.LookPath against the
-// process's current PATH — the round-2 behaviour, kept
-// stable so the not-installed classifier does not
-// silently start honouring unrelated env-var prefixes.
+// Round-4 fix: the path-qualified-binary contract from
+// exec.LookPath's documentation is
+//
+//	"If file contains a slash, it is tried directly
+//	 and the PATH is not consulted."
+//
+// The round-3 helper loop did not honor that contract
+// for the combination of a `PATH=<value>` prefix and
+// an absolute binary (e.g. `env PATH=/tmp
+// /opt/codex/bin/codex`): the loop built candidates
+// like `/tmp//opt/codex/bin/codex`, which never
+// resolve, and the helper reported
+// ReasonCodexNotInstalled even though the binary
+// existed. The fix is a short-circuit: when binary
+// contains a path separator, call exec.LookPath
+// directly. The wrapper PATH prefix is irrelevant
+// for path-qualified binaries; the classifier must
+// trust the operator's explicit path.
+//
+// Tests:
+//   - TestLookPathWithWrapperPATHHandlesAbsoluteBinary
+//   - TestLookPathWithWrapperPATHHandlesRelativeBinary
+//   - TestRunPreflightClassifiesAbsoluteBinaryAsMalformedNotNotInstalled
 func lookPathWithWrapperPATH(binary, command string) (string, error) {
+	// Path-qualified binary: never consult PATH. The
+	// PATH-prefix augmentation in `command` is
+	// irrelevant; the operator gave us an explicit
+	// path and we honor it. exec.LookPath handles the
+	// dir / executable-mode / symlink cases itself.
+	if strings.ContainsRune(binary, os.PathSeparator) {
+		return exec.LookPath(binary)
+	}
 	prefix := pathPrefixFromCommand(command)
 	if prefix == "" {
 		return exec.LookPath(binary)
@@ -843,6 +869,14 @@ func isSyntheticSentinelStringForTest(s string) bool {
 // internal helper.
 func pathPrefixFromCommandForTest(command string) string {
 	return pathPrefixFromCommand(command)
+}
+
+// lookPathWithWrapperPATHForTest exposes the wrapped
+// PATH-augmented LookPath helper so the package-internal
+// `*_test.go` can pin the path-qualified binary semantics
+// without reaching into the internal helper.
+func lookPathWithWrapperPATHForTest(binary, command string) (string, error) {
+	return lookPathWithWrapperPATH(binary, command)
 }
 
 // scratchDirIsEmpty reports whether the path is either missing or

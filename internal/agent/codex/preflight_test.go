@@ -1164,3 +1164,125 @@ func TestVerifyWrapperPATHOverrideTeamLeadRepro(t *testing.T) {
 		}
 	}
 }
+
+// TestLookPathWithWrapperPATHHandlesAbsoluteBinary is the
+// round-4 P2 regression: an absolute binary path (e.g.
+// `/opt/codex/bin/codex`) must NEVER be resolved through
+// PATH search. exec.LookPath's documented contract is
+// "If file contains a slash, it is tried directly and
+// the PATH is not consulted." The round-3 helper loop
+// ignored that contract and built candidates like
+// `<PATH-entry>//opt/codex/bin/codex`, which never
+// resolve, so a real absolute codex binary was
+// misclassified as ReasonCodexNotInstalled.
+//
+// The failing case the round-3 helper got wrong is the
+// combination of a `PATH=<value>` prefix and an
+// absolute binary: `Command: "env PATH=/tmp
+// /opt/codex/bin/codex"` — the helper loop built
+// `/tmp//opt/codex/bin/codex`, which never resolves.
+func TestLookPathWithWrapperPATHHandlesAbsoluteBinary(t *testing.T) {
+	dir := t.TempDir()
+	binPath := dir + "/codex-abs"
+	script := "#!/bin/sh\nexit 0\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	// The command carries a PATH= prefix that does
+	// NOT contain the stub. The round-3 helper loop
+	// walks PATH entries and concatenates the
+	// separator + the absolute path, producing
+	// entries like `<dir>//opt/.../codex-abs`
+	// which never resolve. Pre-fix, the helper
+	// reported exec.ErrNotFound. Post-fix, the
+	// path-qualified binary must short-circuit
+	// to a verbatim stat and resolve to the file.
+	commandWithPATHPrefix := "env PATH=/does/not/exist " + binPath
+	got, err := lookPathWithWrapperPATHForTest(binPath, commandWithPATHPrefix)
+	if err != nil {
+		t.Fatalf("lookPathWithWrapperPATH(%q, command=%q) returned error: %v", binPath, commandWithPATHPrefix, err)
+	}
+	if got == "" {
+		t.Fatalf("lookPathWithWrapperPATH(%q, command=%q) returned empty path", binPath, commandWithPATHPrefix)
+	}
+	// The returned path should resolve to the same file.
+	if _, err := os.Stat(got); err != nil {
+		t.Fatalf("returned path %q is not stat-able: %v", got, err)
+	}
+}
+
+// TestLookPathWithWrapperPATHHandlesRelativeBinary is the
+// round-4 P2 regression for the relative-path case. A
+// command that uses `./codex-rel` as the binary name must
+// resolve to the literal relative path, not be subject
+// to PATH search. The round-3 helper built
+// `<PATH-entry>//./codex-rel` which never resolves.
+//
+// We chdir into the directory holding the stub so the
+// relative path is meaningful; the helper must stat the
+// literal `./codex-rel` and find it.
+func TestLookPathWithWrapperPATHHandlesRelativeBinary(t *testing.T) {
+	dir := t.TempDir()
+	binPath := dir + "/codex-rel"
+	script := "#!/bin/sh\nexit 0\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	// Save CWD and chdir to the stub's dir so the
+	// relative path is meaningful. Without this, a
+	// relative path from a different CWD would
+	// correctly return exec.ErrNotFound (the file
+	// simply does not exist there), defeating the
+	// test.
+	originalCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(originalCwd)
+	}()
+	relBin := "./codex-rel"
+	got, err := lookPathWithWrapperPATHForTest(relBin, "")
+	if err != nil {
+		t.Fatalf("lookPathWithWrapperPATH(%q, command=\"\") returned error: %v", relBin, err)
+	}
+	if got == "" {
+		t.Fatalf("lookPathWithWrapperPATH(%q, command=\"\") returned empty path", relBin)
+	}
+}
+
+// TestRunPreflightClassifiesAbsoluteBinaryAsMalformedNotNotInstalled
+// is the round-4 P2 end-to-end regression. An operator
+// who invokes codex via an absolute path (a common
+// pattern in CI / containers) must see the binary
+// resolved and the classifier must report
+// ReasonMalformedVersion (because the stub returns
+// empty --version), NOT ReasonCodexNotInstalled. The
+// round-3 helper falsely reported not-installed.
+func TestRunPreflightClassifiesAbsoluteBinaryAsMalformedNotNotInstalled(t *testing.T) {
+	binDir := t.TempDir()
+	binPath := binDir + "/codex-abs"
+	script := "#!/bin/sh\n# Pretend to be codex. Empty --version\n# output to force the malformed_version branch.\nexit 0\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	// Run the absolute-path invocation directly. The
+	// wrapper-prefix PATH augmentation is irrelevant
+	// for an absolute path; the classifier must find
+	// the binary regardless of the wrapper's PATH
+	// value.
+	summary := RunPreflight(PreflightOptions{
+		Command:       binPath,
+		VersionOutput: "",
+		Now:           fixedNow,
+	})
+	if summary.Available {
+		t.Fatalf("Available = true, want false (stub returns empty --version)")
+	}
+	if summary.FailureReason != ReasonMalformedVersion {
+		t.Fatalf("FailureReason = %q, want %q (absolute-path binary must be classified as malformed, not not-installed)", summary.FailureReason, ReasonMalformedVersion)
+	}
+}
