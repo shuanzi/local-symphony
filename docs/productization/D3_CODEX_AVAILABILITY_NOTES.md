@@ -148,13 +148,17 @@ ea2a130 schemas/openapi/contract: extend codex diagnostics with metadata/fixture
 4b37cb5 internal/agent/codex: round-1 review fixes (4 findings)
 293985c docs/productization: D3 Codex availability notes
 6073a15 internal/agent/codex: round-2 review fixes (2 findings)
+69dedc6 docs/productization: note round-2 review fixes in D3 notes
+5003070 internal/agent/codex: round-3 review fixes (3 findings)
 ```
 
 提交 hash（`git log` 输出）：
 
 ```
 $ git log --oneline codex/v1-productization-d3-codex-availability ^main
-6073a15 (HEAD -> codex/v1-productization-d3-codex-availability) internal/agent/codex: round-2 review fixes (2 findings)
+5003070 (HEAD -> codex/v1-productization-d3-codex-availability) internal/agent/codex: round-3 review fixes (3 findings)
+69dedc6 docs/productization: note round-2 review fixes in D3 notes
+6073a15 internal/agent/codex: round-2 review fixes (2 findings)
 293985c docs/productization: D3 Codex availability notes
 4b37cb5 internal/agent/codex: round-1 review fixes (4 findings)
 7b5cb64 web: tighten Codex types and link Overview → Diagnostics
@@ -164,7 +168,7 @@ a05a0eb internal/cli+httpapi: expose codex availability in status and /state
 90f0ded internal/agent/codex: add preflight summary and tests
 ```
 
-7 个 commit，按计划顺序 1→5 落地后，codex review round 1 触发了第 6 个 commit（4b37cb5）修补 3 × P1 + 1 × P2 finding，codex review round 2 触发了第 7 个 commit（6073a15）修补 1 × P1 + 1 × P2 finding。Doc 笔记（本文）跟随最后一个 commit。
+8 个 commit + 1 个笔记更新，按计划顺序 1→5 落地后，三轮 codex review 触发了 3 个修复 commit。Doc 笔记（本文）跟随最后一个 commit。
 
 ### 4.1 Round-1 review 修复
 
@@ -226,6 +230,40 @@ contract validation passed
 
 $ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
 ok  	local-symphony/internal/agent/codex	1.020s
+```
+
+### 4.3 Round-3 review 修复
+
+codex review round 3 对 commit 6073a15 给出 3 个 finding（1 × P1 + 1 × P2 + 1 × P3 panic）：
+
+| # | Sev | 修复 |
+|---|-----|------|
+| 1 | P3 panic | `isWrapperFlagToken` 增 `len(token) == 0` guard 2 行。`env "" codex` / 多空格 / 空命令等边界 case 不再索引空字符串。`unwrapCodexBinaryToken` round-2 的 `token == ""` 早退逻辑保留。 |
+| 2 | P1 | `isSyntheticSentinelString` 改用与 `scripts/validate_contracts.py::SYNTHETIC_SENTINEL_RE` 同一份预编译 regex `r"\bSYNTHETIC_[A-Z0-9_]+\b"`。gate 与 contract validator 现在共享同一份 source of truth，`protocol-SYNTHETIC_PROMPT_BODY-v1` 这种嵌入 sentinel 不再漏。复用现有 3 个 PreflightReason（`metadata_protocol_version_sentinel` / `metadata_schema_version_sentinel` / `metadata_codex_version_sentinel`），schema / openapi / contract enum 不动。 |
+| 3 | P2 | `classifyEmptyOrMalformedVersion` 改用 `lookPathWithWrapperPATH`：当 command 含 `PATH=<value>` env-var prefix 时，构造 `PATH=<value>:<current>` 临时 env 给 LookPath。`env PATH=/opt/codex/bin codex` 这种命令不再被误报 `codex_not_installed`。`pathPrefixFromCommand` 只识别 `PATH=` 键，其他 env 前缀（`X=1` 等）不影响 PATH 行为。 |
+
+新增 5 个 R3 回归测试（21 个 sub-case），全部覆盖：empty token 路径（用 `defer recover()` 确保 panic 也会失败）、embedded sentinel、`PATH=` prefix 抽取、PATH-augmented classification end-to-end。
+
+修复后：
+
+```
+$ go test -count=1 -race ./internal/agent/codex
+ok  	local-symphony/internal/agent/codex	20.134s
+
+$ go vet ./internal/agent/codex/...
+(clean)
+
+$ go test -count=1 ./internal/agent/codex ./internal/observability ./internal/cli ./internal/httpapi
+ok  	local-symphony/internal/agent/codex	28.427s
+ok  	local-symphony/internal/observability	2.996s
+ok  	local-symphony/internal/cli	2.890s
+ok  	local-symphony/internal/httpapi	12.210s
+
+$ python3 scripts/validate_contracts.py
+contract validation passed
+
+$ SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
+ok  	local-symphony/internal/agent/codex	1.046s
 ```
 
 ## 5. 范围合规
