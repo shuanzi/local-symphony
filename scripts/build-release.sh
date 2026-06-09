@@ -31,17 +31,45 @@ EXT=""
 if [ "$GOOS_VALUE" = "windows" ]; then EXT=".exe"; fi
 BIN_PATH="$OUT_DIR/${BIN_NAME}${EXT}"
 
-# Refuse OUT_DIR that resolves to/under $ROOT. Without this guard, the
-# destructive `rm -rf "$OUT_DIR/web"` later in this script would
-# silently wipe the checked-in `web/` source tree the rest of the
-# build relies on. (D5 codex review F1 [P1].)
+# Refuse OUT_DIR that would cause the build to overwrite a real source
+# subdirectory of $ROOT. Without this guard, an OUT_DIR like
+# $ROOT/internal or $ROOT/web would let the destructive
+# `rm -rf "$OUT_DIR/web/dist"` line below silently erase source files
+# the rest of the build relies on. (D5 codex review F1 [P1] round 1,
+# narrowed in round 2 to allow the documented default $ROOT/dist.)
+#
+# The guard explicitly ALLOWS $ROOT/dist (the documented default
+# output location) and SIBLINGS of $ROOT (e.g. /tmp/release). It
+# REJECTS only paths that resolve to a known source subdirectory
+# (web/, scripts/, internal/, cmd/, docs/, schemas/, api/, examples/,
+# tests/, db/) or to $ROOT itself.
 ROOT_RESOLVED=$(cd "$ROOT" && pwd -P)
 OUT_DIR_RESOLVED=$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd -P)
-if [ "$OUT_DIR_RESOLVED" = "$ROOT_RESOLVED" ] || \
-   { [ "${OUT_DIR_RESOLVED#$ROOT_RESOLVED/}" != "$OUT_DIR_RESOLVED" ] && [ -n "$OUT_DIR_RESOLVED" ]; }; then
-  echo "[build-release] refusing to run: OUT_DIR=$OUT_DIR_RESOLVED overlaps with source ROOT=$ROOT_RESOLVED" >&2
-  echo "[build-release] pick an OUT_DIR that is a sibling of the source tree (e.g. /tmp/release) so the build cannot delete the checked-in web/ source." >&2
+if [ "$OUT_DIR_RESOLVED" = "$ROOT_RESOLVED" ]; then
+  echo "[build-release] refusing to run: OUT_DIR=$OUT_DIR_RESOLVED equals source ROOT=$ROOT_RESOLVED" >&2
+  echo "[build-release] use the documented default (\$ROOT/dist) or pick a sibling path (e.g. /tmp/release)." >&2
   exit 2
+fi
+# Explicitly allow the documented default OUT_DIR.
+if [ "$OUT_DIR_RESOLVED" = "$ROOT_RESOLVED/dist" ]; then
+  : # allowed
+else
+  case "$OUT_DIR_RESOLVED" in
+    "$ROOT_RESOLVED/web"|"$ROOT_RESOLVED/web"/*|\
+    "$ROOT_RESOLVED/scripts"|"$ROOT_RESOLVED/scripts"/*|\
+    "$ROOT_RESOLVED/internal"|"$ROOT_RESOLVED/internal"/*|\
+    "$ROOT_RESOLVED/cmd"|"$ROOT_RESOLVED/cmd"/*|\
+    "$ROOT_RESOLVED/docs"|"$ROOT_RESOLVED/docs"/*|\
+    "$ROOT_RESOLVED/schemas"|"$ROOT_RESOLVED/schemas"/*|\
+    "$ROOT_RESOLVED/api"|"$ROOT_RESOLVED/api"/*|\
+    "$ROOT_RESOLVED/examples"|"$ROOT_RESOLVED/examples"/*|\
+    "$ROOT_RESOLVED/tests"|"$ROOT_RESOLVED/tests"/*|\
+    "$ROOT_RESOLVED/db"|"$ROOT_RESOLVED/db"/*)
+      echo "[build-release] refusing to run: OUT_DIR=$OUT_DIR_RESOLVED overlaps with a source subdirectory of ROOT=$ROOT_RESOLVED" >&2
+      echo "[build-release] pick a path outside the source tree (the documented default is \$ROOT/dist, or pass OUT_DIR=/tmp/release)." >&2
+      exit 2
+      ;;
+  esac
 fi
 
 mkdir -p "$OUT_DIR"
@@ -56,12 +84,13 @@ if [ "${SKIP_WEB:-0}" = "1" ]; then
 else
   if command -v npm >/dev/null 2>&1; then
     echo "[build-release] npm run build (dashboard)"
-    # Use a frozen install against the committed web/package-lock.json.
-    # `npm install` would re-resolve `latest`-pinned versions and break
-    # the release's reproducibility contract. (D5 codex review F2 [P2].)
-    if [ ! -d "$ROOT/web/node_modules" ]; then
-      (cd "$ROOT/web" && npm ci --no-audit --no-fund)
-    fi
+    # Always run `npm ci` so the release artifact's dependencies
+    # match the committed web/package-lock.json exactly. A
+    # developer's stale web/node_modules (from a previous
+    # `pnpm install` or a `latest`-resolved `npm install`) would
+    # otherwise get packaged into the release. (D5 codex review
+    # F3-r2 [P2].)
+    (cd "$ROOT/web" && npm ci --no-audit --no-fund)
     (cd "$ROOT/web" && npm run build)
     # Only clean the script's own $OUT_DIR/web/dist target. A blanket
     # `rm -rf "$OUT_DIR/web"` would erase unrelated user data the

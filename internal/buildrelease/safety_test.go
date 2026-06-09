@@ -1,23 +1,52 @@
 // Package buildrelease contains tests that lock in the safety guarantees
-// of scripts/build-release.sh as required by the D5 codex review round 1:
+// of scripts/build-release.sh as required by the D5 codex review
+// rounds 1 + 2:
 //
-//   F1 [P1]  scripts/build-release.sh must not data-destructively delete the
-//            repo's `web/` source tree when OUT_DIR resolves to/under
-//            $ROOT. Two protections: (a) early-exit guard rejecting
-//            OUT_DIR equal to or under $ROOT; (b) the destructive
-//            `rm -rf` is scoped to $OUT_DIR/web/dist, not $OUT_DIR/web.
+//   F1-r0 [P1] (R1)  scripts/build-release.sh must not data-destructively
+//                    delete the repo's `web/` source tree. Two
+//                    protections: (a) early-exit guard rejecting
+//                    OUT_DIR that equals or falls under a dangerous
+//                    source subdir of $ROOT; (b) the destructive
+//                    `rm -rf` is scoped to $OUT_DIR/web/dist.
 //
-//   F2 [P2]  the web install must be deterministic — a frozen install
-//            against the committed web/package-lock.json. The script
-//            must invoke `npm ci` (not `npm install`); the repo must
-//            carry web/package-lock.json while NOT carrying
-//            web/pnpm-lock.yaml (a stale conflicting lockfile is a
-//            footgun for the next person who runs `pnpm install`).
+//   F2-r0 [P2] (R1)  web install must be deterministic — frozen install
+//                    against the committed web/package-lock.json. The
+//                    script must invoke `npm ci` (not `npm install`).
 //
-// F1 is exercised by running the shell script in an isolated temp
-// workdir (a *copy* of the script, not the real $ROOT) so a regression
-// cannot damage the host's source tree. F2 is exercised by static
-// inspection of the committed script and lockfile layout.
+//   F1-r2 [P1] (R2)  The R1 guard overreached by rejecting "every child
+//                    of $ROOT" — the documented default
+//                    `bash scripts/build-release.sh` uses
+//                    OUT_DIR=$ROOT/dist, which is a legitimate
+//                    output location. The guard must allow $ROOT/dist
+//                    and reject only source subdirs (web/,
+//                    scripts/, internal/, cmd/, docs/, schemas/,
+//                    api/, etc.).
+//
+//   F2-r2 [P1] (R2)  R1's "use npm ci" fix is meaningless if
+//                    web/package-lock.json is excluded by .gitignore
+//                    — a clean checkout / git archive / CI will not
+//                    have the lockfile, and `npm ci` fails
+//                    immediately. The lockfile must be tracked.
+//
+//   F3-r2 [P2] (R2)  The R1 `if [ ! -d $ROOT/web/node_modules ]` guard
+//                    skips `npm ci` when node_modules already
+//                    exists. That means a developer's stale
+//                    node_modules (from a previous `pnpm install` or
+//                    a `latest`-resolved `npm install`) gets
+//                    packaged into the release. `npm ci` must run
+//                    unconditionally.
+//
+// Tests in this package exercise the script in two modes:
+//
+//   * **In-isolated-tempdir tests (F1-r0)**: the script is COPIED
+//     to a fresh tmp workdir so the script's auto-derived $ROOT is
+//     the tmp dir, never the real repo.
+//
+//   * **In-clean-git-archive tests (F2-r2)**: `git archive HEAD` is
+//     extracted to a t.TempDir() so the test sees exactly what a CI
+//     fresh checkout would see. This catches a class of bugs where
+//     the developer's working tree has untracked-but-on-disk state
+//     that masks a missing-in-source-tree problem.
 package buildrelease
 
 import (
@@ -133,18 +162,25 @@ func TestBuildReleaseRejectsOUTDirEqualToRoot(t *testing.T) {
 	assertWebSourceTreeIntact(t, root, out)
 }
 
-// F1 — second protection layer: OUT_DIR that falls UNDER $ROOT (a
-// subdirectory of the source tree) must also be rejected, for the
-// same reason.
+// F1 — second protection layer: OUT_DIR that falls inside a real
+// source subdirectory of $ROOT (the list the R2 guard enumerates)
+// must be rejected. The R2 guard narrowed the rejection list to
+// specific source subdirs (web/, scripts/, internal/, cmd/, docs/,
+// schemas/, api/, examples/, tests/, db/) so the documented default
+// $ROOT/dist still works. A path under $ROOT/web is the canonical
+// dangerous case the R1 guard was trying to catch.
 func TestBuildReleaseRejectsOUTDirUnderRoot(t *testing.T) {
 	root := t.TempDir()
 	copyMinimumWebTree(t, root)
 	copyMinimumGoModule(t, root)
-	outDir := filepath.Join(root, "build-output")
+	outDir := filepath.Join(root, "web", "build-output") // under $ROOT/web
 
 	out, exit := runIsolatedScriptWithRoot(t, root, outDir)
 	if exit == 0 {
-		t.Fatalf("OUT_DIR under $ROOT was accepted (exit 0). Output:\n%s", out)
+		t.Fatalf("OUT_DIR under $ROOT/web was accepted (exit 0). Output:\n%s", out)
+	}
+	if !strings.Contains(out, "refusing to run") {
+		t.Fatalf("rejection error missing. Output:\n%s", out)
 	}
 	assertWebSourceTreeIntact(t, root, out)
 }
@@ -192,6 +228,162 @@ func TestBuildReleaseDoesNotBlanketDeleteOUTDirWeb(t *testing.T) {
 	}
 }
 
+// F1-r2 — regression test: the documented default command
+// `bash scripts/build-release.sh` resolves OUT_DIR to $ROOT/dist
+// (see the `OUT_DIR="${OUT_DIR:-$ROOT/dist}"` line at the top of
+// the script). R1's guard rejected this default. R2 narrows the
+// guard so $ROOT/dist is allowed.
+//
+// To run the script in this mode we copy it into a fresh tmp
+// workdir so the script's auto-derived $ROOT is the tmp dir, and
+// we set OUT_DIR explicitly to the tmp-dir/dist path. The test
+// asserts the script does NOT exit 2 with the "refusing to run"
+// message that R1 emitted.
+func TestBuildReleaseAcceptsDefaultOUTDir(t *testing.T) {
+	root := t.TempDir()
+	copyMinimumWebTree(t, root)
+	copyMinimumGoModule(t, root)
+	outDir := filepath.Join(root, "dist") // mirrors $ROOT/dist
+
+	out, exit := runIsolatedScriptWithRoot(t, root, outDir)
+	if exit != 0 {
+		t.Fatalf("OUT_DIR=$ROOT/dist (the documented default) was rejected. exit=%d\nOutput:\n%s\nThe R1 guard overreached; the F1-r2 fix should narrow it to source subdirs only.", exit, out)
+	}
+	if strings.Contains(out, "refusing to run") {
+		t.Fatalf("OUT_DIR=$ROOT/dist triggered the R1 refusal message. Output:\n%s", out)
+	}
+}
+
+// F3-r2 — regression test: even when $ROOT/web/node_modules
+// already exists (developer has run a previous install), the
+// script must still invoke `npm ci` so the on-disk dependencies
+// match the committed lockfile exactly. We verify by stubbing
+// `npm` with a logging stub that records its invocations to a
+// file; if `npm ci` is not in the call log, the F3-r2 bug is back.
+func TestBuildReleaseAlwaysRunsNpmCi(t *testing.T) {
+	root := t.TempDir()
+	copyMinimumWebTree(t, root)
+	copyMinimumGoModule(t, root)
+	stagePrebuiltWebDist(t, root)
+	// Stage node_modules so the (broken) R1 `if [ ! -d ... ]` guard
+	// would have skipped npm ci.
+	if err := os.MkdirAll(filepath.Join(root, "web", "node_modules"), 0o755); err != nil {
+		t.Fatalf("mkdir web/node_modules: %v", err)
+	}
+	// Stub npm with a logging shim. We don't actually need
+	// network; we only need to observe that `npm ci` is called.
+	binDir := filepath.Join(root, "fake-bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir fake-bin: %v", err)
+	}
+	logPath := filepath.Join(root, "npm-invocations.log")
+	stub := "#!/usr/bin/env bash\necho \"$@\" >> \"" + logPath + "\"\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "npm"), []byte(stub), 0o755); err != nil {
+		t.Fatalf("write fake npm: %v", err)
+	}
+	outDir := t.TempDir() + "-sibling"
+	pathWithFakeNpm := binDir + string(os.PathListSeparator) + os.Getenv("PATH")
+	_, _ = runIsolatedScriptWithRoot(t, root, outDir, "SKIP_WEB=0", "PATH="+pathWithFakeNpm)
+
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read npm invocation log: %v", err)
+	}
+	log := string(logData)
+	// `npm ci` may be called bare, as `npm ci --no-audit --no-fund`,
+	// or as part of a longer command. We assert the log contains
+	// the literal token `ci` *as a separate argv* (preceded by a
+	// space or at start of line). `npm run build` is also called
+	// and would log `run build` — that's not what we want.
+	lines := strings.Split(strings.TrimSpace(log), "\n")
+	calledCi := false
+	for _, line := range lines {
+		// We look for an invocation that has `ci` as a standalone
+		// argument (the second token after `npm`).
+		fields := strings.Fields(line)
+		if len(fields) >= 1 && fields[0] == "ci" {
+			calledCi = true
+			break
+		}
+	}
+	if !calledCi {
+		t.Fatalf("`npm ci` was not called even though web/node_modules exists. The F3-r2 `if [ ! -d ... ]` guard is back. Invocation log:\n%s\nFull script output:\n%s", log, log)
+	}
+}
+
+// F2-r2 — rewritten to use `git archive` so a developer's stray
+// web/package-lock.json on disk cannot mask a missing-in-source
+// lockfile. The test extracts `git archive HEAD` to a t.TempDir()
+// and verifies that web/package-lock.json is present, web/pnpm-lock.yaml
+// is absent, and web/package-lock.json is NOT excluded by .gitignore.
+func TestBuildReleaseLockfileStoryIsConsistent(t *testing.T) {
+	root := repoRoot(t)
+
+	// (a) .gitignore must NOT exclude web/package-lock.json. R1's
+	// mistake was to add it; R2 removes it.
+	gi, err := os.ReadFile(filepath.Join(root, ".gitignore"))
+	if err != nil {
+		t.Fatalf("read .gitignore: %v", err)
+	}
+	for _, line := range strings.Split(string(gi), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if trimmed == "web/package-lock.json" {
+			t.Fatalf(".gitignore still excludes web/package-lock.json; a clean checkout / git archive will not have the lockfile and `npm ci` will fail. Remove that line.")
+		}
+	}
+
+	// (b) Run the same checks under a `git archive` clean extract
+	// so on-disk-only state cannot mask a missing-in-source
+	// problem. The `git archive` output is what a CI fresh
+	// checkout would have; the developer's stray worktree files
+	// are NOT included.
+	clean := extractCleanTarball(t, root)
+	plPath := filepath.Join(clean, "web", "package-lock.json")
+	if _, err := os.Stat(plPath); err != nil {
+		t.Fatalf("web/package-lock.json missing from git archive extract at %s. err=%v\nA clean checkout cannot run `npm ci` without a tracked lockfile.", plPath, err)
+	}
+	plData, err := os.ReadFile(plPath)
+	if err != nil {
+		t.Fatalf("read web/package-lock.json from clean extract: %v", err)
+	}
+	if !strings.Contains(string(plData), `"lockfileVersion"`) {
+		t.Fatalf("web/package-lock.json in clean extract is not a valid lockfile (missing lockfileVersion).")
+	}
+
+	ylPath := filepath.Join(clean, "web", "pnpm-lock.yaml")
+	if _, err := os.Stat(ylPath); err == nil {
+		t.Fatalf("web/pnpm-lock.yaml present in clean extract; pick one lockfile to avoid silent drift.")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat web/pnpm-lock.yaml in clean extract: %v", err)
+	}
+}
+
+// extractCleanTarball runs `git archive HEAD` from the repo root
+// and extracts the tar into a fresh t.TempDir(). The result is
+// what a CI fresh checkout of HEAD would have on disk.
+func extractCleanTarball(t *testing.T, repoRoot string) string {
+	t.Helper()
+	dir := t.TempDir()
+	cmd := exec.Command("git", "archive", "HEAD")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git archive HEAD: %v", err)
+	}
+	untar := exec.Command("tar", "-x", "-C", dir)
+	untar.Stdin = &buf
+	untar.Stderr = os.Stderr
+	if err := untar.Run(); err != nil {
+		t.Fatalf("tar -x: %v", err)
+	}
+	return dir
+}
+
 // F2 — first protection: the script must invoke `npm ci` (frozen
 // install against web/package-lock.json), not `npm install`. Static
 // text inspection of the script is sufficient and is what the
@@ -230,30 +422,12 @@ func TestBuildReleaseUsesNpmCiNotNpmInstall(t *testing.T) {
 // F2 — second protection: the repo must carry web/package-lock.json
 // (so `npm ci` has something to install from) and must NOT carry
 // web/pnpm-lock.yaml (a stale conflicting lockfile would let a future
-// `pnpm install` re-resolve `latest` and break reproducibility).
-func TestBuildReleaseLockfileStoryIsConsistent(t *testing.T) {
-	root := repoRoot(t)
-
-	plPath := filepath.Join(root, "web", "package-lock.json")
-	if _, err := os.Stat(plPath); err != nil {
-		t.Fatalf("web/package-lock.json missing; `npm ci` cannot run. err=%v", err)
-	}
-	plData, err := os.ReadFile(plPath)
-	if err != nil {
-		t.Fatalf("read web/package-lock.json: %v", err)
-	}
-	if !strings.Contains(string(plData), `"lockfileVersion"`) {
-		t.Fatalf("web/package-lock.json is not a valid lockfile (missing lockfileVersion).")
-	}
-
-	ylPath := filepath.Join(root, "web", "pnpm-lock.yaml")
-	if _, err := os.Stat(ylPath); err == nil {
-		t.Fatalf("web/pnpm-lock.yaml still present alongside web/package-lock.json; pick one lockfile to avoid silent drift.")
-	} else if !os.IsNotExist(err) {
-		t.Fatalf("stat web/pnpm-lock.yaml: %v", err)
-	}
-}
-
+// `pnpm install` re-resolve `latest` and break reproducibility). The
+// rewritten TestBuildReleaseLockfileStoryIsConsistent at the top of
+// this file is the authoritative version; this block is intentionally
+// left empty (it was the R1 version that did not protect against
+// developer-stray-lockfile masking).
+//
 // runIsolatedScriptWithRoot is the lower-level runner used by the F1
 // tests; it places a fresh copy of the script in `root/scripts/` so
 // the script's auto-derived $ROOT is exactly `root`.
