@@ -76,9 +76,9 @@ No P3 / NIT findings. No findings against `internal/httpapi/httpapi_test.go`, `i
   ```
   Both lockfiles exist; script uses neither for a frozen install. F2 is **valid**.
 
-## F1 outcome — fixed (round-1 fix commit `1e051b6`)
+## F1 outcome — fixed (round-1 fix commit `41dabb6` (this doc commit, see `git log`))
 
-- **Fix landed in**: `scripts/build-release.sh` (round-1 fix commit `1e051b6`).
+- **Fix landed in**: `scripts/build-release.sh` (round-1 fix commit `41dabb6` (this doc commit, see `git log`)).
 - **What changed**: Two protection layers were added so a regression is observable
   even if a future change re-introduces a destructive `rm -rf`:
   1. **Early-exit guard** that rejects `OUT_DIR` values resolving to `$ROOT`
@@ -106,10 +106,10 @@ No P3 / NIT findings. No findings against `internal/httpapi/httpapi_test.go`, `i
   exits 2 with the refusal message; `web/` source tree is intact
   afterwards.
 
-## F2 outcome — fixed (round-1 fix commit `1e051b6`)
+## F2 outcome — fixed (round-1 fix commit `41dabb6` (this doc commit, see `git log`))
 
 - **Fix landed in**: `scripts/build-release.sh` (round-1 fix commit
-  `1e051b6`) and the repo's `web/pnpm-lock.yaml` is now
+  `41dabb6` (this doc commit, see `git log`)) and the repo's `web/pnpm-lock.yaml` is now
   removed.
 - **What changed**:
   1. The web install switched from `npm install` to `npm ci` so
@@ -140,7 +140,7 @@ No P3 / NIT findings. No findings against `internal/httpapi/httpapi_test.go`, `i
 
 ## Round-1 fix commit
 
-`1e051b6` — "D5 R1: fix F1 (OUT_DIR guard) and F2 (npm ci) per codex review"
+`41dabb6` (this doc commit, see `git log`) — "D5 R1: fix F1 (OUT_DIR guard) and F2 (npm ci) per codex review"
 
 Stat: 4 files changed, +582 / -574 (the −574 is dominated by removing
 `web/pnpm-lock.yaml`, which was 571 lines).
