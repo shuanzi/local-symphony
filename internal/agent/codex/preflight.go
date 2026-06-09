@@ -150,7 +150,16 @@ func RunPreflight(opts PreflightOptions) PreflightSummary {
 	}
 	versionOutput := opts.VersionOutput
 	if versionOutput == "" {
-		versionOutput = DetectVersionForCommand(command)
+		// SYMPHONY_CODEX_VERSION_OUTPUT is the test-only override
+		// for `codex --version`. When unset, the preflight calls
+		// DetectVersionForCommand (which may invoke the real codex
+		// binary). Setting the env var makes the preflight fully
+		// deterministic in offline / sandboxed test environments.
+		if override := strings.TrimSpace(os.Getenv("SYMPHONY_CODEX_VERSION_OUTPUT")); override != "" {
+			versionOutput = override
+		} else {
+			versionOutput = DetectVersionForCommand(command)
+		}
 	}
 	ranAt := now().UTC().Format(time.RFC3339)
 	summary := PreflightSummary{
