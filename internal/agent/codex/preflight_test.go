@@ -553,10 +553,16 @@ func testdataFixtureRoot(t *testing.T) string {
 }
 
 // TestIsSyntheticSentinelStringDistinguishesVersionAndSentinel is
-// the round-2 P1 #1 negative-coverage regression: legitimate
-// version / protocol / schema identifiers must not be flagged
-// as sentinel-shaped, and synthetic-sentinel-shaped values must
-// be flagged.
+// the round-2 + round-3 P1 regression: legitimate version /
+// protocol / schema identifiers must not be flagged as
+// sentinel-shaped, and synthetic-sentinel-shaped values (both
+// whole-token and embedded matches) must be flagged.
+//
+// The detector is a word-boundary regex identical to the
+// SYNTHETIC_SENTINEL_RE regex in scripts/validate_contracts.py;
+// a poisoned fixture that survives the gate would also
+// survive the contract validator, so the two layers agree
+// on what a sentinel-shaped value looks like.
 func TestIsSyntheticSentinelStringDistinguishesVersionAndSentinel(t *testing.T) {
 	cases := []struct {
 		value    string
@@ -569,23 +575,31 @@ func TestIsSyntheticSentinelStringDistinguishesVersionAndSentinel(t *testing.T) 
 		{value: "protocol-test-v1", sentinel: false},
 		{value: "schema-2024-01", sentinel: false},
 		{value: "0.0.0-test", sentinel: false},
-		// Synthetic-sentinel-shaped values — must be flagged.
+		// Whole-token sentinel-shaped values — must be flagged.
 		{value: "SYNTHETIC_FOO", sentinel: true},
 		{value: "SYNTHETIC_PROMPT_BODY", sentinel: true},
 		{value: "SYNTHETIC_OWNER_NONCE_XYZ", sentinel: true},
 		{value: "SYNTHETIC_API_SECRET_KEY", sentinel: true},
+		// Embedded sentinel-shaped values — round-3 fix. The
+		// previous whole-string-prefix detector accepted
+		// these as legitimate; the word-boundary regex
+		// correctly rejects them.
+		{value: "protocol-SYNTHETIC_PROMPT_BODY-v1", sentinel: true},
+		{value: "schema-SYNTHETIC_CODEX_LOG-2024", sentinel: true},
+		// Embedded sentinels whose trailing `_xxx` suffix
+		// contains lowercase letters are NOT detected —
+		// the word-boundary regex requires the sentinel
+		// body to be a continuous run of [A-Z0-9_], and
+		// the contract validator's identical regex agrees.
+		// Operators / fixture authors who plant a poisoned
+		// value should follow the same convention as the
+		// rest of the codebase: upper-snake-case body.
+		{value: "v1.0.0+SYNTHETIC_OWNER_NONCE_xxx", sentinel: false},
+		{value: "SYNTHETIC_PROMPT_BODY_do_not_leak", sentinel: false},
 		// Bare prefix is not a sentinel.
 		{value: "SYNTHETIC_", sentinel: false},
 		// Lowercase prefix is not a sentinel.
 		{value: "synthetic_foo", sentinel: false},
-		// Mixed-case trailing suffix is not a sentinel —
-		// the detector requires the UPPER_SNAKE_CASE shape
-		// because the contract validator's
-		// SYNTHETIC_SENTINEL_RE uses the same shape, and
-		// the redaction scrubber in
-		// observability/assertNoSentinelsInDiagnostics
-		// relies on the same boundary.
-		{value: "SYNTHETIC_PROMPT_BODY_do_not_leak", sentinel: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.value, func(t *testing.T) {
@@ -795,5 +809,238 @@ func TestRunPreflightClassifiesWrappedMissingBinaryAsNotInstalled(t *testing.T) 
 				t.Fatalf("FailureReason = %q, want %q (wrapped invocation with missing wrapped binary must be reported as not-installed, not malformed)", summary.FailureReason, ReasonCodexNotInstalled)
 			}
 		})
+	}
+}
+
+// TestUnwrapCodexBinaryTokenRejectsEmptyTokens is the round-3
+// P3 panic regression. `commandParts` produces an empty
+// token for inputs like `env "" codex` (a quoted empty arg)
+// and `sudo   codex` (consecutive spaces produce empty
+// tokens between them). The round-2 walker passed empty
+// tokens through to isWrapperFlagToken, which then
+// indexed `token[0]` on an empty string and panicked at
+// runtime. The fix is a 2-line guard in isWrapperFlagToken
+// plus a defensive `token == ""` skip in
+// unwrapCodexBinaryToken (already present from round 2).
+// The test exercises the boundary cases.
+func TestUnwrapCodexBinaryTokenRejectsEmptyTokens(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{
+			name:    "empty quoted arg after env wrapper",
+			command: `env "" codex`,
+			// The walker must skip the empty token and
+			// land on `codex`. Pre-fix: panic.
+			want: "codex",
+		},
+		{
+			name:    "empty quoted arg after sudo wrapper",
+			command: `sudo "" codex`,
+			want:    "codex",
+		},
+		{
+			name:    "multiple consecutive spaces produce empty tokens",
+			command: "sudo    codex",
+			want:    "codex",
+		},
+		{
+			name:    "tab-separated empty token",
+			command: "env\t\tcodex",
+			want:    "codex",
+		},
+		{
+			name:    "empty command yields empty result",
+			command: "",
+			want:    "",
+		},
+		{
+			name:    "all-empty tokens yield empty result",
+			command: `"" "" ""`,
+			want:    "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("unwrapCodexBinaryToken panicked on %q: %v", tc.command, r)
+				}
+			}()
+			if got := unwrapCodexBinaryTokenForTest(tc.command); got != tc.want {
+				t.Fatalf("unwrapCodexBinaryToken(%q) = %q, want %q", tc.command, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunPreflightDoesNotPanicOnMalformedCommand is the
+// round-3 P3 end-to-end regression. The same malformed
+// commands must not crash the preflight; they must return
+// a non-success summary with a deterministic
+// FailureReason. Without the round-3 fix, RunPreflight
+// would panic at runtime when the operator's command
+// happens to have a quoted empty arg.
+func TestRunPreflightDoesNotPanicOnMalformedCommand(t *testing.T) {
+	commands := []string{
+		`env "" codex`,
+		`sudo "" codex`,
+		"sudo    codex",
+		"env\t\tcodex",
+		`"" "" ""`,
+		"",
+	}
+	for _, cmd := range commands {
+		t.Run(cmd, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("RunPreflight panicked on command %q: %v", cmd, r)
+				}
+			}()
+			summary := RunPreflight(PreflightOptions{
+				Command:       cmd,
+				VersionOutput: "",
+				Now:           fixedNow,
+			})
+			if summary.Available {
+				t.Fatalf("RunPreflight(%q) returned Available=true, want false", cmd)
+			}
+			if summary.FailureReason == "" {
+				t.Fatalf("RunPreflight(%q) returned empty FailureReason, want a deterministic value", cmd)
+			}
+		})
+	}
+}
+
+// TestRunPreflightRejectsEmbeddedSentinelProtocolVersion is
+// the round-3 P1 regression: a poisoned compatibility.json
+// whose protocol_version embeds a synthetic-sentinel-shaped
+// substring (rather than starting with one) is rejected
+// at the source. The pre-round-3 detector only matched
+// whole-string prefixes, so a fixture that planted
+// `protocol-SYNTHETIC_PROMPT_BODY-v1` would have slipped
+// through the gate. The word-boundary regex closes the
+// gap.
+func TestRunPreflightRejectsEmbeddedSentinelProtocolVersion(t *testing.T) {
+	root := t.TempDir()
+	version := "9.9.9-embedded-sentinel"
+	schemaDir := filepath.Join(root, "schema", version)
+	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "transcripts", version), 0o755); err != nil {
+		t.Fatalf("mkdir transcripts: %v", err)
+	}
+	// protocol_version is poisoned with a sentinel embedded
+	// in a longer identifier; codex_version matches the
+	// detected version; everything else is structurally
+	// valid.
+	poisoned := `{
+  "codex_version": "9.9.9-embedded-sentinel",
+  "protocol_version": "protocol-SYNTHETIC_PROMPT_BODY-v1",
+  "schema_version": "schema-embedded-v1",
+  "supported_notifications": ["handoff"],
+  "supported_requests": ["initialize"],
+  "experimental_api": false
+}`
+	if err := os.WriteFile(filepath.Join(schemaDir, compatibilityMetadataFile), []byte(poisoned), 0o600); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+	schemaStub := `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}`
+	if err := os.WriteFile(filepath.Join(schemaDir, "schema.json"), []byte(schemaStub), 0o600); err != nil {
+		t.Fatalf("write schema stub: %v", err)
+	}
+	transcript := `{"type":"handshake","codex_version":"9.9.9-embedded-sentinel","protocol_version":"protocol-SYNTHETIC_PROMPT_BODY-v1","schema_version":"schema-embedded-v1","experimental_api":false}
+{"type":"turn_completed"}
+`
+	if err := os.WriteFile(filepath.Join(root, "transcripts", version, "happy-path.jsonl"), []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	summary := RunPreflight(PreflightOptions{
+		Command:       "codex",
+		VersionOutput: "codex 9.9.9-embedded-sentinel",
+		FixtureRoot:   root,
+		Now:           fixedNow,
+	})
+	if summary.Available {
+		t.Fatalf("Available = true, want false (embedded sentinel in protocol_version must be rejected)")
+	}
+	if summary.FailureReason != ReasonMetadataProtoSentinel {
+		t.Fatalf("FailureReason = %q, want %q", summary.FailureReason, ReasonMetadataProtoSentinel)
+	}
+	b, _ := json.Marshal(summary)
+	body := string(b)
+	if strings.Contains(body, "SYNTHETIC_PROMPT_BODY") {
+		t.Fatalf("summary leaks embedded sentinel: %s", body)
+	}
+}
+
+// TestPathPrefixFromCommandExtractsWrapperPATH is the
+// round-3 P2 PATH-prefix extractor regression. The
+// helper must surface the operator's wrapper PATH so
+// lookPathWithWrapperPATH can resolve a codex binary
+// that exists only on the operator's augmented PATH.
+func TestPathPrefixFromCommandExtractsWrapperPATH(t *testing.T) {
+	cases := []struct {
+		command string
+		want    string
+	}{
+		{command: "env PATH=/opt/codex/bin codex", want: "/opt/codex/bin"},
+		{command: "PATH=/opt/codex/bin codex", want: "/opt/codex/bin"},
+		{command: "env X=1 PATH=/a:/b codex", want: "/a:/b"},
+		{command: "env PATH=/opt/bin sudo PATH=/usr/bin codex", want: "/usr/bin"},
+		{command: "env X=1 codex", want: ""},
+		{command: "codex", want: ""},
+		{command: "", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.command, func(t *testing.T) {
+			if got := pathPrefixFromCommandForTest(tc.command); got != tc.want {
+				t.Fatalf("pathPrefixFromCommand(%q) = %q, want %q", tc.command, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunPreflightHonorsWrapperPATHForClassification is the
+// round-3 P2 end-to-end regression: an operator who wraps
+// codex with `env PATH=/tmp/codex-stub codex-stub` where
+// `/tmp/codex-stub/codex-stub` is an executable file (a
+// stub we create in TempDir) must be classified by
+// `malformed_version` (because the stub returns empty
+// output) — not `codex_not_installed`. Pre-round-3 the
+// classifier would have LookPath'd against the
+// process's PATH, which does not include
+// `/tmp/codex-stub`, and reported the binary as missing.
+func TestRunPreflightHonorsWrapperPATHForClassification(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("cannot run PATH-augmentation test without a go binary to anchor /tmp: %v", err)
+	}
+	// Create a stub codex binary in a fresh temp dir.
+	// The stub prints nothing to stdout (empty --version
+	// output), which is the malformed-version signal.
+	stubDir := t.TempDir()
+	stubPath := filepath.Join(stubDir, "codex-stub")
+	stubScript := "#!/bin/sh\n# Pretend to be codex. We deliberately\n# emit empty --version so the preflight\n# classifier reaches the LookPath branch.\nexit 0\n"
+	if err := os.WriteFile(stubPath, []byte(stubScript), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	summary := RunPreflight(PreflightOptions{
+		Command:       "env PATH=" + stubDir + " codex-stub",
+		VersionOutput: "",
+		Now:           fixedNow,
+	})
+	if summary.Available {
+		t.Fatalf("Available = true, want false (stub returns empty --version)")
+	}
+	// The stub exists and is executable; the augmented
+	// PATH must let the classifier find it and report
+	// malformed_version. Without the round-3 PATH
+	// augmentation, the classifier would see
+	// `codex_not_installed`.
+	if summary.FailureReason != ReasonMalformedVersion {
+		t.Fatalf("FailureReason = %q, want %q (PATH-augmented lookup must surface the wrapped codex binary)", summary.FailureReason, ReasonMalformedVersion)
 	}
 }

@@ -1887,25 +1887,42 @@ func validateCompatibilityMetadata(version string, metadata CompatibilityMetadat
 // consists entirely of uppercase letters, digits, or
 // underscores. Plain version strings ("1.2.3", "v1.2.3",
 // "protocol-test-v1", "schema-2024-01") never match.
+// syntheticSentinelPattern mirrors the SYNTHETIC_SENTINEL_RE
+// regex in scripts/validate_contracts.py
+// (r"\bSYNTHETIC_[A-Z0-9_]+\b"). The precompiled regex is the
+// source of truth for "what looks like a synthetic
+// sentinel"; the gate layer and the contract validator
+// MUST agree on the shape or a poisoned fixture can plant
+// a sentinel that the gate accepts but the contract
+// validator flags (or vice versa).
+//
+// Round-3 fix: the previous hand-written detector required
+// the string to START with `SYNTHETIC_`, which missed
+// embedded matches like `protocol-SYNTHETIC_PROMPT_BODY-v1`.
+// The word-boundary regex matches the sentinel anywhere in
+// the value as long as it is bounded by non-identifier
+// characters (or the start/end of the string).
+var syntheticSentinelPattern = regexp.MustCompile(`\bSYNTHETIC_[A-Z0-9_]+\b`)
+
+// isSyntheticSentinelString reports whether s carries a
+// synthetic-sentinel-shaped substring. The detector is the
+// regex `syntheticSentinelPattern` (see above) applied to
+// the whole value. The shape detector runs at the
+// compatibility-metadata gate so a poisoned fixture that
+// plants raw prompt / raw Codex log / raw secret content
+// into a version identifier (protocol_version /
+// schema_version / codex_version) is rejected before the
+// preflight success path could echo it back through
+// diagnostics / `symphony status`.
+//
+// The detector is intentionally narrow: a string is a
+// sentinel only when it contains the `SYNTHETIC_` prefix
+// followed by one or more uppercase letters / digits /
+// underscores, with a non-identifier boundary on either
+// side. Plain version strings ("1.2.3", "v1.2.3",
+// "protocol-test-v1", "schema-2024-01") never match.
 func isSyntheticSentinelString(s string) bool {
-	const sentinel = "SYNTHETIC_"
-	if !strings.HasPrefix(s, sentinel) {
-		return false
-	}
-	if len(s) == len(sentinel) {
-		return false
-	}
-	// The remainder must be entirely [A-Z0-9_]. The Python
-	// sentinel contract uses underscores freely
-	// (SYNTHETIC_PROMPT_BODY, SYNTHETIC_OWNER_NONCE_x, etc.)
-	// and the same shape is what we want to reject in
-	// identifier slots.
-	for _, r := range s[len(sentinel):] {
-		if r != '_' && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
-			return false
-		}
-	}
-	return true
+	return syntheticSentinelPattern.MatchString(s)
 }
 
 func defaultFixtureRoot() string {

@@ -276,8 +276,16 @@ func RunPreflight(opts PreflightOptions) PreflightSummary {
 //     against the DetectVersionForCommand implementation losing
 //     malformed output by returning "" for a real parse failure.
 //
-// Tests assert the three branches independently and the
-// wrapped-command unwrap path.
+// Round-3 fix: if the command carries a `PATH=<value>` env-var
+// prefix (e.g. `env PATH=/opt/codex/bin codex app-server`),
+// the lookup must consult the prefix-augmented PATH. Without
+// the augmentation the binary resolves to whatever the
+// current process's PATH says, which can falsely report
+// ReasonCodexNotInstalled for a codex binary that exists
+// only on the operator's wrapped PATH.
+//
+// Tests assert the three branches independently, the
+// wrapped-command unwrap path, and the PATH-prefix augmentation.
 func classifyEmptyOrMalformedVersion(probeOutput, command string) PreflightReason {
 	if strings.TrimSpace(probeOutput) != "" {
 		return ReasonMalformedVersion
@@ -286,10 +294,101 @@ func classifyEmptyOrMalformedVersion(probeOutput, command string) PreflightReaso
 	if binary == "" {
 		return ReasonCodexNotInstalled
 	}
-	if _, err := exec.LookPath(binary); err != nil {
+	if _, err := lookPathWithWrapperPATH(binary, command); err != nil {
 		return ReasonCodexNotInstalled
 	}
 	return ReasonMalformedVersion
+}
+
+// lookPathWithWrapperPATH resolves binary on PATH, honoring
+// a `PATH=<value>` env-var prefix in the operator's command
+// string. If the command is
+// `env PATH=/opt/codex/bin codex app-server` and
+// `/opt/codex/bin/codex` exists, the result is the resolved
+// absolute path; if it does not exist, exec.LookPath fails
+// and the classifier reports ReasonCodexNotInstalled.
+//
+// When the command does not carry a PATH-prefix, the
+// function falls through to exec.LookPath against the
+// process's current PATH — the round-2 behaviour, kept
+// stable so the not-installed classifier does not
+// silently start honouring unrelated env-var prefixes.
+func lookPathWithWrapperPATH(binary, command string) (string, error) {
+	prefix := pathPrefixFromCommand(command)
+	if prefix == "" {
+		return exec.LookPath(binary)
+	}
+	currentPATH := os.Getenv("PATH")
+	augmented := prefix
+	if currentPATH != "" {
+		augmented = prefix + string(os.PathListSeparator) + currentPATH
+	}
+	// We only need LookPath semantics here, not full exec
+	// semantics. exec.LookPath is the standard helper, so
+	// emulate its behaviour by re-doing the search with
+	// the augmented env. Each PATH entry is checked in
+	// order; the first executable file with the right
+	// name wins.
+	for _, dir := range splitPATHList(augmented) {
+		if dir == "" {
+			continue
+		}
+		candidate := dir + string(os.PathSeparator) + binary
+		info, err := os.Stat(candidate)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			continue
+		}
+		if info.Mode()&0o111 == 0 {
+			continue
+		}
+		return candidate, nil
+	}
+	return "", exec.ErrNotFound
+}
+
+// pathPrefixFromCommand extracts a `PATH=<value>` env-var
+// prefix from a wrapper-style command. Returns the path
+// list (with all the operator's added directories) or
+// "" if no PATH prefix is present. The detection mirrors
+// isEnvAssignment so a `PATH=` token anywhere in the argv
+// is recognised.
+//
+// Examples:
+//
+//	"env PATH=/opt/bin codex"      -> "/opt/bin"
+//	"PATH=/opt/bin codex"          -> "/opt/bin"
+//	"env X=1 PATH=/a:/b codex"     -> "/a:/b"  (last wins)
+//	"env X=1 codex"                -> ""        (no PATH prefix)
+func pathPrefixFromCommand(command string) string {
+	parts := commandParts(command)
+	value := ""
+	for _, token := range parts {
+		if !isEnvAssignment(token) {
+			continue
+		}
+		eq := strings.IndexByte(token, '=')
+		if eq <= 0 {
+			continue
+		}
+		if token[:eq] != "PATH" {
+			continue
+		}
+		value = token[eq+1:]
+	}
+	return value
+}
+
+// splitPATHList yields each entry of a PATH-style list.
+// Exposed for tests so the path-splitting semantics are
+// pinned to the same algorithm exec.LookPath uses.
+func splitPATHList(pathList string) []string {
+	if pathList == "" {
+		return nil
+	}
+	return strings.Split(pathList, string(os.PathListSeparator))
 }
 
 // firstTokenOfCommand returns the leading binary token of a
@@ -416,7 +515,20 @@ func consumeWrapperFlagsFor(wrapper string) bool {
 // like a flag argument (e.g. `-E`, `-H`, `-I{}`, `--user`).
 // Used to skip past the optional flag run after a known
 // wrapper invocation.
+//
+// Round-3 fix: the empty-string case must be handled
+// explicitly. `env "" codex` and similar malformed commands
+// produce an empty token from commandParts; indexing into
+// an empty string at `token[0]` panics with index out of
+// range. The empty token is not a flag and not a binary
+// either, so we return false and let the unwrap walker
+// skip past it. The fix is two lines (the `len(token) == 0`
+// guard) but it closes a runtime crash that the round-2
+// test set did not cover.
 func isWrapperFlagToken(token string) bool {
+	if len(token) == 0 {
+		return false
+	}
 	if len(token) < 2 || token[0] != '-' || token[1] == '-' {
 		// Either too short to be a flag, or a long-form
 		// `--key=value` flag that takes a value in the
@@ -723,6 +835,14 @@ func unwrapCodexBinaryTokenForTest(command string) string {
 // be flagged).
 func isSyntheticSentinelStringForTest(s string) bool {
 	return isSyntheticSentinelString(s)
+}
+
+// pathPrefixFromCommandForTest exposes the PATH-prefix
+// extractor so the package-internal `*_test.go` can assert
+// the wrapper PATH semantics without reaching into the
+// internal helper.
+func pathPrefixFromCommandForTest(command string) string {
+	return pathPrefixFromCommand(command)
 }
 
 // scratchDirIsEmpty reports whether the path is either missing or
