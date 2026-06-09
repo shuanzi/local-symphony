@@ -218,6 +218,13 @@ func (g Generator) Generate(runID string) (string, error) {
 	// the persisted packet instead of recomputing from disk
 	// artifacts. We rebuild the safe summary with the final packet
 	// id and re-marshal review.json.
+	//
+	// PR #27 / D4 F4: after the rewrite, recompute the on-disk
+	// SHA256 + size and update the artifacts row so the metadata
+	// reflects the *post-rewrite* content. The previous
+	// implementation stamped the artifact row with the pre-rewrite
+	// SHA/size, leaving a stale metadata row out of sync with the
+	// file the next operator or Rework injector reads.
 	if safe, safeErr := BuildSafeSummaryFromIssue(g.Store, issue, run); safeErr == nil && safe != nil {
 		safe.ReviewPacketID = finalID
 		if data, rerr := os.ReadFile(reviewJSONPath); rerr == nil {
@@ -225,7 +232,17 @@ func (g Generator) Generate(runID string) (string, error) {
 			if uerr := json.Unmarshal(data, &packet); uerr == nil {
 				packet["safe_summary"] = safe
 				if jb, merr := json.MarshalIndent(packet, "", "  "); merr == nil {
-					_ = os.WriteFile(reviewJSONPath, jb, 0o644)
+					if werr := os.WriteFile(reviewJSONPath, jb, 0o644); werr == nil {
+						newSHA := sha256.Sum256(jb)
+						newSHAHex := hex.EncodeToString(newSHA[:])
+						newSize := int64(len(jb))
+						if uerr := g.Store.Project.Exec(
+							`UPDATE artifacts SET size_bytes=?, sha256=? WHERE review_packet_id=? AND kind='review_packet' AND path=?`,
+							newSize, newSHAHex, finalID, reviewJSONPath,
+						); uerr != nil {
+							return "", reviewPacketError("update review.json artifact metadata", uerr)
+						}
+					}
 				}
 			}
 		}

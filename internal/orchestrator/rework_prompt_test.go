@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -87,6 +88,99 @@ func mustReviewPacketID(t *testing.T, st *store.Store, runID string) string {
 	return row["id"].String()
 }
 
+// newReworkDispatchIssueWithGitWorkspace mirrors
+// newReworkDispatchIssue but builds a real git workspace at the
+// workspace path (so computeCumulativeDiffSHA can resolve HEAD and
+// git diff content). Used by the F1 / F2 tests.
+func newReworkDispatchIssueWithGitWorkspace(t *testing.T) (*store.Store, *core.Issue, *core.RunAttempt) {
+	t.Helper()
+	st, err := store.InitProject(t.TempDir(), "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	t.Cleanup(st.Close)
+	issue, err := st.CreateIssue(store.CreateIssueInput{
+		Title:              "Rework dispatch with git",
+		Description:        "desc",
+		AcceptanceCriteria: []string{"done"},
+		Priority:           3,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := st.TransitionIssue(issue.ID, core.StateReady, "", ""); err != nil {
+		t.Fatalf("TransitionIssue: %v", err)
+	}
+	run, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	// Real git workspace.
+	workspace := t.TempDir()
+	gitInit(t, workspace)
+	if err := os.WriteFile(filepath.Join(workspace, "app.txt"), []byte("first\n"), 0o644); err != nil {
+		t.Fatalf("write app.txt: %v", err)
+	}
+	gitCommit(t, workspace, "initial")
+	wsID, err := st.CreateOrUpdateWorkspace(issue.ID, workspace, "rework-git", "auto", "main", "base-sha")
+	if err != nil {
+		t.Fatalf("CreateOrUpdateWorkspace: %v", err)
+	}
+	if err := st.SetRunWorkspace(run.ID, wsID, "rework-git", "auto", "main", "base-sha"); err != nil {
+		t.Fatalf("SetRunWorkspace: %v", err)
+	}
+	if err := st.Project.Exec(`UPDATE issues SET state=? WHERE id=?`, string(core.StateWorking), issue.ID); err != nil {
+		t.Fatalf("force state Working: %v", err)
+	}
+	if _, err := st.InsertHandoff(issue.ID, run.ID, "payload-hash-1", map[string]any{
+		"summary":       "Initial implementation done.",
+		"changed_files": []string{"app.txt"},
+		"tests":         []string{"go test ./..."},
+		"risks":         []string{"Low"},
+		"verification":  []string{"Manual smoke test"},
+		"target_state":  "Human Review",
+	}); err != nil {
+		t.Fatalf("InsertHandoff: %v", err)
+	}
+	gen := review.Generator{Store: st}
+	if _, err := gen.Generate(run.ID); err != nil {
+		t.Fatalf("Generate review packet: %v", err)
+	}
+	if err := st.CompleteRunWithReview(run.ID, mustReviewPacketID(t, st, run.ID)); err != nil {
+		t.Fatalf("CompleteRunWithReview: %v", err)
+	}
+	if _, err := st.SendToRework(issue.ID, "Please cover the empty input edge case."); err != nil {
+		t.Fatalf("SendToRework: %v", err)
+	}
+	issue, err = st.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	return st, issue, run
+}
+
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	for _, args := range [][]string{{"init"}, {"config", "user.email", "review@example.test"}, {"config", "user.name", "Review Test"}} {
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+}
+
+func gitCommit(t *testing.T, dir, msg string) {
+	t.Helper()
+	for _, args := range [][]string{{"add", "."}, {"commit", "-m", msg}} {
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+}
+
 func TestReworkPromptIncludesLatestReviewReason(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SYMPHONY_RUNNER_KIND", "")
@@ -100,24 +194,45 @@ func TestReworkPromptIncludesLatestReviewReason(t *testing.T) {
 	if res.Run.SourceIssueState != core.StateRework {
 		t.Fatalf("source_issue_state = %s, want %s", res.Run.SourceIssueState, core.StateRework)
 	}
-	// Read the redacted prompt that the orchestrator wrote to the
-	// prompt snapshot. The fake runner surfaces the prompt it
-	// received via run events; we use that as the canonical artifact.
+	// PR #27 / D4 F2: the orchestrator no longer writes the raw
+	// rendered prompt to disk. The redacted prompt file is
+	// metadata-only. We verify the rework injection took place by
+	// reading the rework_snapshots row (which carries the
+	// post-injection prompt hash) and the safe_summary_sha256.
+	rec, err := st.GetReworkSnapshot(res.Run.ID)
+	if err != nil {
+		t.Fatalf("GetReworkSnapshot: %v", err)
+	}
+	if rec.ReviewReason != "Please cover the empty input edge case." {
+		t.Fatalf("rework snapshot review reason = %q, want %q", rec.ReviewReason, "Please cover the empty input edge case.")
+	}
+	if rec.SafeSummarySHA256 == "" {
+		t.Fatal("rework snapshot SafeSummarySHA256 is empty")
+	}
+	if rec.PromptHash == "" {
+		t.Fatal("rework snapshot PromptHash is empty")
+	}
+	// And the redacted prompt file on disk must be metadata-only.
 	promptPath := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, res.Run.ID, "prompt", "rework_prompt.redacted.md")
 	data, err := os.ReadFile(promptPath)
 	if err != nil {
 		t.Fatalf("read redacted prompt: %v", err)
 	}
 	prompt := string(data)
-	if !strings.Contains(prompt, "Please cover the empty input edge case.") {
-		t.Fatalf("prompt missing review reason\n---\n%s\n---", prompt)
+	if !strings.Contains(prompt, "metadata-only") {
+		t.Fatalf("redacted prompt is not metadata-only\n---\n%s\n---", prompt)
 	}
-	// Safe summary marker should also be present.
-	if !strings.Contains(prompt, "Previous Review Packet (Safe Summary)") {
-		t.Fatalf("prompt missing safe summary header\n---\n%s\n---", prompt)
-	}
-	if !strings.Contains(prompt, "Initial implementation done.") {
-		t.Fatalf("prompt missing safe summary prose\n---\n%s\n---", prompt)
+	// The on-disk file MUST NOT contain any leaked raw prompt
+	// prose (issue description, review reason prose, safe summary
+	// markdown).
+	for _, marker := range []string{
+		"Please cover the empty input edge case.",
+		"Initial implementation done.",
+		"# Previous Review Packet (Safe Summary)",
+	} {
+		if strings.Contains(prompt, marker) {
+			t.Fatalf("redacted prompt leaked raw prompt marker %q\n---\n%s\n---", marker, prompt)
+		}
 	}
 }
 
@@ -166,7 +281,12 @@ func TestReworkPromptSnapshotExcludesRawArtifactMarkers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DispatchIssue: %v", err)
 	}
-	promptPath := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, res.Run.ID, "prompt", "rendered_prompt.redacted.md")
+	// PR #27 / D4 F2: rework dispatches write a metadata-only
+	// `rework_prompt.redacted.md` artifact; the test must inspect
+	// that file (not `rendered_prompt.redacted.md`, which is only
+	// written on non-rework dispatches and later overwritten by the
+	// review packet generator).
+	promptPath := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, res.Run.ID, "prompt", "rework_prompt.redacted.md")
 	data, err := os.ReadFile(promptPath)
 	if err != nil {
 		t.Fatalf("read prompt: %v", err)
@@ -259,6 +379,93 @@ func TestReworkPromptDeterministicAcrossRuns(t *testing.T) {
 	}
 	if row["rendered_prompt_hash"].String() != rec.PromptHash {
 		t.Fatalf("prompt_snapshots.rendered_prompt_hash = %q, rework_snapshots.prompt_hash = %q", row["rendered_prompt_hash"].String(), rec.PromptHash)
+	}
+}
+
+// TestCumulativeDiffHashCoversUncommittedChanges verifies that two
+// rework snapshots taken against the same base + HEAD SHA but with
+// different uncommitted worktree contents produce different
+// cumulative_diff_sha values. The previous hash-only-base+HEAD
+// scheme collapsed dirty worktree states to the same value, hiding
+// agent-applied-but-uncommitted work from prompt/diagnostic
+// correlation.
+func TestCumulativeDiffHashCoversUncommittedChanges(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_RUNNER_KIND", "")
+	st, issue, prev := newReworkDispatchIssueWithGitWorkspace(t)
+
+	// Snapshot #1: clean worktree (prev already wrote a commit).
+	hashClean := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha")
+	if hashClean == "" {
+		t.Fatal("cumulative diff SHA is empty for clean worktree")
+	}
+
+	// Snapshot #2: agent leaves uncommitted work — untracked file plus
+	// modified tracked file. The hash must differ.
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, "uncommitted.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write uncommitted: %v", err)
+	}
+	hashDirty := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha")
+	if hashDirty == "" {
+		t.Fatal("cumulative diff SHA is empty for dirty worktree")
+	}
+	if hashDirty == "" {
+		t.Fatal("cumulative diff SHA is empty for dirty worktree")
+	}
+	if hashDirty == hashClean {
+		t.Fatalf("cumulative_diff_sha collapsed dirty worktree to clean hash (%q == %q)", hashDirty, hashClean)
+	}
+}
+
+// TestRedactedArtifactDoesNotContainRawPrompt verifies that the
+// rework-prompt redacted artifact written under
+// .symphony/artifacts/<identifier>/<run>/prompt/rework_prompt.redacted.md
+// never contains the raw rendered prompt body. The previous
+// implementation wrote "[redacted]\n" + the full rendered prompt;
+// that violates the raw-prompt logging boundary (a rendered prompt
+// can echo issue description + workflow prompt) and a rework run
+// that fails before the review packet is generated leaves the file
+// on disk for the next operator.
+func TestRedactedArtifactDoesNotContainRawPrompt(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_RUNNER_KIND", "")
+	st, issue, _ := newReworkDispatchIssue(t)
+
+	// The Rework dispatch writes the redacted artifact at the
+	// prompt-rendering step (before the agent runs). Simulate the
+	// fail-before-review-packet case by inspecting the artifact
+	// written for the first rework run.
+	res, err := (Orchestrator{Store: st}).DispatchIssue(issue.Identifier, "manual")
+	if err != nil {
+		t.Fatalf("DispatchIssue: %v", err)
+	}
+	promptPath := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, res.Run.ID, "prompt", "rework_prompt.redacted.md")
+	data, err := os.ReadFile(promptPath)
+	if err != nil {
+		t.Fatalf("read redacted prompt artifact: %v", err)
+	}
+	body := string(data)
+	// A redacted artifact MUST NOT contain a body of the rendered
+	// prompt. We assert this by checking the file is small
+	// (metadata-only) and contains redaction metadata.
+	if len(body) > 2048 {
+		t.Fatalf("redacted artifact is too large (%d bytes); must be metadata-only, not raw prompt\n---\n%s\n---", len(body), body)
+	}
+	if !strings.Contains(body, "redacted") && !strings.Contains(body, "metadata") {
+		t.Fatalf("redacted artifact missing redaction marker\n---\n%s\n---", body)
+	}
+	// And MUST NOT contain any of the markers from the actual
+	// rendered prompt (issue title, previous review reason prose,
+	// or safe summary markdown).
+	for _, marker := range []string{
+		"Please cover the empty input edge case.", // review reason prose
+		"Initial implementation done.",             // handoff summary
+		"# Previous Review Packet (Safe Summary)",  // safe summary header
+	} {
+		if strings.Contains(body, marker) {
+			t.Fatalf("redacted artifact leaked raw prompt marker %q\n---\n%s\n---", marker, body)
+		}
 	}
 }
 

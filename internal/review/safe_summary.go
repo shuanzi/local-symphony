@@ -108,7 +108,38 @@ func BuildSafeSummaryFromIssue(s *store.Store, issue *core.Issue, run *core.RunA
 	if run == nil {
 		return nil, core.NewError(core.ErrReviewPacketRequired, "run is nil", nil)
 	}
-	packet, err := latestReviewPacketForRun(s, issue, run)
+	return buildSafeSummaryFromIssueCore(s, issue, run, nil)
+}
+
+// BuildSafeSummaryFromIssueWithPrev is the D4 / R16 rework-aware
+// variant. When `prev` is non-nil the safe summary is projected
+// from the *previous* run's review packet and run_attempts row —
+// because a Rework-dispatched run has no review packet of its own
+// yet, and using the current run's source_issue_state would corrupt
+// the snapshot (the current run is in Rework state by definition).
+// Callers MUST pass `prev` whenever they have it (the orchestrator's
+// rework injector always does).
+func BuildSafeSummaryFromIssueWithPrev(s *store.Store, issue *core.Issue, run *core.RunAttempt, prev *core.RunAttempt) (*SafeSummary, error) {
+	if issue == nil {
+		return nil, core.NewError(core.ErrReviewPacketRequired, "issue is nil", nil)
+	}
+	if run == nil {
+		return nil, core.NewError(core.ErrReviewPacketRequired, "run is nil", nil)
+	}
+	return buildSafeSummaryFromIssueCore(s, issue, run, prev)
+}
+
+// buildSafeSummaryFromIssueCore is the shared projection path. When
+// prev is non-nil the function reads the previous run's review
+// packet, run_attempts row, and source_issue_state, then returns a
+// SafeSummary that reflects the *previous* dispatch's state. When
+// prev is nil the function falls back to the current run.
+func buildSafeSummaryFromIssueCore(s *store.Store, issue *core.Issue, run *core.RunAttempt, prev *core.RunAttempt) (*SafeSummary, error) {
+	sourceRun := run
+	if prev != nil {
+		sourceRun = prev
+	}
+	packet, err := latestReviewPacketForRun(s, issue, sourceRun)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +147,7 @@ func BuildSafeSummaryFromIssue(s *store.Store, issue *core.Issue, run *core.RunA
 		ReviewPacketID:   packet["id"].String(),
 		PacketNo:         packet["packet_no"].Int(),
 		RunID:            packet["run_id"].String(),
-		SourceIssueState: string(run.SourceIssueState),
+		SourceIssueState: string(sourceRun.SourceIssueState),
 		Status:           packet["status"].String(),
 		CreatedAt:        packet["created_at"].String(),
 	}
@@ -427,25 +458,41 @@ func safeSummaryApprovalCount(s *store.Store, runID string) int {
 
 // scanRefusalKind returns the matching raw-artifact marker if any of
 // the blocklist tokens are present in raw. The check is case
-// insensitive and matches at word boundaries so legitimate text like
-// "tools called" or "codex launch" do not false-positive.
+// insensitive and matches at token boundaries so legitimate text
+// like "tools called", "codex launch", or paths like
+// "internal/secrets/store.go" do not false-positive (the token
+// "secrets" must appear as a stand-alone marker, not embedded in a
+// path segment or identifier). PR #27 / D4 F5.
 func scanRefusalKind(raw string) string {
 	low := strings.ToLower(raw)
 	for _, kind := range refusalKindBlocklist() {
-		if containsCI(low, kind) {
+		if containsCIToken(low, kind) {
 			return kind
 		}
 	}
 	return ""
 }
 
-func containsCI(haystack, needle string) bool {
+func containsCIToken(haystack, needle string) bool {
 	if needle == "" {
 		return true
 	}
 	hl := len(haystack)
 	nl := len(needle)
 	for i := 0; i+nl <= hl; i++ {
+		// Left boundary: the character immediately before the
+		// match (if any) must be a "boundary" character
+		// (whitespace or sentence punctuation). '/' '_' '-' and
+		// alnum bytes are NOT treated as boundaries so substrings
+		// inside paths/identifiers do not false-positive.
+		// PR #27 / D4 F5.
+		if i > 0 && !isBoundaryByteCI(haystack[i-1]) {
+			continue
+		}
+		// Right boundary: same rule.
+		if i+nl < hl && !isBoundaryByteCI(haystack[i+nl]) {
+			continue
+		}
 		match := true
 		for j := 0; j < nl; j++ {
 			a := haystack[i+j]
@@ -464,6 +511,30 @@ func containsCI(haystack, needle string) bool {
 		if match {
 			return true
 		}
+	}
+	return false
+}
+
+// isBoundaryByteCI reports whether b is a "boundary" byte — a
+// whitespace, sentence punctuation, or structural delimiter that
+// separates tokens in human-readable prose. It is intentionally
+// *not* a path/identifier boundary detector: '/' '_' '-' and alnum
+// bytes are treated as non-boundary so substrings like "secrets"
+// or "prompt_snapshot" inside paths or identifiers do not match
+// the raw-artifact blocklist. PR #27 / D4 F5.
+func isBoundaryByteCI(b byte) bool {
+	if b >= 'A' && b <= 'Z' {
+		b += 32
+	}
+	switch b {
+	case ' ', '\t', '\n', '\r', '\f', '\v':
+		return true
+	case '.', ',', ';', ':', '!', '?':
+		return true
+	case '(', ')', '[', ']', '{', '}':
+		return true
+	case '"', '\'', '`':
+		return true
 	}
 	return false
 }

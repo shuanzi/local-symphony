@@ -176,12 +176,20 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("rework context: %v", reworkErr), core.RunFailed)
 			return nil
 		}
-		// Write the redacted prompt + meta so diagnostics and tests
-		// can introspect what the agent received. We use a dedicated
-		// `rework_prompt.redacted.md` filename so the review packet
-		// generator (which overwrites rendered_prompt.redacted.md)
-		// does not clobber this artifact.
-		if err := os.WriteFile(filepath.Join(promptDir, "rework_prompt.redacted.md"), []byte("[redacted]\n"+prompt), 0o644); err != nil {
+		// Write a metadata-only redacted artifact (NOT the raw
+		// rendered prompt). PR #27 / D4 F2: the previous
+		// implementation wrote "[redacted]\n" + the full rendered
+		// prompt body, violating the raw-prompt logging boundary
+		// (rendered prompts can echo issue description + workflow
+		// prompt). When a Rework run failed before the review
+		// packet was generated, the file stayed on disk for the
+		// next operator — and the review packet generator never
+		// overwrites this dedicated rework artifact.
+		promptLen := len(prompt)
+		promptHashBytes := sha256.Sum256([]byte(prompt))
+		promptHashHex := hex.EncodeToString(promptHashBytes[:])
+		redactedMeta := fmt.Sprintf("# redacted\n\nThe rendered rework prompt is not persisted to disk in raw form.\n\n- redaction: metadata-only\n- prompt_length_bytes: %d\n- prompt_sha256: %s\n- review_reason_redacted: false (see rework_snapshots row)\n", promptLen, promptHashHex)
+		if err := os.WriteFile(filepath.Join(promptDir, "rework_prompt.redacted.md"), []byte(redactedMeta), 0o644); err != nil {
 			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("write redacted rework prompt: %v", err), core.RunFailed)
 			return nil
 		}
@@ -196,7 +204,15 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 			_, _ = o.Store.CreateReworkSnapshot(reworkRec)
 		}
 	} else {
-		_ = os.WriteFile(filepath.Join(promptDir, "rendered_prompt.redacted.md"), []byte("[redacted]\n"+prompt), 0o644)
+		// PR #27 / D4 F2: write a metadata-only redacted artifact
+		// (not the raw rendered prompt). The previous implementation
+		// wrote the full rendered prompt body; a redaction label
+		// does not satisfy the raw-prompt logging boundary.
+		promptLen := len(prompt)
+		promptHashBytes := sha256.Sum256([]byte(prompt))
+		promptHashHex := hex.EncodeToString(promptHashBytes[:])
+		redactedMeta := fmt.Sprintf("# redacted\n\nThe rendered prompt is not persisted to disk in raw form.\n\n- redaction: metadata-only\n- prompt_length_bytes: %d\n- prompt_sha256: %s\n", promptLen, promptHashHex)
+		_ = os.WriteFile(filepath.Join(promptDir, "rendered_prompt.redacted.md"), []byte(redactedMeta), 0o644)
 		ph := sha256.Sum256([]byte(prompt))
 		ch := sha256.Sum256([]byte(issue.ID + runID))
 		_, _ = o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), promptRoot)
@@ -345,15 +361,16 @@ func (o Orchestrator) injectReworkContext(issue *core.Issue, run *core.RunAttemp
 	if strings.TrimSpace(reason) == "" {
 		reason = "manual_rework"
 	}
-	summary, err := review.BuildSafeSummaryFromRun(o.Store, run.ID)
+	// PR #27 / D4 F3: when the previous run is known, build the
+	// safe summary directly from it. The previous implementation
+	// tried the current run first and only fell back to the
+	// previous run on error; that meant a Rework-dispatched run
+	// (SourceIssueState=Rework, no review packet of its own) would
+	// surface a SafeSummary stamped with the *current* run's
+	// source_issue_state — corrupting snapshot metadata.
+	summary, err := review.BuildSafeSummaryFromIssueWithPrev(o.Store, issue, run, prevRun)
 	if err != nil {
-		// Fallback: try the previous run.
-		if prev != nil {
-			summary, err = review.BuildSafeSummaryFromRun(o.Store, prev.ID)
-		}
-		if err != nil {
-			return "", "", emptyRec, fmt.Errorf("build safe summary: %w", err)
-		}
+		return "", "", emptyRec, fmt.Errorf("build safe summary: %w", err)
 	}
 	if reviewPacketID == "" {
 		reviewPacketID = summary.ReviewPacketID
@@ -398,7 +415,15 @@ func (o Orchestrator) computeCumulativeDiffSHA(issue *core.Issue, run *core.RunA
 	if head == "" {
 		return ""
 	}
-	h := sha256.Sum256([]byte(baseSHA + "\x00" + head))
+	// PR #27 / D4 F1: incorporate the worktree's uncommitted state
+	// (status --porcelain + diff content) into the cumulative diff
+	// SHA. Without this, two reworks taken against the same
+	// base+HEAD but with different uncommitted agent work produce
+	// identical cumulative_diff_sha values, which breaks prompt /
+	// diagnostic correlation between successive reworks.
+	statusOut, _ := exec.Command("git", "-C", root, "status", "--porcelain=v1", "-z", "-uall").Output()
+	diffOut, _ := exec.Command("git", "-C", root, "diff", "HEAD").Output()
+	h := sha256.Sum256([]byte(baseSHA + "\x00" + head + "\x00" + string(statusOut) + "\x00" + string(diffOut)))
 	return hex.EncodeToString(h[:])
 }
 

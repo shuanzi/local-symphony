@@ -45,6 +45,14 @@ func TestSafeSummarySealIsDeterministicAndExcludesRawRefusalKinds(t *testing.T) 
 }
 
 func TestSafeSummaryScanForRawArtifactsRejectsRefusalKindTokens(t *testing.T) {
+	// PR #27 / D4 F5: the raw-artifact blocklist is matched at
+	// strict token boundaries (whitespace or sentence punctuation).
+	// A path-like ChangedFiles entry such as "raw_prompt/x.txt"
+	// is NOT a raw artifact marker — the substring is embedded in
+	// a larger identifier. We assert whitespace-bounded prose
+	// (e.g. "leaked <kind> token") still trips the blocklist, and
+	// the path-bounded case is covered by
+	// TestSafeSummaryAllowsSecretPathAsChangedFile above.
 	cases := []struct {
 		name  string
 		field string
@@ -68,7 +76,11 @@ func TestSafeSummaryScanForRawArtifactsRejectsRefusalKindTokens(t *testing.T) {
 			case "risks":
 				s.Risks = []string{"risk: " + tc.kind}
 			case "changed_files":
-				s.ChangedFiles = []string{tc.kind + "/x.txt"}
+				// Whitespace-bounded prose inside a ChangedFiles
+				// entry is still a leak; the path-like
+				// "raw_prompt/x.txt" case is asserted in
+				// TestSafeSummaryAllowsSecretPathAsChangedFile.
+				s.ChangedFiles = []string{tc.kind + " helper.go"}
 			case "diffstat":
 				s.Diffstat = tc.kind + " line"
 			case "how_to_continue":
@@ -263,6 +275,67 @@ func TestBuildSafeSummaryRendersValidJSON(t *testing.T) {
 		if _, ok := roundtrip[key]; !ok {
 			t.Fatalf("json missing key %q", key)
 		}
+	}
+}
+
+// TestReworkSafeSummaryUsesPreviousRunFields verifies that when a
+// Rework dispatch (current run has no review packet yet) is being
+// prepared and the orchestrator passes a `prev` pointer to
+// BuildSafeSummaryFromIssue, the resulting summary carries the
+// *previous* run's source_issue_state and run_id, not the current
+// run's. The previous implementation always read the current
+// run's SourceIssueState, so the first Rework after a Ready run
+// rendered a safe summary stamped with the current Rework state —
+// corrupting the snapshot metadata used by downstream diagnostics.
+func TestReworkSafeSummaryUsesPreviousRunFields(t *testing.T) {
+	st := newReviewTestStore(t)
+	issue, prev := prepareReviewRun(t, st)
+	if _, err := (Generator{Store: st}).Generate(prev.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// Force prev's source_issue_state to a known value so we can
+	// assert it is preserved on the rework safe summary.
+	if err := st.Project.Exec(`UPDATE run_attempts SET source_issue_state=? WHERE id=?`, string(core.StateReady), prev.ID); err != nil {
+		t.Fatalf("force prev SourceIssueState: %v", err)
+	}
+	// Move the issue into Human Review and Rework so a new run can
+	// be claimed for the rework dispatch. CompleteRunWithReview is
+	// the orchestrator's review-packet-completion path; it
+	// transitions Working -> Human Review and is the state SendToRework
+	// requires as its precondition.
+	rpID := mustReviewPacketIDForRun(t, st, prev.ID)
+	if err := st.CompleteRunWithReview(prev.ID, rpID); err != nil {
+		t.Fatalf("CompleteRunWithReview: %v", err)
+	}
+	if _, err := st.SendToRework(issue.ID, "rework test"); err != nil {
+		t.Fatalf("SendToRework: %v", err)
+	}
+	cur, err := st.ClaimRun(issue.ID, "manual", "fake", 1)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	if err := st.Project.Exec(`UPDATE run_attempts SET source_issue_state=? WHERE id=?`, string(core.StateRework), cur.ID); err != nil {
+		t.Fatalf("force cur SourceIssueState: %v", err)
+	}
+	curLoaded, err := st.GetRun(cur.ID)
+	if err != nil {
+		t.Fatalf("GetRun cur: %v", err)
+	}
+	issue, err = st.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	// Pass prev into the safe summary builder; it should pick up
+	// the *previous* run's source_issue_state.
+	summary, err := BuildSafeSummaryFromIssueWithPrev(st, issue, curLoaded, prev)
+	if err != nil {
+		t.Fatalf("BuildSafeSummaryFromIssueWithPrev: %v", err)
+	}
+	if summary.SourceIssueState != string(core.StateReady) {
+		t.Fatalf("SourceIssueState = %q, want %q (rework safe summary must use prev run fields)", summary.SourceIssueState, core.StateReady)
+	}
+	if summary.RunID != prev.ID {
+		t.Fatalf("RunID = %q, want %q (rework safe summary must use prev run id)", summary.RunID, prev.ID)
 	}
 }
 
