@@ -1062,11 +1062,15 @@ components:
     DiagnosticsCodex:
       type: object
       additionalProperties: false
-      required: [available, version, support]
+      required: [available, version, support, metadata, fixture_support, last_preflight, warning]
       properties:
         available: { type: boolean }
         version: { type: [string, 'null'] }
         support: { $ref: '#/components/schemas/DiagnosticsCodexSupport' }
+        metadata: { $ref: '#/components/schemas/DiagnosticsCodexMetadata' }
+        fixture_support: { $ref: '#/components/schemas/DiagnosticsCodexFixtureSupport' }
+        last_preflight: { $ref: '#/components/schemas/DiagnosticsCodexPreflight' }
+        warning: { type: [string, 'null'] }
     DiagnosticsCodexSupport:
       type: object
       additionalProperties: false
@@ -1075,6 +1079,40 @@ components:
         cli: { $ref: '#/components/schemas/DiagnosticsSupportStatus' }
         model: { $ref: '#/components/schemas/DiagnosticsSupportStatus' }
         sandbox: { $ref: '#/components/schemas/DiagnosticsSupportStatus' }
+    DiagnosticsCodexMetadata:
+      type: [object, 'null']
+      additionalProperties: false
+      required: [codex_version, protocol_version, schema_version, experimental_api, supported_notifications, supported_requests]
+      properties:
+        codex_version: { type: string, minLength: 1 }
+        protocol_version: { type: string, minLength: 1 }
+        schema_version: { type: string, minLength: 1 }
+        experimental_api: { type: boolean }
+        supported_notifications:
+          type: array
+          items: { type: string, minLength: 1 }
+        supported_requests:
+          type: array
+          items: { type: string, minLength: 1 }
+    DiagnosticsCodexFixtureSupport:
+      type: object
+      additionalProperties: false
+      required: [schema_available, metadata_available, transcript_available]
+      properties:
+        schema_available: { type: boolean }
+        metadata_available: { type: boolean }
+        transcript_available: { type: boolean }
+    DiagnosticsCodexPreflight:
+      type: object
+      additionalProperties: false
+      required: [ran_at, available, failure_code, failure_reason, failure_message]
+      properties:
+        ran_at: { type: string, format: date-time }
+        available: { type: boolean }
+        failure_code: { type: [string, 'null'] }
+        failure_reason:
+          enum: [malformed_version, missing_fixture, missing_metadata, malformed_metadata, metadata_codex_version_mismatch, experimental_api_not_supported, metadata_missing_codex_version, metadata_missing_protocol_version, metadata_missing_schema_version, metadata_missing_supported_notifications, metadata_missing_supported_requests, missing_schema_fixture, missing_transcript_fixture, invalid_transcript_fixture, codex_not_installed, unknown]
+        failure_message: { type: [string, 'null'] }
     DiagnosticsSupportStatus:
       enum: [supported, unsupported, unknown]
     DiagnosticsGit:
