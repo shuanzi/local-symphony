@@ -247,7 +247,7 @@ func (s *Server) state(w http.ResponseWriter) {
 		"repo_root":  s.Store.RepoRoot,
 		"issues":     issues,
 		"runs":       runs,
-		"codex":      observability.CodexAvailability(),
+		"codex":      observability.CodexAvailability(s.Store.RepoRoot),
 	})
 }
 func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {

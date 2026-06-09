@@ -477,6 +477,75 @@ func TestRunPreflightScrubberStripsSentinels(t *testing.T) {
 	}
 }
 
+// TestCodexScrubCatchesSentinelAfterUnderscore is the round-5
+// (PR #24 review) F3 regression: a poisoned fixture that
+// plants a synthetic-sentinel-shaped substring after an
+// underscore (e.g. `protocol_SYNTHETIC_PROMPT_BODY`,
+// `schema_SYNTHETIC_API_SECRET`) must be redacted to
+// `[REDACTED]`, not echoed verbatim into the diagnostics
+// envelope. The previous detector used a `\b...\b` regex
+// (matching word boundaries), and `_` is a word character,
+// so the boundary did NOT match before an underscore — the
+// detector considered `protocol_SYNTHETIC_PROMPT_BODY` a
+// legitimate identifier and the redaction scrubber left it
+// alone. The fix extends the unsafe boundary set to also
+// include `_`, so a sentinel preceded by an underscore is
+// still flagged. The `syntheticSentinelPattern` in codex.go
+// and the contract validator's `SYNTHETIC_SENTINEL_RE` must
+// agree; the previous shape is preserved for non-underscore
+// boundaries (start-of-string, end-of-string, dash, etc.)
+// and the underscore case is added as a new boundary. Tests
+// pin both the detector (a `protocol_SYNTHETIC_*` value must
+// be flagged) and the scrubber (the raw substring must
+// become `[REDACTED]`).
+func TestCodexScrubCatchesSentinelAfterUnderscore(t *testing.T) {
+	// Detector level: a `protocol_SYNTHETIC_PROMPT_BODY`
+	// value must be recognised as a sentinel. Without the
+	// round-5 fix the regex `\bSYNTHETIC_[A-Z0-9_]+\b` would
+	// not match the embedded sentinel because the leading
+	// `_` is a word character and `\b` requires a non-word
+	// / word transition.
+	if !isSyntheticSentinelStringForTest("protocol_SYNTHETIC_PROMPT_BODY") {
+		t.Fatalf("detector must flag protocol_SYNTHETIC_PROMPT_BODY (sentinel preceded by underscore)")
+	}
+	if !isSyntheticSentinelStringForTest("schema_SYNTHETIC_API_SECRET") {
+		t.Fatalf("detector must flag schema_SYNTHETIC_API_SECRET (sentinel preceded by underscore)")
+	}
+	// Scrubber level: a poisoned compatibility.json whose
+	// protocol_version carries the underscored sentinel must
+	// be redacted end-to-end. The fixture is rejected by
+	// the gate (sentinel-shaped protocol_version) so the
+	// preflight returns a failure summary, but the failure
+	// details (which include the value the validator saw)
+	// must NOT carry the raw sentinel.
+	scrubbed := scrubbedForDiagnostics("protocol_SYNTHETIC_PROMPT_BODY")
+	if strings.Contains(scrubbed, "SYNTHETIC_PROMPT_BODY") {
+		t.Fatalf("scrubber left the sentinel intact in %q", scrubbed)
+	}
+	if !strings.Contains(scrubbed, "[REDACTED]") {
+		t.Fatalf("scrubber output should contain [REDACTED], got: %q", scrubbed)
+	}
+	// And the redaction must also flow through the
+	// failureDetailsForTest path so a poisoned detail
+	// value never leaks through diagnostics.
+	details := map[string]any{
+		"protocol_version": "protocol_SYNTHETIC_PROMPT_BODY",
+		"schema_version":   "schema_SYNTHETIC_API_SECRET",
+		"safe_value":       "1.2.3",
+	}
+	out := failureDetailsForTest(details)
+	b, _ := json.Marshal(out)
+	body := string(b)
+	for _, sentinel := range []string{"SYNTHETIC_PROMPT_BODY", "SYNTHETIC_API_SECRET"} {
+		if strings.Contains(body, sentinel) {
+			t.Fatalf("redacted failure details still leak sentinel %q: %s", sentinel, body)
+		}
+	}
+	if !strings.Contains(body, "1.2.3") {
+		t.Fatalf("redacted output should preserve non-sentinel values, got: %s", body)
+	}
+}
+
 func TestAllPreflightReasonsCoversStableSet(t *testing.T) {
 	all := AllPreflightReasons()
 	if len(all) == 0 {
@@ -1096,14 +1165,27 @@ func TestVerifyPanicTeamLeadRepro(t *testing.T) {
 }
 
 // TestVerifyEmbeddedSentinelTeamLeadRepro is the team-lead
-// repro of the round-3 P1 embedded-sentinel finding. The
-// detector must agree with the Python contract validator
-// regex 'r"\bSYNTHETIC_[A-Z0-9_]+\b"' on every case
-// team-lead independently verified: embedded sentinels
-// (with '-' on either side) match; bare 'vSYNTHETIC_OWNER_NONCE'
-// does not (because 'v' and '_' are both word characters
-// and there is no boundary between them); plain versions
-// do not.
+// repro of the round-3 P1 embedded-sentinel finding,
+// extended for the round-5 F3 sentinel-after-underscore
+// finding. The detector must agree with the Python
+// contract validator regex 'r"\bSYNTHETIC_[A-Z0-9_]+\b"'
+// for the cases team-lead independently verified under
+// the round-3 contract (embedded sentinels with '-' on
+// either side match; plain versions do not), and the
+// round-5 widening adds two more positive cases:
+// `protocol_SYNTHETIC_PROMPT_BODY` (sentinel preceded by
+// underscore) and `vSYNTHETIC_OWNER_NONCE` (sentinel
+// preceded by a lowercase letter) are both flagged.
+// The previous team-lead case
+// `vSYNTHETIC_OWNER_NONCE: false` was the round-3
+// word-boundary argument; the round-5 detector widens
+// the prefix boundary to "not in [A-Z0-9]" so an
+// underscore OR a lowercase letter before the `S` is
+// also a valid boundary. This is the runtime gate's
+// stricter position vs. the Python contract regex
+// (which the contract validator uses for redaction
+// golden fixture validation, a different threat
+// surface).
 func TestVerifyEmbeddedSentinelTeamLeadRepro(t *testing.T) {
 	cases := []struct {
 		value    string
@@ -1111,7 +1193,13 @@ func TestVerifyEmbeddedSentinelTeamLeadRepro(t *testing.T) {
 	}{
 		{value: "protocol-SYNTHETIC_PROMPT_BODY-v1", sentinel: true},
 		{value: "schema-SYNTHETIC_LOG", sentinel: true},
-		{value: "vSYNTHETIC_OWNER_NONCE", sentinel: false},
+		// Round-5 widening: a sentinel preceded by an
+		// underscore or a lowercase letter is now a
+		// positive match. The runtime gate treats
+		// both as a valid prefix boundary.
+		{value: "vSYNTHETIC_OWNER_NONCE", sentinel: true},
+		{value: "protocol_SYNTHETIC_PROMPT_BODY", sentinel: true},
+		{value: "schema_SYNTHETIC_API_SECRET", sentinel: true},
 		{value: "protocol-test-v1", sentinel: false},
 		{value: "1.2.3", sentinel: false},
 	}

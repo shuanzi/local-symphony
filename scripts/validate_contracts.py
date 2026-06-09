@@ -425,6 +425,33 @@ def assert_enum(schema: dict[str, Any], label: str, expected: tuple[str, ...]) -
         fail(f"{label}.enum must be {list(expected)}")
 
 
+def unwrap_one_of_enum(schema: dict[str, Any], label: str) -> dict[str, Any]:
+    """Return the enum branch of a `oneOf` schema that
+    allows either JSON null or one of a closed enum.
+
+    The F1 (round-5) fix changes `failure_reason` to
+    surface as JSON null on the success path. The schema
+    declares the field as
+    `{"oneOf": [{"type": "null"}, {"enum": [...]}]}`.
+    The contract validator's `assert_enum` only inspects
+    a flat enum schema, so this helper walks the `oneOf`
+    and returns the enum branch. If the schema is not
+    a `oneOf` of null-and-enum, the helper returns the
+    input unchanged and the caller will surface a
+    contract mismatch as before.
+    """
+    one_of = schema.get("oneOf")
+    if not isinstance(one_of, list):
+        return schema
+    for branch in one_of:
+        if not isinstance(branch, dict):
+            continue
+        if "enum" in branch:
+            return branch
+    fail(f"{label} oneOf has no enum branch; expected null-or-enum")
+    return schema
+
+
 def assert_non_blank_string_schema(schema: Any, label: str) -> None:
     if (
         not isinstance(schema, dict)
@@ -901,8 +928,22 @@ def validate_diagnostics_schema_contract() -> None:
         require_dict(codex_preflight.get("properties"), "schemas/diagnostics.schema.json.$defs.codexPreflight.properties").get("failure_reason"),
         "schemas/diagnostics.schema.json.$defs.codexPreflight.properties.failure_reason",
     )
-    assert_enum(
+    # F1 (round-5 review): the success path emits
+    # `failure_reason: null` (Go nil), not the empty
+    # string. The schema declares the field as a `oneOf`
+    # of `null` and the canonical failure enum, so the
+    # contract validator walks the oneOf and pulls the
+    # enum branch. Without the unwrap, the validator
+    # would either fail (because the outer shape is
+    # `oneOf`, not `enum`) or silently accept any
+    # failure_reason string (because the outer
+    # `oneOf` has no enum member).
+    preflight_reason_enum = unwrap_one_of_enum(
         preflight_reason_schema,
+        "schemas/diagnostics.schema.json.$defs.codexPreflight.properties.failure_reason",
+    )
+    assert_enum(
+        preflight_reason_enum,
         "schemas/diagnostics.schema.json.$defs.codexPreflight.properties.failure_reason",
         DIAGNOSTICS_CODEX_FAILURE_REASON_ENUM,
     )
@@ -1096,8 +1137,17 @@ def validate_openapi_diagnostics_contract(data: dict[str, Any]) -> None:
         require_dict(codex_preflight.get("properties"), "OpenAPI DiagnosticsCodexPreflight.properties").get("failure_reason"),
         "OpenAPI DiagnosticsCodexPreflight.properties.failure_reason",
     )
-    assert_enum(
+    # F1 (round-5 review): see the matching comment in
+    # validate_diagnostics_schema_contract. The OpenAPI
+    # mirror is the same `oneOf`-of-`null`-and-enum
+    # shape, so the contract validator unwraps the
+    # oneOf before checking the enum membership.
+    openapi_preflight_reason_enum = unwrap_one_of_enum(
         openapi_preflight_reason,
+        "OpenAPI DiagnosticsCodexPreflight.properties.failure_reason",
+    )
+    assert_enum(
+        openapi_preflight_reason_enum,
         "OpenAPI DiagnosticsCodexPreflight.properties.failure_reason",
         DIAGNOSTICS_CODEX_FAILURE_REASON_ENUM,
     )

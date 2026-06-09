@@ -240,7 +240,7 @@ func statusData(st *store.Store) (any, error) {
 		"repo_root":  st.RepoRoot,
 		"issues":     issues,
 		"runs":       runs,
-		"codex":      observability.CodexAvailability(),
+		"codex":      observability.CodexAvailability(st.RepoRoot),
 	}, nil
 }
 
