@@ -102,6 +102,22 @@
 - 本次未引入 `symphony review path --json` 形态，CLI 仍走 `Main` → `printResult` → `ok(...)`，shape 与 v1.1 之前保持一致；openapi/contract 校验未新增 CLI 形态校验。
 - OpenAPI `ReviewPacketSummary` 加 `additionalProperties: true` 以兼容老 daemon（v1.1 WIP 之前的 C3 行为），不破坏 v1.1 客户端。
 
+## v1.1 WIP 收口决策（D1 / R10）
+
+D1 / R10 在 v1 阶段经历了 codex review 2 轮：
+
+- **Round 1**（在 commit `2cc1888` 上跑）落 3 finding（0 P1 + 2 P2 + 1 P3），已在 commit `0aee74c` 修毕：per-artifact `raw_*_exposed` schema 声明、local store `safeContainedPath` 补 `EvalSymlinks`、OpenAPI `ReviewPacketSummary` 加 `git` 字段。
+- **Round 2**（在 commit `0aee74c` 上跑）落 3 finding（1 P1 + 2 P2 regression，全部为 R1 修复引入的边角 case），已在 commit `2709a94` 修毕：file schema 顶层 `required` 不再含 `artifacts`（该字段由 HTTP /reviews 路径从 DB 派生，不写进 review.json 文件本身）；`Generator.Generate` 只在 promptID 非空时写 `prompt_snapshot` 字段以满足 `^ps_` pattern；`ReviewPacketArtifact.kind.enum` 补齐为 `Artifact.kind` 的超集；daemon handler 的 `raw_secret_exposed` 谓词与 local store 对齐。
+
+D1 / R10 在 v1 阶段不再开新 review（codex-review-d1-round2 agent 已关闭，无法再跑 R3）。v1.1 WIP 收口策略与 D3 / R14、D6 / R15 保持一致：
+
+- 主要 contract（结构化 review packet、raw refusal、EvalSymlinks、git 字段、schema 一致性）全部已通过 schema validator + openapi 校验 + 单元测试保障。
+- 任何后续 R3 残余的"边角 finding"应在 v1.1 WIP 阶段继续按需修复，**不**阻塞 v1 主线 ship。
+- D1 / R10 的已知限制保留在本文档 "已知限制" 节，覆盖 schema `additionalProperties` 兼容、ToolCalls hash surface、`review.json` 缺省回退等非阻塞项。
+
 ## 提交列表
 
 - `2cc1888` D1: Review Packet API returns structured projection + raw refusal
+- `d0677a1` D1: notes for review packet structured projection work
+- `0aee74c` D1 R1: fix codex review round 1 findings (0 P1 + 2 P2 + 1 P3)
+- `2709a94` D1 R2: fix codex review round 2 findings (1 P1 + 2 P2)
