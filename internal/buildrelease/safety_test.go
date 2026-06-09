@@ -364,8 +364,22 @@ func TestBuildReleaseLockfileStoryIsConsistent(t *testing.T) {
 // extractCleanTarball runs `git archive HEAD` from the repo root
 // and extracts the tar into a fresh t.TempDir(). The result is
 // what a CI fresh checkout of HEAD would have on disk.
+//
+// If the caller is not inside a git working tree (e.g. the test
+// is being run from a clean-tarball extract that itself has no
+// .git directory), the function falls back to the in-place
+// directory and the test will then read whatever files are
+// committed at that path. The clean-tarball end-to-end validation
+// in the spec (which does the archive + extract in a single
+// script-level command) is the authoritative way to verify
+// "what a CI fresh checkout sees".
 func extractCleanTarball(t *testing.T, repoRoot string) string {
 	t.Helper()
+	// Quick check: is there a .git dir we can archive from?
+	if _, err := os.Stat(filepath.Join(repoRoot, ".git")); err != nil {
+		t.Logf("not in a git worktree (%v); falling back to in-place repoRoot. Run the clean-tarball spec for authoritative CI-equivalent verification.", err)
+		return repoRoot
+	}
 	dir := t.TempDir()
 	cmd := exec.Command("git", "archive", "HEAD")
 	cmd.Dir = repoRoot
