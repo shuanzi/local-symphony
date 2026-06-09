@@ -1,9 +1,10 @@
 # Local Symphony App v1 PRD
 
-**状态**：v1 产品方案合并版
-**更新日期**：2026-05-11
+**状态**：v1 阶段 D 收口（2026-06-09）
+**更新日期**：2026-06-09（阶段 D 收口状态注；产品范围与 §1–§22 一致，未新增/扩大 v1 能力）
 **来源**：`local-symphony.zip` 原始文档包经 agent-executable hardening 后更新
 **文档权威性**：Local Symphony App v1 的产品事实和产品范围以本 PRD 定义为准。`TECH_SPEC.md` 只作为字段、表结构、API/schema、状态机、校验规则等技术合同细节的 source of truth；它和 executable contracts 不得新增或扩大本 PRD 未定义的 v1 产品能力。
+**阶段 D 收口状态指针**：`docs/productization/D6_DOCS_CLOSE_NOTES.md`（R 项 status note 表、文档变更清单、已知限制）
 
 ---
 
@@ -269,6 +270,8 @@ workspace 在所有 issue state、所有 run terminal outcome、startup stale ru
 Codex Runner 使用 `codex app-server`。v1 要求 Codex adapter 是 version-fixture gated：prelaunch gate 基于 installed Codex version 与 committed fixture metadata/static compatibility metadata；generated protocol/schema version 来自该 metadata，而不是启动真实 `codex app-server` 后才知道。只有有 committed fixture 的 Codex protocol/schema version 才可运行；不支持的版本必须在启动真实 Codex process 前失败，并给出 `unsupported_codex_version`。若启动后的 initialize handshake 与 metadata 不一致或出现 schema mismatch，run 走 `codex_protocol_error` 失败路径。
 
 真实 Codex adapter 是 v1 release scope，但真实 Codex 兼容性必须通过 committed fixture gate 进入；没有匹配 fixture 的本机 Codex 版本只阻断 real Codex dispatch，不影响 fake runner 主路径和默认 CI。默认测试使用 fake runner。Real Codex tests 只在显式设置 `SYMPHONY_TEST_CODEX=1` 时运行。
+
+> **阶段 D 收口状态（2026-06-09）**：D3 / R14 codex availability diagnostics 已 ship——`symphony status` / `/api/v1/state` / `/api/v1/diagnostics` 现在会暴露本机 Codex 可用性（installed / available / unsupported_version / not_installed 等 reason），5 轮 codex review 0 finding 收口。Real Codex dispatch 在 fixtures 缺失时 fail-closed with `unsupported_codex_version`。D5 / R13 release layout 已 ship（主体 + R1 修复 + R2 修复 commit 均落地；R2 review 文档待生成）。详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
 
 ### 8.5 WORKFLOW.md 与 Prompt
 

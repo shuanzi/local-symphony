@@ -1,9 +1,10 @@
 # Local Symphony App v1 Tech SPEC
 
-**状态**：v1 技术方案合并版
-**更新日期**：2026-05-11
+**状态**：v1 阶段 D 收口（2026-06-09）
+**更新日期**：2026-06-09（阶段 D 收口状态注；技术合同与 §1–§20 一致，未新增/扩大 v1 能力）
 **来源**：`local-symphony.zip` 原始文档包经 agent-executable hardening 后更新
 **文档权威性**：`PRD.md` 是 Local Symphony App v1 产品事实与产品范围的 source of truth。本文档是字段、表结构、API/schema、状态机、校验规则等技术合同细节的 source of truth；`api/openapi.yaml`、`db/schema/*.sql`、`schemas/*.schema.json`、`docs/agent_work_orders/*.md` 与 `docs/testing/*.md` 是本文的可执行合同与验收材料。本文档与 executable contracts 不得新增或扩大 `PRD.md` 未定义的 v1 产品能力。
+**阶段 D 收口状态指针**：`docs/productization/D6_DOCS_CLOSE_NOTES.md`（R 项 status note 表、文档变更清单、已知限制）
 
 ---
 
@@ -2062,6 +2063,8 @@ Startup behavior:
 The prelaunch fixture gate is based only on the installed Codex version and committed fixture metadata/static compatibility metadata. It MUST NOT depend on starting the real `codex app-server` process to discover the generated protocol/schema version. If the post-launch initialize handshake contradicts the committed compatibility metadata or returns an incompatible schema/protocol shape, the adapter MUST terminate the run through the normal failure path with `codex_protocol_error`.
 
 Default CI MUST use `internal/agent/fake`. Real Codex tests MUST be opt-in through `SYMPHONY_TEST_CODEX=1`.
+
+> **阶段 D 收口状态（2026-06-09）**：D3 / R14 codex availability diagnostics 已 ship。`internal/agent/codex` 暴露 preflight summary（installed / available / unsupported_version / not_installed 等 reason）；`internal/observability` 在 `Diagnostics` payload 中暴露 `codex` 子对象；`internal/cli` + `internal/httpapi` 在 `symphony status` 与 `GET /api/v1/state` 中暴露 codex availability；`api/openapi.yaml` / `schemas/diagnostics.schema.json` / `web/src/types.ts` / `web/src/App.tsx` 同步（dashboard Overview 链接到 Diagnostics）。5 轮 codex review 0 finding 收口，HEAD `57c46c0`。详见 `docs/productization/D3_CODEX_AVAILABILITY_NOTES.md` 与 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
 
 ### 10.3 Runner interface
 
@@ -4370,3 +4373,22 @@ raw prompt/raw Codex logs not exposed by v1 API
 single dist/symphony binary builds
 known limitations are documented
 ```
+
+## 21. 阶段 D 收口指针（D6 / R15）
+
+阶段 D（D1 / D2 / D3 / D4 / D5 / D6）截至 2026-06-09 的 R 项 status note 表、文档变更清单与已知限制详见：
+
+```text
+docs/productization/D6_DOCS_CLOSE_NOTES.md
+```
+
+要点：
+
+- D1 / R10 review packet 结构化投影已 ship；R1 修复 commit `0aee74c` 落地；R2 review 跑中（1 P1 + 2 P2 forwarding，归 D1 实施 agent 跟进）。
+- D3 / R14 codex availability diagnostics 已 ship（5 轮 codex review 0 finding 收口，HEAD `57c46c0`）。
+- D5 / R13 release packaging 已 ship（主体 `573b1f0` + R1 修复 `41dabb6` + R2 修复 `cdf08ed` 均落地，R2 review 文档待生成）。
+- C3 数据层 5 轮 review 0 finding；协调层 shutdown-ordering 1 P1 留作 C5 daemon lifecycle design problem。
+- C4 trust 边界专项 4 项（fail-open 反复 / validation 区分 / 镜像未去重 / project_id 不匹配可观测性）留作 v1.1 收口后续。
+
+D6 范围内**不修改**任何代码、schema、test；仅做文档同步。
+
