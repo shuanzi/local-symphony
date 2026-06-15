@@ -246,6 +246,7 @@ func TestRevokeCLISession(t *testing.T) {
 		t.Fatalf("idempotent revoke status = %d, want 200", delRec.Code)
 	}
 }
+
 // must report authenticated=true when a valid CLI bearer is
 // presented, even without a browser cookie. The previous
 // implementation only checked the cookie and reported
@@ -3222,12 +3223,17 @@ func TestReviewPacketArtifactsRedactRawPromptAndCodexLog(t *testing.T) {
 	if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
+	packetRow, err := srv.Store.Project.QueryOne(`SELECT id FROM review_packets WHERE id=(SELECT latest_review_packet_id FROM issues WHERE id=?)`, issue.ID)
+	if err != nil {
+		t.Fatalf("query review_packets: %v", err)
+	}
+	packetID := packetRow["id"].String()
 	for _, kind := range []string{"prompt_rendered", "codex_log", "codex_events", "secret_artifact"} {
 		p := filepath.Join(artifactsDir, kind+".bin")
 		if err := os.WriteFile(p, []byte("raw "+kind+" content"), 0o644); err != nil {
 			t.Fatalf("write %s: %v", kind, err)
 		}
-		if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_" + kind, Kind: kind, Path: p, Redacted: true}); err != nil {
+		if err := srv.Store.InsertArtifact(store.ArtifactRecord{ID: "art_" + kind, IssueID: &issue.ID, RunID: &run.ID, ReviewPacketID: &packetID, Kind: kind, Path: p, Redacted: true}); err != nil {
 			t.Fatalf("InsertArtifact %s: %v", kind, err)
 		}
 	}
@@ -3250,6 +3256,9 @@ func TestReviewPacketArtifactsRedactRawPromptAndCodexLog(t *testing.T) {
 	arts, ok := data["artifacts"].([]any)
 	if !ok {
 		t.Fatalf("artifacts not array: %#v", data["artifacts"])
+	}
+	if got, want := len(arts), 4; got != want {
+		t.Fatalf("review artifacts count = %d, want %d; artifacts=%#v", got, want, arts)
 	}
 	for _, item := range arts {
 		entry := item.(map[string]any)

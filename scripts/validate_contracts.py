@@ -1627,9 +1627,15 @@ def validate_tool_gateway_manifest(manifest: dict[str, Any]) -> None:
     if schema_tools != manifest_tools:
         fail(f"Tool Gateway registry mismatch with {CONTRACT_MANIFEST_REL}: {sorted(schema_tools ^ manifest_tools)}")
     gateway_defs = gateway_schema["$defs"]
+    artifact_attach_schema = load_json("schemas/tools/artifact_attach.input.schema.json")
     issue_comment_schema = load_json("schemas/tools/issue_comment.input.schema.json")
     followup_create_schema = load_json("schemas/tools/followup_create.input.schema.json")
     handoff_submit_schema = load_json("schemas/tools/handoff_submit.input.schema.json")
+
+    gateway_artifact_kinds = gateway_defs["artifactAttachInput"]["properties"]["kind"].get("enum")
+    standalone_artifact_kinds = artifact_attach_schema["properties"]["kind"].get("enum")
+    if gateway_artifact_kinds != standalone_artifact_kinds:
+        fail("schemas/tool_gateway.schema.json artifactAttachInput.kind enum must match artifact_attach input schema")
 
     assert_non_blank_string_schema(
         gateway_defs["issueCommentInput"]["properties"].get("body"),

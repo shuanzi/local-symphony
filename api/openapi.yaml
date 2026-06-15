@@ -884,7 +884,7 @@ components:
           items: { type: string }
         diff:
           type: string
-          description: "Full diff body for the packet (truncated allowed paths only; protected paths are omitted)."
+          description: "Structured diff body for small text patches. Large or binary patches are omitted here with a pointer to the changes.patch artifact, which preserves the full patch."
         tests:
           type: array
           items: { type: string }

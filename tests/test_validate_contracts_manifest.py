@@ -499,6 +499,51 @@ class ManifestContractTests(unittest.TestCase):
                     finally:
                         validator.ROOT = old_root
 
+    def test_tool_gateway_artifact_kind_enum_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        def mutate_json(temp_root: Path, rel: str, mutate: Any) -> None:
+            path = temp_root / rel
+            data = json.loads(path.read_text(encoding="utf-8"))
+            mutate(data)
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+        cases = (
+            (
+                "embedded artifact kind enum missing codex_log",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tool_gateway.schema.json",
+                    lambda schema: schema["$defs"]["artifactAttachInput"]["properties"]["kind"]["enum"].remove(
+                        "codex_log"
+                    ),
+                ),
+            ),
+            (
+                "standalone artifact kind enum missing codex_log",
+                lambda root: mutate_json(
+                    root,
+                    "schemas/tools/artifact_attach.input.schema.json",
+                    lambda schema: schema["properties"]["kind"]["enum"].remove("codex_log"),
+                ),
+            ),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    copy_contract_root(temp_root)
+                    mutate(temp_root)
+
+                    old_root = validator.ROOT
+                    validator.ROOT = temp_root
+                    try:
+                        with self.assertRaises(SystemExit):
+                            validator.validate_tool_gateway_manifest(manifest)
+                    finally:
+                        validator.ROOT = old_root
+
     def test_review_packet_handoff_requires_followups_and_human_review_target(self) -> None:
         validator = load_validator()
 

@@ -554,6 +554,71 @@ func TestGenerateWritesStructuredFieldsToReviewJSONArtifact(t *testing.T) {
 	}
 }
 
+func TestGenerateOmitsLargePatchFromStructuredReviewJSON(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "large.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	largeBody := strings.Repeat("large diff line\n", 9000)
+	writeFile(t, workspace, "large.txt", largeBody)
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"large.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if got := strings.Count(patch, "+large diff line"); got < 8000 {
+		t.Fatalf("changes.patch did not preserve full patch artifact")
+	}
+	var packet map[string]any
+	if err := json.Unmarshal([]byte(readReviewArtifact(t, st, issue, run, "review.json")), &packet); err != nil {
+		t.Fatalf("unmarshal review.json: %v", err)
+	}
+	diff, _ := packet["diff"].(string)
+	if strings.Count(diff, "+large diff line") >= 8000 {
+		t.Fatalf("review.json diff embedded the full large patch; len(diff)=%d", len(diff))
+	}
+	if !strings.Contains(diff, "omitted") || !strings.Contains(diff, "changes.patch") {
+		t.Fatalf("review.json diff = %q, want omission message pointing to changes.patch", diff)
+	}
+}
+
+func TestGenerateOmitsBinaryPatchFromStructuredReviewJSON(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	binaryPath := filepath.Join(workspace, "bin.dat")
+	if err := os.WriteFile(binaryPath, bytesForBinaryPatch(0x04), 0o644); err != nil {
+		t.Fatalf("write base binary file: %v", err)
+	}
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	if err := os.WriteFile(binaryPath, bytesForBinaryPatch(0x09), 0o644); err != nil {
+		t.Fatalf("write changed binary file: %v", err)
+	}
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"bin.dat"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "GIT binary patch") || !strings.Contains(patch, "literal ") {
+		t.Fatalf("changes.patch missing git binary patch content:\n%s", patch)
+	}
+	var packet map[string]any
+	if err := json.Unmarshal([]byte(readReviewArtifact(t, st, issue, run, "review.json")), &packet); err != nil {
+		t.Fatalf("unmarshal review.json: %v", err)
+	}
+	diff, _ := packet["diff"].(string)
+	want := "# Diff omitted from structured review JSON: binary patch content is not embedded. See changes.patch artifact for the full patch.\n"
+	if diff != want {
+		t.Fatalf("review.json diff = %q, want binary omission message pointing to changes.patch", diff)
+	}
+	if strings.Contains(diff, "GIT binary patch") || strings.Contains(diff, "literal ") {
+		t.Fatalf("review.json diff embedded binary patch content: %q", diff)
+	}
+}
+
 func TestReviewFailureDoesNotTransitionIssueToHumanReview(t *testing.T) {
 	st := newReviewTestStore(t)
 	issue, run := prepareReviewRun(t, st)
@@ -692,6 +757,15 @@ func writeFile(t *testing.T, root, rel, data string) {
 	}
 }
 
+func bytesForBinaryPatch(marker byte) []byte {
+	pattern := []byte{0x00, 0x01, 0x02, 0x03, marker, 0x00, 0xff}
+	out := make([]byte, 0, len(pattern)*200)
+	for i := 0; i < 200; i++ {
+		out = append(out, pattern...)
+	}
+	return out
+}
+
 func readReviewArtifact(t *testing.T, st *store.Store, issue *core.Issue, run *core.RunAttempt, name string) string {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID, name))
@@ -749,6 +823,25 @@ func TestReviewPacketFileSchemaValidatesAgainstGeneratedPacket(t *testing.T) {
 	}
 	schemaPath := filepath.Join(repoRootForReviewTest(t), "schemas", "review_packet.schema.json")
 	validateJSONAgainstSchema(t, schemaPath, reviewPath)
+}
+
+func TestSchemaValidatorScriptMissingJsonschemaReturnsSkipFailure(t *testing.T) {
+	pythonBin, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skipf("python3 not on PATH: %v", err)
+	}
+	blockingSite := t.TempDir()
+	if err := os.WriteFile(filepath.Join(blockingSite, "jsonschema.py"), []byte(`raise ImportError("forced missing jsonschema")`), 0o644); err != nil {
+		t.Fatalf("write jsonschema blocker: %v", err)
+	}
+	cmd := exec.Command(pythonBin, "-c", schemaValidatorScript(blockingSite), "schema.json", "data.json")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("schema validator exited 0 for missing jsonschema; output:\n%s", string(out))
+	}
+	if !strings.Contains(string(out), "__SCHEMA_SKIP__") {
+		t.Fatalf("schema validator output missing skip marker:\n%s", string(out))
+	}
 }
 
 // repoRootForReviewTest walks up from the current working
@@ -830,7 +923,7 @@ try:
     from jsonschema import Draft202012Validator
 except ImportError as e:
     print("__SCHEMA_SKIP__:" + str(e))
-    sys.exit(0)
+    sys.exit(2)
 schema = json.load(open(sys.argv[1]))
 data = json.load(open(sys.argv[2]))
 errors = list(Draft202012Validator(schema).iter_errors(data))

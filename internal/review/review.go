@@ -31,6 +31,7 @@ type UntrackedInfo struct {
 }
 
 const maxUntrackedPatchBytes int64 = 1024 * 1024
+const maxStructuredDiffBytes = 64 * 1024
 
 const (
 	untrackedReasonBinaryOrLarge = "binary or large file omitted from patch"
@@ -159,13 +160,13 @@ func (g Generator) Generate(runID string) (string, error) {
 			"files":               map[string]any{"review_md_path": "review.md", "review_json_path": "review.json", "patch_path": "changes.patch", "changed_files_path": "changed-files.txt", "untracked_files_path": "untracked-files.json", "diffstat_path": "diffstat.txt"},
 			"handoff":             map[string]any{"summary": handoff.Summary, "tests": handoff.Tests, "risks": handoff.Risks, "verification": handoff.Verification, "followups": handoff.Followups, "target_state": "Human Review"},
 			"changed_files":       changed, "untracked_files": untracked,
-			"diff":       patch,
-			"tests":      handoff.Tests,
-			"risks":      handoff.Risks,
-			"verification": handoff.Verification,
-			"approvals":  approvalEntries,
-			"tool_calls": toolCallEntries,
-			"how_to_continue": howToContinue,
+			"diff":                  structuredDiffForReviewJSON(patch),
+			"tests":                 handoff.Tests,
+			"risks":                 handoff.Risks,
+			"verification":          handoff.Verification,
+			"approvals":             approvalEntries,
+			"tool_calls":            toolCallEntries,
+			"how_to_continue":       howToContinue,
 			"raw_prompt_exposed":    false,
 			"raw_codex_log_exposed": false,
 			"raw_secret_exposed":    false,
@@ -215,6 +216,20 @@ func (g Generator) Generate(runID string) (string, error) {
 		return "", err
 	}
 	return finalID, nil
+}
+
+func structuredDiffForReviewJSON(patch string) string {
+	if len(patch) <= maxStructuredDiffBytes && !strings.Contains(patch, "GIT binary patch") {
+		return patch
+	}
+	reasons := []string{}
+	if len(patch) > maxStructuredDiffBytes {
+		reasons = append(reasons, fmt.Sprintf("diff is %d bytes, over the %d byte structured limit", len(patch), maxStructuredDiffBytes))
+	}
+	if strings.Contains(patch, "GIT binary patch") {
+		reasons = append(reasons, "binary patch content is not embedded")
+	}
+	return "# Diff omitted from structured review JSON: " + strings.Join(reasons, "; ") + ". See changes.patch artifact for the full patch.\n"
 }
 
 func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
