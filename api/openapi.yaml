@@ -760,7 +760,7 @@ components:
         workspace_id: { type: [string, 'null'] }
         workflow_snapshot_id: { type: [string, 'null'] }
         status: { $ref: '#/components/schemas/RunStatus' }
-        dispatch_reason: { type: string, enum: [manual, scheduler] }
+        dispatch_reason: { type: string, enum: [manual, scheduler, manual_recovery, manual_rework] }
         source_issue_state: { type: string, enum: [Ready, Rework] }
         runner_kind: { type: string, enum: [fake, codex] }
         failure_code: { anyOf: [ { $ref: '#/components/schemas/FailureCode' }, { type: 'null' } ] }

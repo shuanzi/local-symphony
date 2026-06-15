@@ -827,6 +827,26 @@ class ManifestContractTests(unittest.TestCase):
                     finally:
                         validator.ROOT = old_root
 
+    def test_openapi_run_attempt_dispatch_reason_contract_fails_when_drifted(self) -> None:
+        validator = load_validator()
+        manifest = load_manifest()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            copy_contract_root(temp_root)
+            openapi_path = temp_root / "api/openapi.yaml"
+            openapi = yaml.safe_load(openapi_path.read_text(encoding="utf-8"))
+            openapi["components"]["schemas"]["RunAttempt"]["properties"]["dispatch_reason"]["enum"].remove("manual_rework")
+            openapi_path.write_text(yaml.safe_dump(openapi, sort_keys=False), encoding="utf-8")
+
+            old_root = validator.ROOT
+            validator.ROOT = temp_root
+            try:
+                with self.assertRaises(SystemExit):
+                    validator.validate_openapi(manifest)
+            finally:
+                validator.ROOT = old_root
+
     def test_openapi_issue_list_query_param_contract_fails_when_drifted(self) -> None:
         validator = load_validator()
         manifest = load_manifest()

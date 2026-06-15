@@ -1187,6 +1187,26 @@ func TestCompleteRunWithReviewRejectsNonGeneratedReviewPacket(t *testing.T) {
 	assertIssueLatestReviewPacketID(t, st, issue.ID, &reviewPacketID)
 }
 
+func TestLatestCompletedRunForIssueSkipsRunsWithoutReviewPacket(t *testing.T) {
+	st := newStoreTestStore(t)
+	issue, reviewedRun := prepareCompletedReviewRun(t, st)
+	now := "9999-12-31T23:59:59Z"
+	if err := st.Project.Exec(`INSERT INTO run_attempts(id,issue_id,attempt_no,status,dispatch_reason,source_issue_state,runner_kind,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, "run_no_packet", issue.ID, reviewedRun.AttemptNo+1, string(core.RunCompletedWithoutHandoff), "manual", string(core.StateReady), "fake", now, now); err != nil {
+		t.Fatalf("insert run without review packet: %v", err)
+	}
+
+	got, err := st.LatestCompletedRunForIssue(issue.ID, "run_current")
+	if err != nil {
+		t.Fatalf("LatestCompletedRunForIssue: %v", err)
+	}
+	if got == nil {
+		t.Fatal("LatestCompletedRunForIssue returned nil, want reviewed run")
+	}
+	if got.ID != reviewedRun.ID {
+		t.Fatalf("LatestCompletedRunForIssue returned %s, want %s", got.ID, reviewedRun.ID)
+	}
+}
+
 func TestMarkDoneRollsBackWhenAuditCommentInsertFails(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, _ := prepareCompletedReviewRun(t, st)

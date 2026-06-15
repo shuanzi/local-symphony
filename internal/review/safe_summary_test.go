@@ -170,6 +170,25 @@ func TestSafeSummaryScanDoesNotFalsePositiveOnLegitimateText(t *testing.T) {
 	}
 }
 
+func TestSafeSummaryAllowsBlockedWordsInsideLegitimatePaths(t *testing.T) {
+	s := &SafeSummary{
+		ReviewPacketID: "rp_paths",
+		Status:         "generated",
+		Summary:        "Reviewed path-only changes.",
+		Tests:          []string{"go test ./internal/review"},
+		Risks:          []string{"No raw artifacts included."},
+		Verification:   []string{"Checked rework-safe path names."},
+		ChangedFiles: []string{
+			"internal/secrets/store.go",
+			"ui/prompt_snapshot_view.tsx",
+		},
+		HowToContinue: "Review the file path changes.",
+	}
+	if err := s.Seal(); err != nil {
+		t.Fatalf("Seal rejected legitimate paths with blocklisted substrings: %v", err)
+	}
+}
+
 func TestSafeSummaryRefusalKindBlocklistIsStable(t *testing.T) {
 	// Lock the blocklist so a future edit cannot silently relax the
 	// D4 / R16 redaction boundary.

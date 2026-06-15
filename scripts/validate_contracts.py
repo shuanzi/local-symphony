@@ -134,6 +134,7 @@ APPROVAL_STATUS_ENUM = (
     "timeout",
 )
 APPROVAL_FORBIDDEN_API_FIELDS = ("request", "request_json", "decision", "decision_json")
+RUN_ATTEMPT_DISPATCH_REASON_ENUM = ("manual", "scheduler", "manual_recovery", "manual_rework")
 DIAGNOSTICS_DEFINITION_REQUIRED_FIELDS = {
     "database": DIAGNOSTICS_DATABASE_FIELDS,
     "workflow": frozenset({"config_path", "validation", "last_valid_config"}),
@@ -1548,6 +1549,12 @@ def validate_openapi(manifest: dict[str, Any]) -> None:
         data["components"]["schemas"]["RunSummary"]["properties"]["failure_code"],
         "OpenAPI RunSummary.failure_code",
         "#/components/schemas/FailureCode",
+    )
+    run_attempt = data["components"]["schemas"]["RunAttempt"]
+    assert_enum(
+        run_attempt["properties"]["dispatch_reason"],
+        "OpenAPI RunAttempt.dispatch_reason",
+        RUN_ATTEMPT_DISPATCH_REASON_ENUM,
     )
     review_packet_summary = data["components"]["schemas"]["ReviewPacketSummary"]
     assert_required_fields(review_packet_summary, "OpenAPI ReviewPacketSummary", frozenset({"failure_code", "failure_message"}))

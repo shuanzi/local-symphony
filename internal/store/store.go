@@ -1672,7 +1672,7 @@ type ReworkSnapshotRecord struct {
 // exists. Used by the rework prompt injector to locate the previous
 // run whose review packet drives the rework.
 func (s *Store) LatestCompletedRunForIssue(issueID, excludeRunID string) (*core.RunAttempt, error) {
-	rows, err := s.Project.Query(`SELECT r.*, i.identifier AS issue_identifier FROM run_attempts r JOIN issues i ON i.id=r.issue_id WHERE r.issue_id=? AND r.id<>? AND r.status IN ('completed','completed_without_handoff') ORDER BY r.created_at DESC LIMIT 1`, issueID, excludeRunID)
+	rows, err := s.Project.Query(`SELECT r.*, i.identifier AS issue_identifier FROM run_attempts r JOIN issues i ON i.id=r.issue_id WHERE r.issue_id=? AND r.id<>? AND r.status IN ('completed','completed_without_handoff') AND EXISTS (SELECT 1 FROM review_packets rp WHERE rp.run_id=r.id AND rp.status='generated') ORDER BY r.created_at DESC LIMIT 1`, issueID, excludeRunID)
 	if err != nil {
 		return nil, err
 	}
