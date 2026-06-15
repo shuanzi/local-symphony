@@ -3700,3 +3700,79 @@ func getApprovalRow(t *testing.T, st *Store, id string) map[string]db.Value {
 	}
 	return row
 }
+
+// TestSafeContainedPathRejectsSymlinkEscape pins the symlink
+// containment check used by ReviewPacketProjection's fallback
+// read path. Without EvalSymlinks, an operator (or an attacker
+// who can write inside .symphony/artifacts) could drop a
+// symlink under the artifact root pointing outside, and a
+// subsequent ReadFile would follow it. The HTTP path already
+// uses EvalSymlinks; the local store helper must match.
+func TestSafeContainedPathRejectsSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	// Create the contained subtree.
+	inside := filepath.Join(root, "artifacts", "APP-1", "run_x")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatalf("mkdir inside: %v", err)
+	}
+	// And an "outside" target the symlink will try to escape to.
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("SECRET"), 0o644); err != nil {
+		t.Fatalf("write outside: %v", err)
+	}
+	// Place a symlink *inside* the contained root that points at
+	// the outside file.
+	link := filepath.Join(inside, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink unsupported on this platform: %v", err)
+	}
+	// Walk containment: filepath.HasPrefix passes for `link`
+	// because it sits inside `inside`. EvalSymlinks must catch
+	// the escape and the helper must reject.
+	if _, ok := safeContainedPath(link, inside); ok {
+		t.Fatalf("safeContainedPath accepted symlink escape %q -> %q", link, outside)
+	}
+}
+
+// TestSafeContainedPathAllowsNonExistentPath covers the case
+// where the review.json file has not been written yet (e.g. a
+// daemon restart mid-generation). The helper must not fail
+// closed in that case: it should return the cleaned path with
+// ok=true so the projection can keep going and render an empty
+// structured packet.
+func TestSafeContainedPathAllowsNonExistentPath(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "artifacts")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	missing := filepath.Join(inside, "APP-1", "run_x", "review.json")
+	got, ok := safeContainedPath(missing, inside)
+	if !ok {
+		t.Fatalf("safeContainedPath rejected non-existent contained path %q", missing)
+	}
+	if got == "" {
+		t.Fatalf("safeContainedPath returned empty path for %q", missing)
+	}
+}
+
+// TestSafeContainedPathAllowsRealFile is the happy path: a real
+// file written inside the root must be accepted.
+func TestSafeContainedPathAllowsRealFile(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "artifacts")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	good := filepath.Join(inside, "review.json")
+	if err := os.WriteFile(good, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, ok := safeContainedPath(good, inside)
+	if !ok {
+		t.Fatalf("safeContainedPath rejected real file %q", good)
+	}
+	if got == "" {
+		t.Fatalf("safeContainedPath returned empty path for %q", good)
+	}
+}

@@ -309,6 +309,57 @@ func TestArtifactAttachRejectsMissingKind(t *testing.T) {
 	assertArtifactCount(t, st, run.ID, 0)
 }
 
+// TestArtifactAttachAcceptsNewRawRefusalKinds pins the allow-list
+// in allowedArtifactKind so the tool gateway does not reject the
+// raw refusal kinds (codex_events, prompt_rendered, prompt_context,
+// prompt_meta, prompt_tool_manifest, secret_artifact, secrets)
+// introduced by D1. The Review/Artifact API surfaces these kinds
+// with content_url=null; for that flow to work end to end, agents
+// must also be able to attach them via the artifact.attach tool
+// without being rejected at validation time.
+func TestArtifactAttachAcceptsNewRawRefusalKinds(t *testing.T) {
+	cases := []string{
+		"codex_events",
+		"prompt_rendered",
+		"prompt_context",
+		"prompt_meta",
+		"prompt_tool_manifest",
+		"secret_artifact",
+		"secrets",
+	}
+	for _, kind := range cases {
+		t.Run(kind, func(t *testing.T) {
+			st := newGatewayTestStore(t)
+			_, run, workspace := prepareGatewayRun(t, st)
+			source := filepath.Join(workspace, "raw.txt")
+			if err := os.WriteFile(source, []byte("raw "+kind+"\n"), 0o644); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
+			token, err := NewTokenForRun(st, run, workspace)
+			if err != nil {
+				t.Fatalf("NewTokenForRun: %v", err)
+			}
+
+			resp := (Gateway{Store: st}).Call(token, workspace, Request{
+				Tool:  "artifact.attach",
+				Input: map[string]any{"path": "raw.txt", "kind": kind},
+			})
+
+			if !resp.Success {
+				t.Fatalf("artifact.attach kind=%q rejected: %#v", kind, resp.Error)
+			}
+			assertArtifactCount(t, st, run.ID, 1)
+			row, err := st.Project.QueryOne(`SELECT kind FROM artifacts WHERE run_id=?`, run.ID)
+			if err != nil {
+				t.Fatalf("query artifact kind: %v", err)
+			}
+			if got := row["kind"].String(); got != kind {
+				t.Fatalf("persisted artifact kind = %q, want %q", got, kind)
+			}
+		})
+	}
+}
+
 func TestRequiredStringInputsRejectMissingOrBlank(t *testing.T) {
 	tests := []struct {
 		name string

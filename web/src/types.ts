@@ -179,6 +179,15 @@ export interface ReviewPacketArtifact {
   description?: string | null;
 }
 
+export interface ReviewPacketHandoff {
+  summary: string;
+  tests: string[];
+  risks: string[];
+  verification: string[];
+  followups: string[];
+  target_state: string;
+}
+
 export interface ReviewPacketSummary {
   id: string;
   issue_id?: string;
@@ -186,6 +195,24 @@ export interface ReviewPacketSummary {
   packet_no: number;
   status: 'generated' | 'partial' | 'failed' | string;
   root_path: string;
+  // Structured review packet projection (D1 / R10). The dashboard
+  // and CLI consume these fields directly from the Review API and
+  // never read raw prompt / codex log / secret content from disk.
+  summary?: string;
+  acceptance_criteria?: string[];
+  handoff?: ReviewPacketHandoff;
+  changed_files?: string[];
+  diff?: string;
+  tests?: string[];
+  risks?: string[];
+  verification?: string[];
+  approvals?: Array<Record<string, unknown>>;
+  tool_calls?: Array<Record<string, unknown>>;
+  how_to_continue?: string;
+  raw_prompt_exposed?: boolean;
+  raw_codex_log_exposed?: boolean;
+  raw_secret_exposed?: boolean;
+  git?: Record<string, unknown>;
   review_md_path?: string | null;
   review_json_path?: string | null;
   patch_path?: string | null;

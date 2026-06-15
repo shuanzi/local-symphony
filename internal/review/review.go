@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"local-symphony/internal/core"
+	"local-symphony/internal/db"
 	"local-symphony/internal/gitx"
 	"local-symphony/internal/security"
 	"local-symphony/internal/store"
@@ -30,6 +31,7 @@ type UntrackedInfo struct {
 }
 
 const maxUntrackedPatchBytes int64 = 1024 * 1024
+const maxStructuredDiffBytes = 64 * 1024
 
 const (
 	untrackedReasonBinaryOrLarge = "binary or large file omitted from patch"
@@ -146,17 +148,32 @@ func (g Generator) Generate(runID string) (string, error) {
 		}
 		rpID := core.NewID("rp_tmp_")
 		packetNo := nextPacketNo(tx, issue.ID)
+		howToContinue := "Use Send to Rework with a reason, or Mark Done with an acceptance reason."
+		approvalEntries, toolCallEntries := reviewSidecarEntries(tx, handoff.ID)
 		packet := map[string]any{
 			"id": rpID, "packet_no": packetNo, "status": "generated",
-			"issue":         map[string]any{"id": issue.ID, "identifier": issue.Identifier, "title": issue.Title, "acceptance_criteria": issue.AcceptanceCriteria},
-			"run":           map[string]any{"id": run.ID, "status": "completed", "source_issue_state": run.SourceIssueState},
-			"git":           map[string]any{"branch_name": val(issue.BranchName), "base_ref": val(issue.BaseRef), "base_ref_config": val(issue.BaseRefConfig), "base_sha": val(issue.BaseSHA), "head_sha": gitx.HeadSHA(issue.Workspace.Path), "dirty": len(changed) > 0},
-			"files":         map[string]any{"review_md_path": "review.md", "review_json_path": "review.json", "patch_path": "changes.patch", "changed_files_path": "changed-files.txt", "untracked_files_path": "untracked-files.json", "diffstat_path": "diffstat.txt"},
-			"handoff":       map[string]any{"summary": handoff.Summary, "tests": handoff.Tests, "risks": handoff.Risks, "verification": handoff.Verification, "followups": handoff.Followups, "target_state": "Human Review"},
-			"changed_files": changed, "untracked_files": untracked,
-			"approvals": []any{}, "tool_calls": []any{},
-			"prompt_snapshot": map[string]any{"id": promptID, "rendered_prompt_hash": "redacted", "tool_manifest_path": "prompt/tool_manifest.md"},
-			"failure_code":    nil, "failure_message": nil, "created_at": core.Now(),
+			"summary":             handoff.Summary,
+			"acceptance_criteria": issue.AcceptanceCriteria,
+			"issue":               map[string]any{"id": issue.ID, "identifier": issue.Identifier, "title": issue.Title, "acceptance_criteria": issue.AcceptanceCriteria},
+			"run":                 map[string]any{"id": run.ID, "status": "completed", "source_issue_state": run.SourceIssueState},
+			"git":                 map[string]any{"branch_name": val(issue.BranchName), "base_ref": val(issue.BaseRef), "base_ref_config": val(issue.BaseRefConfig), "base_sha": val(issue.BaseSHA), "head_sha": gitx.HeadSHA(issue.Workspace.Path), "dirty": len(changed) > 0},
+			"files":               map[string]any{"review_md_path": "review.md", "review_json_path": "review.json", "patch_path": "changes.patch", "changed_files_path": "changed-files.txt", "untracked_files_path": "untracked-files.json", "diffstat_path": "diffstat.txt"},
+			"handoff":             map[string]any{"summary": handoff.Summary, "tests": handoff.Tests, "risks": handoff.Risks, "verification": handoff.Verification, "followups": handoff.Followups, "target_state": "Human Review"},
+			"changed_files":       changed, "untracked_files": untracked,
+			"diff":                  structuredDiffForReviewJSON(patch),
+			"tests":                 handoff.Tests,
+			"risks":                 handoff.Risks,
+			"verification":          handoff.Verification,
+			"approvals":             approvalEntries,
+			"tool_calls":            toolCallEntries,
+			"how_to_continue":       howToContinue,
+			"raw_prompt_exposed":    false,
+			"raw_codex_log_exposed": false,
+			"raw_secret_exposed":    false,
+			"failure_code":          nil, "failure_message": nil, "created_at": core.Now(),
+		}
+		if promptID != "" {
+			packet["prompt_snapshot"] = map[string]any{"id": promptID, "rendered_prompt_hash": "redacted", "tool_manifest_path": "prompt/tool_manifest.md"}
 		}
 		jb, err := json.MarshalIndent(packet, "", "  ")
 		if err != nil {
@@ -199,6 +216,20 @@ func (g Generator) Generate(runID string) (string, error) {
 		return "", err
 	}
 	return finalID, nil
+}
+
+func structuredDiffForReviewJSON(patch string) string {
+	if len(patch) <= maxStructuredDiffBytes && !strings.Contains(patch, "GIT binary patch") {
+		return patch
+	}
+	reasons := []string{}
+	if len(patch) > maxStructuredDiffBytes {
+		reasons = append(reasons, fmt.Sprintf("diff is %d bytes, over the %d byte structured limit", len(patch), maxStructuredDiffBytes))
+	}
+	if strings.Contains(patch, "GIT binary patch") {
+		reasons = append(reasons, "binary patch content is not embedded")
+	}
+	return "# Diff omitted from structured review JSON: " + strings.Join(reasons, "; ") + ". See changes.patch artifact for the full patch.\n"
 }
 
 func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
@@ -596,6 +627,70 @@ func fileSHA(path string) (string, error) {
 	}
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:]), nil
+}
+
+// reviewSidecarEntries returns redacted, structured approvals and
+// tool_calls entries associated with the run. They are surfaced as
+// top-level fields on the review packet JSON so that the dashboard
+// and CLI can render them without ever reading raw payloads from
+// disk. Errors are swallowed to [] (the structured projection stays
+// authoritative on metadata; raw content is intentionally omitted).
+//
+// The query must be issued against the same transaction that owns the
+// surrounding review packet insert, so the caller passes a TxRunner
+// (not the store's top-level DB handle).
+func reviewSidecarEntries(q store.TxRunner, handoffID string) ([]any, []any) {
+	if q == nil {
+		return []any{}, []any{}
+	}
+	runID := ""
+	if row, err := q.QueryOne(`SELECT run_id FROM handoffs WHERE id=?`, handoffID); err == nil {
+		runID = row["run_id"].String()
+	}
+	if runID == "" {
+		return []any{}, []any{}
+	}
+	approvals := []any{}
+	if rows, err := q.Query(`SELECT id, run_id, issue_id, kind, status, created_at, resolved_at, reason FROM approval_requests WHERE run_id=? ORDER BY created_at`, runID); err == nil {
+		for _, r := range rows {
+			approvals = append(approvals, map[string]any{
+				"id":          r["id"].String(),
+				"run_id":      r["run_id"].String(),
+				"issue_id":    r["issue_id"].String(),
+				"kind":        r["kind"].String(),
+				"status":      r["status"].String(),
+				"created_at":  r["created_at"].String(),
+				"resolved_at": nullableString(r["resolved_at"]),
+				"reason":      nullableString(r["reason"]),
+			})
+		}
+	}
+	toolCalls := []any{}
+	if rows, err := q.Query(`SELECT id, run_id, tool_name, status, input_hash, output_hash, error_code, error_message, started_at, ended_at FROM tool_calls WHERE run_id=? ORDER BY started_at`, runID); err == nil {
+		for _, r := range rows {
+			toolCalls = append(toolCalls, map[string]any{
+				"id":            r["id"].String(),
+				"run_id":        r["run_id"].String(),
+				"tool_name":     r["tool_name"].String(),
+				"status":        r["status"].String(),
+				"input_hash":    nullableString(r["input_hash"]),
+				"output_hash":   nullableString(r["output_hash"]),
+				"error_code":    nullableString(r["error_code"]),
+				"error_message": nullableString(r["error_message"]),
+				"started_at":    r["started_at"].String(),
+				"ended_at":      nullableString(r["ended_at"]),
+			})
+		}
+	}
+	return approvals, toolCalls
+}
+
+func nullableString(v db.Value) any {
+	s := v.String()
+	if s == "" {
+		return nil
+	}
+	return s
 }
 func nextPacketNo(q store.TxRunner, issueID string) int {
 	row, err := q.QueryOne(`SELECT COALESCE(MAX(packet_no),0)+1 AS n FROM review_packets WHERE issue_id=?`, issueID)

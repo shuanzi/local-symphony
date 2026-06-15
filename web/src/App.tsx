@@ -625,6 +625,14 @@ function JsonBlock({ value, maxHeight }: { value: unknown; maxHeight?: number })
   );
 }
 
+function ListBlock({ items }: { items: string[] }) {
+  return (
+    <ul className="review-list">
+      {items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}
+    </ul>
+  );
+}
+
 function StatusPill({ value }: { value: string }) {
   const tone = value.includes('failed') || value === 'Blocked' || value === 'Cancelled' || value === 'denied'
     ? 'danger'
@@ -2011,6 +2019,32 @@ function ReviewPacketPage({ route, issues, runMutation, markUnauthenticated, aut
               </div>
             ) : null}
           </Section>
+
+          {review ? (
+            <Section title="Structured review packet">
+              <KeyValue rows={[
+                ['Summary', review.summary || review.handoff?.summary || '—'],
+                ['Acceptance criteria', (review.acceptance_criteria || []).length > 0 ? <ListBlock items={review.acceptance_criteria || []} /> : '—'],
+                ['Handoff target', review.handoff?.target_state || '—'],
+                ['Tests', (review.tests || []).length > 0 ? <ListBlock items={review.tests || []} /> : '—'],
+                ['Risks', (review.risks || []).length > 0 ? <ListBlock items={review.risks || []} /> : '—'],
+                ['Verification', (review.verification || []).length > 0 ? <ListBlock items={review.verification || []} /> : '—'],
+                ['Changed files', (review.changed_files || []).length > 0 ? <ListBlock items={review.changed_files || []} /> : '—'],
+                ['Approvals', review.approvals ? <span>{review.approvals.length} entries</span> : '—'],
+                ['Tool calls', review.tool_calls ? <span>{review.tool_calls.length} entries</span> : '—'],
+                ['How to continue', review.how_to_continue || '—'],
+                ['Raw prompt exposed', review.raw_prompt_exposed ? <Pill tone="danger">yes</Pill> : <Pill tone="good">no</Pill>],
+                ['Raw Codex log exposed', review.raw_codex_log_exposed ? <Pill tone="danger">yes</Pill> : <Pill tone="good">no</Pill>],
+                ['Raw secret exposed', review.raw_secret_exposed ? <Pill tone="danger">yes</Pill> : <Pill tone="good">no</Pill>]
+              ]} />
+              {review.diff ? (
+                <details className="diff-details">
+                  <summary>Diff ({review.changed_files?.length || 0} files)</summary>
+                  <JsonBlock value={review.diff} maxHeight={320} />
+                </details>
+              ) : null}
+            </Section>
+          ) : null}
 
           {review ? (
             <Section title="Artifacts and redaction boundary">

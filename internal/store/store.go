@@ -227,6 +227,9 @@ func InitProject(repoRoot, issuePrefix string) (*Store, error) {
 	if err := s.Project.ExecScript(projSchema); err != nil {
 		return nil, err
 	}
+	if err := db.MigrateProjectSchema(s.Project); err != nil {
+		return nil, err
+	}
 	if err := db.MigrateAppSchema(s.App); err != nil {
 		return nil, err
 	}
@@ -300,6 +303,9 @@ func Open(repoRoot string) (*Store, error) {
 		}
 	}
 	if err := db.MigrateAppSchema(s.App); err != nil {
+		return nil, err
+	}
+	if err := db.MigrateProjectSchema(s.Project); err != nil {
 		return nil, err
 	}
 	if err := validateSchemaVersion(s.App, s.AppDBPath); err != nil {
@@ -1914,6 +1920,164 @@ func (s *Store) ReviewPacketRow(issueRef string) (map[string]db.Value, error) {
 	return row, err
 }
 
+// ReviewPacketProjection returns the structured review packet
+// projection: metadata fields from the review_packets row combined
+// with the structured fields (summary, acceptance criteria, handoff,
+// diff, tests, risks, verification, approvals, tool calls, git, and
+// "how to continue") surfaced from the on-disk review.json artifact.
+// When the on-disk artifact is missing or unparseable the projection
+// still returns the row metadata plus empty defaults — it never
+// reads raw prompt / codex log / secret content.
+func (s *Store) ReviewPacketProjection(issueRef string) (map[string]any, error) {
+	row, err := s.ReviewPacketRow(issueRef)
+	if err != nil {
+		return nil, err
+	}
+	arts, err := s.ArtifactsForReview(row["id"].String())
+	if err != nil {
+		return nil, err
+	}
+	files := make([]map[string]any, 0, len(arts))
+	for _, a := range arts {
+		cu := any(nil)
+		if !isRawArtifactRefusalKindLocal(a.Kind) {
+			cu = "/api/v1/artifacts/" + a.ID + "/content"
+		}
+		files = append(files, map[string]any{
+			"kind":        a.Kind,
+			"artifact_id": a.ID,
+			"path":        a.Path,
+			"redacted":    a.Redacted,
+			"content_url": cu,
+			// Per-artifact refusal boundary flags, kept in lockstep
+			// with the daemon-side projection so a strict OpenAPI
+			// client sees the same shape regardless of whether the
+			// CLI went through the daemon or fell back to the
+			// local store.
+			"raw_prompt_exposed":    a.Kind == "prompt_rendered" || a.Kind == "prompt_context",
+			"raw_codex_log_exposed": a.Kind == "codex_log" || a.Kind == "codex_events",
+			"raw_secret_exposed":    a.Kind == "secret_artifact" || a.Kind == "secrets",
+		})
+	}
+	out := map[string]any{
+		"id":              row["id"].String(),
+		"issue_id":        row["issue_id"].String(),
+		"run_id":          row["run_id"].String(),
+		"packet_no":       row["packet_no"].Int(),
+		"status":          row["status"].String(),
+		"root_path":       row["root_path"].String(),
+		"artifacts":       files,
+		"files":           files,
+		"created_at":      row["created_at"].String(),
+		"failure_code":    nil,
+		"failure_message": nil,
+		"summary":               "",
+		"acceptance_criteria":   []any{},
+		"handoff":               map[string]any{"summary": "", "tests": []any{}, "risks": []any{}, "verification": []any{}, "followups": []any{}, "target_state": "Human Review"},
+		"changed_files":         []any{},
+		"diff":                  "",
+		"tests":                 []any{},
+		"risks":                 []any{},
+		"verification":          []any{},
+		"approvals":             []any{},
+		"tool_calls":            []any{},
+		"git":                   map[string]any{},
+		"how_to_continue":       "Use Send to Rework with a reason, or Mark Done with an acceptance reason.",
+		"raw_prompt_exposed":    false,
+		"raw_codex_log_exposed": false,
+		"raw_secret_exposed":    false,
+	}
+	reviewJSONPath := row["review_json_path"].String()
+	rootPath := row["root_path"].String()
+	if reviewJSONPath == "" {
+		return out, nil
+	}
+	candidate := reviewJSONPath
+	if rootPath != "" && !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(rootPath, candidate)
+	}
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(s.RepoRoot, ".symphony", "artifacts", candidate)
+	}
+	root1 := filepath.Join(s.RepoRoot, ".symphony", "artifacts")
+	root2 := filepath.Join(s.RepoRoot, ".symphony", "exports")
+	safePath, ok := safeContainedPath(candidate, root1)
+	if !ok {
+		safePath, ok = safeContainedPath(candidate, root2)
+	}
+	if !ok {
+		return out, nil
+	}
+	data, err := os.ReadFile(safePath)
+	if err != nil {
+		return out, nil
+	}
+	var projection map[string]any
+	if err := json.Unmarshal(data, &projection); err != nil {
+		return out, nil
+	}
+	for _, key := range []string{
+		"summary", "acceptance_criteria", "handoff", "changed_files", "diff",
+		"tests", "risks", "verification", "approvals", "tool_calls", "git",
+		"how_to_continue", "raw_prompt_exposed", "raw_codex_log_exposed", "raw_secret_exposed",
+	} {
+		if v, ok := projection[key]; ok {
+			out[key] = v
+		}
+	}
+	return out, nil
+}
+
+func isRawArtifactRefusalKindLocal(kind string) bool {
+	switch kind {
+	case "codex_log", "codex_events",
+		"prompt_snapshot", "prompt_rendered", "prompt_context",
+		"secret_artifact", "secrets":
+		return true
+	}
+	return false
+}
+
+// safeContainedPath returns (resolved, true) when p is contained
+// inside root. Containment is checked twice: once against the
+// lexical (un-resolved) path so missing files are tolerated
+// (review.json may not have been written yet) and once against
+// EvalSymlinks of both sides so a symlink planted under the
+// artifact root cannot escape into an outside directory.
+//
+// The HTTP-side helper (safeContainedFilePathAllowMissing in
+// internal/httpapi/httpapi.go) does the same dance. Keep the two
+// implementations in lockstep when modifying the rules.
+func safeContainedPath(p, root string) (string, bool) {
+	cleanP := filepath.Clean(p)
+	cleanRoot := filepath.Clean(root)
+	if !filepath.HasPrefix(cleanP, cleanRoot+string(filepath.Separator)) && cleanP != cleanRoot {
+		return "", false
+	}
+	// EvalSymlinks on the root. If the root itself does not exist
+	// yet (e.g. operators without an artifacts directory), allow
+	// the lexical path through so the caller can still return
+	// metadata-only projection.
+	realRoot, err := filepath.EvalSymlinks(cleanRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cleanP, true
+		}
+		return "", false
+	}
+	realP, err := filepath.EvalSymlinks(cleanP)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cleanP, true
+		}
+		return "", false
+	}
+	if !filepath.HasPrefix(realP, realRoot+string(filepath.Separator)) && realP != realRoot {
+		return "", false
+	}
+	return realP, true
+}
+
 func (s *Store) MarkDone(issueRef, reason string) (*core.Issue, error) {
 	return s.reviewAction(issueRef, reason, core.StateDone)
 }
@@ -2054,6 +2218,68 @@ func (s *Store) PendingApprovals() ([]Approval, error) {
 	out := []Approval{}
 	for _, r := range rows {
 		out = append(out, approvalFromRow(r))
+	}
+	return out, nil
+}
+
+// ApprovalsForRun returns every approval request row associated with
+// the given run, ordered chronologically. It is used by the review
+// packet structured projection to surface operator decisions (kind,
+// status, requested/resolved timestamps, reason) without leaking the
+// raw request payload.
+func (s *Store) ApprovalsForRun(runID string) ([]Approval, error) {
+	rows, err := s.Project.Query(`SELECT * FROM approval_requests WHERE run_id=? ORDER BY created_at`, runID)
+	if err != nil {
+		return nil, err
+	}
+	out := []Approval{}
+	for _, r := range rows {
+		out = append(out, approvalFromRow(r))
+	}
+	return out, nil
+}
+
+// ToolCallRecord mirrors the persisted tool_calls row used by the
+// review packet structured projection. Only redacted input/output
+// hashes plus a tool name and status are exposed — raw payloads are
+// never serialised.
+type ToolCallRecord struct {
+	ID         string  `json:"id"`
+	RunID      string  `json:"run_id"`
+	ToolName   string  `json:"tool_name"`
+	Status     string  `json:"status"`
+	InputHash  *string `json:"input_hash"`
+	OutputHash *string `json:"output_hash"`
+	ErrorCode  *string `json:"error_code"`
+	ErrorMsg   *string `json:"error_message"`
+	StartedAt  string  `json:"started_at"`
+	EndedAt    *string `json:"ended_at"`
+}
+
+// ToolCallsForRun returns every tool_calls row associated with the
+// given run, ordered chronologically. The returned entries only
+// surface identifiers, hashes, and status — never the raw input or
+// output payload. This is what the review packet structured
+// projection feeds into the tool_calls field.
+func (s *Store) ToolCallsForRun(runID string) ([]ToolCallRecord, error) {
+	rows, err := s.Project.Query(`SELECT id, run_id, tool_name, status, input_hash, output_hash, error_code, error_message, started_at, ended_at FROM tool_calls WHERE run_id=? ORDER BY started_at`, runID)
+	if err != nil {
+		return nil, err
+	}
+	out := []ToolCallRecord{}
+	for _, r := range rows {
+		out = append(out, ToolCallRecord{
+			ID:         r["id"].String(),
+			RunID:      r["run_id"].String(),
+			ToolName:   r["tool_name"].String(),
+			Status:     r["status"].String(),
+			InputHash:  ptrFromVal(r["input_hash"]),
+			OutputHash: ptrFromVal(r["output_hash"]),
+			ErrorCode:  ptrFromVal(r["error_code"]),
+			ErrorMsg:   ptrFromVal(r["error_message"]),
+			StartedAt:  r["started_at"].String(),
+			EndedAt:    ptrFromVal(r["ended_at"]),
+		})
 	}
 	return out, nil
 }

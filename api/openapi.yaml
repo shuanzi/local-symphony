@@ -295,8 +295,9 @@ paths:
   /artifacts/{artifact_id}/content:
     get:
       operationId: getArtifactContent
+      description: Serves artifact content for non-raw kinds. Raw prompt snapshots, raw Codex event logs, raw prompt contexts, and secret artifacts return 403 with code raw_log_access_not_supported so the dashboard must learn refusal from the Review/Artifact API rather than reading the filesystem.
       parameters: [ { $ref: '#/components/parameters/ArtifactId' } ]
-      responses: { "200": { description: Artifact content, content: { application/octet-stream: { schema: { type: string, format: binary } } } }, "403": { $ref: '#/components/responses/Error' } }
+      responses: { "200": { description: Artifact content, content: { application/octet-stream: { schema: { type: string, format: binary } } } }, "403": { $ref: '#/components/responses/Error', description: "raw_log_access_not_supported when the artifact kind is raw prompt / codex log / secret." } }
   /workflow:
     get:
       operationId: getWorkflow
@@ -834,17 +835,26 @@ components:
       allOf: [ { $ref: '#/components/schemas/Envelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/ApprovalRequest' } } } } ]
     ReviewPacketArtifact:
       type: object
-      required: [kind, path, artifact_id, redacted, content_url]
+      required: [kind, path, artifact_id, redacted, content_url, raw_prompt_exposed, raw_codex_log_exposed, raw_secret_exposed]
       additionalProperties: false
       properties:
-        kind: { type: string, enum: [review_packet, review_md, review_json, patch, changed_files, untracked_files, diffstat, test_output, agent_final_message, commands, tool_calls, approvals, codex_events, prompt_context, prompt_rendered, prompt_meta, prompt_tool_manifest, other] }
+        kind: { type: string, enum: [test_output, patch, changed_files, untracked_files, diffstat, prompt_snapshot, prompt_rendered, prompt_context, prompt_meta, prompt_tool_manifest, codex_log, codex_events, secret_artifact, secrets, review_packet, review_md, review_json, agent_final_message, commands, tool_calls, approvals, agent_file, diagnostic, other] }
         path: { type: string }
         artifact_id: { type: string, pattern: "^art_" }
         redacted: { type: boolean }
         content_url: { type: [string, 'null'], format: uri-reference }
+        # Per-artifact refusal boundary flags. The server emits
+        # these on every entry so the dashboard and strict
+        # OpenAPI clients can render the redaction pill
+        # consistently. The HTTP layer also returns
+        # `content_url: null` when any of these is true.
+        raw_prompt_exposed: { type: boolean, description: "True iff this artifact is a raw rendered prompt (prompt_rendered or prompt_context kind). The HTTP layer refuses /artifacts/{id}/content for these." }
+        raw_codex_log_exposed: { type: boolean, description: "True iff this artifact is a raw Codex log (codex_log or codex_events kind). The HTTP layer refuses /artifacts/{id}/content for these." }
+        raw_secret_exposed: { type: boolean, description: "True iff this artifact contains a raw secret (secret_artifact or secrets kind). The HTTP layer refuses /artifacts/{id}/content for these." }
     ReviewPacketSummary:
       type: object
-      required: [id, issue_id, run_id, packet_no, status, root_path, artifacts, failure_code, failure_message, created_at]
+      required: [id, issue_id, run_id, packet_no, status, root_path, summary, acceptance_criteria, handoff, changed_files, diff, tests, risks, verification, approvals, tool_calls, how_to_continue, raw_prompt_exposed, raw_codex_log_exposed, raw_secret_exposed, git, artifacts, failure_code, failure_message, created_at]
+      additionalProperties: true
       properties:
         id: { type: string, pattern: "^rp_" }
         issue_id: { type: string }
@@ -852,6 +862,50 @@ components:
         packet_no: { type: integer, minimum: 1 }
         status: { type: string, enum: [generated, partial, failed] }
         root_path: { type: string }
+        git:
+          type: object
+          additionalProperties: true
+          description: "Git metadata for the review packet: branch_name, base_ref, base_ref_config, base_sha, head_sha, dirty. Always present (defaults to {} when not yet populated)."
+          properties:
+            branch_name: { type: string }
+            base_ref: { type: string }
+            base_ref_config: { type: string }
+            base_sha: { type: string }
+            head_sha: { type: [string, 'null'] }
+            dirty: { type: boolean }
+        summary: { type: string, description: "Handoff summary surfaced as a top-level review packet field. Mirrors handoff.summary." }
+        acceptance_criteria:
+          type: array
+          items: { type: string }
+          description: "Issue acceptance criteria copied from the issue row."
+        handoff: { $ref: '#/components/schemas/ReviewPacketHandoff' }
+        changed_files:
+          type: array
+          items: { type: string }
+        diff:
+          type: string
+          description: "Structured diff body for small text patches. Large or binary patches are omitted here with a pointer to the changes.patch artifact, which preserves the full patch."
+        tests:
+          type: array
+          items: { type: string }
+        risks:
+          type: array
+          items: { type: string }
+        verification:
+          type: array
+          items: { type: string }
+        approvals:
+          type: array
+          items: { type: object, additionalProperties: true }
+        tool_calls:
+          type: array
+          items: { type: object, additionalProperties: true }
+        how_to_continue:
+          type: string
+          description: "Operator guidance: 'Use Send to Rework with a reason, or Mark Done with an acceptance reason.'"
+        raw_prompt_exposed: { type: boolean, description: "Always false; the API never surfaces raw prompt content." }
+        raw_codex_log_exposed: { type: boolean, description: "Always false; the API never surfaces raw Codex log content." }
+        raw_secret_exposed: { type: boolean, description: "Always false; the API never surfaces raw secret artifact content." }
         review_md_path: { type: [string, 'null'] }
         review_json_path: { type: [string, 'null'] }
         patch_path: { type: [string, 'null'] }
@@ -864,6 +918,25 @@ components:
         failure_code: { anyOf: [ { $ref: '#/components/schemas/FailureCode' }, { type: 'null' } ] }
         failure_message: { type: [string, 'null'] }
         created_at: { type: string, format: date-time }
+    ReviewPacketHandoff:
+      type: object
+      additionalProperties: true
+      required: [summary, tests, risks, verification, followups, target_state]
+      properties:
+        summary: { type: string }
+        tests:
+          type: array
+          items: { type: string }
+        risks:
+          type: array
+          items: { type: string }
+        verification:
+          type: array
+          items: { type: string }
+        followups:
+          type: array
+          items: { type: string }
+        target_state: { type: string, const: "Human Review" }
     IssueReviewPacketSummary:
       type: object
       required: [id, run_id, packet_no, status, created_at]
@@ -884,7 +957,7 @@ components:
         issue_id: { type: [string, 'null'] }
         run_id: { type: [string, 'null'] }
         review_packet_id: { type: [string, 'null'] }
-        kind: { type: string, enum: [test_output, patch, changed_files, untracked_files, diffstat, prompt_snapshot, codex_log, review_packet, agent_file, diagnostic, other] }
+        kind: { type: string, enum: [test_output, patch, changed_files, untracked_files, diffstat, prompt_snapshot, prompt_rendered, prompt_context, prompt_meta, prompt_tool_manifest, codex_log, codex_events, secret_artifact, secrets, review_packet, agent_file, diagnostic, other] }
         path: { type: string }
         mime_type: { type: [string, 'null'] }
         size_bytes: { type: [integer, 'null'], minimum: 0 }
