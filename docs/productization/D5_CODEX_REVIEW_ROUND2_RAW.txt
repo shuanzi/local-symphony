@@ -1,0 +1,2146 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /Users/xiquandai/Documents/code/local-symphony-d5-release
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019eaaf2-6cef-7c70-9694-6c57a019871e
+--------
+user
+commit 41dabb6: D5 R13: round 1 review fixes (F1 OUT_DIR guard, F2 npm ci)
+exec
+/bin/zsh -lc 'git status --short --branch && git rev-parse --show-toplevel && git show --stat --oneline --decorate --no-renames 41dabb6' in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+## codex/v1-productization-d5-release
+?? docs/productization/D5_R1_FIX_REQUIRED.md
+/Users/xiquandai/Documents/code/local-symphony-d5-release
+41dabb6 D5 R1: fix F1 (OUT_DIR guard) and F2 (npm ci) per codex review
+ docs/productization/D5_CODEX_REVIEW_ROUND1.md | 151 +++++++
+ internal/buildrelease/safety_test.go          | 409 ++++++++++++++++++
+ scripts/build-release.sh                      |  27 +-
+ web/pnpm-lock.yaml                            | 571 --------------------------
+ 4 files changed, 584 insertions(+), 574 deletions(-)
+
+exec
+/bin/zsh -lc 'git show --no-renames --find-renames=0 --find-copies=0 --stat --patch --minimal 41dabb6 -- scripts/build-release.sh internal/buildrelease/safety_test.go web/pnpm-lock.yaml docs/productization/D5_CODEX_REVIEW_ROUND1.md' in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+commit 41dabb6223b3b6615053bd58f1cbd8df03a5d328
+Author: shuanzi <daixiquan@gmail.com>
+Date:   Tue Jun 9 13:21:14 2026 +0800
+
+    D5 R1: fix F1 (OUT_DIR guard) and F2 (npm ci) per codex review
+    
+    F1 [P1] scripts/build-release.sh:49 — OUT_DIR guard + scoped rm
+    - Early-exit guard rejects OUT_DIR that resolves to or under $ROOT
+      (cd ... && pwd -P on both sides, so symlinks/.. traversal cannot
+      bypass the check). Exits with code 2 and a refusal message.
+    - Replaced the blanket 'rm -rf $OUT_DIR/web' with
+      'rm -rf $OUT_DIR/web/dist' — only the subtree the script actually
+      needs to overwrite. A sibling $OUT_DIR/web/<unrelated> directory
+      is now safe from collateral damage.
+    
+    F2 [P2] scripts/build-release.sh:45-46 — frozen web install
+    - Replaced 'npm install' with 'npm ci' so web/package-lock.json pins
+      the exact React/Vite/TypeScript versions that ship in the release
+      artifact. Avoids 'latest'-pin non-reproducibility.
+    - Removed web/pnpm-lock.yaml so the next person who runs
+      'pnpm install' cannot silently re-resolve 'latest' and overwrite
+      the lockfile.
+    
+    Tests (internal/buildrelease/safety_test.go, test-first FAIL→PASS):
+    - TestBuildReleaseRejectsOUTDirEqualToRoot (OUT_DIR=$ROOT refuses)
+    - TestBuildReleaseRejectsOUTDirUnderRoot (OUT_DIR under $ROOT refuses)
+    - TestBuildReleaseDoesNotBlanketDeleteOUTDirWeb (sentinel survives)
+    - TestBuildReleaseUsesNpmCiNotNpmInstall (static text on the script)
+    - TestBuildReleaseLockfileStoryIsConsistent (only package-lock.json
+      remains, no pnpm-lock.yaml)
+    
+    Round-1 review doc updated to record the fix outcomes.
+    
+    Acceptance: go test (httpapi/app/cli/buildrelease) PASS,
+    validate_contracts.py PASS, acceptance-local.sh PASS,
+    end-to-end build with OUT_DIR=/tmp/d5-build-smoke produces a valid
+    artifact using npm ci (darwin/amd64). Manual OUT_DIR=$PWD invocation
+    exits 2 with refusal message; web/ source tree intact.
+---
+ docs/productization/D5_CODEX_REVIEW_ROUND1.md | 151 +++++++
+ internal/buildrelease/safety_test.go          | 409 ++++++++++++++++++
+ scripts/build-release.sh                      |  27 +-
+ web/pnpm-lock.yaml                            | 571 --------------------------
+ 4 files changed, 584 insertions(+), 574 deletions(-)
+
+diff --git a/docs/productization/D5_CODEX_REVIEW_ROUND1.md b/docs/productization/D5_CODEX_REVIEW_ROUND1.md
+new file mode 100644
+index 0000000..cc7ffab
+--- /dev/null
++++ b/docs/productization/D5_CODEX_REVIEW_ROUND1.md
+@@ -0,0 +1,151 @@
++# D5 / R13 Codex Review — Round 1
++
++- **Worktree**: `/Users/xiquandai/Documents/code/local-symphony-d5-release`
++- **Commit under review**: `573b1f0` — D5: release packaging, install layout, routing-priority tests
++- **Base**: `main` (`f15ba39` at review time)
++- **Reviewer**: `codex review` (Codex v0.130.0, model `gpt-5.5`, reasoning effort `xhigh`, sandbox `danger-full-access`, agent profile `~/.codex/agents/reviewer.toml`)
++- **Command**:
++  ```bash
++  cd /Users/xiquandai/Documents/code/local-symphony-d5-release
++  codex review --commit 573b1f0 --title "D5 R13: release packaging, install layout, routing-priority tests"
++  ```
++  > The `codex review` CLI rejects combining `--base <BRANCH>` with `--commit <SHA>` (exit 2). When reviewing a single commit, pass `--commit` only. The D5 commit is the only delta relative to `main`, so the diff is identical.
++- **Timestamp**: 2026-06-09T11:44:21+0800
++- **Exit code**: 0 (clean run, reviewer surfaced findings)
++- **Full stdout/stderr log**: `/tmp/codex_d5_round1.log` (4050 lines, 172 KB)
++
++## Diff scope under review (per `git diff main..HEAD --stat`)
++
++| File | Status | +/- |
++|---|---|---|
++| `.gitignore` | M | +2 / -0 |
++| `README.md` | M | +59 / -17 |
++| `docs/RELEASE_NOTES.md` | A | +179 / -0 |
++| `docs/productization/D5_RELEASE_NOTES.md` | A | +155 / -0 |
++| `internal/cli/cli.go` | M | +18 / -0 |
++| `internal/httpapi/httpapi_test.go` | M | +168 / -0 |
++| `scripts/build-release.sh` | A | +86 / -0 |
++| **Total** | | **+650 / -17** (7 files) |
++
++## Summary
++
++Codex returned **2 unique findings** (the same payload is echoed twice in stdout by the assistant's final summary; `grep -c '^\s*-\s*\[P[0-3]\]'` returns 4 because of the duplication).
++
++| ID | Severity | File | Status |
++|---|---|---|---|
++| F1 | **P1** | `scripts/build-release.sh:49` | **Fixed** in round-1 fix commit (see §F1 outcome below) |
++| F2 | **P2** | `scripts/build-release.sh:45-46` | **Fixed** in round-1 fix commit (see §F2 outcome below) |
++
++No P3 / NIT findings. No findings against `internal/httpapi/httpapi_test.go`, `internal/cli/cli.go`, `docs/RELEASE_NOTES.md`, `docs/productization/D5_RELEASE_NOTES.md`, `README.md`, or `.gitignore`.
++
++## F1 [P1] Guard `OUT_DIR` before deleting web assets
++
++- **File**: `scripts/build-release.sh:49`
++- **Cited line** (verified locally):
++  ```sh
++  49:    rm -rf "$OUT_DIR/web"
++  50:    mkdir -p "$OUT_DIR/web"
++  51:    cp -R "$ROOT/web/dist/." "$OUT_DIR/web/dist/"
++  ```
++- **Reviewer claim**: If a release caller sets `OUT_DIR=$PWD` (or any path that resolves to/under `$ROOT`), the unconditional `rm -rf "$OUT_DIR/web"` deletes the **checked-in `web/` source tree** that was just used by `npm run build`, after which `cp -R "$ROOT/web/dist/." ...` fails because `$ROOT/web/dist` is gone.
++- **Impact**: Release packaging is data-destructively unsafe when the caller chooses an output path overlapping the source tree. This is a footgun the script hands to anyone running it.
++- **Reviewer fix suggestions**: Either (a) reject `OUT_DIR` values that resolve to or under `$ROOT`, or (b) avoid the blanket `rm -rf` and instead delete only a dedicated `$OUT_DIR/web/dist` target (since that is the only thing the script needs to overwrite).
++- **Local verification**: Confirmed — line 49 reads `rm -rf "$OUT_DIR/web"` with no guard, no `--one-file-system`, and no `realpath` equality check against `$ROOT`. F1 is **valid**.
++
++## F2 [P2] Use a checked-in lockfile for web release builds
++
++- **File**: `scripts/build-release.sh:45-46`
++- **Cited lines** (verified locally):
++  ```sh
++  45:    if [ ! -d "$ROOT/web/node_modules" ]; then
++  46:      (cd "$ROOT/web" && npm install --no-audit --no-fund)
++  47:    fi
++  ```
++- **Reviewer claim**:
++  1. The repo has both `web/pnpm-lock.yaml` and `web/package-lock.json` checked in, but the script uses `npm install`, which writes/respects `package-lock.json` (and ignores `pnpm-lock.yaml`).
++  2. `web/package.json` uses `latest`-pinned versions, so a clean `npm install` resolves whatever upstream `latest` points to at build time. Two consecutive release builds with no source change can ship different React/Vite/TypeScript versions, breaking the release gate and producing non-reproducible artifacts.
++- **Impact**: Release artifacts are **non-reproducible**; an upstream `latest` bump can flip the bundled dashboard's behavior between tagged builds.
++- **Reviewer fix suggestions**: Use the committed lockfile with a frozen install — e.g. `npm ci` against `package-lock.json`, or switch to `pnpm install --frozen-lockfile` and stop calling `npm install`.
++- **Local verification**:
++  ```
++  $ ls web/ | grep -E 'lock|json|yaml'
++  action-inventory.json
++  package-lock.json
++  package.json
++  pnpm-lock.yaml
++  ```
++  Both lockfiles exist; script uses neither for a frozen install. F2 is **valid**.
++
++## F1 outcome — fixed (round-1 fix commit `1e051b6`)
++
++- **Fix landed in**: `scripts/build-release.sh` (round-1 fix commit `1e051b6`).
++- **What changed**: Two protection layers were added so a regression is observable
++  even if a future change re-introduces a destructive `rm -rf`:
++  1. **Early-exit guard** that rejects `OUT_DIR` values resolving to `$ROOT`
++     or any descendant of `$ROOT` (uses `cd ... && pwd -P` on both
++     sides so symlinks and `..` traversal cannot bypass it). The
++     script exits with code 2 and prints a clear refusal message.
++  2. **Scoped destructive line**: the blanket `rm -rf "$OUT_DIR/web"`
++     was replaced with `rm -rf "$OUT_DIR/web/dist"` — the only
++     subtree the script actually needs to overwrite. A sibling
++     `$OUT_DIR/web/<unrelated>` directory is now safe from
++     collateral damage.
++- **Test coverage** (`internal/buildrelease/safety_test.go`, all
++  written test-first and verified FAIL on the unfixed script before
++  the fix was applied):
++  - `TestBuildReleaseRejectsOUTDirEqualToRoot` — `OUT_DIR=$ROOT`
++    must exit non-zero with an error naming both `OUT_DIR` and the
++    overlap wording.
++  - `TestBuildReleaseRejectsOUTDirUnderRoot` — `OUT_DIR=<subdir
++    under $ROOT>` must exit non-zero.
++  - `TestBuildReleaseDoesNotBlanketDeleteOUTDirWeb` — a sentinel
++    file in `$OUT_DIR/web/user-data.txt` must survive the script;
++    exercises the destructive line by stubbing `npm` in `PATH` and
++    pre-seeding `web/node_modules` and `web/dist/`.
++- **Re-verification**: `OUT_DIR=$PWD bash scripts/build-release.sh`
++  exits 2 with the refusal message; `web/` source tree is intact
++  afterwards.
++
++## F2 outcome — fixed (round-1 fix commit `1e051b6`)
++
++- **Fix landed in**: `scripts/build-release.sh` (round-1 fix commit
++  `1e051b6`) and the repo's `web/pnpm-lock.yaml` is now
++  removed.
++- **What changed**:
++  1. The web install switched from `npm install` to `npm ci` so
++     web/package-lock.json pins the exact React/Vite/TypeScript
++     versions that ship in the release artifact.
++  2. The conflicting `web/pnpm-lock.yaml` is removed from the repo
++     so the next person who runs `pnpm install` cannot silently
++     re-resolve `latest` and overwrite the lockfile.
++- **Test coverage** (`internal/buildrelease/safety_test.go`, all
++  test-first FAIL → PASS):
++  - `TestBuildReleaseUsesNpmCiNotNpmInstall` — static-text assertion
++    that the script (comments stripped) calls `npm ci` and does not
++    call `npm install`.
++  - `TestBuildReleaseLockfileStoryIsConsistent` — `web/package-lock.json`
++    must exist and contain a `lockfileVersion` field; `web/pnpm-lock.yaml`
++    must NOT exist.
++- **Re-verification**: `SKIP_WEB=0 OUT_DIR=/tmp/d5-build-smoke bash
++  scripts/build-release.sh` produces a valid release artifact using
++  `npm ci` end-to-end (verified locally on darwin/amd64).
++
++## What is NOT flagged (good signal)
++
++- **Routing-priority / dist-discovery tests** in `internal/httpapi/httpapi_test.go` (the three new tests) — no correctness findings.
++- **`internal/cli/cli.go`** `printHelp` alignment (--host, --port, --addr, --no-open, login semantics) — no findings.
++- **`docs/RELEASE_NOTES.md`** and **`docs/productization/D5_RELEASE_NOTES.md`** — no findings (release contract, version matrix, non-capability list, Windows caveats all read clean).
++- **`README.md`** quickstart + cleanup section — no findings.
++- **`.gitignore`** additions (`dist/`, `web/package-lock.json`) — no findings.
++
++## Round-1 fix commit
++
++`1e051b6` — "D5 R1: fix F1 (OUT_DIR guard) and F2 (npm ci) per codex review"
++
++Stat: 4 files changed, +582 / -574 (the −574 is dominated by removing
++`web/pnpm-lock.yaml`, which was 571 lines).
++2. After the fixes land as a new commit on `codex/v1-productization-d5-release`, re-run codex review:
++   ```bash
++   codex review --commit <NEW_SHA> --title "D5 R13: release packaging (round 2)"
++   ```
++3. If round 2 returns 0 findings, mark `D3.0` / `D5.0` review tasks complete and the worktree is ready for PR.
+diff --git a/internal/buildrelease/safety_test.go b/internal/buildrelease/safety_test.go
+new file mode 100644
+index 0000000..676f4f5
+--- /dev/null
++++ b/internal/buildrelease/safety_test.go
+@@ -0,0 +1,409 @@
++// Package buildrelease contains tests that lock in the safety guarantees
++// of scripts/build-release.sh as required by the D5 codex review round 1:
++//
++//   F1 [P1]  scripts/build-release.sh must not data-destructively delete the
++//            repo's `web/` source tree when OUT_DIR resolves to/under
++//            $ROOT. Two protections: (a) early-exit guard rejecting
++//            OUT_DIR equal to or under $ROOT; (b) the destructive
++//            `rm -rf` is scoped to $OUT_DIR/web/dist, not $OUT_DIR/web.
++//
++//   F2 [P2]  the web install must be deterministic — a frozen install
++//            against the committed web/package-lock.json. The script
++//            must invoke `npm ci` (not `npm install`); the repo must
++//            carry web/package-lock.json while NOT carrying
++//            web/pnpm-lock.yaml (a stale conflicting lockfile is a
++//            footgun for the next person who runs `pnpm install`).
++//
++// F1 is exercised by running the shell script in an isolated temp
++// workdir (a *copy* of the script, not the real $ROOT) so a regression
++// cannot damage the host's source tree. F2 is exercised by static
++// inspection of the committed script and lockfile layout.
++package buildrelease
++
++import (
++	"bytes"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++// repoRoot returns the absolute path of the Local Symphony repo, derived
++// from this test file's location (internal/buildrelease/safety_test.go
++// → ../ → repo root).
++func repoRoot(t *testing.T) string {
++	t.Helper()
++	cwd, err := os.Getwd()
++	if err != nil {
++		t.Fatalf("getwd: %v", err)
++	}
++	// `go test` runs with cwd == the package directory by default.
++	// Internal callers can `go test ./internal/buildrelease` from the
++	// repo root, in which case cwd is the package dir and the repo
++	// root is one level up. Accept both layouts.
++	if filepath.Base(cwd) == "buildrelease" {
++		return filepath.Clean(filepath.Join(cwd, "..", ".."))
++	}
++	return cwd
++}
++
++// runIsolatedScript copies scripts/build-release.sh to a fresh temp
++// directory, lays down the minimum web/ tree the script's F1 guard
++// expects to find, and runs the copy with the supplied $OUT_DIR. The
++// script auto-derives its own $ROOT from its location, so the real
++// repo's $ROOT is never at risk.
++func runIsolatedScript(t *testing.T, outDir string, extraEnv ...string) (string, int) {
++	t.Helper()
++	root := repoRoot(t)
++	scriptSrc, err := os.ReadFile(filepath.Join(root, "scripts", "build-release.sh"))
++	if err != nil {
++		t.Fatalf("read source script: %v", err)
++	}
++	tmp := t.TempDir()
++	dstScript := filepath.Join(tmp, "scripts", "build-release.sh")
++	if err := os.MkdirAll(filepath.Dir(dstScript), 0o755); err != nil {
++		t.Fatalf("mkdir scripts: %v", err)
++	}
++	if err := os.WriteFile(dstScript, scriptSrc, 0o755); err != nil {
++		t.Fatalf("write script: %v", err)
++	}
++	// Lay down the minimum `web/` tree the script's F1 guard will
++	// inspect. Only committed files are copied; node_modules is
++	// intentionally NOT seeded because the F1 tests run with
++	// SKIP_WEB=1.
++	mustCopyFromRepo(t, root, "web/package.json", filepath.Join(tmp, "web", "package.json"))
++	mustCopyFromRepo(t, root, "web/vite.config.ts", filepath.Join(tmp, "web", "vite.config.ts"))
++	mustCopyFromRepo(t, root, "web/tsconfig.json", filepath.Join(tmp, "web", "tsconfig.json"))
++
++	cmd := exec.Command("bash", dstScript)
++	cmd.Dir = tmp
++	env := append(os.Environ(),
++		"OUT_DIR="+outDir,
++		"SKIP_WEB=1",
++	)
++	env = append(env, extraEnv...)
++	cmd.Env = env
++	var buf bytes.Buffer
++	cmd.Stdout = &buf
++	cmd.Stderr = &buf
++	err = cmd.Run()
++	exit := 0
++	if ee, ok := err.(*exec.ExitError); ok {
++		exit = ee.ExitCode()
++	} else if err != nil {
++		t.Fatalf("script exec errored unexpectedly: %v\noutput:\n%s", err, buf.String())
++	}
++	return buf.String(), exit
++}
++
++func mustCopyFromRepo(t *testing.T, root, srcRel, dst string) {
++	t.Helper()
++	b, err := os.ReadFile(filepath.Join(root, srcRel))
++	if err != nil {
++		t.Fatalf("read %s: %v", srcRel, err)
++	}
++	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
++		t.Fatalf("mkdir %s: %v", filepath.Dir(dst), err)
++	}
++	if err := os.WriteFile(dst, b, 0o644); err != nil {
++		t.Fatalf("write %s: %v", dst, err)
++	}
++}
++
++// F1 — first protection layer: OUT_DIR that resolves to $ROOT must be
++// rejected with a non-zero exit and a clear error. The script must
++// not have written any artifact and the source tree under $ROOT must
++// be untouched.
++func TestBuildReleaseRejectsOUTDirEqualToRoot(t *testing.T) {
++	root := t.TempDir()
++	copyMinimumWebTree(t, root)
++	copyMinimumGoModule(t, root)
++
++	out, exit := runIsolatedScriptWithRoot(t, root, root)
++	if exit == 0 {
++		t.Fatalf("OUT_DIR=$ROOT was accepted (exit 0). Output:\n%s", out)
++	}
++	if !strings.Contains(out, "OUT_DIR") {
++		t.Fatalf("rejection error does not name OUT_DIR. Output:\n%s", out)
++	}
++	if !strings.Contains(out, "ROOT") && !strings.Contains(out, "source") && !strings.Contains(out, "overlap") && !strings.Contains(out, "refus") {
++		t.Fatalf("rejection error lacks overlap/refuse/source wording. Output:\n%s", out)
++	}
++	assertWebSourceTreeIntact(t, root, out)
++}
++
++// F1 — second protection layer: OUT_DIR that falls UNDER $ROOT (a
++// subdirectory of the source tree) must also be rejected, for the
++// same reason.
++func TestBuildReleaseRejectsOUTDirUnderRoot(t *testing.T) {
++	root := t.TempDir()
++	copyMinimumWebTree(t, root)
++	copyMinimumGoModule(t, root)
++	outDir := filepath.Join(root, "build-output")
++
++	out, exit := runIsolatedScriptWithRoot(t, root, outDir)
++	if exit == 0 {
++		t.Fatalf("OUT_DIR under $ROOT was accepted (exit 0). Output:\n%s", out)
++	}
++	assertWebSourceTreeIntact(t, root, out)
++}
++
++// F1 — third protection layer: even when OUT_DIR is a safe sibling,
++// the script must not execute the blanket `rm -rf "$OUT_DIR/web"`
++// that would erase a sibling `web/` directory the user happens to
++// keep there. The script only needs to overwrite
++// `$OUT_DIR/web/dist`, so the destructive line should be scoped to
++// that target. This test stages a sentinel file in a pre-existing
++// `$OUT_DIR/web/` directory; if the script deletes that sentinel,
++// the blanket rm is back.
++//
++// To exercise the destructive line we cannot use SKIP_WEB=1 (the
++// line is gated on the web-build branch). We stage a pre-built
++// `$ROOT/web/dist/` and a `$ROOT/web/node_modules/` marker so the
++// script skips the `npm install` and `npm run build` calls but still
++// reaches the rm/cp section. If `npm` is missing, the script logs a
++// warning and skips the web build entirely; this test therefore
++// stubs `npm` in the PATH via a temp bin dir.
++func TestBuildReleaseDoesNotBlanketDeleteOUTDirWeb(t *testing.T) {
++	root := t.TempDir()
++	copyMinimumWebTree(t, root)
++	copyMinimumGoModule(t, root)
++	stagePrebuiltWebDist(t, root)
++	stageFakeNpm(t, root)
++
++	outDir := t.TempDir() + "-sibling"
++	if err := os.MkdirAll(outDir, 0o755); err != nil {
++		t.Fatalf("mkdir outDir: %v", err)
++	}
++	sentinel := filepath.Join(outDir, "web", "user-data.txt")
++	if err := os.MkdirAll(filepath.Dir(sentinel), 0o755); err != nil {
++		t.Fatalf("mkdir sentinel dir: %v", err)
++	}
++	if err := os.WriteFile(sentinel, []byte("user data — must survive"), 0o644); err != nil {
++		t.Fatalf("write sentinel: %v", err)
++	}
++
++	pathWithFakeNpm := filepath.Join(root, "fake-bin") + string(os.PathListSeparator) + os.Getenv("PATH")
++	_, _ = runIsolatedScriptWithRoot(t, root, outDir, "SKIP_WEB=0", "PATH="+pathWithFakeNpm)
++
++	if _, err := os.Stat(sentinel); err != nil {
++		t.Fatalf("sentinel %s was deleted by the build script; blanket rm -rf $OUT_DIR/web is back. err=%v", sentinel, err)
++	}
++}
++
++// F2 — first protection: the script must invoke `npm ci` (frozen
++// install against web/package-lock.json), not `npm install`. Static
++// text inspection of the script is sufficient and is what the
++// round-1 reviewer asked for.
++func TestBuildReleaseUsesNpmCiNotNpmInstall(t *testing.T) {
++	root := repoRoot(t)
++	b, err := os.ReadFile(filepath.Join(root, "scripts", "build-release.sh"))
++	if err != nil {
++		t.Fatalf("read script: %v", err)
++	}
++	script := stripShellComments(string(b))
++
++	if !strings.Contains(script, "npm ci") {
++		t.Fatalf("scripts/build-release.sh does not call `npm ci`.\nThe frozen-install contract is broken. Script (comments stripped):\n%s", script)
++	}
++	// `npm install` (with whitespace) is the destructive variant. The
++	// script may still mention `npm install` inside a comment / help
++	// text, but the body of the script must not call it.
++	lines := strings.Split(script, "\n")
++	for i, line := range lines {
++		trimmed := strings.TrimSpace(line)
++		// A line that contains `npm install` AND is not a `npm ci`
++		// variant is a regression. We allow the literal text to
++		// appear inside shell comments (which we already stripped) or
++		// inside a quoted string used for an echo; stripShellComments
++		// handles the former. We still allow `npm install` in a doc
++		// comment INSIDE a quoted echo statement, but the script
++		// currently has no such occurrence. If a future change adds
++		// one, the assertion must be revisited.
++		if strings.Contains(trimmed, "npm install") && !strings.Contains(trimmed, "npm ci") {
++			t.Fatalf("scripts/build-release.sh line %d still calls `npm install`:\n  %s\nThe frozen-install contract requires `npm ci`.", i+1, trimmed)
++		}
++	}
++}
++
++// F2 — second protection: the repo must carry web/package-lock.json
++// (so `npm ci` has something to install from) and must NOT carry
++// web/pnpm-lock.yaml (a stale conflicting lockfile would let a future
++// `pnpm install` re-resolve `latest` and break reproducibility).
++func TestBuildReleaseLockfileStoryIsConsistent(t *testing.T) {
++	root := repoRoot(t)
++
++	plPath := filepath.Join(root, "web", "package-lock.json")
++	if _, err := os.Stat(plPath); err != nil {
++		t.Fatalf("web/package-lock.json missing; `npm ci` cannot run. err=%v", err)
++	}
++	plData, err := os.ReadFile(plPath)
++	if err != nil {
++		t.Fatalf("read web/package-lock.json: %v", err)
++	}
++	if !strings.Contains(string(plData), `"lockfileVersion"`) {
++		t.Fatalf("web/package-lock.json is not a valid lockfile (missing lockfileVersion).")
++	}
++
++	ylPath := filepath.Join(root, "web", "pnpm-lock.yaml")
++	if _, err := os.Stat(ylPath); err == nil {
++		t.Fatalf("web/pnpm-lock.yaml still present alongside web/package-lock.json; pick one lockfile to avoid silent drift.")
++	} else if !os.IsNotExist(err) {
++		t.Fatalf("stat web/pnpm-lock.yaml: %v", err)
++	}
++}
++
++// runIsolatedScriptWithRoot is the lower-level runner used by the F1
++// tests; it places a fresh copy of the script in `root/scripts/` so
++// the script's auto-derived $ROOT is exactly `root`.
++func runIsolatedScriptWithRoot(t *testing.T, root, outDir string, extraEnv ...string) (string, int) {
++	t.Helper()
++	repoRoot := repoRoot(t)
++	scriptSrc, err := os.ReadFile(filepath.Join(repoRoot, "scripts", "build-release.sh"))
++	if err != nil {
++		t.Fatalf("read source script: %v", err)
++	}
++	dstScript := filepath.Join(root, "scripts", "build-release.sh")
++	if err := os.MkdirAll(filepath.Dir(dstScript), 0o755); err != nil {
++		t.Fatalf("mkdir scripts: %v", err)
++	}
++	if err := os.WriteFile(dstScript, scriptSrc, 0o755); err != nil {
++		t.Fatalf("write script: %v", err)
++	}
++
++	cmd := exec.Command("bash", dstScript)
++	cmd.Dir = root
++	env := append(os.Environ(),
++		"OUT_DIR="+outDir,
++		"SKIP_WEB=1",
++	)
++	env = append(env, extraEnv...)
++	cmd.Env = env
++	var buf bytes.Buffer
++	cmd.Stdout = &buf
++	cmd.Stderr = &buf
++	err = cmd.Run()
++	exit := 0
++	if ee, ok := err.(*exec.ExitError); ok {
++		exit = ee.ExitCode()
++	} else if err != nil {
++		t.Fatalf("script exec errored unexpectedly: %v\noutput:\n%s", err, buf.String())
++	}
++	return buf.String(), exit
++}
++
++func copyMinimumWebTree(t *testing.T, root string) {
++	t.Helper()
++	repo := repoRoot(t)
++	for _, rel := range []string{"web/package.json", "web/vite.config.ts", "web/tsconfig.json"} {
++		mustCopyFromRepo(t, repo, rel, filepath.Join(root, rel))
++	}
++}
++
++// copyMinimumGoModule stages a minimal Go module under `root` so the
++// build script's `go build ./cmd/symphony` succeeds. The code is a
++// throwaway `package main` with an empty `main()` — the only thing
++// the script needs is a successful `go build` exit so it reaches
++// the dangerous `rm -rf` line that the F1 tests are guarding.
++func copyMinimumGoModule(t *testing.T, root string) {
++	t.Helper()
++	if err := os.MkdirAll(filepath.Join(root, "cmd", "symphony"), 0o755); err != nil {
++		t.Fatalf("mkdir cmd/symphony: %v", err)
++	}
++	mainSrc := []byte("package main\n\nfunc main() {}\n")
++	if err := os.WriteFile(filepath.Join(root, "cmd", "symphony", "main.go"), mainSrc, 0o644); err != nil {
++		t.Fatalf("write main.go: %v", err)
++	}
++	gomod := []byte("module example.com/testbuild\n\ngo 1.23\n")
++	if err := os.WriteFile(filepath.Join(root, "go.mod"), gomod, 0o644); err != nil {
++		t.Fatalf("write go.mod: %v", err)
++	}
++}
++
++// stagePrebuiltWebDist creates a `web/dist/index.html` and
++// `web/node_modules/` marker so the build script believes the npm
++// install / build steps have already been done. This lets the F1
++// test reach the `rm -rf $OUT_DIR/web` line without actually running
++// npm.
++func stagePrebuiltWebDist(t *testing.T, root string) {
++	t.Helper()
++	distDir := filepath.Join(root, "web", "dist")
++	if err := os.MkdirAll(distDir, 0o755); err != nil {
++		t.Fatalf("mkdir web/dist: %v", err)
++	}
++	if err := os.WriteFile(filepath.Join(distDir, "index.html"), []byte("<html></html>"), 0o644); err != nil {
++		t.Fatalf("write web/dist/index.html: %v", err)
++	}
++	if err := os.MkdirAll(filepath.Join(root, "web", "node_modules"), 0o755); err != nil {
++		t.Fatalf("mkdir web/node_modules: %v", err)
++	}
++}
++
++// stageFakeNpm creates a `fake-bin/npm` that responds to
++// `npm run build` by exit 0. The script's check `command -v npm`
++// then succeeds, and the `if [ ! -d "$ROOT/web/node_modules" ]` short
++// branch is bypassed because the helper above already seeded
++// `node_modules`. The destructive `rm -rf $OUT_DIR/web` is reached
++// and that's what this test guards.
++func stageFakeNpm(t *testing.T, root string) {
++	t.Helper()
++	binDir := filepath.Join(root, "fake-bin")
++	if err := os.MkdirAll(binDir, 0o755); err != nil {
++		t.Fatalf("mkdir fake-bin: %v", err)
++	}
++	// A shell stub that mimics `npm` enough to keep the script
++	// happy: `npm run build` exits 0.
++	stub := "#!/usr/bin/env bash\nexit 0\n"
++	if err := os.WriteFile(filepath.Join(binDir, "npm"), []byte(stub), 0o755); err != nil {
++		t.Fatalf("write fake npm: %v", err)
++	}
++}
++
++func assertWebSourceTreeIntact(t *testing.T, root, scriptOut string) {
++	t.Helper()
++	required := []string{
++		filepath.Join(root, "web", "package.json"),
++		filepath.Join(root, "web", "vite.config.ts"),
++		filepath.Join(root, "web", "tsconfig.json"),
++	}
++	for _, p := range required {
++		if _, err := os.Stat(p); err != nil {
++			t.Fatalf("committed source file missing after rejected run: %s (err=%v)\nScript output:\n%s", p, err, scriptOut)
++		}
++	}
++}
++
++// stripShellComments removes `# …` line comments and inline `# …`
++// comments outside of single-quoted strings. It is good enough for
++// grep-style assertions on the build script, which has no nested
++// quoting or escapes.
++func stripShellComments(src string) string {
++	var b strings.Builder
++	inSingle := false
++	inDouble := false
++	for i := 0; i < len(src); i++ {
++		c := src[i]
++		if c == '\'' && !inDouble {
++			inSingle = !inSingle
++			b.WriteByte(c)
++			continue
++		}
++		if c == '"' && !inSingle {
++			inDouble = !inDouble
++			b.WriteByte(c)
++			continue
++		}
++		if c == '#' && !inSingle && !inDouble {
++			for i < len(src) && src[i] != '\n' {
++				i++
++			}
++			if i < len(src) {
++				b.WriteByte('\n')
++			}
++			continue
++		}
++		b.WriteByte(c)
++	}
++	return b.String()
++}
+diff --git a/scripts/build-release.sh b/scripts/build-release.sh
+index 0b8f448..3ddcd7c 100755
+--- a/scripts/build-release.sh
++++ b/scripts/build-release.sh
+@@ -13,6 +13,7 @@
+ # Usage:
+ #   bash scripts/build-release.sh              # build for the host's GOOS/GOARCH
+ #   GOOS=darwin GOARCH=arm64 bash scripts/build-release.sh
++#   OUT_DIR=/tmp/release bash scripts/build-release.sh
+ #
+ # This script is best-effort: the dashboard build is skipped if `npm` is not on
+ # PATH. In that case the Go binary is still produced and the user can drop a
+@@ -30,6 +31,19 @@ EXT=""
+ if [ "$GOOS_VALUE" = "windows" ]; then EXT=".exe"; fi
+ BIN_PATH="$OUT_DIR/${BIN_NAME}${EXT}"
+ 
++# Refuse OUT_DIR that resolves to/under $ROOT. Without this guard, the
++# destructive `rm -rf "$OUT_DIR/web"` later in this script would
++# silently wipe the checked-in `web/` source tree the rest of the
++# build relies on. (D5 codex review F1 [P1].)
++ROOT_RESOLVED=$(cd "$ROOT" && pwd -P)
++OUT_DIR_RESOLVED=$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd -P)
++if [ "$OUT_DIR_RESOLVED" = "$ROOT_RESOLVED" ] || \
++   { [ "${OUT_DIR_RESOLVED#$ROOT_RESOLVED/}" != "$OUT_DIR_RESOLVED" ] && [ -n "$OUT_DIR_RESOLVED" ]; }; then
++  echo "[build-release] refusing to run: OUT_DIR=$OUT_DIR_RESOLVED overlaps with source ROOT=$ROOT_RESOLVED" >&2
++  echo "[build-release] pick an OUT_DIR that is a sibling of the source tree (e.g. /tmp/release) so the build cannot delete the checked-in web/ source." >&2
++  exit 2
++fi
++
+ mkdir -p "$OUT_DIR"
+ 
+ echo "[build-release] target=${GOOS_VALUE}/${GOARCH_VALUE}"
+@@ -42,12 +56,19 @@ if [ "${SKIP_WEB:-0}" = "1" ]; then
+ else
+   if command -v npm >/dev/null 2>&1; then
+     echo "[build-release] npm run build (dashboard)"
++    # Use a frozen install against the committed web/package-lock.json.
++    # `npm install` would re-resolve `latest`-pinned versions and break
++    # the release's reproducibility contract. (D5 codex review F2 [P2].)
+     if [ ! -d "$ROOT/web/node_modules" ]; then
+-      (cd "$ROOT/web" && npm install --no-audit --no-fund)
++      (cd "$ROOT/web" && npm ci --no-audit --no-fund)
+     fi
+     (cd "$ROOT/web" && npm run build)
+-    rm -rf "$OUT_DIR/web"
+-    mkdir -p "$OUT_DIR/web"
++    # Only clean the script's own $OUT_DIR/web/dist target. A blanket
++    # `rm -rf "$OUT_DIR/web"` would erase unrelated user data the
++    # caller may keep in $OUT_DIR/web. (D5 codex review F1 [P1] —
++    # scoped rm.)
++    rm -rf "$OUT_DIR/web/dist"
++    mkdir -p "$OUT_DIR/web/dist"
+     cp -R "$ROOT/web/dist/." "$OUT_DIR/web/dist/"
+     echo "[build-release] dashboard copied to $OUT_DIR/web/dist"
+   else
+diff --git a/web/pnpm-lock.yaml b/web/pnpm-lock.yaml
+deleted file mode 100644
+index 8cc623f..0000000
+--- a/web/pnpm-lock.yaml
++++ /dev/null
+@@ -1,571 +0,0 @@
+-lockfileVersion: '9.0'
+-
+-settings:
+-  autoInstallPeers: true
+-  excludeLinksFromLockfile: false
+-
+-importers:
+-
+-  .:
+-    dependencies:
+-      react:
+-        specifier: latest
+-        version: 19.2.6
+-      react-dom:
+-        specifier: latest
+-        version: 19.2.6(react@19.2.6)
+-    devDependencies:
+-      '@types/react':
+-        specifier: latest
+-        version: 19.2.14
+-      '@types/react-dom':
+-        specifier: latest
+-        version: 19.2.3(@types/react@19.2.14)
+-      '@vitejs/plugin-react':
+-        specifier: latest
+-        version: 6.0.2(vite@8.0.13)
+-      typescript:
+-        specifier: latest
+-        version: 6.0.3
+-      vite:
+-        specifier: latest
+-        version: 8.0.13
+-
+-packages:
+-
+-  '@emnapi/core@1.10.0':
+-    resolution: {integrity: sha512-yq6OkJ4p82CAfPl0u9mQebQHKPJkY7WrIuk205cTYnYe+k2Z8YBh11FrbRG/H6ihirqcacOgl2BIO8oyMQLeXw==}
+-
+-  '@emnapi/runtime@1.10.0':
+-    resolution: {integrity: sha512-ewvYlk86xUoGI0zQRNq/mC+16R1QeDlKQy21Ki3oSYXNgLb45GV1P6A0M+/s6nyCuNDqe5VpaY84BzXGwVbwFA==}
+-
+-  '@emnapi/wasi-threads@1.2.1':
+-    resolution: {integrity: sha512-uTII7OYF+/Mes/MrcIOYp5yOtSMLBWSIoLPpcgwipoiKbli6k322tcoFsxoIIxPDqW01SQGAgko4EzZi2BNv2w==}
+-
+-  '@napi-rs/wasm-runtime@1.1.4':
+-    resolution: {integrity: sha512-3NQNNgA1YSlJb/kMH1ildASP9HW7/7kYnRI2szWJaofaS1hWmbGI4H+d3+22aGzXXN9IJ+n+GiFVcGipJP18ow==}
+-    peerDependencies:
+-      '@emnapi/core': ^1.7.1
+-      '@emnapi/runtime': ^1.7.1
+-
+-  '@oxc-project/types@0.130.0':
+-    resolution: {integrity: sha512-ibD2usx9JRu7f5pu2tMKMI4cpA4NgXJQoYRP4pQ7Pxmn1l6k/53qWtQWZayhYy3X4QZkt90Ot+mJEaeXouio6Q==}
+-
+-  '@rolldown/binding-android-arm64@1.0.1':
+-    resolution: {integrity: sha512-fJI3I0r3C3Oj/zdBCpaCmBRZYf07xpaq4yCfDDoSFm+beWNzbIl26puW8RraUdugoJw/95zerNOn6jasAhzSmg==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [arm64]
+-    os: [android]
+-
+-  '@rolldown/binding-darwin-arm64@1.0.1':
+-    resolution: {integrity: sha512-cKnAhWEsV7TPcA/5EAteDp6KcJZBQ2G+BqE7zayMMi7kMvwRsbv7WT9aOnn0WNl4SKEIf43vjS31iUPu80nzXg==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [arm64]
+-    os: [darwin]
+-
+-  '@rolldown/binding-darwin-x64@1.0.1':
+-    resolution: {integrity: sha512-YKrVwQjIRBPo+5G/u03wGjbdy4q7pyzCe93DK9VJ7zkVmeg8LJ7GbgsiHWdR4xSoe4CAXRD7Bcjgbtr64bkXNg==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [x64]
+-    os: [darwin]
+-
+-  '@rolldown/binding-freebsd-x64@1.0.1':
+-    resolution: {integrity: sha512-z/oBsREo46SsFqBwYtFe0kpJeBijAT48O/WXLI4suiCLBkr03RTtTJMCzSdDd2znlh8VJizL09XVkQgk8IZonw==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [x64]
+-    os: [freebsd]
+-
+-  '@rolldown/binding-linux-arm-gnueabihf@1.0.1':
+-    resolution: {integrity: sha512-ik8q7GM11zxvYxFc2PeDcT6TBvhCQMaUxfph/M5l9sKuTs/Sjg3L+Byw0F7w0ZVLBZmx30P+gG0ECzzN+MFcmQ==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [arm]
+-    os: [linux]
+-
+-  '@rolldown/binding-linux-arm64-gnu@1.0.1':
+-    resolution: {integrity: sha512-QoSx2EkyrrdZ6kcyE8stqZ62t0Yra8Fs5ia9lOxJrh6TMQJK7gQKmscdTHf7pOXKREKrVwOtJcQG3qVSfc866A==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [arm64]
+-    os: [linux]
+-
+-  '@rolldown/binding-linux-arm64-musl@1.0.1':
+-    resolution: {integrity: sha512-uwNwFpwKeNiZawfAWBgg0VIztPTV3ihhh1vV334h9ivnNLorxnQMU6Fz8wG1Zb4Qh9LC1/MkcyT3YlDXG3Rsgg==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [arm64]
+-    os: [linux]
+-
+-  '@rolldown/binding-linux-ppc64-gnu@1.0.1':
+-    resolution: {integrity: sha512-zY1bul7OWr7DFBiJ++wofXvnr8B45ce3QsQUhKrIhXsygAh7bTkwyeM1bi1a2g5C/yC/N8TZyGDEoMfm/l9mpg==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [ppc64]
+-    os: [linux]
+-
+-  '@rolldown/binding-linux-s390x-gnu@1.0.1':
+-    resolution: {integrity: sha512-0frlsT/f4Ft6I7SMESTKnF3cZsdicQn1dCMkF/jT9wDLE+gGoiQfv1nmT9e+s7s/fekvvy6tZM2jHvI2tkbJDQ==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [s390x]
+-    os: [linux]
+-
+-  '@rolldown/binding-linux-x64-gnu@1.0.1':
+-    resolution: {integrity: sha512-XABVmGp9Tg0WspTVvwduTc4fpqy6JnAUrSQe6OuyqD/03nI7r0O9OWUkMIwFrjKAIqolvqoA4ZrJppgwE0Gxmw==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [x64]
+-    os: [linux]
+-
+-  '@rolldown/binding-linux-x64-musl@1.0.1':
+-    resolution: {integrity: sha512-bV4fzswuzVcKD90o/VM6QqKxnxlDq0g2BISDLNVmxrnhpv1DDbyPhCIjYfvzYLV+MvkKKnQt2Q6AO86SEBULUQ==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [x64]
+-    os: [linux]
+-
+-  '@rolldown/binding-openharmony-arm64@1.0.1':
+-    resolution: {integrity: sha512-/Mh0Zhq3OP7fVs0kcQHZP6lZEthMGTaSf8UBQYSFEZDWGXXlEC+nJ6EqenaK2t4LBXMe3A+K/G2BVXXdtOr4PQ==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [arm64]
+-    os: [openharmony]
+-
+-  '@rolldown/binding-wasm32-wasi@1.0.1':
+-    resolution: {integrity: sha512-+1xc9X45l8ufsBAm6Gjvx2qDRIY9lTVt0cgWNcJ+1gdhXvkbxePA60yRTwSTuXL09CMhyJmjpV7E3NoyxbqFQQ==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [wasm32]
+-
+-  '@rolldown/binding-win32-arm64-msvc@1.0.1':
+-    resolution: {integrity: sha512-1D+UqZdfnuR+Jy1GgMJwi85bD40H21uNmOPRWQhw4oRSuolZ/B5rixZ45DK2KXOTCvmVCecauWgEhbw8bI7tOw==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [arm64]
+-    os: [win32]
+-
+-  '@rolldown/binding-win32-x64-msvc@1.0.1':
+-    resolution: {integrity: sha512-INAycaWuhlOK3wk4mRHGsdgwYWmd9cChdPdE9bwWmy6rn9VqVNYNFGhOdXrofXUxwHIncSiPNb8tNm8knDVIeQ==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    cpu: [x64]
+-    os: [win32]
+-
+-  '@rolldown/pluginutils@1.0.1':
+-    resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
+-
+-  '@tybys/wasm-util@0.10.2':
+-    resolution: {integrity: sha512-RoBvJ2X0wuKlWFIjrwffGw1IqZHKQqzIchKaadZZfnNpsAYp2mM0h36JtPCjNDAHGgYez/15uMBpfGwchhiMgg==}
+-
+-  '@types/react-dom@19.2.3':
+-    resolution: {integrity: sha512-jp2L/eY6fn+KgVVQAOqYItbF0VY/YApe5Mz2F0aykSO8gx31bYCZyvSeYxCHKvzHG5eZjc+zyaS5BrBWya2+kQ==}
+-    peerDependencies:
+-      '@types/react': ^19.2.0
+-
+-  '@types/react@19.2.14':
+-    resolution: {integrity: sha512-ilcTH/UniCkMdtexkoCN0bI7pMcJDvmQFPvuPvmEaYA/NSfFTAgdUSLAoVjaRJm7+6PvcM+q1zYOwS4wTYMF9w==}
+-
+-  '@vitejs/plugin-react@6.0.2':
+-    resolution: {integrity: sha512-DlSMqo4WhThw4vB8Mpn0Woe9J+Jfq1geJ61AKW0QEgLzGMNwtIMdxbDUzLxcun8W7NbJO0e2Jg/Nxm3cCSVzzg==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    peerDependencies:
+-      '@rolldown/plugin-babel': ^0.1.7 || ^0.2.0
+-      babel-plugin-react-compiler: ^1.0.0
+-      vite: ^8.0.0
+-    peerDependenciesMeta:
+-      '@rolldown/plugin-babel':
+-        optional: true
+-      babel-plugin-react-compiler:
+-        optional: true
+-
+-  csstype@3.2.3:
+-    resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
+-
+-  detect-libc@2.1.2:
+-    resolution: {integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==}
+-    engines: {node: '>=8'}
+-
+-  fdir@6.5.0:
+-    resolution: {integrity: sha512-tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg==}
+-    engines: {node: '>=12.0.0'}
+-    peerDependencies:
+-      picomatch: ^3 || ^4
+-    peerDependenciesMeta:
+-      picomatch:
+-        optional: true
+-
+-  fsevents@2.3.3:
+-    resolution: {integrity: sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==}
+-    engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
+-    os: [darwin]
+-
+-  lightningcss-android-arm64@1.32.0:
+-    resolution: {integrity: sha512-YK7/ClTt4kAK0vo6w3X+Pnm0D2cf2vPHbhOXdoNti1Ga0al1P4TBZhwjATvjNwLEBCnKvjJc2jQgHXH0NEwlAg==}
+-    engines: {node: '>= 12.0.0'}
+-    cpu: [arm64]
+-    os: [android]
+-
+-  lightningcss-darwin-arm64@1.32.0:
+-    resolution: {integrity: sha512-RzeG9Ju5bag2Bv1/lwlVJvBE3q6TtXskdZLLCyfg5pt+HLz9BqlICO7LZM7VHNTTn/5PRhHFBSjk5lc4cmscPQ==}
+-    engines: {node: '>= 12.0.0'}
+-    cpu: [arm64]
+-    os: [darwin]
+-
+-  lightningcss-darwin-x64@1.32.0:
+-    resolution: {integrity: sha512-U+QsBp2m/s2wqpUYT/6wnlagdZbtZdndSmut/NJqlCcMLTWp5muCrID+K5UJ6jqD2BFshejCYXniPDbNh73V8w==}
+-    engines: {node: '>= 12.0.0'}
+-    cpu: [x64]
+-    os: [darwin]
+-
+-  lightningcss-freebsd-x64@1.32.0:
+-    resolution: {integrity: sha512-JCTigedEksZk3tHTTthnMdVfGf61Fky8Ji2E4YjUTEQX14xiy/lTzXnu1vwiZe3bYe0q+SpsSH/CTeDXK6WHig==}
+-    engines: {node: '>= 12.0.0'}
+-    cpu: [x64]
+-    os: [freebsd]
+-
+-  lightningcss-linux-arm-gnueabihf@1.32.0:
+-    resolution: {integrity: sha512-x6rnnpRa2GL0zQOkt6rts3YDPzduLpWvwAF6EMhXFVZXD4tPrBkEFqzGowzCsIWsPjqSK+tyNEODUBXeeVHSkw==}
+-    engines: {node: '>= 12.0.0'}
+-    cpu: [arm]
+-    os: [linux]
+-
+-  lightningcss-linux-arm64-gnu@1.32.0:
+-    resolution: {integrity: sha512-0nnMyoyOLRJXfbMOilaSRcLH3Jw5z9HDNGfT/gwCPgaDjnx0i8w7vBzFLFR1f6CMLKF8gVbebmkUN3fa/kQJpQ==}
+-    engines: {node: '>= 12.0.0'}
+-    cpu: [arm64]
+-    os: [linux]
+-
+-  lightningcss-linux-arm64-musl@1.32.0:
+-    resolution: {integrity: sha512-UpQkoenr4UJEzgVIYpI80lDFvRmPVg6oqboNHfoH4CQIfNA+HOrZ7Mo7KZP02dC6LjghPQJeBsvXhJod/wnIBg==}
+-    engines: {node: '>= 12.0.0'}
+-    cpu: [arm64]
+-    os: [linux]
+-
+-  lightningcss-linux-x64-gnu@1.32.0:
+-    resolution: {integrity: sha512-V7Qr52IhZmdKPVr+Vtw8o+WLsQJYCTd8loIfpDaMRWGUZfBOYEJeyJIkqGIDMZPwPx24pUMfwSxxI8phr/MbOA==}
+-    engines: {node: '>= 12.0.0'}
+-    cpu: [x64]
+-    os: [linux]
+-
+-  lightningcss-linux-x64-musl@1.32.0:
+-    resolution: {integrity: sha512-bYcLp+Vb0awsiXg/80uCRezCYHNg1/l3mt0gzHnWV9XP1W5sKa5/TCdGWaR/zBM2PeF/HbsQv/j2URNOiVuxWg==}
+-    engines: {node: '>= 12.0.0'}
+-    cpu: [x64]
+-    os: [linux]
+-
+-  lightningcss-win32-arm64-msvc@1.32.0:
+-    resolution: {integrity: sha512-8SbC8BR40pS6baCM8sbtYDSwEVQd4JlFTOlaD3gWGHfThTcABnNDBda6eTZeqbofalIJhFx0qKzgHJmcPTnGdw==}
+-    engines: {node: '>= 12.0.0'}
+-    cpu: [arm64]
+-    os: [win32]
+-
+-  lightningcss-win32-x64-msvc@1.32.0:
+-    resolution: {integrity: sha512-Amq9B/SoZYdDi1kFrojnoqPLxYhQ4Wo5XiL8EVJrVsB8ARoC1PWW6VGtT0WKCemjy8aC+louJnjS7U18x3b06Q==}
+-    engines: {node: '>= 12.0.0'}
+-    cpu: [x64]
+-    os: [win32]
+-
+-  lightningcss@1.32.0:
+-    resolution: {integrity: sha512-NXYBzinNrblfraPGyrbPoD19C1h9lfI/1mzgWYvXUTe414Gz/X1FD2XBZSZM7rRTrMA8JL3OtAaGifrIKhQ5yQ==}
+-    engines: {node: '>= 12.0.0'}
+-
+-  nanoid@3.3.12:
+-    resolution: {integrity: sha512-ZB9RH/39qpq5Vu6Y+NmUaFhQR6pp+M2Xt76XBnEwDaGcVAqhlvxrl3B2bKS5D3NH3QR76v3aSrKaF/Kiy7lEtQ==}
+-    engines: {node: ^10 || ^12 || ^13.7 || ^14 || >=15.0.1}
+-    hasBin: true
+-
+-  picocolors@1.1.1:
+-    resolution: {integrity: sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==}
+-
+-  picomatch@4.0.4:
+-    resolution: {integrity: sha512-QP88BAKvMam/3NxH6vj2o21R6MjxZUAd6nlwAS/pnGvN9IVLocLHxGYIzFhg6fUQ+5th6P4dv4eW9jX3DSIj7A==}
+-    engines: {node: '>=12'}
+-
+-  postcss@8.5.14:
+-    resolution: {integrity: sha512-SoSL4+OSEtR99LHFZQiJLkT59C5B1amGO1NzTwj7TT1qCUgUO6hxOvzkOYxD+vMrXBM3XJIKzokoERdqQq/Zmg==}
+-    engines: {node: ^10 || ^12 || >=14}
+-
+-  react-dom@19.2.6:
+-    resolution: {integrity: sha512-0prMI+hvBbPjsWnxDLxlCGyM8PN6UuWjEUCYmZhO67xIV9Xasa/r/vDnq+Xyq4Lo27g8QSbO5YzARu0D1Sps3g==}
+-    peerDependencies:
+-      react: ^19.2.6
+-
+-  react@19.2.6:
+-    resolution: {integrity: sha512-sfWGGfavi0xr8Pg0sVsyHMAOziVYKgPLNrS7ig+ivMNb3wbCBw3KxtflsGBAwD3gYQlE/AEZsTLgToRrSCjb0Q==}
+-    engines: {node: '>=0.10.0'}
+-
+-  rolldown@1.0.1:
+-    resolution: {integrity: sha512-X0KQHljNnEkWNqqiz9zJrGunh1B0HgOxLXvnFpCOcadzcy5qohZ3tqMEUg00vncoRovXuK3ZqCT9KnnKzoInFQ==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    hasBin: true
+-
+-  scheduler@0.27.0:
+-    resolution: {integrity: sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q==}
+-
+-  source-map-js@1.2.1:
+-    resolution: {integrity: sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==}
+-    engines: {node: '>=0.10.0'}
+-
+-  tinyglobby@0.2.16:
+-    resolution: {integrity: sha512-pn99VhoACYR8nFHhxqix+uvsbXineAasWm5ojXoN8xEwK5Kd3/TrhNn1wByuD52UxWRLy8pu+kRMniEi6Eq9Zg==}
+-    engines: {node: '>=12.0.0'}
+-
+-  tslib@2.8.1:
+-    resolution: {integrity: sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==}
+-
+-  typescript@6.0.3:
+-    resolution: {integrity: sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==}
+-    engines: {node: '>=14.17'}
+-    hasBin: true
+-
+-  vite@8.0.13:
+-    resolution: {integrity: sha512-MFtjBYgzmSxmgA4RAfjIyXWpGe1oALnjgUTzzV7QLx/TKxCzjtMH6Fd9/eVK+5Fg1qNoz5VAwsmMs/NofrmJvw==}
+-    engines: {node: ^20.19.0 || >=22.12.0}
+-    hasBin: true
+-    peerDependencies:
+-      '@types/node': ^20.19.0 || >=22.12.0
+-      '@vitejs/devtools': ^0.1.18
+-      esbuild: ^0.27.0 || ^0.28.0
+-      jiti: '>=1.21.0'
+-      less: ^4.0.0
+-      sass: ^1.70.0
+-      sass-embedded: ^1.70.0
+-      stylus: '>=0.54.8'
+-      sugarss: ^5.0.0
+-      terser: ^5.16.0
+-      tsx: ^4.8.1
+-      yaml: ^2.4.2
+-    peerDependenciesMeta:
+-      '@types/node':
+-        optional: true
+-      '@vitejs/devtools':
+-        optional: true
+-      esbuild:
+-        optional: true
+-      jiti:
+-        optional: true
+-      less:
+-        optional: true
+-      sass:
+-        optional: true
+-      sass-embedded:
+-        optional: true
+-      stylus:
+-        optional: true
+-      sugarss:
+-        optional: true
+-      terser:
+-        optional: true
+-      tsx:
+-        optional: true
+-      yaml:
+-        optional: true
+-
+-snapshots:
+-
+-  '@emnapi/core@1.10.0':
+-    dependencies:
+-      '@emnapi/wasi-threads': 1.2.1
+-      tslib: 2.8.1
+-    optional: true
+-
+-  '@emnapi/runtime@1.10.0':
+-    dependencies:
+-      tslib: 2.8.1
+-    optional: true
+-
+-  '@emnapi/wasi-threads@1.2.1':
+-    dependencies:
+-      tslib: 2.8.1
+-    optional: true
+-
+-  '@napi-rs/wasm-runtime@1.1.4(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0)':
+-    dependencies:
+-      '@emnapi/core': 1.10.0
+-      '@emnapi/runtime': 1.10.0
+-      '@tybys/wasm-util': 0.10.2
+-    optional: true
+-
+-  '@oxc-project/types@0.130.0': {}
+-
+-  '@rolldown/binding-android-arm64@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-darwin-arm64@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-darwin-x64@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-freebsd-x64@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-linux-arm-gnueabihf@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-linux-arm64-gnu@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-linux-arm64-musl@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-linux-ppc64-gnu@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-linux-s390x-gnu@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-linux-x64-gnu@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-linux-x64-musl@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-openharmony-arm64@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-wasm32-wasi@1.0.1':
+-    dependencies:
+-      '@emnapi/core': 1.10.0
+-      '@emnapi/runtime': 1.10.0
+-      '@napi-rs/wasm-runtime': 1.1.4(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0)
+-    optional: true
+-
+-  '@rolldown/binding-win32-arm64-msvc@1.0.1':
+-    optional: true
+-
+-  '@rolldown/binding-win32-x64-msvc@1.0.1':
+-    optional: true
+-
+-  '@rolldown/pluginutils@1.0.1': {}
+-
+-  '@tybys/wasm-util@0.10.2':
+-    dependencies:
+-      tslib: 2.8.1
+-    optional: true
+-
+-  '@types/react-dom@19.2.3(@types/react@19.2.14)':
+-    dependencies:
+-      '@types/react': 19.2.14
+-
+-  '@types/react@19.2.14':
+-    dependencies:
+-      csstype: 3.2.3
+-
+-  '@vitejs/plugin-react@6.0.2(vite@8.0.13)':
+-    dependencies:
+-      '@rolldown/pluginutils': 1.0.1
+-      vite: 8.0.13
+-
+-  csstype@3.2.3: {}
+-
+-  detect-libc@2.1.2: {}
+-
+-  fdir@6.5.0(picomatch@4.0.4):
+-    optionalDependencies:
+-      picomatch: 4.0.4
+-
+-  fsevents@2.3.3:
+-    optional: true
+-
+-  lightningcss-android-arm64@1.32.0:
+-    optional: true
+-
+-  lightningcss-darwin-arm64@1.32.0:
+-    optional: true
+-
+-  lightningcss-darwin-x64@1.32.0:
+-    optional: true
+-
+-  lightningcss-freebsd-x64@1.32.0:
+-    optional: true
+-
+-  lightningcss-linux-arm-gnueabihf@1.32.0:
+-    optional: true
+-
+-  lightningcss-linux-arm64-gnu@1.32.0:
+-    optional: true
+-
+-  lightningcss-linux-arm64-musl@1.32.0:
+-    optional: true
+-
+-  lightningcss-linux-x64-gnu@1.32.0:
+-    optional: true
+-
+-  lightningcss-linux-x64-musl@1.32.0:
+-    optional: true
+-
+-  lightningcss-win32-arm64-msvc@1.32.0:
+-    optional: true
+-
+-  lightningcss-win32-x64-msvc@1.32.0:
+-    optional: true
+-
+-  lightningcss@1.32.0:
+-    dependencies:
+-      detect-libc: 2.1.2
+-    optionalDependencies:
+-      lightningcss-android-arm64: 1.32.0
+-      lightningcss-darwin-arm64: 1.32.0
+-      lightningcss-darwin-x64: 1.32.0
+-      lightningcss-freebsd-x64: 1.32.0
+-      lightningcss-linux-arm-gnueabihf: 1.32.0
+-      lightningcss-linux-arm64-gnu: 1.32.0
+-      lightningcss-linux-arm64-musl: 1.32.0
+-      lightningcss-linux-x64-gnu: 1.32.0
+-      lightningcss-linux-x64-musl: 1.32.0
+-      lightningcss-win32-arm64-msvc: 1.32.0
+-      lightningcss-win32-x64-msvc: 1.32.0
+-
+-  nanoid@3.3.12: {}
+-
+-  picocolors@1.1.1: {}
+-
+-  picomatch@4.0.4: {}
+-
+-  postcss@8.5.14:
+-    dependencies:
+-      nanoid: 3.3.12
+-      picocolors: 1.1.1
+-      source-map-js: 1.2.1
+-
+-  react-dom@19.2.6(react@19.2.6):
+-    dependencies:
+-      react: 19.2.6
+-      scheduler: 0.27.0
+-
+-  react@19.2.6: {}
+-
+-  rolldown@1.0.1:
+-    dependencies:
+-      '@oxc-project/types': 0.130.0
+-      '@rolldown/pluginutils': 1.0.1
+-    optionalDependencies:
+-      '@rolldown/binding-android-arm64': 1.0.1
+-      '@rolldown/binding-darwin-arm64': 1.0.1
+-      '@rolldown/binding-darwin-x64': 1.0.1
+-      '@rolldown/binding-freebsd-x64': 1.0.1
+-      '@rolldown/binding-linux-arm-gnueabihf': 1.0.1
+-      '@rolldown/binding-linux-arm64-gnu': 1.0.1
+-      '@rolldown/binding-linux-arm64-musl': 1.0.1
+-      '@rolldown/binding-linux-ppc64-gnu': 1.0.1
+-      '@rolldown/binding-linux-s390x-gnu': 1.0.1
+-      '@rolldown/binding-linux-x64-gnu': 1.0.1
+-      '@rolldown/binding-linux-x64-musl': 1.0.1
+-      '@rolldown/binding-openharmony-arm64': 1.0.1
+-      '@rolldown/binding-wasm32-wasi': 1.0.1
+-      '@rolldown/binding-win32-arm64-msvc': 1.0.1
+-      '@rolldown/binding-win32-x64-msvc': 1.0.1
+-
+-  scheduler@0.27.0: {}
+-
+-  source-map-js@1.2.1: {}
+-
+-  tinyglobby@0.2.16:
+-    dependencies:
+-      fdir: 6.5.0(picomatch@4.0.4)
+-      picomatch: 4.0.4
+-
+-  tslib@2.8.1:
+-    optional: true
+-
+-  typescript@6.0.3: {}
+-
+-  vite@8.0.13:
+-    dependencies:
+-      lightningcss: 1.32.0
+-      picomatch: 4.0.4
+-      postcss: 8.5.14
+-      rolldown: 1.0.1
+-      tinyglobby: 0.2.16
+-    optionalDependencies:
+-      fsevents: 2.3.3
+
+exec
+/bin/zsh -lc "git show --format= --no-renames 41dabb6 -- scripts/build-release.sh | sed -n '1,220p'
+
+echo '--- current file ---'
+nl -ba scripts/build-release.sh | sed -n '1,180p'" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+diff --git a/scripts/build-release.sh b/scripts/build-release.sh
+index 0b8f448..3ddcd7c 100755
+--- a/scripts/build-release.sh
++++ b/scripts/build-release.sh
+@@ -13,6 +13,7 @@
+ # Usage:
+ #   bash scripts/build-release.sh              # build for the host's GOOS/GOARCH
+ #   GOOS=darwin GOARCH=arm64 bash scripts/build-release.sh
++#   OUT_DIR=/tmp/release bash scripts/build-release.sh
+ #
+ # This script is best-effort: the dashboard build is skipped if `npm` is not on
+ # PATH. In that case the Go binary is still produced and the user can drop a
+@@ -30,6 +31,19 @@ EXT=""
+ if [ "$GOOS_VALUE" = "windows" ]; then EXT=".exe"; fi
+ BIN_PATH="$OUT_DIR/${BIN_NAME}${EXT}"
+ 
++# Refuse OUT_DIR that resolves to/under $ROOT. Without this guard, the
++# destructive `rm -rf "$OUT_DIR/web"` later in this script would
++# silently wipe the checked-in `web/` source tree the rest of the
++# build relies on. (D5 codex review F1 [P1].)
++ROOT_RESOLVED=$(cd "$ROOT" && pwd -P)
++OUT_DIR_RESOLVED=$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd -P)
++if [ "$OUT_DIR_RESOLVED" = "$ROOT_RESOLVED" ] || \
++   { [ "${OUT_DIR_RESOLVED#$ROOT_RESOLVED/}" != "$OUT_DIR_RESOLVED" ] && [ -n "$OUT_DIR_RESOLVED" ]; }; then
++  echo "[build-release] refusing to run: OUT_DIR=$OUT_DIR_RESOLVED overlaps with source ROOT=$ROOT_RESOLVED" >&2
++  echo "[build-release] pick an OUT_DIR that is a sibling of the source tree (e.g. /tmp/release) so the build cannot delete the checked-in web/ source." >&2
++  exit 2
++fi
++
+ mkdir -p "$OUT_DIR"
+ 
+ echo "[build-release] target=${GOOS_VALUE}/${GOARCH_VALUE}"
+@@ -42,12 +56,19 @@ if [ "${SKIP_WEB:-0}" = "1" ]; then
+ else
+   if command -v npm >/dev/null 2>&1; then
+     echo "[build-release] npm run build (dashboard)"
++    # Use a frozen install against the committed web/package-lock.json.
++    # `npm install` would re-resolve `latest`-pinned versions and break
++    # the release's reproducibility contract. (D5 codex review F2 [P2].)
+     if [ ! -d "$ROOT/web/node_modules" ]; then
+-      (cd "$ROOT/web" && npm install --no-audit --no-fund)
++      (cd "$ROOT/web" && npm ci --no-audit --no-fund)
+     fi
+     (cd "$ROOT/web" && npm run build)
+-    rm -rf "$OUT_DIR/web"
+-    mkdir -p "$OUT_DIR/web"
++    # Only clean the script's own $OUT_DIR/web/dist target. A blanket
++    # `rm -rf "$OUT_DIR/web"` would erase unrelated user data the
++    # caller may keep in $OUT_DIR/web. (D5 codex review F1 [P1] —
++    # scoped rm.)
++    rm -rf "$OUT_DIR/web/dist"
++    mkdir -p "$OUT_DIR/web/dist"
+     cp -R "$ROOT/web/dist/." "$OUT_DIR/web/dist/"
+     echo "[build-release] dashboard copied to $OUT_DIR/web/dist"
+   else
+--- current file ---
+     1	#!/usr/bin/env bash
+     2	# Build a single-file release artifact under dist/.
+     3	#
+     4	# Layout produced:
+     5	#   dist/symphony            # Go daemon + CLI binary
+     6	#   dist/web/dist/...        # Dashboard static assets (already-built Vite output)
+     7	#   dist/INSTALL.md          # Short notes about the layout and supported platforms
+     8	#
+     9	# Discovery is wired in internal/httpapi.httpapi.go: when the binary is launched
+    10	# from this layout, dashboardDist() resolves dist/web/dist via os.Executable()'s
+    11	# parent directory without requiring SYMPHONY_DASHBOARD_DIST.
+    12	#
+    13	# Usage:
+    14	#   bash scripts/build-release.sh              # build for the host's GOOS/GOARCH
+    15	#   GOOS=darwin GOARCH=arm64 bash scripts/build-release.sh
+    16	#   OUT_DIR=/tmp/release bash scripts/build-release.sh
+    17	#
+    18	# This script is best-effort: the dashboard build is skipped if `npm` is not on
+    19	# PATH. In that case the Go binary is still produced and the user can drop a
+    20	# pre-built dist/web/dist/ into the layout (or set SYMPHONY_DASHBOARD_DIST).
+    21	set -euo pipefail
+    22	
+    23	ROOT=$(cd "$(dirname "$0")/.." && pwd)
+    24	cd "$ROOT"
+    25	
+    26	OUT_DIR="${OUT_DIR:-$ROOT/dist}"
+    27	BIN_NAME="${BIN_NAME:-symphony}"
+    28	GOOS_VALUE="${GOOS:-$(go env GOOS)}"
+    29	GOARCH_VALUE="${GOARCH:-$(go env GOARCH)}"
+    30	EXT=""
+    31	if [ "$GOOS_VALUE" = "windows" ]; then EXT=".exe"; fi
+    32	BIN_PATH="$OUT_DIR/${BIN_NAME}${EXT}"
+    33	
+    34	# Refuse OUT_DIR that resolves to/under $ROOT. Without this guard, the
+    35	# destructive `rm -rf "$OUT_DIR/web"` later in this script would
+    36	# silently wipe the checked-in `web/` source tree the rest of the
+    37	# build relies on. (D5 codex review F1 [P1].)
+    38	ROOT_RESOLVED=$(cd "$ROOT" && pwd -P)
+    39	OUT_DIR_RESOLVED=$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd -P)
+    40	if [ "$OUT_DIR_RESOLVED" = "$ROOT_RESOLVED" ] || \
+    41	   { [ "${OUT_DIR_RESOLVED#$ROOT_RESOLVED/}" != "$OUT_DIR_RESOLVED" ] && [ -n "$OUT_DIR_RESOLVED" ]; }; then
+    42	  echo "[build-release] refusing to run: OUT_DIR=$OUT_DIR_RESOLVED overlaps with source ROOT=$ROOT_RESOLVED" >&2
+    43	  echo "[build-release] pick an OUT_DIR that is a sibling of the source tree (e.g. /tmp/release) so the build cannot delete the checked-in web/ source." >&2
+    44	  exit 2
+    45	fi
+    46	
+    47	mkdir -p "$OUT_DIR"
+    48	
+    49	echo "[build-release] target=${GOOS_VALUE}/${GOARCH_VALUE}"
+    50	echo "[build-release] go build -> $BIN_PATH"
+    51	GOOS="$GOOS_VALUE" GOARCH="$GOARCH_VALUE" CGO_ENABLED="${CGO_ENABLED:-1}" \
+    52	  go build -trimpath -o "$BIN_PATH" ./cmd/symphony
+    53	
+    54	if [ "${SKIP_WEB:-0}" = "1" ]; then
+    55	  echo "[build-release] SKIP_WEB=1 set, skipping dashboard build"
+    56	else
+    57	  if command -v npm >/dev/null 2>&1; then
+    58	    echo "[build-release] npm run build (dashboard)"
+    59	    # Use a frozen install against the committed web/package-lock.json.
+    60	    # `npm install` would re-resolve `latest`-pinned versions and break
+    61	    # the release's reproducibility contract. (D5 codex review F2 [P2].)
+    62	    if [ ! -d "$ROOT/web/node_modules" ]; then
+    63	      (cd "$ROOT/web" && npm ci --no-audit --no-fund)
+    64	    fi
+    65	    (cd "$ROOT/web" && npm run build)
+    66	    # Only clean the script's own $OUT_DIR/web/dist target. A blanket
+    67	    # `rm -rf "$OUT_DIR/web"` would erase unrelated user data the
+    68	    # caller may keep in $OUT_DIR/web. (D5 codex review F1 [P1] —
+    69	    # scoped rm.)
+    70	    rm -rf "$OUT_DIR/web/dist"
+    71	    mkdir -p "$OUT_DIR/web/dist"
+    72	    cp -R "$ROOT/web/dist/." "$OUT_DIR/web/dist/"
+    73	    echo "[build-release] dashboard copied to $OUT_DIR/web/dist"
+    74	  else
+    75	    echo "[build-release] npm not on PATH; dashboard NOT bundled. The release artifact will still run, but the embedded dashboard will only appear if you pre-populate $OUT_DIR/web/dist or set SYMPHONY_DASHBOARD_DIST." >&2
+    76	  fi
+    77	fi
+    78	
+    79	# Drop a short install hint next to the binary.
+    80	cat > "$OUT_DIR/INSTALL.md" <<EOF
+    81	# Local Symphony v1.1 WIP release layout
+    82	
+    83	This directory was produced by \`scripts/build-release.sh\`.
+    84	
+    85	\`\`\`
+    86	dist/
+    87	  ${BIN_NAME}${EXT}    # daemon + CLI entry point
+    88	  web/dist/...         # React/Vite dashboard static assets
+    89	\`\`\`
+    90	
+    91	To run:
+    92	
+    93	\`\`\`bash
+    94	./${BIN_NAME}${EXT} serve --project /path/to/your/repo --no-open
+    95	\`\`\`
+    96	
+    97	Dashboard assets are auto-discovered from the \`web/dist/\` directory next to
+    98	the executable. To override, set \`SYMPHONY_DASHBOARD_DIST\` to an absolute
+    99	path.
+   100	
+   101	Target supported by this build: ${GOOS_VALUE}/${GOARCH_VALUE}
+   102	
+   103	See \`docs/RELEASE_NOTES.md\` for supported platform / dependency versions
+   104	and Windows best-effort caveats.
+   105	EOF
+   106	
+   107	echo "[build-release] done: $BIN_PATH"
+
+exec
+/bin/zsh -lc "nl -ba internal/buildrelease/safety_test.go | sed -n '1,460p'" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+     1	// Package buildrelease contains tests that lock in the safety guarantees
+     2	// of scripts/build-release.sh as required by the D5 codex review round 1:
+     3	//
+     4	//   F1 [P1]  scripts/build-release.sh must not data-destructively delete the
+     5	//            repo's `web/` source tree when OUT_DIR resolves to/under
+     6	//            $ROOT. Two protections: (a) early-exit guard rejecting
+     7	//            OUT_DIR equal to or under $ROOT; (b) the destructive
+     8	//            `rm -rf` is scoped to $OUT_DIR/web/dist, not $OUT_DIR/web.
+     9	//
+    10	//   F2 [P2]  the web install must be deterministic — a frozen install
+    11	//            against the committed web/package-lock.json. The script
+    12	//            must invoke `npm ci` (not `npm install`); the repo must
+    13	//            carry web/package-lock.json while NOT carrying
+    14	//            web/pnpm-lock.yaml (a stale conflicting lockfile is a
+    15	//            footgun for the next person who runs `pnpm install`).
+    16	//
+    17	// F1 is exercised by running the shell script in an isolated temp
+    18	// workdir (a *copy* of the script, not the real $ROOT) so a regression
+    19	// cannot damage the host's source tree. F2 is exercised by static
+    20	// inspection of the committed script and lockfile layout.
+    21	package buildrelease
+    22	
+    23	import (
+    24		"bytes"
+    25		"os"
+    26		"os/exec"
+    27		"path/filepath"
+    28		"strings"
+    29		"testing"
+    30	)
+    31	
+    32	// repoRoot returns the absolute path of the Local Symphony repo, derived
+    33	// from this test file's location (internal/buildrelease/safety_test.go
+    34	// → ../ → repo root).
+    35	func repoRoot(t *testing.T) string {
+    36		t.Helper()
+    37		cwd, err := os.Getwd()
+    38		if err != nil {
+    39			t.Fatalf("getwd: %v", err)
+    40		}
+    41		// `go test` runs with cwd == the package directory by default.
+    42		// Internal callers can `go test ./internal/buildrelease` from the
+    43		// repo root, in which case cwd is the package dir and the repo
+    44		// root is one level up. Accept both layouts.
+    45		if filepath.Base(cwd) == "buildrelease" {
+    46			return filepath.Clean(filepath.Join(cwd, "..", ".."))
+    47		}
+    48		return cwd
+    49	}
+    50	
+    51	// runIsolatedScript copies scripts/build-release.sh to a fresh temp
+    52	// directory, lays down the minimum web/ tree the script's F1 guard
+    53	// expects to find, and runs the copy with the supplied $OUT_DIR. The
+    54	// script auto-derives its own $ROOT from its location, so the real
+    55	// repo's $ROOT is never at risk.
+    56	func runIsolatedScript(t *testing.T, outDir string, extraEnv ...string) (string, int) {
+    57		t.Helper()
+    58		root := repoRoot(t)
+    59		scriptSrc, err := os.ReadFile(filepath.Join(root, "scripts", "build-release.sh"))
+    60		if err != nil {
+    61			t.Fatalf("read source script: %v", err)
+    62		}
+    63		tmp := t.TempDir()
+    64		dstScript := filepath.Join(tmp, "scripts", "build-release.sh")
+    65		if err := os.MkdirAll(filepath.Dir(dstScript), 0o755); err != nil {
+    66			t.Fatalf("mkdir scripts: %v", err)
+    67		}
+    68		if err := os.WriteFile(dstScript, scriptSrc, 0o755); err != nil {
+    69			t.Fatalf("write script: %v", err)
+    70		}
+    71		// Lay down the minimum `web/` tree the script's F1 guard will
+    72		// inspect. Only committed files are copied; node_modules is
+    73		// intentionally NOT seeded because the F1 tests run with
+    74		// SKIP_WEB=1.
+    75		mustCopyFromRepo(t, root, "web/package.json", filepath.Join(tmp, "web", "package.json"))
+    76		mustCopyFromRepo(t, root, "web/vite.config.ts", filepath.Join(tmp, "web", "vite.config.ts"))
+    77		mustCopyFromRepo(t, root, "web/tsconfig.json", filepath.Join(tmp, "web", "tsconfig.json"))
+    78	
+    79		cmd := exec.Command("bash", dstScript)
+    80		cmd.Dir = tmp
+    81		env := append(os.Environ(),
+    82			"OUT_DIR="+outDir,
+    83			"SKIP_WEB=1",
+    84		)
+    85		env = append(env, extraEnv...)
+    86		cmd.Env = env
+    87		var buf bytes.Buffer
+    88		cmd.Stdout = &buf
+    89		cmd.Stderr = &buf
+    90		err = cmd.Run()
+    91		exit := 0
+    92		if ee, ok := err.(*exec.ExitError); ok {
+    93			exit = ee.ExitCode()
+    94		} else if err != nil {
+    95			t.Fatalf("script exec errored unexpectedly: %v\noutput:\n%s", err, buf.String())
+    96		}
+    97		return buf.String(), exit
+    98	}
+    99	
+   100	func mustCopyFromRepo(t *testing.T, root, srcRel, dst string) {
+   101		t.Helper()
+   102		b, err := os.ReadFile(filepath.Join(root, srcRel))
+   103		if err != nil {
+   104			t.Fatalf("read %s: %v", srcRel, err)
+   105		}
+   106		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+   107			t.Fatalf("mkdir %s: %v", filepath.Dir(dst), err)
+   108		}
+   109		if err := os.WriteFile(dst, b, 0o644); err != nil {
+   110			t.Fatalf("write %s: %v", dst, err)
+   111		}
+   112	}
+   113	
+   114	// F1 — first protection layer: OUT_DIR that resolves to $ROOT must be
+   115	// rejected with a non-zero exit and a clear error. The script must
+   116	// not have written any artifact and the source tree under $ROOT must
+   117	// be untouched.
+   118	func TestBuildReleaseRejectsOUTDirEqualToRoot(t *testing.T) {
+   119		root := t.TempDir()
+   120		copyMinimumWebTree(t, root)
+   121		copyMinimumGoModule(t, root)
+   122	
+   123		out, exit := runIsolatedScriptWithRoot(t, root, root)
+   124		if exit == 0 {
+   125			t.Fatalf("OUT_DIR=$ROOT was accepted (exit 0). Output:\n%s", out)
+   126		}
+   127		if !strings.Contains(out, "OUT_DIR") {
+   128			t.Fatalf("rejection error does not name OUT_DIR. Output:\n%s", out)
+   129		}
+   130		if !strings.Contains(out, "ROOT") && !strings.Contains(out, "source") && !strings.Contains(out, "overlap") && !strings.Contains(out, "refus") {
+   131			t.Fatalf("rejection error lacks overlap/refuse/source wording. Output:\n%s", out)
+   132		}
+   133		assertWebSourceTreeIntact(t, root, out)
+   134	}
+   135	
+   136	// F1 — second protection layer: OUT_DIR that falls UNDER $ROOT (a
+   137	// subdirectory of the source tree) must also be rejected, for the
+   138	// same reason.
+   139	func TestBuildReleaseRejectsOUTDirUnderRoot(t *testing.T) {
+   140		root := t.TempDir()
+   141		copyMinimumWebTree(t, root)
+   142		copyMinimumGoModule(t, root)
+   143		outDir := filepath.Join(root, "build-output")
+   144	
+   145		out, exit := runIsolatedScriptWithRoot(t, root, outDir)
+   146		if exit == 0 {
+   147			t.Fatalf("OUT_DIR under $ROOT was accepted (exit 0). Output:\n%s", out)
+   148		}
+   149		assertWebSourceTreeIntact(t, root, out)
+   150	}
+   151	
+   152	// F1 — third protection layer: even when OUT_DIR is a safe sibling,
+   153	// the script must not execute the blanket `rm -rf "$OUT_DIR/web"`
+   154	// that would erase a sibling `web/` directory the user happens to
+   155	// keep there. The script only needs to overwrite
+   156	// `$OUT_DIR/web/dist`, so the destructive line should be scoped to
+   157	// that target. This test stages a sentinel file in a pre-existing
+   158	// `$OUT_DIR/web/` directory; if the script deletes that sentinel,
+   159	// the blanket rm is back.
+   160	//
+   161	// To exercise the destructive line we cannot use SKIP_WEB=1 (the
+   162	// line is gated on the web-build branch). We stage a pre-built
+   163	// `$ROOT/web/dist/` and a `$ROOT/web/node_modules/` marker so the
+   164	// script skips the `npm install` and `npm run build` calls but still
+   165	// reaches the rm/cp section. If `npm` is missing, the script logs a
+   166	// warning and skips the web build entirely; this test therefore
+   167	// stubs `npm` in the PATH via a temp bin dir.
+   168	func TestBuildReleaseDoesNotBlanketDeleteOUTDirWeb(t *testing.T) {
+   169		root := t.TempDir()
+   170		copyMinimumWebTree(t, root)
+   171		copyMinimumGoModule(t, root)
+   172		stagePrebuiltWebDist(t, root)
+   173		stageFakeNpm(t, root)
+   174	
+   175		outDir := t.TempDir() + "-sibling"
+   176		if err := os.MkdirAll(outDir, 0o755); err != nil {
+   177			t.Fatalf("mkdir outDir: %v", err)
+   178		}
+   179		sentinel := filepath.Join(outDir, "web", "user-data.txt")
+   180		if err := os.MkdirAll(filepath.Dir(sentinel), 0o755); err != nil {
+   181			t.Fatalf("mkdir sentinel dir: %v", err)
+   182		}
+   183		if err := os.WriteFile(sentinel, []byte("user data — must survive"), 0o644); err != nil {
+   184			t.Fatalf("write sentinel: %v", err)
+   185		}
+   186	
+   187		pathWithFakeNpm := filepath.Join(root, "fake-bin") + string(os.PathListSeparator) + os.Getenv("PATH")
+   188		_, _ = runIsolatedScriptWithRoot(t, root, outDir, "SKIP_WEB=0", "PATH="+pathWithFakeNpm)
+   189	
+   190		if _, err := os.Stat(sentinel); err != nil {
+   191			t.Fatalf("sentinel %s was deleted by the build script; blanket rm -rf $OUT_DIR/web is back. err=%v", sentinel, err)
+   192		}
+   193	}
+   194	
+   195	// F2 — first protection: the script must invoke `npm ci` (frozen
+   196	// install against web/package-lock.json), not `npm install`. Static
+   197	// text inspection of the script is sufficient and is what the
+   198	// round-1 reviewer asked for.
+   199	func TestBuildReleaseUsesNpmCiNotNpmInstall(t *testing.T) {
+   200		root := repoRoot(t)
+   201		b, err := os.ReadFile(filepath.Join(root, "scripts", "build-release.sh"))
+   202		if err != nil {
+   203			t.Fatalf("read script: %v", err)
+   204		}
+   205		script := stripShellComments(string(b))
+   206	
+   207		if !strings.Contains(script, "npm ci") {
+   208			t.Fatalf("scripts/build-release.sh does not call `npm ci`.\nThe frozen-install contract is broken. Script (comments stripped):\n%s", script)
+   209		}
+   210		// `npm install` (with whitespace) is the destructive variant. The
+   211		// script may still mention `npm install` inside a comment / help
+   212		// text, but the body of the script must not call it.
+   213		lines := strings.Split(script, "\n")
+   214		for i, line := range lines {
+   215			trimmed := strings.TrimSpace(line)
+   216			// A line that contains `npm install` AND is not a `npm ci`
+   217			// variant is a regression. We allow the literal text to
+   218			// appear inside shell comments (which we already stripped) or
+   219			// inside a quoted string used for an echo; stripShellComments
+   220			// handles the former. We still allow `npm install` in a doc
+   221			// comment INSIDE a quoted echo statement, but the script
+   222			// currently has no such occurrence. If a future change adds
+   223			// one, the assertion must be revisited.
+   224			if strings.Contains(trimmed, "npm install") && !strings.Contains(trimmed, "npm ci") {
+   225				t.Fatalf("scripts/build-release.sh line %d still calls `npm install`:\n  %s\nThe frozen-install contract requires `npm ci`.", i+1, trimmed)
+   226			}
+   227		}
+   228	}
+   229	
+   230	// F2 — second protection: the repo must carry web/package-lock.json
+   231	// (so `npm ci` has something to install from) and must NOT carry
+   232	// web/pnpm-lock.yaml (a stale conflicting lockfile would let a future
+   233	// `pnpm install` re-resolve `latest` and break reproducibility).
+   234	func TestBuildReleaseLockfileStoryIsConsistent(t *testing.T) {
+   235		root := repoRoot(t)
+   236	
+   237		plPath := filepath.Join(root, "web", "package-lock.json")
+   238		if _, err := os.Stat(plPath); err != nil {
+   239			t.Fatalf("web/package-lock.json missing; `npm ci` cannot run. err=%v", err)
+   240		}
+   241		plData, err := os.ReadFile(plPath)
+   242		if err != nil {
+   243			t.Fatalf("read web/package-lock.json: %v", err)
+   244		}
+   245		if !strings.Contains(string(plData), `"lockfileVersion"`) {
+   246			t.Fatalf("web/package-lock.json is not a valid lockfile (missing lockfileVersion).")
+   247		}
+   248	
+   249		ylPath := filepath.Join(root, "web", "pnpm-lock.yaml")
+   250		if _, err := os.Stat(ylPath); err == nil {
+   251			t.Fatalf("web/pnpm-lock.yaml still present alongside web/package-lock.json; pick one lockfile to avoid silent drift.")
+   252		} else if !os.IsNotExist(err) {
+   253			t.Fatalf("stat web/pnpm-lock.yaml: %v", err)
+   254		}
+   255	}
+   256	
+   257	// runIsolatedScriptWithRoot is the lower-level runner used by the F1
+   258	// tests; it places a fresh copy of the script in `root/scripts/` so
+   259	// the script's auto-derived $ROOT is exactly `root`.
+   260	func runIsolatedScriptWithRoot(t *testing.T, root, outDir string, extraEnv ...string) (string, int) {
+   261		t.Helper()
+   262		repoRoot := repoRoot(t)
+   263		scriptSrc, err := os.ReadFile(filepath.Join(repoRoot, "scripts", "build-release.sh"))
+   264		if err != nil {
+   265			t.Fatalf("read source script: %v", err)
+   266		}
+   267		dstScript := filepath.Join(root, "scripts", "build-release.sh")
+   268		if err := os.MkdirAll(filepath.Dir(dstScript), 0o755); err != nil {
+   269			t.Fatalf("mkdir scripts: %v", err)
+   270		}
+   271		if err := os.WriteFile(dstScript, scriptSrc, 0o755); err != nil {
+   272			t.Fatalf("write script: %v", err)
+   273		}
+   274	
+   275		cmd := exec.Command("bash", dstScript)
+   276		cmd.Dir = root
+   277		env := append(os.Environ(),
+   278			"OUT_DIR="+outDir,
+   279			"SKIP_WEB=1",
+   280		)
+   281		env = append(env, extraEnv...)
+   282		cmd.Env = env
+   283		var buf bytes.Buffer
+   284		cmd.Stdout = &buf
+   285		cmd.Stderr = &buf
+   286		err = cmd.Run()
+   287		exit := 0
+   288		if ee, ok := err.(*exec.ExitError); ok {
+   289			exit = ee.ExitCode()
+   290		} else if err != nil {
+   291			t.Fatalf("script exec errored unexpectedly: %v\noutput:\n%s", err, buf.String())
+   292		}
+   293		return buf.String(), exit
+   294	}
+   295	
+   296	func copyMinimumWebTree(t *testing.T, root string) {
+   297		t.Helper()
+   298		repo := repoRoot(t)
+   299		for _, rel := range []string{"web/package.json", "web/vite.config.ts", "web/tsconfig.json"} {
+   300			mustCopyFromRepo(t, repo, rel, filepath.Join(root, rel))
+   301		}
+   302	}
+   303	
+   304	// copyMinimumGoModule stages a minimal Go module under `root` so the
+   305	// build script's `go build ./cmd/symphony` succeeds. The code is a
+   306	// throwaway `package main` with an empty `main()` — the only thing
+   307	// the script needs is a successful `go build` exit so it reaches
+   308	// the dangerous `rm -rf` line that the F1 tests are guarding.
+   309	func copyMinimumGoModule(t *testing.T, root string) {
+   310		t.Helper()
+   311		if err := os.MkdirAll(filepath.Join(root, "cmd", "symphony"), 0o755); err != nil {
+   312			t.Fatalf("mkdir cmd/symphony: %v", err)
+   313		}
+   314		mainSrc := []byte("package main\n\nfunc main() {}\n")
+   315		if err := os.WriteFile(filepath.Join(root, "cmd", "symphony", "main.go"), mainSrc, 0o644); err != nil {
+   316			t.Fatalf("write main.go: %v", err)
+   317		}
+   318		gomod := []byte("module example.com/testbuild\n\ngo 1.23\n")
+   319		if err := os.WriteFile(filepath.Join(root, "go.mod"), gomod, 0o644); err != nil {
+   320			t.Fatalf("write go.mod: %v", err)
+   321		}
+   322	}
+   323	
+   324	// stagePrebuiltWebDist creates a `web/dist/index.html` and
+   325	// `web/node_modules/` marker so the build script believes the npm
+   326	// install / build steps have already been done. This lets the F1
+   327	// test reach the `rm -rf $OUT_DIR/web` line without actually running
+   328	// npm.
+   329	func stagePrebuiltWebDist(t *testing.T, root string) {
+   330		t.Helper()
+   331		distDir := filepath.Join(root, "web", "dist")
+   332		if err := os.MkdirAll(distDir, 0o755); err != nil {
+   333			t.Fatalf("mkdir web/dist: %v", err)
+   334		}
+   335		if err := os.WriteFile(filepath.Join(distDir, "index.html"), []byte("<html></html>"), 0o644); err != nil {
+   336			t.Fatalf("write web/dist/index.html: %v", err)
+   337		}
+   338		if err := os.MkdirAll(filepath.Join(root, "web", "node_modules"), 0o755); err != nil {
+   339			t.Fatalf("mkdir web/node_modules: %v", err)
+   340		}
+   341	}
+   342	
+   343	// stageFakeNpm creates a `fake-bin/npm` that responds to
+   344	// `npm run build` by exit 0. The script's check `command -v npm`
+   345	// then succeeds, and the `if [ ! -d "$ROOT/web/node_modules" ]` short
+   346	// branch is bypassed because the helper above already seeded
+   347	// `node_modules`. The destructive `rm -rf $OUT_DIR/web` is reached
+   348	// and that's what this test guards.
+   349	func stageFakeNpm(t *testing.T, root string) {
+   350		t.Helper()
+   351		binDir := filepath.Join(root, "fake-bin")
+   352		if err := os.MkdirAll(binDir, 0o755); err != nil {
+   353			t.Fatalf("mkdir fake-bin: %v", err)
+   354		}
+   355		// A shell stub that mimics `npm` enough to keep the script
+   356		// happy: `npm run build` exits 0.
+   357		stub := "#!/usr/bin/env bash\nexit 0\n"
+   358		if err := os.WriteFile(filepath.Join(binDir, "npm"), []byte(stub), 0o755); err != nil {
+   359			t.Fatalf("write fake npm: %v", err)
+   360		}
+   361	}
+   362	
+   363	func assertWebSourceTreeIntact(t *testing.T, root, scriptOut string) {
+   364		t.Helper()
+   365		required := []string{
+   366			filepath.Join(root, "web", "package.json"),
+   367			filepath.Join(root, "web", "vite.config.ts"),
+   368			filepath.Join(root, "web", "tsconfig.json"),
+   369		}
+   370		for _, p := range required {
+   371			if _, err := os.Stat(p); err != nil {
+   372				t.Fatalf("committed source file missing after rejected run: %s (err=%v)\nScript output:\n%s", p, err, scriptOut)
+   373			}
+   374		}
+   375	}
+   376	
+   377	// stripShellComments removes `# …` line comments and inline `# …`
+   378	// comments outside of single-quoted strings. It is good enough for
+   379	// grep-style assertions on the build script, which has no nested
+   380	// quoting or escapes.
+   381	func stripShellComments(src string) string {
+   382		var b strings.Builder
+   383		inSingle := false
+   384		inDouble := false
+   385		for i := 0; i < len(src); i++ {
+   386			c := src[i]
+   387			if c == '\'' && !inDouble {
+   388				inSingle = !inSingle
+   389				b.WriteByte(c)
+   390				continue
+   391			}
+   392			if c == '"' && !inSingle {
+   393				inDouble = !inDouble
+   394				b.WriteByte(c)
+   395				continue
+   396			}
+   397			if c == '#' && !inSingle && !inDouble {
+   398				for i < len(src) && src[i] != '\n' {
+   399					i++
+   400				}
+   401				if i < len(src) {
+   402					b.WriteByte('\n')
+   403				}
+   404				continue
+   405			}
+   406			b.WriteByte(c)
+   407		}
+   408		return b.String()
+   409	}
+
+exec
+/bin/zsh -lc "ls -la web | sed -n '1,80p'; git ls-files web/package-lock.json web/package.json web/pnpm-lock.yaml .gitignore; git show 41dabb6"'^:.gitignore | sed -n '"'1,120p'; grep -n \"package-lock\" -n .gitignore web/.gitignore 2>/dev/null || true; git status --short --branch" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 145ms:
+
+*.patch
+.symphony/
+.superpowers/
+bin/
+dist/
+web/dist/
+web/node_modules/
+web/package-lock.json
+.gitignore:9:web/package-lock.json
+## codex/v1-productization-d5-release
+?? docs/productization/D5_R1_FIX_REQUIRED.md
+
+exec
+/bin/zsh -lc "cat web/package.json; echo '--- package-lock tracked?'; git cat-file -e 41dabb6:web/package-lock.json && echo yes || echo no; git ls-tree -r --name-only 41dabb6 web | grep -E 'lock|package'" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+{
+  "name": "local-symphony-web",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "typecheck": "node scripts/typecheck.mjs",
+    "test": "node scripts/test.mjs"
+  },
+  "dependencies": {
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "typescript": "latest"
+  }
+}
+--- package-lock tracked?
+fatal: path 'web/package-lock.json' exists on disk, but not in '41dabb6'
+no
+web/package.json
+
+exec
+/bin/zsh -lc 'git show 41dabb6''^:scripts/build-release.sh | nl -ba | sed -n '"'1,120p'; echo '--- parent tree locks'; git ls-tree -r --name-only 41dabb6"'^ web | grep -E '"'lock|package'" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+     1	#!/usr/bin/env bash
+     2	# Build a single-file release artifact under dist/.
+     3	#
+     4	# Layout produced:
+     5	#   dist/symphony            # Go daemon + CLI binary
+     6	#   dist/web/dist/...        # Dashboard static assets (already-built Vite output)
+     7	#   dist/INSTALL.md          # Short notes about the layout and supported platforms
+     8	#
+     9	# Discovery is wired in internal/httpapi.httpapi.go: when the binary is launched
+    10	# from this layout, dashboardDist() resolves dist/web/dist via os.Executable()'s
+    11	# parent directory without requiring SYMPHONY_DASHBOARD_DIST.
+    12	#
+    13	# Usage:
+    14	#   bash scripts/build-release.sh              # build for the host's GOOS/GOARCH
+    15	#   GOOS=darwin GOARCH=arm64 bash scripts/build-release.sh
+    16	#
+    17	# This script is best-effort: the dashboard build is skipped if `npm` is not on
+    18	# PATH. In that case the Go binary is still produced and the user can drop a
+    19	# pre-built dist/web/dist/ into the layout (or set SYMPHONY_DASHBOARD_DIST).
+    20	set -euo pipefail
+    21	
+    22	ROOT=$(cd "$(dirname "$0")/.." && pwd)
+    23	cd "$ROOT"
+    24	
+    25	OUT_DIR="${OUT_DIR:-$ROOT/dist}"
+    26	BIN_NAME="${BIN_NAME:-symphony}"
+    27	GOOS_VALUE="${GOOS:-$(go env GOOS)}"
+    28	GOARCH_VALUE="${GOARCH:-$(go env GOARCH)}"
+    29	EXT=""
+    30	if [ "$GOOS_VALUE" = "windows" ]; then EXT=".exe"; fi
+    31	BIN_PATH="$OUT_DIR/${BIN_NAME}${EXT}"
+    32	
+    33	mkdir -p "$OUT_DIR"
+    34	
+    35	echo "[build-release] target=${GOOS_VALUE}/${GOARCH_VALUE}"
+    36	echo "[build-release] go build -> $BIN_PATH"
+    37	GOOS="$GOOS_VALUE" GOARCH="$GOARCH_VALUE" CGO_ENABLED="${CGO_ENABLED:-1}" \
+    38	  go build -trimpath -o "$BIN_PATH" ./cmd/symphony
+    39	
+    40	if [ "${SKIP_WEB:-0}" = "1" ]; then
+    41	  echo "[build-release] SKIP_WEB=1 set, skipping dashboard build"
+    42	else
+    43	  if command -v npm >/dev/null 2>&1; then
+    44	    echo "[build-release] npm run build (dashboard)"
+    45	    if [ ! -d "$ROOT/web/node_modules" ]; then
+    46	      (cd "$ROOT/web" && npm install --no-audit --no-fund)
+    47	    fi
+    48	    (cd "$ROOT/web" && npm run build)
+    49	    rm -rf "$OUT_DIR/web"
+    50	    mkdir -p "$OUT_DIR/web"
+    51	    cp -R "$ROOT/web/dist/." "$OUT_DIR/web/dist/"
+    52	    echo "[build-release] dashboard copied to $OUT_DIR/web/dist"
+    53	  else
+    54	    echo "[build-release] npm not on PATH; dashboard NOT bundled. The release artifact will still run, but the embedded dashboard will only appear if you pre-populate $OUT_DIR/web/dist or set SYMPHONY_DASHBOARD_DIST." >&2
+    55	  fi
+    56	fi
+    57	
+    58	# Drop a short install hint next to the binary.
+    59	cat > "$OUT_DIR/INSTALL.md" <<EOF
+    60	# Local Symphony v1.1 WIP release layout
+    61	
+    62	This directory was produced by \`scripts/build-release.sh\`.
+    63	
+    64	\`\`\`
+    65	dist/
+    66	  ${BIN_NAME}${EXT}    # daemon + CLI entry point
+    67	  web/dist/...         # React/Vite dashboard static assets
+    68	\`\`\`
+    69	
+    70	To run:
+    71	
+    72	\`\`\`bash
+    73	./${BIN_NAME}${EXT} serve --project /path/to/your/repo --no-open
+    74	\`\`\`
+    75	
+    76	Dashboard assets are auto-discovered from the \`web/dist/\` directory next to
+    77	the executable. To override, set \`SYMPHONY_DASHBOARD_DIST\` to an absolute
+    78	path.
+    79	
+    80	Target supported by this build: ${GOOS_VALUE}/${GOARCH_VALUE}
+    81	
+    82	See \`docs/RELEASE_NOTES.md\` for supported platform / dependency versions
+    83	and Windows best-effort caveats.
+    84	EOF
+    85	
+    86	echo "[build-release] done: $BIN_PATH"
+--- parent tree locks
+web/package.json
+web/pnpm-lock.yaml
+
+exec
+/bin/zsh -lc "git branch -vv --no-abbrev | sed -n '1,80p'; git remote -v | sed -n '1,20p'" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+  0512_doc_integrate                            8e19c0ecc7005b2ec79f723f861a38fa2d26ef57 [origin/0512_doc_integrate] docs: enforce workflow preview request contract
+  0513_doc_improve                              21ad66c8f76da80adabba3afe1a89152dff547a5 [origin/0513_doc_improve] docs: address PR review contract drift
+  codex/phase-b-approval-contract               bc614352629bb01a190e75123783e30799ab71ca [origin/codex/phase-b-approval-contract] Complete approval API contract
+  codex/prd-tech-spec-review                    ff221e880fd81c10b1d4daa622c906807d313722 [origin/codex/prd-tech-spec-review] align dispatch control guard docs
+  codex/update-productization-plan-progress     658a02a21b8ed2fe64a542b3dfe7aa9528292506 [origin/codex/update-productization-plan-progress] docs: update productization plan progress
++ codex/v1-productization-d1-review-packet      0aee74c6ee85254d54dfb055df8fb3bbfbdca8e3 (/Users/xiquandai/Documents/code/local-symphony-d1-review-packet) D1 R1: fix codex review round 1 findings (0 P1 + 2 P2 + 1 P3)
++ codex/v1-productization-d3-codex-availability 57c46c0963b38ff9f1da8500fa5b8a0c07a5bddb (/Users/xiquandai/Documents/code/local-symphony-d3-codex-availability) docs/productization: note round-4 review fix in D3 notes
+* codex/v1-productization-d5-release            c790f3c6aa09eafa4be6dac6fddd9befd49d7c58 D5 R1: anchor review doc SHA to final commit 41dabb6
++ codex/v1-productization-next-20260604         d542c3bc23e755fdfa67a05b21d9af413980a5b2 (/Users/xiquandai/.codex/worktrees/1437/local-symphony) [origin/codex/v1-productization-next-20260604] Implement scheduler tick loop
++ codex/workboard-ui-design                     0cd8f8d9e62732f6f20d66c22c9bc1cfa8b3c26d (/Users/xiquandai/Documents/code/.worktree/local-symphony-workboard-ui-design) [origin/main: behind 26] Merge pull request #16 from shuanzi/codex/v1-phase-b-redaction-golden
++ fix/prd-tech-spec-review-fixes                46d948329e327516f2ff17d95ed20ad0ab44fb81 (/Users/xiquandai/Documents/code/.worktree/local-symphony-prd-tech-fixes) [origin/fix/prd-tech-spec-review-fixes] Fix PRD and tech spec contract drift
++ main                                          f15ba39121aac05007054d25ea44cf531f87b5fa (/Users/xiquandai/Documents/code/local-symphony) [origin/main] Merge pull request #22 from shuanzi/pr/c4-cli-rest-v1-1-wip
++ shuanzi/check-pr-comments                     22e8f2d2263f888b87902128c94369710149bb3a (/Users/xiquandai/conductor/workspaces/local-symphony/washington) Merge pull request #7 from shuanzi/codex/prd-tech-spec-review
++ symphony/loc-1-a6593239b31a                   9b81ef3aa946785ad8979350b1a333e15e152e07 (/Users/xiquandai/.symphony/workspaces/prj_3a989a359f7293ac/LOC-1) feat: add local dashboard gui
++ symphony/loc-2-d98c9cff52bb                   41b96fe62ab7a94b78e66b8551bb91ad56380268 (/Users/xiquandai/.symphony/workspaces/prj_3a989a359f7293ac/LOC-2) fix: use allowed actor for dispatch events
+origin	git@github.com:shuanzi/local-symphony.git (fetch)
+origin	git@github.com:shuanzi/local-symphony.git (push)
+
+exec
+/bin/zsh -lc "git show --name-only --format= 41dabb6..HEAD | sed -n '1,80p'; git diff --stat 41dabb6..HEAD; git diff -- scripts/build-release.sh internal/buildrelease/safety_test.go 41dabb6..HEAD --stat" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+docs/productization/D5_CODEX_REVIEW_ROUND1.md
+ docs/productization/D5_CODEX_REVIEW_ROUND1.md | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+exec
+/bin/zsh -lc 'set +e
+bash scripts/build-release.sh >/tmp/build_release_default.out 2>&1
+code=$?
+echo exit=$code
+sed -n '"'1,20p' /tmp/build_release_default.out
+
+echo '--- clean archive lockfiles ---'
+tmp="'$(mktemp -d)
+git archive 41dabb6 | tar -x -C "$tmp"
+find "$tmp/web" -maxdepth 1 -type f -name '"'*lock*' -o -name 'package.json' | sed \"s#"'$tmp/##" | sort
+[ -f "$tmp/web/package-lock.json" ]; echo package_lock_exists=$?' in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 498ms:
+exit=2
+[build-release] refusing to run: OUT_DIR=/Users/xiquandai/Documents/code/local-symphony-d5-release/dist overlaps with source ROOT=/Users/xiquandai/Documents/code/local-symphony-d5-release
+[build-release] pick an OUT_DIR that is a sibling of the source tree (e.g. /tmp/release) so the build cannot delete the checked-in web/ source.
+--- clean archive lockfiles ---
+web/package.json
+package_lock_exists=1
+
+exec
+/bin/zsh -lc 'set +e
+tmp=$(mktemp -d)
+git archive 41dabb6 | tar -x -C "$tmp"
+(cd "$tmp/web" && npm ci --no-audit --no-fund) >/tmp/npm_ci_clean.out 2>&1
+code=$?
+echo exit=$code
+sed -n '"'1,35p' /tmp/npm_ci_clean.out" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 511ms:
+exit=1
+npm error code EUSAGE
+npm error
+npm error The `npm ci` command can only install with an existing package-lock.json or
+npm error npm-shrinkwrap.json with lockfileVersion >= 1. Run an install with npm@5 or
+npm error later to generate a package-lock.json file, then try again.
+npm error
+npm error Clean install a project
+npm error
+npm error Usage:
+npm error npm ci
+npm error
+npm error Options:
+npm error [--install-strategy <hoisted|nested|shallow|linked>] [--legacy-bundling]
+npm error [--global-style] [--omit <dev|optional|peer> [--omit <dev|optional|peer> ...]]
+npm error [--include <prod|dev|optional|peer> [--include <prod|dev|optional|peer> ...]]
+npm error [--strict-peer-deps] [--foreground-scripts] [--ignore-scripts]
+npm error [--allow-git <all|none|root>] [--no-audit] [--no-bin-links] [--no-fund]
+npm error [--dry-run]
+npm error [-w|--workspace <workspace-name> [-w|--workspace <workspace-name> ...]]
+npm error [--workspaces] [--include-workspace-root] [--install-links]
+npm error
+npm error   --install-strategy
+npm error     Sets the strategy for installing packages in node_modules.
+npm error
+npm error   --legacy-bundling
+npm error     Instead of hoisting package installs in `node_modules`, install packages
+npm error
+npm error   --global-style
+npm error     Only install direct dependencies in the top level `node_modules`,
+npm error
+npm error   --omit
+npm error     Dependency types to omit from the installation tree on disk.
+npm error
+npm error   --include
+npm error     Option that allows for defining which types of dependencies to install.
+
+exec
+/bin/zsh -lc 'set +e
+tmp=$(mktemp -d)
+git archive 41dabb6 | tar -x -C "$tmp"
+(cd "$tmp" && go test ./internal/buildrelease) >/tmp/go_test_buildrelease_clean.out 2>&1
+code=$?
+echo exit=$code
+sed -n '"'1,80p' /tmp/go_test_buildrelease_clean.out" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 3819ms:
+exit=1
+--- FAIL: TestBuildReleaseLockfileStoryIsConsistent (0.00s)
+    safety_test.go:239: web/package-lock.json missing; `npm ci` cannot run. err=stat /var/folders/5j/2r880lbs0lbdvd2qsgtqy4yr0000gn/T/tmp.0rYzKQNneK/web/package-lock.json: no such file or directory
+FAIL
+FAIL	local-symphony/internal/buildrelease	2.761s
+FAIL
+
+exec
+/bin/zsh -lc "grep '"'^go '"' go.mod; go version" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+go 1.23
+go version go1.26.2 darwin/amd64
+
+codex
+The patch breaks the documented default release command and switches to `npm ci` without committing the required npm lockfile, so clean release/CI workflows fail. It also still skips the frozen install when stale node_modules is present.
+
+Full review comments:
+
+- [P1] Allow the documented default OUT_DIR — /Users/xiquandai/Documents/code/local-symphony-d5-release/scripts/build-release.sh:40-41
+  When callers use the documented `bash scripts/build-release.sh` path, `OUT_DIR` defaults to `$ROOT/dist`; this new guard treats every child of `$ROOT` as an overlap and exits 2 before building. That breaks the normal release command and the layout described at the top of the script, even though the later deletion is now scoped to `$OUT_DIR/web/dist`.
+
+- [P1] Commit the lockfile required by npm ci — /Users/xiquandai/Documents/code/local-symphony-d5-release/scripts/build-release.sh:63-63
+  In a clean checkout of this commit, `web/package-lock.json` is not present or tracked while the only tracked lockfile (`pnpm-lock.yaml`) was deleted, so this new `npm ci` call fails immediately with npm's “can only install with an existing package-lock.json” error whenever `node_modules` is absent. The ignored local package-lock in a developer workspace can mask this, but clean release builds and the new buildrelease test fail until the npm lockfile is actually committed or the script keeps using a tracked lockfile.
+
+- [P2] Run npm ci even when node_modules exists — /Users/xiquandai/Documents/code/local-symphony-d5-release/scripts/build-release.sh:62-63
+  When a developer already has `web/node_modules` from a previous `npm install`/`pnpm install` or older lockfile, this guard skips the frozen install entirely and `npm run build` uses whatever dependencies happen to be on disk. That leaves release artifacts non-reproducible in the common non-clean workspace case; `npm ci` should be the step that recreates `node_modules` from the lockfile for release builds.
+The patch breaks the documented default release command and switches to `npm ci` without committing the required npm lockfile, so clean release/CI workflows fail. It also still skips the frozen install when stale node_modules is present.
+
+Full review comments:
+
+- [P1] Allow the documented default OUT_DIR — /Users/xiquandai/Documents/code/local-symphony-d5-release/scripts/build-release.sh:40-41
+  When callers use the documented `bash scripts/build-release.sh` path, `OUT_DIR` defaults to `$ROOT/dist`; this new guard treats every child of `$ROOT` as an overlap and exits 2 before building. That breaks the normal release command and the layout described at the top of the script, even though the later deletion is now scoped to `$OUT_DIR/web/dist`.
+
+- [P1] Commit the lockfile required by npm ci — /Users/xiquandai/Documents/code/local-symphony-d5-release/scripts/build-release.sh:63-63
+  In a clean checkout of this commit, `web/package-lock.json` is not present or tracked while the only tracked lockfile (`pnpm-lock.yaml`) was deleted, so this new `npm ci` call fails immediately with npm's “can only install with an existing package-lock.json” error whenever `node_modules` is absent. The ignored local package-lock in a developer workspace can mask this, but clean release builds and the new buildrelease test fail until the npm lockfile is actually committed or the script keeps using a tracked lockfile.
+
+- [P2] Run npm ci even when node_modules exists — /Users/xiquandai/Documents/code/local-symphony-d5-release/scripts/build-release.sh:62-63
+  When a developer already has `web/node_modules` from a previous `npm install`/`pnpm install` or older lockfile, this guard skips the frozen install entirely and `npm run build` uses whatever dependencies happen to be on disk. That leaves release artifacts non-reproducible in the common non-clean workspace case; `npm ci` should be the step that recreates `node_modules` from the lockfile for release builds.
+---EXIT_CODE: 0---

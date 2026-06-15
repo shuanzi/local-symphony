@@ -2076,6 +2076,174 @@ func TestDashboardDoesNotServeRepoWebDistWhenExecutableIsRepoRelative(t *testing
 	}
 }
 
+// TestRoutingPriorityAPIBeforeDashboard locks in the v1.1 WIP contract that
+// the API and Tool Gateway handlers are matched *before* the static-asset
+// catch-all. If `dashboardDist` ever starts returning a non-empty path for
+// a request under /api/v1 or /tool/v1, this test fires.
+//
+// We seed a dashboard dist that intentionally contains an `index.html`
+// shadowing the API responses, then assert the API responses still take
+// precedence. This protects against an accidental future refactor that
+// re-registers the dashboard handler ahead of /api/v1 or /tool/v1.
+func TestRoutingPriorityAPIBeforeDashboard(t *testing.T) {
+	srv := newTestServer(t)
+	dist := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dist, "index.html"), []byte("dashboard shadow"), 0o644); err != nil {
+		t.Fatalf("write dashboard index: %v", err)
+	}
+	// Also write assets that *look* like API responses; if routing
+	// priority ever regresses we want the catch-all to surface them.
+	if err := os.WriteFile(filepath.Join(dist, "health"), []byte("shadow health"), 0o644); err != nil {
+		t.Fatalf("write shadow /health: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dist, "tool", "v1"), 0o755); err != nil {
+		t.Fatalf("mkdir tool/v1: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dist, "tool", "v1", "call"), []byte("shadow tool"), 0o644); err != nil {
+		t.Fatalf("write shadow tool/v1/call: %v", err)
+	}
+	t.Setenv("SYMPHONY_DASHBOARD_DIST", dist)
+
+	// /api/v1/health is public and returns the health envelope.
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/health = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "shadow health") {
+		t.Fatalf("dashboard shadow intercepted /api/v1/health: %s", rec.Body.String())
+	}
+	var healthEnv map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &healthEnv); err != nil {
+		t.Fatalf("decode /api/v1/health: %v", err)
+	}
+	data, ok := healthEnv["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("health envelope missing data: %v", healthEnv)
+	}
+	if data["ok"] != true {
+		t.Fatalf("health ok = %v, want true", data["ok"])
+	}
+
+	// /api/v1/auth/session is public and returns the session envelope.
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/auth/session = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "dashboard shadow") {
+		t.Fatalf("dashboard shadow intercepted /api/v1/auth/session: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"authenticated\":false") {
+		t.Fatalf("/api/v1/auth/session body = %s, want authenticated:false", rec.Body.String())
+	}
+
+	// /api/v1/state requires a session; the API handler must return 401,
+	// not the dashboard index.html.
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/state", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/v1/state (no session) = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "dashboard shadow") {
+		t.Fatalf("dashboard shadow intercepted /api/v1/state: %s", rec.Body.String())
+	}
+
+	// /tool/v1/call only accepts POST; a GET must be rejected with 405
+	// from handleTool, not routed into the dashboard fallback.
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/tool/v1/call", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /tool/v1/call = %d, want 405; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "dashboard shadow") {
+		t.Fatalf("dashboard shadow intercepted /tool/v1/call: %s", rec.Body.String())
+	}
+
+	// A non-API path still gets the dashboard. This is the sanity check
+	// that the dashboard fallback is wired up at all.
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if !strings.Contains(rec.Body.String(), "dashboard shadow") {
+		t.Fatalf("dashboard fallback did not serve /, body=%s", rec.Body.String())
+	}
+}
+
+// TestDashboardDistDiscoveryFailureSurfacesError covers the failure mode the
+// release script must protect against: a binary launched from a release
+// layout where the `web/dist` directory is missing or unreadable.
+//
+// The contract: the API still works (handlers are not blocked by a broken
+// dist), the dashboard handler returns the safe HTML fallback page (status
+// 200, no leaked file paths), and the fallback page tells the operator how
+// to point at a real dist.
+func TestDashboardDistDiscoveryFailureSurfacesError(t *testing.T) {
+	srv := newTestServer(t)
+	// Force the explicit override to a path that does not exist.
+	t.Setenv("SYMPHONY_DASHBOARD_DIST", filepath.Join(t.TempDir(), "does-not-exist"))
+	// The candidate set includes the executable's own directory, which in
+	// `go test` is the test binary's tmp location and has no `web/dist`
+	// under it. The repo-root web/dist is excluded by the safety check.
+	distRoot, indexPath, found := dashboardDist(srv.Store.RepoRoot)
+	if found {
+		t.Fatalf("dashboardDist unexpectedly found a candidate: distRoot=%s indexPath=%s", distRoot, indexPath)
+	}
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET / fallback status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Dashboard assets were not found in a trusted install location") {
+		t.Fatalf("fallback page missing the operator guidance; body=%s", body)
+	}
+	if !strings.Contains(body, "SYMPHONY_DASHBOARD_DIST") {
+		t.Fatalf("fallback page missing the SYMPHONY_DASHBOARD_DIST hint; body=%s", body)
+	}
+
+	// The API must still work in this failure mode.
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/health (no dist) = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "Dashboard assets were not found") {
+		t.Fatalf("API endpoint unexpectedly returned dashboard fallback: %s", rec.Body.String())
+	}
+}
+
+// TestDashboardDistDiscoveryCorruptIndexSurfacesError covers the second
+// failure mode: a `web/dist` directory exists but the `index.html` is
+// missing or unreadable. The handler must not serve a 500 or panic; it
+// must return the same safe fallback page.
+func TestDashboardDistDiscoveryCorruptIndexSurfacesError(t *testing.T) {
+	srv := newTestServer(t)
+	dist := t.TempDir()
+	// Create the dist directory with an asset, but no index.html.
+	if err := os.MkdirAll(dist, 0o755); err != nil {
+		t.Fatalf("mkdir dist: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dist, "asset.js"), []byte("/* nothing */"), 0o644); err != nil {
+		t.Fatalf("write asset: %v", err)
+	}
+	t.Setenv("SYMPHONY_DASHBOARD_DIST", dist)
+
+	distRoot, indexPath, found := dashboardDist(srv.Store.RepoRoot)
+	if found {
+		t.Fatalf("dashboardDist unexpectedly succeeded with corrupt dist: distRoot=%s indexPath=%s", distRoot, indexPath)
+	}
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET / (corrupt dist) status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Dashboard assets were not found in a trusted install location") {
+		t.Fatalf("corrupt dist did not return the safe fallback page: %s", rec.Body.String())
+	}
+}
+
 func TestEventStreamEmitsStoredEventOnceAsDefaultMessage(t *testing.T) {
 	srv := newTestServer(t)
 	if _, err := srv.Store.CreateIssue(store.CreateIssueInput{Title: "SSE issue", Description: "desc"}); err != nil {

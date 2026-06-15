@@ -1,0 +1,3208 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /Users/xiquandai/Documents/code/local-symphony-d5-release
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019eab26-9d9f-77e3-ac2b-86dcf3829b24
+--------
+user
+commit 4cd80ec: D5 R13: round 3 review fix (pin Node-18-compatible Vite 5 + React 18)
+exec
+/bin/zsh -lc 'git status --short && git rev-parse --show-toplevel && git rev-parse 4cd80ec''^ && git rev-parse 4cd80ec && git log --oneline -5' in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 142ms:
+4cd80ec4f998414ef0896cb5268f3c843dcbcb4f
+4cd80ec D5 R3: pin Node-18-compatible Vite 5 + React 18 versions
+acb4364 D5 R2: review docs (F1-r2/F2-r2/F3-r2 fixed, clean-tarball verified)
+9d1e57d D5 R2: skip git archive when not in a git worktree
+cdf08ed D5 R2: fix F1-r2/F2-r2/F3-r2 per codex review round 2
+c790f3c D5 R1: anchor review doc SHA to final commit 41dabb6
+
+exec
+/bin/zsh -lc 'git show --stat --oneline --decorate --find-renames 4cd80ec && git show --find-renames --format=fuller --no-ext-diff --unified=80 4cd80ec' in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+4cd80ec (HEAD -> codex/v1-productization-d5-release) D5 R3: pin Node-18-compatible Vite 5 + React 18 versions
+ internal/buildrelease/safety_test.go |  186 ++++
+ web/package-lock.json                | 1754 +++++++++++++++++++++++++---------
+ web/package.json                     |   18 +-
+ 3 files changed, 1473 insertions(+), 485 deletions(-)
+commit 4cd80ec4f998414ef0896cb5268f3c843dcbcb4f
+Author:     shuanzi <daixiquan@gmail.com>
+AuthorDate: Tue Jun 9 14:44:57 2026 +0800
+Commit:     shuanzi <daixiquan@gmail.com>
+CommitDate: Tue Jun 9 14:44:57 2026 +0800
+
+    D5 R3: pin Node-18-compatible Vite 5 + React 18 versions
+    
+    F1-r3 [P1] web/package.json + web/package-lock.json
+    - R2's 'npm install --package-lock-only' was run on Node 25 and
+      resolved to Vite 8.0.16 + @vitejs/plugin-react 6.0.2 + Rolldown,
+      which all declare engines.node = '^20.19.0 || >=22.12.0'.
+      The documented supported runtime (docs/RELEASE_NOTES.md,
+      README.md) is Node 18+ LTS, so a CI on Node 18 would fail at
+      'npm run build' with 'ReferenceError: CustomEvent is not
+      defined'.
+    - Pin top-level deps to Node-18-compatible versions:
+        vite: ^5.4.10       (last Vite 5 line; resolved 5.4.21)
+        @vitejs/plugin-react: ^4.3.4
+        react: ^18.3.1
+        react-dom: ^18.3.1
+        @types/react: ^18.3.12
+        @types/react-dom: ^18.3.1
+        typescript: ^5.6.3
+    - Drop the 'packageManager: pnpm@9.0.0' field — the release
+      artifact uses npm ci, not pnpm, so the field was misleading.
+    - Add 'engines.node: >=18.0.0' to web/package.json to document
+      the supported runtime at the source.
+    - Regenerate web/package-lock.json (lockfileVersion 3, 977 lines)
+      via 'npm install --package-lock-only' so the new pins are
+      what 'npm ci' resolves.
+    
+    Test (test-first FAIL→PASS in
+    internal/buildrelease/safety_test.go):
+    - TestBuildReleaseLockfileEnginesCompatibleWithNode18 parses the
+      committed web/package-lock.json from a clean 'git archive HEAD'
+      extract and asserts no package's engines.node field excludes
+      Node 18. The check is conservative: any '>=X' or '^X' where
+      X's major >= 20 fails. Multi-clause 'A || B' constraints are
+      checked clause-by-clause.
+    
+    Verified end-to-end: 'npm ci' in a clean tree resolves
+    node_modules in 2s; 'npm run build' produces 32 modules
+    transformed (was 17 on Vite 8) and exits 0.
+
+diff --git a/internal/buildrelease/safety_test.go b/internal/buildrelease/safety_test.go
+index a1f0653..c2e66ad 100644
+--- a/internal/buildrelease/safety_test.go
++++ b/internal/buildrelease/safety_test.go
+@@ -1,133 +1,135 @@
+ // Package buildrelease contains tests that lock in the safety guarantees
+ // of scripts/build-release.sh as required by the D5 codex review
+ // rounds 1 + 2:
+ //
+ //   F1-r0 [P1] (R1)  scripts/build-release.sh must not data-destructively
+ //                    delete the repo's `web/` source tree. Two
+ //                    protections: (a) early-exit guard rejecting
+ //                    OUT_DIR that equals or falls under a dangerous
+ //                    source subdir of $ROOT; (b) the destructive
+ //                    `rm -rf` is scoped to $OUT_DIR/web/dist.
+ //
+ //   F2-r0 [P2] (R1)  web install must be deterministic — frozen install
+ //                    against the committed web/package-lock.json. The
+ //                    script must invoke `npm ci` (not `npm install`).
+ //
+ //   F1-r2 [P1] (R2)  The R1 guard overreached by rejecting "every child
+ //                    of $ROOT" — the documented default
+ //                    `bash scripts/build-release.sh` uses
+ //                    OUT_DIR=$ROOT/dist, which is a legitimate
+ //                    output location. The guard must allow $ROOT/dist
+ //                    and reject only source subdirs (web/,
+ //                    scripts/, internal/, cmd/, docs/, schemas/,
+ //                    api/, etc.).
+ //
+ //   F2-r2 [P1] (R2)  R1's "use npm ci" fix is meaningless if
+ //                    web/package-lock.json is excluded by .gitignore
+ //                    — a clean checkout / git archive / CI will not
+ //                    have the lockfile, and `npm ci` fails
+ //                    immediately. The lockfile must be tracked.
+ //
+ //   F3-r2 [P2] (R2)  The R1 `if [ ! -d $ROOT/web/node_modules ]` guard
+ //                    skips `npm ci` when node_modules already
+ //                    exists. That means a developer's stale
+ //                    node_modules (from a previous `pnpm install` or
+ //                    a `latest`-resolved `npm install`) gets
+ //                    packaged into the release. `npm ci` must run
+ //                    unconditionally.
+ //
+ // Tests in this package exercise the script in two modes:
+ //
+ //   * **In-isolated-tempdir tests (F1-r0)**: the script is COPIED
+ //     to a fresh tmp workdir so the script's auto-derived $ROOT is
+ //     the tmp dir, never the real repo.
+ //
+ //   * **In-clean-git-archive tests (F2-r2)**: `git archive HEAD` is
+ //     extracted to a t.TempDir() so the test sees exactly what a CI
+ //     fresh checkout would see. This catches a class of bugs where
+ //     the developer's working tree has untracked-but-on-disk state
+ //     that masks a missing-in-source-tree problem.
+ package buildrelease
+ 
+ import (
+ 	"bytes"
++	"encoding/json"
++	"fmt"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+ 	"strings"
+ 	"testing"
+ )
+ 
+ // repoRoot returns the absolute path of the Local Symphony repo, derived
+ // from this test file's location (internal/buildrelease/safety_test.go
+ // → ../ → repo root).
+ func repoRoot(t *testing.T) string {
+ 	t.Helper()
+ 	cwd, err := os.Getwd()
+ 	if err != nil {
+ 		t.Fatalf("getwd: %v", err)
+ 	}
+ 	// `go test` runs with cwd == the package directory by default.
+ 	// Internal callers can `go test ./internal/buildrelease` from the
+ 	// repo root, in which case cwd is the package dir and the repo
+ 	// root is one level up. Accept both layouts.
+ 	if filepath.Base(cwd) == "buildrelease" {
+ 		return filepath.Clean(filepath.Join(cwd, "..", ".."))
+ 	}
+ 	return cwd
+ }
+ 
+ // runIsolatedScript copies scripts/build-release.sh to a fresh temp
+ // directory, lays down the minimum web/ tree the script's F1 guard
+ // expects to find, and runs the copy with the supplied $OUT_DIR. The
+ // script auto-derives its own $ROOT from its location, so the real
+ // repo's $ROOT is never at risk.
+ func runIsolatedScript(t *testing.T, outDir string, extraEnv ...string) (string, int) {
+ 	t.Helper()
+ 	root := repoRoot(t)
+ 	scriptSrc, err := os.ReadFile(filepath.Join(root, "scripts", "build-release.sh"))
+ 	if err != nil {
+ 		t.Fatalf("read source script: %v", err)
+ 	}
+ 	tmp := t.TempDir()
+ 	dstScript := filepath.Join(tmp, "scripts", "build-release.sh")
+ 	if err := os.MkdirAll(filepath.Dir(dstScript), 0o755); err != nil {
+ 		t.Fatalf("mkdir scripts: %v", err)
+ 	}
+ 	if err := os.WriteFile(dstScript, scriptSrc, 0o755); err != nil {
+ 		t.Fatalf("write script: %v", err)
+ 	}
+ 	// Lay down the minimum `web/` tree the script's F1 guard will
+ 	// inspect. Only committed files are copied; node_modules is
+ 	// intentionally NOT seeded because the F1 tests run with
+ 	// SKIP_WEB=1.
+ 	mustCopyFromRepo(t, root, "web/package.json", filepath.Join(tmp, "web", "package.json"))
+ 	mustCopyFromRepo(t, root, "web/vite.config.ts", filepath.Join(tmp, "web", "vite.config.ts"))
+ 	mustCopyFromRepo(t, root, "web/tsconfig.json", filepath.Join(tmp, "web", "tsconfig.json"))
+ 
+ 	cmd := exec.Command("bash", dstScript)
+ 	cmd.Dir = tmp
+ 	env := append(os.Environ(),
+ 		"OUT_DIR="+outDir,
+ 		"SKIP_WEB=1",
+ 	)
+ 	env = append(env, extraEnv...)
+ 	cmd.Env = env
+ 	var buf bytes.Buffer
+ 	cmd.Stdout = &buf
+ 	cmd.Stderr = &buf
+ 	err = cmd.Run()
+ 	exit := 0
+ 	if ee, ok := err.(*exec.ExitError); ok {
+ 		exit = ee.ExitCode()
+ 	} else if err != nil {
+ 		t.Fatalf("script exec errored unexpectedly: %v\noutput:\n%s", err, buf.String())
+ 	}
+ 	return buf.String(), exit
+ }
+ 
+ func mustCopyFromRepo(t *testing.T, root, srcRel, dst string) {
+ 	t.Helper()
+ 	b, err := os.ReadFile(filepath.Join(root, srcRel))
+ 	if err != nil {
+ 		t.Fatalf("read %s: %v", srcRel, err)
+@@ -284,160 +286,344 @@ func TestBuildReleaseAlwaysRunsNpmCi(t *testing.T) {
+ 	outDir := t.TempDir() + "-sibling"
+ 	pathWithFakeNpm := binDir + string(os.PathListSeparator) + os.Getenv("PATH")
+ 	_, _ = runIsolatedScriptWithRoot(t, root, outDir, "SKIP_WEB=0", "PATH="+pathWithFakeNpm)
+ 
+ 	logData, err := os.ReadFile(logPath)
+ 	if err != nil {
+ 		t.Fatalf("read npm invocation log: %v", err)
+ 	}
+ 	log := string(logData)
+ 	// `npm ci` may be called bare, as `npm ci --no-audit --no-fund`,
+ 	// or as part of a longer command. We assert the log contains
+ 	// the literal token `ci` *as a separate argv* (preceded by a
+ 	// space or at start of line). `npm run build` is also called
+ 	// and would log `run build` — that's not what we want.
+ 	lines := strings.Split(strings.TrimSpace(log), "\n")
+ 	calledCi := false
+ 	for _, line := range lines {
+ 		// We look for an invocation that has `ci` as a standalone
+ 		// argument (the second token after `npm`).
+ 		fields := strings.Fields(line)
+ 		if len(fields) >= 1 && fields[0] == "ci" {
+ 			calledCi = true
+ 			break
+ 		}
+ 	}
+ 	if !calledCi {
+ 		t.Fatalf("`npm ci` was not called even though web/node_modules exists. The F3-r2 `if [ ! -d ... ]` guard is back. Invocation log:\n%s\nFull script output:\n%s", log, log)
+ 	}
+ }
+ 
+ // F2-r2 — rewritten to use `git archive` so a developer's stray
+ // web/package-lock.json on disk cannot mask a missing-in-source
+ // lockfile. The test extracts `git archive HEAD` to a t.TempDir()
+ // and verifies that web/package-lock.json is present, web/pnpm-lock.yaml
+ // is absent, and web/package-lock.json is NOT excluded by .gitignore.
+ func TestBuildReleaseLockfileStoryIsConsistent(t *testing.T) {
+ 	root := repoRoot(t)
+ 
+ 	// (a) .gitignore must NOT exclude web/package-lock.json. R1's
+ 	// mistake was to add it; R2 removes it.
+ 	gi, err := os.ReadFile(filepath.Join(root, ".gitignore"))
+ 	if err != nil {
+ 		t.Fatalf("read .gitignore: %v", err)
+ 	}
+ 	for _, line := range strings.Split(string(gi), "\n") {
+ 		trimmed := strings.TrimSpace(line)
+ 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+ 			continue
+ 		}
+ 		if trimmed == "web/package-lock.json" {
+ 			t.Fatalf(".gitignore still excludes web/package-lock.json; a clean checkout / git archive will not have the lockfile and `npm ci` will fail. Remove that line.")
+ 		}
+ 	}
+ 
+ 	// (b) Run the same checks under a `git archive` clean extract
+ 	// so on-disk-only state cannot mask a missing-in-source
+ 	// problem. The `git archive` output is what a CI fresh
+ 	// checkout would have; the developer's stray worktree files
+ 	// are NOT included.
+ 	clean := extractCleanTarball(t, root)
+ 	plPath := filepath.Join(clean, "web", "package-lock.json")
+ 	if _, err := os.Stat(plPath); err != nil {
+ 		t.Fatalf("web/package-lock.json missing from git archive extract at %s. err=%v\nA clean checkout cannot run `npm ci` without a tracked lockfile.", plPath, err)
+ 	}
+ 	plData, err := os.ReadFile(plPath)
+ 	if err != nil {
+ 		t.Fatalf("read web/package-lock.json from clean extract: %v", err)
+ 	}
+ 	if !strings.Contains(string(plData), `"lockfileVersion"`) {
+ 		t.Fatalf("web/package-lock.json in clean extract is not a valid lockfile (missing lockfileVersion).")
+ 	}
+ 
+ 	ylPath := filepath.Join(clean, "web", "pnpm-lock.yaml")
+ 	if _, err := os.Stat(ylPath); err == nil {
+ 		t.Fatalf("web/pnpm-lock.yaml present in clean extract; pick one lockfile to avoid silent drift.")
+ 	} else if !os.IsNotExist(err) {
+ 		t.Fatalf("stat web/pnpm-lock.yaml in clean extract: %v", err)
+ 	}
+ }
+ 
++// F1-r3 — regression: docs/RELEASE_NOTES.md and README.md promise
++// Node 18+ LTS as the supported runtime for the dashboard build.
++// R2's `npm install --package-lock-only` was run on Node 25 and
++// resolved to Vite 8.0.16 / @vitejs/plugin-react 6.0.2, both of
++// which require Node `^20.19.0 || >=22.12.0`. A CI that runs the
++// documented Node 18 LTS would fail at `npm run build` with
++// `ReferenceError: CustomEvent is not defined`.
++//
++// This test parses web/package-lock.json from a clean `git
++// archive` extract and asserts that NO package in the resolved
++// dependency tree declares an `engines.node` field that excludes
++// Node 18. The supported constraint is
++// "Node 18 must be a possible installation target", which
++// translates to: any `engines.node` constraint that appears must
++// NOT require Node >=20 as a hard floor (e.g. `^20.19.0` or
++// `>=22.12.0` or `>=20`).
++//
++// This is a static lockfile check; the CI clean-room Node 18
++// build is exercised by the spec's clean-tarball verification.
++func TestBuildReleaseLockfileEnginesCompatibleWithNode18(t *testing.T) {
++	root := repoRoot(t)
++	clean := extractCleanTarball(t, root)
++	plPath := filepath.Join(clean, "web", "package-lock.json")
++	plData, err := os.ReadFile(plPath)
++	if err != nil {
++		t.Fatalf("read web/package-lock.json from clean extract: %v", err)
++	}
++	// Parse the npm lockfile. The shape is a flat object with a
++	// top-level "packages" key whose values are package objects
++	// (one per installed package, keyed by install path).
++	var lockfile struct {
++		Packages map[string]struct {
++			Name      string `json:"name"`
++			Version   string `json:"version"`
++			Engines   any    `json:"engines"`
++			HasBin    any    `json:"hasBin"`
++			Resolved  string `json:"resolved"`
++		} `json:"packages"`
++	}
++	if err := json.Unmarshal(plData, &lockfile); err != nil {
++		t.Fatalf("parse web/package-lock.json: %v", err)
++	}
++	if lockfile.Packages == nil {
++		t.Fatalf("web/package-lock.json has no `packages` key; lockfile is malformed")
++	}
++	// The supported Node 18 contract: any `engines.node` field
++	// that appears must be one of:
++	//   - absent (the package has no Node engine constraint)
++	//   - a `>=X` form where X is < 20 (Node 18 is allowed)
++	//   - a `^X.Y.Z` form where the major version is 18 or earlier
++	//   - a multi-clause `A || B` form where every clause meets
++	//     the same rule
++	//
++	// The test only flags a hard exclusion: a clause that starts
++	// at Node 20 or higher. Soft ranges that include Node 18 are
++	// allowed.
++	disallowed := []string{}
++	for installPath, pkg := range lockfile.Packages {
++		// The empty key (installPath == "") is the workspace root
++		// itself; its engines.node field is a top-level package
++		// constraint, not a transitive one. We still want to
++		// check it because the workspace root's `engines` is
++		// what npm actually uses to refuse installs.
++		rawEngines, ok := pkg.Engines.(map[string]any)
++		if !ok || rawEngines == nil {
++			continue
++		}
++		nodeRaw, ok := rawEngines["node"]
++		if !ok {
++			continue
++		}
++		nodeConstraint, ok := nodeRaw.(string)
++		if !ok {
++			continue
++		}
++		if !node18Compatible(nodeConstraint) {
++			disallowed = append(disallowed, fmt.Sprintf("%s@%s (%s) engines.node=%q", pkg.Name, pkg.Version, installPath, nodeConstraint))
++		}
++	}
++	if len(disallowed) > 0 {
++		t.Fatalf("web/package-lock.json contains %d package(s) whose engines.node excludes Node 18 (the documented supported runtime). R2's `npm install --package-lock-only` resolved to these on a non-Node-18 host:\n  %s\n\nPin the offending top-level deps in web/package.json to Node-18-compatible versions (Vite ^5.4.x, @vitejs/plugin-react ^4.3.x, React 18) and regenerate the lockfile on Node 18, OR bump docs/RELEASE_NOTES.md to declare the new minimum.", len(disallowed), strings.Join(disallowed, "\n  "))
++	}
++}
++
++// node18Compatible reports whether a single `engines.node`
++// constraint string allows installation on Node 18. The supported
++// shapes are:
++//
++//   - `">=18"` / `">=18.0.0"` (Node 18 is the floor)
++//   - `"^18.0.0"` / `"^18"` (Node 18 major only)
++//   - `">=16"` / `">=14"` / etc. (Node 18 is above the floor)
++//   - `">=18 || ..."` multi-clause where every clause allows Node 18
++//   - `""` (empty) — treated as no constraint
++//
++// It returns false (incompatible) for shapes that hard-exclude
++// Node 18, e.g. `^20`, `>=20`, `>=20.19.0`, `>=22.12.0`,
++// `^20.19.0 || >=22.12.0`, etc.
++func node18Compatible(constraint string) bool {
++	trimmed := strings.TrimSpace(constraint)
++	if trimmed == "" {
++		return true
++	}
++	// Split on `||` for multi-clause constraints. Every clause
++	// must be Node-18-compatible for the whole constraint to be.
++	for _, clause := range strings.Split(trimmed, "||") {
++		clause = strings.TrimSpace(clause)
++		if !node18CompatibleClause(clause) {
++			return false
++		}
++	}
++	return true
++}
++
++func node18CompatibleClause(clause string) bool {
++	clause = strings.TrimSpace(clause)
++	if clause == "" {
++		return true
++	}
++	// Strip a leading comparator.
++	comparator := ""
++	rest := clause
++	for _, prefix := range []string{">=", "<=", "==", "!=", ">", "<", "^", "~"} {
++		if strings.HasPrefix(rest, prefix) {
++			comparator = prefix
++			rest = strings.TrimSpace(strings.TrimPrefix(rest, prefix))
++			break
++		}
++	}
++	// The remaining token is a version. We only care about the
++	// major version.
++	if rest == "" {
++		return true
++	}
++	// Strip a leading `v` if present.
++	if rest[0] == 'v' || rest[0] == 'V' {
++		rest = rest[1:]
++	}
++	// Take the first dotted chunk as the major version.
++	major := ""
++	for _, c := range rest {
++		if c == '.' || c == '-' || c == ' ' {
++			break
++		}
++		if c < '0' || c > '9' {
++			return true // unparseable: be conservative but allow
++		}
++		major += string(c)
++	}
++	if major == "" {
++		return true
++	}
++	// Major < 20 means Node 18 is allowed; the comparator only
++	// matters when it tightens the constraint. The only comparator
++	// that *excludes* Node 18 is a `>` or `>=` whose major is >=20
++	// (Node 18 is below the floor). A bare version like `20.0.0`
++	// is a `=` — allow it (the package would refuse to install
++	// on Node 18, but that's a package-side decision, not an
++	// engine gate; the npm registry treats a bare version as
++	// "equal-or-greater-implied"). To stay aligned with the
++	// R3 finding — which specifically rejects `^20.19.0` and
++	// `>=22.12.0` — we treat the comparison more strictly: any
++	// `>=X` or `^X` where X's major >= 20 fails.
++	switch comparator {
++	case ">=", ">", "^":
++		// Major is the floor or required major. If floor >= 20,
++		// Node 18 is not allowed.
++		if majorInt(major) >= 20 {
++			return false
++		}
++	}
++	return true
++}
++
++func majorInt(s string) int {
++	n := 0
++	for _, c := range s {
++		if c < '0' || c > '9' {
++			break
++		}
++		n = n*10 + int(c-'0')
++	}
++	return n
++}
++
+ // extractCleanTarball runs `git archive HEAD` from the repo root
+ // and extracts the tar into a fresh t.TempDir(). The result is
+ // what a CI fresh checkout of HEAD would have on disk.
+ //
+ // If the caller is not inside a git working tree (e.g. the test
+ // is being run from a clean-tarball extract that itself has no
+ // .git directory), the function falls back to the in-place
+ // directory and the test will then read whatever files are
+ // committed at that path. The clean-tarball end-to-end validation
+ // in the spec (which does the archive + extract in a single
+ // script-level command) is the authoritative way to verify
+ // "what a CI fresh checkout sees".
+ func extractCleanTarball(t *testing.T, repoRoot string) string {
+ 	t.Helper()
+ 	// Quick check: is there a .git dir we can archive from?
+ 	if _, err := os.Stat(filepath.Join(repoRoot, ".git")); err != nil {
+ 		t.Logf("not in a git worktree (%v); falling back to in-place repoRoot. Run the clean-tarball spec for authoritative CI-equivalent verification.", err)
+ 		return repoRoot
+ 	}
+ 	dir := t.TempDir()
+ 	cmd := exec.Command("git", "archive", "HEAD")
+ 	cmd.Dir = repoRoot
+ 	var buf bytes.Buffer
+ 	cmd.Stdout = &buf
+ 	cmd.Stderr = os.Stderr
+ 	if err := cmd.Run(); err != nil {
+ 		t.Fatalf("git archive HEAD: %v", err)
+ 	}
+ 	untar := exec.Command("tar", "-x", "-C", dir)
+ 	untar.Stdin = &buf
+ 	untar.Stderr = os.Stderr
+ 	if err := untar.Run(); err != nil {
+ 		t.Fatalf("tar -x: %v", err)
+ 	}
+ 	return dir
+ }
+ 
+ // F2 — first protection: the script must invoke `npm ci` (frozen
+ // install against web/package-lock.json), not `npm install`. Static
+ // text inspection of the script is sufficient and is what the
+ // round-1 reviewer asked for.
+ func TestBuildReleaseUsesNpmCiNotNpmInstall(t *testing.T) {
+ 	root := repoRoot(t)
+ 	b, err := os.ReadFile(filepath.Join(root, "scripts", "build-release.sh"))
+ 	if err != nil {
+ 		t.Fatalf("read script: %v", err)
+ 	}
+ 	script := stripShellComments(string(b))
+ 
+ 	if !strings.Contains(script, "npm ci") {
+ 		t.Fatalf("scripts/build-release.sh does not call `npm ci`.\nThe frozen-install contract is broken. Script (comments stripped):\n%s", script)
+ 	}
+ 	// `npm install` (with whitespace) is the destructive variant. The
+ 	// script may still mention `npm install` inside a comment / help
+ 	// text, but the body of the script must not call it.
+ 	lines := strings.Split(script, "\n")
+ 	for i, line := range lines {
+ 		trimmed := strings.TrimSpace(line)
+ 		// A line that contains `npm install` AND is not a `npm ci`
+ 		// variant is a regression. We allow the literal text to
+ 		// appear inside shell comments (which we already stripped) or
+ 		// inside a quoted string used for an echo; stripShellComments
+ 		// handles the former. We still allow `npm install` in a doc
+ 		// comment INSIDE a quoted echo statement, but the script
+ 		// currently has no such occurrence. If a future change adds
+ 		// one, the assertion must be revisited.
+ 		if strings.Contains(trimmed, "npm install") && !strings.Contains(trimmed, "npm ci") {
+ 			t.Fatalf("scripts/build-release.sh line %d still calls `npm install`:\n  %s\nThe frozen-install contract requires `npm ci`.", i+1, trimmed)
+ 		}
+ 	}
+ }
+ 
+ // F2 — second protection: the repo must carry web/package-lock.json
+ // (so `npm ci` has something to install from) and must NOT carry
+ // web/pnpm-lock.yaml (a stale conflicting lockfile would let a future
+ // `pnpm install` re-resolve `latest` and break reproducibility). The
+ // rewritten TestBuildReleaseLockfileStoryIsConsistent at the top of
+ // this file is the authoritative version; this block is intentionally
+ // left empty (it was the R1 version that did not protect against
+ // developer-stray-lockfile masking).
+diff --git a/web/package-lock.json b/web/package-lock.json
+index 8b5c747..e46fca3 100644
+--- a/web/package-lock.json
++++ b/web/package-lock.json
+@@ -1,972 +1,1772 @@
+ {
+   "name": "local-symphony-web",
+   "version": "0.2.0",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "local-symphony-web",
+       "version": "0.2.0",
+       "dependencies": {
+-        "react": "latest",
+-        "react-dom": "latest"
++        "react": "^18.3.1",
++        "react-dom": "^18.3.1"
+       },
+       "devDependencies": {
+-        "@types/react": "latest",
+-        "@types/react-dom": "latest",
+-        "@vitejs/plugin-react": "latest",
+-        "typescript": "latest",
+-        "vite": "latest"
++        "@types/react": "^18.3.12",
++        "@types/react-dom": "^18.3.1",
++        "@vitejs/plugin-react": "^4.3.4",
++        "typescript": "^5.6.3",
++        "vite": "^5.4.10"
++      },
++      "engines": {
++        "node": ">=18.0.0"
+       }
+     },
+-    "node_modules/@emnapi/core": {
+-      "version": "1.10.0",
+-      "resolved": "https://registry.npmjs.org/@emnapi/core/-/core-1.10.0.tgz",
+-      "integrity": "sha512-yq6OkJ4p82CAfPl0u9mQebQHKPJkY7WrIuk205cTYnYe+k2Z8YBh11FrbRG/H6ihirqcacOgl2BIO8oyMQLeXw==",
++    "node_modules/@babel/code-frame": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/code-frame/-/code-frame-7.29.7.tgz",
++      "integrity": "sha512-Aup7aUOfpbAUg2ROOJN6Iw5f9DMBlzu0mIkm/malLQFN/YQgO48wCj0Kxa3sEHJvPVFg7siR+qRInwXd2qhQKw==",
+       "dev": true,
+       "license": "MIT",
+-      "optional": true,
+       "dependencies": {
+-        "@emnapi/wasi-threads": "1.2.1",
+-        "tslib": "^2.4.0"
++        "@babel/helper-validator-identifier": "^7.29.7",
++        "js-tokens": "^4.0.0",
++        "picocolors": "^1.1.1"
++      },
++      "engines": {
++        "node": ">=6.9.0"
+       }
+     },
+-    "node_modules/@emnapi/runtime": {
+-      "version": "1.10.0",
+-      "resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.10.0.tgz",
+-      "integrity": "sha512-ewvYlk86xUoGI0zQRNq/mC+16R1QeDlKQy21Ki3oSYXNgLb45GV1P6A0M+/s6nyCuNDqe5VpaY84BzXGwVbwFA==",
++    "node_modules/@babel/compat-data": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/compat-data/-/compat-data-7.29.7.tgz",
++      "integrity": "sha512-locTkQyKvwIEgBzVrn8693ebc97F2U8ZHjbXwDXJ5Fn2TCpNwTlKcaKLkdHop5c/icOFE7qt7Q9JC5hnKNa6Gg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/core": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/core/-/core-7.29.7.tgz",
++      "integrity": "sha512-RgHBCvtjbOK2gXSNBNIkNoEc9qoVEtau3hj8gEqKQuL3HZAibKarWFEI3Lfm6EYKkLalOh8eSrj9b+ch9H/VBA==",
+       "dev": true,
+       "license": "MIT",
+-      "optional": true,
+       "dependencies": {
+-        "tslib": "^2.4.0"
++        "@babel/code-frame": "^7.29.7",
++        "@babel/generator": "^7.29.7",
++        "@babel/helper-compilation-targets": "^7.29.7",
++        "@babel/helper-module-transforms": "^7.29.7",
++        "@babel/helpers": "^7.29.7",
++        "@babel/parser": "^7.29.7",
++        "@babel/template": "^7.29.7",
++        "@babel/traverse": "^7.29.7",
++        "@babel/types": "^7.29.7",
++        "@jridgewell/remapping": "^2.3.5",
++        "convert-source-map": "^2.0.0",
++        "debug": "^4.1.0",
++        "gensync": "^1.0.0-beta.2",
++        "json5": "^2.2.3",
++        "semver": "^6.3.1"
++      },
++      "engines": {
++        "node": ">=6.9.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/babel"
+       }
+     },
+-    "node_modules/@emnapi/wasi-threads": {
+-      "version": "1.2.1",
+-      "resolved": "https://registry.npmjs.org/@emnapi/wasi-threads/-/wasi-threads-1.2.1.tgz",
+-      "integrity": "sha512-uTII7OYF+/Mes/MrcIOYp5yOtSMLBWSIoLPpcgwipoiKbli6k322tcoFsxoIIxPDqW01SQGAgko4EzZi2BNv2w==",
++    "node_modules/@babel/generator": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/generator/-/generator-7.29.7.tgz",
++      "integrity": "sha512-DkXD5OJQaAQIdZ1bt3UZdEnHAn9Imd3IVBdX03UFe+ony9Ojw5pzr9YVKGDY1jt+Gcn/FnGkNf8r+Vj5NOJWtQ==",
+       "dev": true,
+       "license": "MIT",
+-      "optional": true,
+       "dependencies": {
+-        "tslib": "^2.4.0"
++        "@babel/parser": "^7.29.7",
++        "@babel/types": "^7.29.7",
++        "@jridgewell/gen-mapping": "^0.3.12",
++        "@jridgewell/trace-mapping": "^0.3.28",
++        "jsesc": "^3.0.2"
++      },
++      "engines": {
++        "node": ">=6.9.0"
+       }
+     },
+-    "node_modules/@napi-rs/wasm-runtime": {
+-      "version": "1.1.4",
+-      "resolved": "https://registry.npmjs.org/@napi-rs/wasm-runtime/-/wasm-runtime-1.1.4.tgz",
+-      "integrity": "sha512-3NQNNgA1YSlJb/kMH1ildASP9HW7/7kYnRI2szWJaofaS1hWmbGI4H+d3+22aGzXXN9IJ+n+GiFVcGipJP18ow==",
++    "node_modules/@babel/helper-compilation-targets": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helper-compilation-targets/-/helper-compilation-targets-7.29.7.tgz",
++      "integrity": "sha512-wem6WaBj4NaVYVdNhLPPVacES6ZJ+KBBfSkTMD3YZxbP3rm3Di85tJU5ljaUNhaOynt+Aj0xruhYuzQBt8n71g==",
+       "dev": true,
+       "license": "MIT",
+-      "optional": true,
+       "dependencies": {
+-        "@tybys/wasm-util": "^0.10.1"
++        "@babel/compat-data": "^7.29.7",
++        "@babel/helper-validator-option": "^7.29.7",
++        "browserslist": "^4.24.0",
++        "lru-cache": "^5.1.1",
++        "semver": "^6.3.1"
+       },
+-      "funding": {
+-        "type": "github",
+-        "url": "https://github.com/sponsors/Brooooooklyn"
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/helper-globals": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helper-globals/-/helper-globals-7.29.7.tgz",
++      "integrity": "sha512-3nQVUAtvkKH9zahfWgw96Jc/uFOmjACE1kQz82E2lqWmHBgjzbNlsC22nuQTfahmWeQtTq5nQ/4Nnd2A1wj4zA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/helper-module-imports": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helper-module-imports/-/helper-module-imports-7.29.7.tgz",
++      "integrity": "sha512-ejHwrQQYcm9xnTivShn2IDOlIzInN34AXskvq9QicvCtEzq1Vzclu/tKF8Jq1Cg8JG2GL6/EmjgsCT7lXepE3g==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/traverse": "^7.29.7",
++        "@babel/types": "^7.29.7"
++      },
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/helper-module-transforms": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helper-module-transforms/-/helper-module-transforms-7.29.7.tgz",
++      "integrity": "sha512-UPUVSyXbOh627KiCIGQSgwWzGeBKLkaJ9PJEdrngIwMSzxLR4jS4+f1f1jb7VzBbg8nFLaYotvVPFCTqdrmTAg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/helper-module-imports": "^7.29.7",
++        "@babel/helper-validator-identifier": "^7.29.7",
++        "@babel/traverse": "^7.29.7"
++      },
++      "engines": {
++        "node": ">=6.9.0"
+       },
+       "peerDependencies": {
+-        "@emnapi/core": "^1.7.1",
+-        "@emnapi/runtime": "^1.7.1"
++        "@babel/core": "^7.0.0"
+       }
+     },
+-    "node_modules/@oxc-project/types": {
+-      "version": "0.133.0",
++    "node_modules/@babel/helper-plugin-utils": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helper-plugin-utils/-/helper-plugin-utils-7.29.7.tgz",
++      "integrity": "sha512-G7sHYigPY17oO5SYWnfD/0MTBwVR781S/JI643e/JhUYgVgWE/61SoW3NH9KWUKyKq5LVh3npif99Wkt6j86Jw==",
+       "dev": true,
+       "license": "MIT",
+-      "funding": {
+-        "url": "https://github.com/sponsors/Boshen"
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/helper-string-parser": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helper-string-parser/-/helper-string-parser-7.29.7.tgz",
++      "integrity": "sha512-Pb5ijPrZ89GDH8223L4UP8i6QApWxs04RbPQJTeWDV0/keR2E36MeKnyr6LYmUUvqRRI+Iv87SuF1W6ErINzYw==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/helper-validator-identifier": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helper-validator-identifier/-/helper-validator-identifier-7.29.7.tgz",
++      "integrity": "sha512-qehxGkRj55h/ff8EMaJ+cYhyaKlHIxqYDn682wQD7RNp9UujOQsHog2uS0r2vzr4pW+sXf90NeeayjcNaX3fFg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/helper-validator-option": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helper-validator-option/-/helper-validator-option-7.29.7.tgz",
++      "integrity": "sha512-N9ZErrD+yW5geCDtBqnOoxmR8+tNKiGuxKlDpuJxfsqpa2dFcexaziGAE/qoHLiDDreVNMupxGmSoNlyvsA3gw==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/helpers": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helpers/-/helpers-7.29.7.tgz",
++      "integrity": "sha512-1k2lAGRMfHTcwuNYcCNUmaUffmQv8KWMfh2iJUUeRlwlwH4FdNG7mfPI10NPfLHJFThE4Tyr4mv7kTNZOiPuBg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/template": "^7.29.7",
++        "@babel/types": "^7.29.7"
++      },
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/parser": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/parser/-/parser-7.29.7.tgz",
++      "integrity": "sha512-hnORnjP/1P/zFEndoeX+n+t1RwWRJiJpM/jO7FW32Kn9r5+sJB2JWOdYo4L6k78j15eCwY3Gm/7364B1EMwtNg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/types": "^7.29.7"
++      },
++      "bin": {
++        "parser": "bin/babel-parser.js"
++      },
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/@babel/plugin-transform-react-jsx-self": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/plugin-transform-react-jsx-self/-/plugin-transform-react-jsx-self-7.29.7.tgz",
++      "integrity": "sha512-TL0hMc9xzy86VD31nUiwzd5otRAcyEPcsegCxolO0PvcXuH1v0kECe/UIznYFihpkvU5wg/jk4v0TTEFfm53fw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/helper-plugin-utils": "^7.29.7"
++      },
++      "engines": {
++        "node": ">=6.9.0"
++      },
++      "peerDependencies": {
++        "@babel/core": "^7.0.0-0"
++      }
++    },
++    "node_modules/@babel/plugin-transform-react-jsx-source": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/plugin-transform-react-jsx-source/-/plugin-transform-react-jsx-source-7.29.7.tgz",
++      "integrity": "sha512-06IyK09H3wi4cGbhDBwp5gUGo0IKtnYa8tyTiephirPCK6fbobVGiXMMI5zLQ4aKEYP3wZ3ArU44o+8KMrSG/Q==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/helper-plugin-utils": "^7.29.7"
++      },
++      "engines": {
++        "node": ">=6.9.0"
++      },
++      "peerDependencies": {
++        "@babel/core": "^7.0.0-0"
++      }
++    },
++    "node_modules/@babel/template": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/template/-/template-7.29.7.tgz",
++      "integrity": "sha512-puq+Gf35oI24FeN11LkoUQFqv9uwNeWpxXZi/Ji3rRIoKAzKnxRaZ+Gkj0vKS9ZCiTESfng1N9LyOyXvo+m+Gg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/code-frame": "^7.29.7",
++        "@babel/parser": "^7.29.7",
++        "@babel/types": "^7.29.7"
++      },
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/traverse": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/traverse/-/traverse-7.29.7.tgz",
++      "integrity": "sha512-EhlfNQtZ+NK22w5BM61ciuiq1m58ed33Wr1Xan//ZRTy6hgjnwyCffRYwzsGXdASJSUJ1guZILsErh1eQcl+zw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/code-frame": "^7.29.7",
++        "@babel/generator": "^7.29.7",
++        "@babel/helper-globals": "^7.29.7",
++        "@babel/parser": "^7.29.7",
++        "@babel/template": "^7.29.7",
++        "@babel/types": "^7.29.7",
++        "debug": "^4.3.1"
++      },
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/types": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/types/-/types-7.29.7.tgz",
++      "integrity": "sha512-4zBIxpPzowiZpusoFkyGVwakdRJUyuH5PxQ/PrqghfdFWWasvnCdPfQXHrenDai+gyLARulZjZowCOj6fjT4pA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/helper-string-parser": "^7.29.7",
++        "@babel/helper-validator-identifier": "^7.29.7"
++      },
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@esbuild/aix-ppc64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/aix-ppc64/-/aix-ppc64-0.21.5.tgz",
++      "integrity": "sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ==",
++      "cpu": [
++        "ppc64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "aix"
++      ],
++      "engines": {
++        "node": ">=12"
++      }
++    },
++    "node_modules/@esbuild/android-arm": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/android-arm/-/android-arm-0.21.5.tgz",
++      "integrity": "sha512-vCPvzSjpPHEi1siZdlvAlsPxXl7WbOVUBBAowWug4rJHb68Ox8KualB+1ocNvT5fjv6wpkX6o/iEpbDrf68zcg==",
++      "cpu": [
++        "arm"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "engines": {
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-android-arm64": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-android-arm64/-/binding-android-arm64-1.0.3.tgz",
+-      "integrity": "sha512-454rs7jHngixp/NMxd5srYD57OnzSlZ/eFTETjORQHLwJG1lRtmNOJcBerZlfu4GjKqeq8aCCIQrMdHyhI51Hw==",
++    "node_modules/@esbuild/android-arm64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/android-arm64/-/android-arm64-0.21.5.tgz",
++      "integrity": "sha512-c0uX9VAUBQ7dTDCjq+wdyGLowMdtR/GoC2U5IYk/7D1H1JYC0qseD7+11iMP2mRLN9RcCMRcjC4YMclCzGwS/A==",
+       "cpu": [
+         "arm64"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "android"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
++      }
++    },
++    "node_modules/@esbuild/android-x64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/android-x64/-/android-x64-0.21.5.tgz",
++      "integrity": "sha512-D7aPRUUNHRBwHxzxRvp856rjUHRFW1SdQATKXH2hqA0kAZb1hKmi02OpYRacl0TxIGz/ZmXWlbZgjwWYaCakTA==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "engines": {
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-darwin-arm64": {
+-      "version": "1.0.3",
++    "node_modules/@esbuild/darwin-arm64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/darwin-arm64/-/darwin-arm64-0.21.5.tgz",
++      "integrity": "sha512-DwqXqZyuk5AiWWf3UfLiRDJ5EDd49zg6O9wclZ7kUMv2WRFr4HKjXp/5t8JZ11QbQfUS6/cRCKGwYhtNAY88kQ==",
+       "cpu": [
+         "arm64"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "darwin"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-darwin-x64": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.0.3.tgz",
+-      "integrity": "sha512-9YpfeUvSE2RS7wysJ81uOZkXJz7f7Q55H2Gvp3VEw/EsahqDtrphrZ0EwDLK5vvKOzaCrBsjF8JmnMLcUt78Gg==",
++    "node_modules/@esbuild/darwin-x64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/darwin-x64/-/darwin-x64-0.21.5.tgz",
++      "integrity": "sha512-se/JjF8NlmKVG4kNIuyWMV/22ZaerB+qaSi5MdrXtd6R08kvs2qCN4C09miupktDitvh8jRFflwGFBQcxZRjbw==",
+       "cpu": [
+         "x64"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "darwin"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
++      }
++    },
++    "node_modules/@esbuild/freebsd-arm64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/freebsd-arm64/-/freebsd-arm64-0.21.5.tgz",
++      "integrity": "sha512-5JcRxxRDUJLX8JXp/wcBCy3pENnCgBR9bN6JsY4OmhfUtIHe3ZW0mawA7+RDAcMLrMIZaf03NlQiX9DGyB8h4g==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "freebsd"
++      ],
++      "engines": {
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-freebsd-x64": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-freebsd-x64/-/binding-freebsd-x64-1.0.3.tgz",
+-      "integrity": "sha512-yB1IlAsSNHncV6SCTL27/MVGR5htvQsoGxIv5KMGXALp+Ll1wYsn+x98M9MW7qa+NdSbvrrY7ANI4wLJ0n1e6g==",
++    "node_modules/@esbuild/freebsd-x64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/freebsd-x64/-/freebsd-x64-0.21.5.tgz",
++      "integrity": "sha512-J95kNBj1zkbMXtHVH29bBriQygMXqoVQOQYA+ISs0/2l3T9/kj42ow2mpqerRBxDJnmkUDCaQT/dfNXWX/ZZCQ==",
+       "cpu": [
+         "x64"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "freebsd"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-linux-arm-gnueabihf": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm-gnueabihf/-/binding-linux-arm-gnueabihf-1.0.3.tgz",
+-      "integrity": "sha512-Yi30IVAAfLUCy2MseFjbB1jAMDl1VMCAas5StnYp8da9+CKvMd2H2cbEjWcw5NPaPqzvYkVIaF1nNUG+b7u/sw==",
++    "node_modules/@esbuild/linux-arm": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-arm/-/linux-arm-0.21.5.tgz",
++      "integrity": "sha512-bPb5AHZtbeNGjCKVZ9UGqGwo8EUu4cLq68E95A53KlxAPRmUyYv2D6F0uUI65XisGOL1hBP5mTronbgo+0bFcA==",
+       "cpu": [
+         "arm"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-linux-arm64-gnu": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.0.3.tgz",
+-      "integrity": "sha512-jsO7R8To+AdlYgUmN5sHSCZbfhtMBkO0WUx8iORQnPcMMdgr7qM2DQmMwgabs3GhNztdmoKkMKQFHD6DTMCIQw==",
++    "node_modules/@esbuild/linux-arm64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-arm64/-/linux-arm64-0.21.5.tgz",
++      "integrity": "sha512-ibKvmyYzKsBeX8d8I7MH/TMfWDXBF3db4qM6sy+7re0YXya+K1cem3on9XgdT2EQGMu4hQyZhan7TeQ8XkGp4Q==",
+       "cpu": [
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
+       ],
++      "engines": {
++        "node": ">=12"
++      }
++    },
++    "node_modules/@esbuild/linux-ia32": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-ia32/-/linux-ia32-0.21.5.tgz",
++      "integrity": "sha512-YvjXDqLRqPDl2dvRODYmmhz4rPeVKYvppfGYKSNGdyZkA01046pLWyRKKI3ax8fbJoK5QbxblURkwK/MWY18Tg==",
++      "cpu": [
++        "ia32"
++      ],
++      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-linux-arm64-musl": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm64-musl/-/binding-linux-arm64-musl-1.0.3.tgz",
+-      "integrity": "sha512-VWkUHwWriDciit80wleYwKILoR/KMvxh/IdwS/paX+ZgpuRpCrKLUdadJbc0NpBEiyhpYawsJ73j9aCvOH+f7Q==",
++    "node_modules/@esbuild/linux-loong64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-loong64/-/linux-loong64-0.21.5.tgz",
++      "integrity": "sha512-uHf1BmMG8qEvzdrzAqg2SIG/02+4/DHB6a9Kbya0XDvwDEKCoC8ZRWI5JJvNdUjtciBGFQ5PuBlpEOXQj+JQSg==",
+       "cpu": [
+-        "arm64"
++        "loong64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=12"
++      }
++    },
++    "node_modules/@esbuild/linux-mips64el": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-mips64el/-/linux-mips64el-0.21.5.tgz",
++      "integrity": "sha512-IajOmO+KJK23bj52dFSNCMsz1QP1DqM6cwLUv3W1QwyxkyIWecfafnI555fvSGqEKwjMXVLokcV5ygHW5b3Jbg==",
++      "cpu": [
++        "mips64el"
+       ],
++      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-linux-ppc64-gnu": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-ppc64-gnu/-/binding-linux-ppc64-gnu-1.0.3.tgz",
+-      "integrity": "sha512-5f1laC0SlIR0yDbFCd8acUhvJIag6N3zC5P7oUPN6wX0aOma+uKJ0wBDH5aq7I1PVI2ttTlhJwzwRIBnLiSGEg==",
++    "node_modules/@esbuild/linux-ppc64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-ppc64/-/linux-ppc64-0.21.5.tgz",
++      "integrity": "sha512-1hHV/Z4OEfMwpLO8rp7CvlhBDnjsC3CttJXIhBi+5Aj5r+MBvy4egg7wCbe//hSsT+RvDAG7s81tAvpL2XAE4w==",
+       "cpu": [
+         "ppc64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=12"
++      }
++    },
++    "node_modules/@esbuild/linux-riscv64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-riscv64/-/linux-riscv64-0.21.5.tgz",
++      "integrity": "sha512-2HdXDMd9GMgTGrPWnJzP2ALSokE/0O5HhTUvWIbD3YdjME8JwvSCnNGBnTThKGEB91OZhzrJ4qIIxk/SBmyDDA==",
++      "cpu": [
++        "riscv64"
+       ],
++      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-linux-s390x-gnu": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-s390x-gnu/-/binding-linux-s390x-gnu-1.0.3.tgz",
+-      "integrity": "sha512-Iq4ko0r4XsgbrF/LunNgHtAGLRRVE2kXonAXQ/MV0mC6jQpMOhW1SvtZja2EhC/kd05++bP78dsqBeIQyYJ6Yg==",
++    "node_modules/@esbuild/linux-s390x": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-s390x/-/linux-s390x-0.21.5.tgz",
++      "integrity": "sha512-zus5sxzqBJD3eXxwvjN1yQkRepANgxE9lgOW2qLnmr8ikMTphkjgXu1HR01K4FJg8h1kEEDAqDcZQtbrRnB41A==",
+       "cpu": [
+         "s390x"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-linux-x64-gnu": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.0.3.tgz",
+-      "integrity": "sha512-B8m6tD5+/N5FeNQFbKlLA/2yVq9ycQP1SeedyEYYKWBNR3ZQbkvIUcNnDNM03lO1l5F2roiiFJGgvoLLyZXtSg==",
++    "node_modules/@esbuild/linux-x64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.21.5.tgz",
++      "integrity": "sha512-1rYdTpyv03iycF1+BhzrzQJCdOuAOtaqHTWJZCWvijKD2N5Xu0TtVC8/+1faWqcP9iBCWOmjmhoH94dH82BxPQ==",
+       "cpu": [
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-linux-x64-musl": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-x64-musl/-/binding-linux-x64-musl-1.0.3.tgz",
+-      "integrity": "sha512-pSdpdUJHkuCxun9LE7jvgUB9qsRgaiyNNCX7m/AvHTcq67AiT/Yhoxvw5zPfhrM8k/BfP8ce/hMOpthKDpEUow==",
++    "node_modules/@esbuild/netbsd-x64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/netbsd-x64/-/netbsd-x64-0.21.5.tgz",
++      "integrity": "sha512-Woi2MXzXjMULccIwMnLciyZH4nCIMpWQAs049KEeMvOcNADVxo0UBIQPfSmxB3CWKedngg7sWZdLvLczpe0tLg==",
+       "cpu": [
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+-        "linux"
++        "netbsd"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-openharmony-arm64": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-openharmony-arm64/-/binding-openharmony-arm64-1.0.3.tgz",
+-      "integrity": "sha512-OXXS3RKJgX2uLwM+gYyuH5omcH8fL1LJs96pZGgtetVCahON57+d4SJHzTgZiOjxgGkSnpXpOsWuPDGAKAigEg==",
++    "node_modules/@esbuild/openbsd-x64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/openbsd-x64/-/openbsd-x64-0.21.5.tgz",
++      "integrity": "sha512-HLNNw99xsvx12lFBUwoT8EVCsSvRNDVxNpjZ7bPn947b8gJPzeHWyNVhFsaerc0n3TsbOINvRP2byTZ5LKezow==",
+       "cpu": [
+-        "arm64"
++        "x64"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+-        "openharmony"
++        "openbsd"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-wasm32-wasi": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-wasm32-wasi/-/binding-wasm32-wasi-1.0.3.tgz",
+-      "integrity": "sha512-JTtb8BWFynicNSoPrehsCzBtOKjZ6jhMiPFEmOiuXg1Fl8dn2KHQob+GuPSGR0dryQa1PQJbzjF3dqO/whhjLg==",
++    "node_modules/@esbuild/sunos-x64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/sunos-x64/-/sunos-x64-0.21.5.tgz",
++      "integrity": "sha512-6+gjmFpfy0BHU5Tpptkuh8+uw3mnrvgs+dSPQXQOv3ekbordwnzTVEb4qnIvQcYXq6gzkyTnoZ9dZG+D4garKg==",
+       "cpu": [
+-        "wasm32"
++        "x64"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+-      "dependencies": {
+-        "@emnapi/core": "1.10.0",
+-        "@emnapi/runtime": "1.10.0",
+-        "@napi-rs/wasm-runtime": "^1.1.4"
+-      },
++      "os": [
++        "sunos"
++      ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-win32-arm64-msvc": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-1.0.3.tgz",
+-      "integrity": "sha512-gEdFFEN70A/jxb2svrWsN3aDL7OUtmvlOy+6fa2jxG8K0wQ1ZbdeLGnidov6Yu5/733dI5ySfzFlQ/cb0bSz1g==",
++    "node_modules/@esbuild/win32-arm64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/win32-arm64/-/win32-arm64-0.21.5.tgz",
++      "integrity": "sha512-Z0gOTd75VvXqyq7nsl93zwahcTROgqvuAcYDUr+vOv8uHhNSKROyU961kgtCD1e95IqPKSQKH7tBTslnS3tA8A==",
+       "cpu": [
+         "arm64"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "win32"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/binding-win32-x64-msvc": {
+-      "version": "1.0.3",
+-      "resolved": "https://registry.npmjs.org/@rolldown/binding-win32-x64-msvc/-/binding-win32-x64-msvc-1.0.3.tgz",
+-      "integrity": "sha512-eXB7CHuaQdqmJcc3koCNtNPmT/bj2gc999kUFgBxG8Ac0NdgXc4rkCHhqrgrhN3zddvvvrgzj1e90SuSfmyIXA==",
++    "node_modules/@esbuild/win32-ia32": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/win32-ia32/-/win32-ia32-0.21.5.tgz",
++      "integrity": "sha512-SWXFF1CL2RVNMaVs+BBClwtfZSvDgtL//G/smwAc5oVK/UPu2Gu9tIaRgFmYFFKrmg3SyAjSrElf0TiJ1v8fYA==",
+       "cpu": [
+-        "x64"
++        "ia32"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "win32"
+       ],
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=12"
+       }
+     },
+-    "node_modules/@rolldown/pluginutils": {
+-      "version": "1.0.1",
++    "node_modules/@esbuild/win32-x64": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/@esbuild/win32-x64/-/win32-x64-0.21.5.tgz",
++      "integrity": "sha512-tQd/1efJuzPC6rCFwEvLtci/xNFcTZknmXs98FYDfGE4wP9ClFV98nyKrzJKVPMhdDnjzLhdUyMX4PsQAPjwIw==",
++      "cpu": [
++        "x64"
++      ],
+       "dev": true,
+-      "license": "MIT"
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">=12"
++      }
+     },
+-    "node_modules/@tybys/wasm-util": {
+-      "version": "0.10.2",
+-      "resolved": "https://registry.npmjs.org/@tybys/wasm-util/-/wasm-util-0.10.2.tgz",
+-      "integrity": "sha512-RoBvJ2X0wuKlWFIjrwffGw1IqZHKQqzIchKaadZZfnNpsAYp2mM0h36JtPCjNDAHGgYez/15uMBpfGwchhiMgg==",
++    "node_modules/@jridgewell/gen-mapping": {
++      "version": "0.3.13",
++      "resolved": "https://registry.npmjs.org/@jridgewell/gen-mapping/-/gen-mapping-0.3.13.tgz",
++      "integrity": "sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==",
+       "dev": true,
+       "license": "MIT",
+-      "optional": true,
+       "dependencies": {
+-        "tslib": "^2.4.0"
++        "@jridgewell/sourcemap-codec": "^1.5.0",
++        "@jridgewell/trace-mapping": "^0.3.24"
+       }
+     },
+-    "node_modules/@types/react": {
+-      "version": "19.2.17",
+-      "resolved": "https://registry.npmjs.org/@types/react/-/react-19.2.17.tgz",
+-      "integrity": "sha512-MXfmqaVPEVgkBT/aY0aGCkRWWtByiYQXo3xdQ8r5RzuFrPiRn8Gar2tQdXSUQ2GKV3bkXckek89V8wQBY2Q/Aw==",
++    "node_modules/@jridgewell/remapping": {
++      "version": "2.3.5",
++      "resolved": "https://registry.npmjs.org/@jridgewell/remapping/-/remapping-2.3.5.tgz",
++      "integrity": "sha512-LI9u/+laYG4Ds1TDKSJW2YPrIlcVYOwi2fUC6xB43lueCjgxV4lffOCZCtYFiH6TNOX+tQKXx97T4IKHbhyHEQ==",
+       "dev": true,
+       "license": "MIT",
+       "dependencies": {
+-        "csstype": "^3.2.2"
++        "@jridgewell/gen-mapping": "^0.3.5",
++        "@jridgewell/trace-mapping": "^0.3.24"
+       }
+     },
+-    "node_modules/@types/react-dom": {
+-      "version": "19.2.3",
+-      "resolved": "https://registry.npmjs.org/@types/react-dom/-/react-dom-19.2.3.tgz",
+-      "integrity": "sha512-jp2L/eY6fn+KgVVQAOqYItbF0VY/YApe5Mz2F0aykSO8gx31bYCZyvSeYxCHKvzHG5eZjc+zyaS5BrBWya2+kQ==",
++    "node_modules/@jridgewell/resolve-uri": {
++      "version": "3.1.2",
++      "resolved": "https://registry.npmjs.org/@jridgewell/resolve-uri/-/resolve-uri-3.1.2.tgz",
++      "integrity": "sha512-bRISgCIjP20/tbWSPWMEi54QVPRZExkuD9lJL+UIxUKtwVJA8wW1Trb1jMs1RFXo1CBTNZ/5hpC9QvmKWdopKw==",
+       "dev": true,
+       "license": "MIT",
+-      "peerDependencies": {
+-        "@types/react": "^19.2.0"
+-      }
+-    },
+-    "node_modules/@vitejs/plugin-react": {
+-      "version": "6.0.2",
+-      "resolved": "https://registry.npmjs.org/@vitejs/plugin-react/-/plugin-react-6.0.2.tgz",
+-      "integrity": "sha512-DlSMqo4WhThw4vB8Mpn0Woe9J+Jfq1geJ61AKW0QEgLzGMNwtIMdxbDUzLxcun8W7NbJO0e2Jg/Nxm3cCSVzzg==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@rolldown/pluginutils": "^1.0.0"
+-      },
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
+-      },
+-      "peerDependencies": {
+-        "@rolldown/plugin-babel": "^0.1.7 || ^0.2.0",
+-        "babel-plugin-react-compiler": "^1.0.0",
+-        "vite": "^8.0.0"
+-      },
+-      "peerDependenciesMeta": {
+-        "@rolldown/plugin-babel": {
+-          "optional": true
+-        },
+-        "babel-plugin-react-compiler": {
+-          "optional": true
+-        }
++        "node": ">=6.0.0"
+       }
+     },
+-    "node_modules/csstype": {
+-      "version": "3.2.3",
++    "node_modules/@jridgewell/sourcemap-codec": {
++      "version": "1.5.5",
++      "resolved": "https://registry.npmjs.org/@jridgewell/sourcemap-codec/-/sourcemap-codec-1.5.5.tgz",
++      "integrity": "sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==",
+       "dev": true,
+       "license": "MIT"
+     },
+-    "node_modules/detect-libc": {
+-      "version": "2.1.2",
++    "node_modules/@jridgewell/trace-mapping": {
++      "version": "0.3.31",
++      "resolved": "https://registry.npmjs.org/@jridgewell/trace-mapping/-/trace-mapping-0.3.31.tgz",
++      "integrity": "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==",
+       "dev": true,
+-      "license": "Apache-2.0",
+-      "engines": {
+-        "node": ">=8"
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/resolve-uri": "^3.1.0",
++        "@jridgewell/sourcemap-codec": "^1.4.14"
+       }
+     },
+-    "node_modules/fdir": {
+-      "version": "6.5.0",
++    "node_modules/@rolldown/pluginutils": {
++      "version": "1.0.0-beta.27",
++      "resolved": "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.0-beta.27.tgz",
++      "integrity": "sha512-+d0F4MKMCbeVUJwG96uQ4SgAznZNSq93I3V+9NHA4OpvqG8mRCpGdKmK8l/dl02h2CCDHwW2FqilnTyDcAnqjA==",
+       "dev": true,
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=12.0.0"
+-      },
+-      "peerDependencies": {
+-        "picomatch": "^3 || ^4"
+-      },
+-      "peerDependenciesMeta": {
+-        "picomatch": {
+-          "optional": true
+-        }
+-      }
++      "license": "MIT"
+     },
+-    "node_modules/fsevents": {
+-      "version": "2.3.3",
+-      "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
+-      "integrity": "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",
++    "node_modules/@rollup/rollup-android-arm-eabi": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-android-arm-eabi/-/rollup-android-arm-eabi-4.61.1.tgz",
++      "integrity": "sha512-JnBB8MdXj45cajvTuO5FmPlvFVJRQgvrz1uSEl3NwqFnReAPGwb8EanbGi4z2nRaqLzjJSv5/JmycoTKlRZxHA==",
++      "cpu": [
++        "arm"
++      ],
+       "dev": true,
+-      "hasInstallScript": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+-        "darwin"
+-      ],
+-      "engines": {
+-        "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
+-      }
++        "android"
++      ]
+     },
+-    "node_modules/lightningcss": {
+-      "version": "1.32.0",
+-      "dev": true,
+-      "license": "MPL-2.0",
+-      "dependencies": {
+-        "detect-libc": "^2.0.3"
+-      },
+-      "engines": {
+-        "node": ">= 12.0.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
+-      },
+-      "optionalDependencies": {
+-        "lightningcss-android-arm64": "1.32.0",
+-        "lightningcss-darwin-arm64": "1.32.0",
+-        "lightningcss-darwin-x64": "1.32.0",
+-        "lightningcss-freebsd-x64": "1.32.0",
+-        "lightningcss-linux-arm-gnueabihf": "1.32.0",
+-        "lightningcss-linux-arm64-gnu": "1.32.0",
+-        "lightningcss-linux-arm64-musl": "1.32.0",
+-        "lightningcss-linux-x64-gnu": "1.32.0",
+-        "lightningcss-linux-x64-musl": "1.32.0",
+-        "lightningcss-win32-arm64-msvc": "1.32.0",
+-        "lightningcss-win32-x64-msvc": "1.32.0"
+-      }
+-    },
+-    "node_modules/lightningcss-android-arm64": {
+-      "version": "1.32.0",
+-      "resolved": "https://registry.npmjs.org/lightningcss-android-arm64/-/lightningcss-android-arm64-1.32.0.tgz",
+-      "integrity": "sha512-YK7/ClTt4kAK0vo6w3X+Pnm0D2cf2vPHbhOXdoNti1Ga0al1P4TBZhwjATvjNwLEBCnKvjJc2jQgHXH0NEwlAg==",
++    "node_modules/@rollup/rollup-android-arm64": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-android-arm64/-/rollup-android-arm64-4.61.1.tgz",
++      "integrity": "sha512-Jx2g7iSjw4AOT0HDPHM9RV3GNjRXwybWtSFZiZAYUTjUwjVrYIwq3kBf+LnhqJlzXFAqTAh2F7IGI+O568exPw==",
+       "cpu": [
+         "arm64"
+       ],
+       "dev": true,
+-      "license": "MPL-2.0",
++      "license": "MIT",
+       "optional": true,
+       "os": [
+         "android"
+-      ],
+-      "engines": {
+-        "node": ">= 12.0.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
+-      }
++      ]
+     },
+-    "node_modules/lightningcss-darwin-arm64": {
+-      "version": "1.32.0",
++    "node_modules/@rollup/rollup-darwin-arm64": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-darwin-arm64/-/rollup-darwin-arm64-4.61.1.tgz",
++      "integrity": "sha512-0F1L/Z3Eqv8mT2n3dCpeO8GcTvHvVqkP5/t6DMsn0KzhYVcg+s7Ncl5DS8qjKYEeio6Az0Gt6nyBORay5qIlCA==",
+       "cpu": [
+         "arm64"
+       ],
+       "dev": true,
+-      "license": "MPL-2.0",
++      "license": "MIT",
+       "optional": true,
+       "os": [
+         "darwin"
+-      ],
+-      "engines": {
+-        "node": ">= 12.0.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
+-      }
++      ]
+     },
+-    "node_modules/lightningcss-darwin-x64": {
+-      "version": "1.32.0",
+-      "resolved": "https://registry.npmjs.org/lightningcss-darwin-x64/-/lightningcss-darwin-x64-1.32.0.tgz",
+-      "integrity": "sha512-U+QsBp2m/s2wqpUYT/6wnlagdZbtZdndSmut/NJqlCcMLTWp5muCrID+K5UJ6jqD2BFshejCYXniPDbNh73V8w==",
++    "node_modules/@rollup/rollup-darwin-x64": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-darwin-x64/-/rollup-darwin-x64-4.61.1.tgz",
++      "integrity": "sha512-qLttcH871ujY4YcVfUSShhOw+CsoTatYz8gRbHO7Bb92QH059/P0y5do1KMs41fY0BpD2x4AJH/gID0zFiqVKQ==",
+       "cpu": [
+         "x64"
+       ],
+       "dev": true,
+-      "license": "MPL-2.0",
++      "license": "MIT",
+       "optional": true,
+       "os": [
+         "darwin"
++      ]
++    },
++    "node_modules/@rollup/rollup-freebsd-arm64": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-freebsd-arm64/-/rollup-freebsd-arm64-4.61.1.tgz",
++      "integrity": "sha512-fUI4RapGE0Oh3mb8mgfvC1O2nU1RpDZUKnDQm3xB1Ipg7C2wTs5Kstz7G2uWK99a8S2yTMq8/P4uycwNa0nJyw==",
++      "cpu": [
++        "arm64"
+       ],
+-      "engines": {
+-        "node": ">= 12.0.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
+-      }
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "freebsd"
++      ]
+     },
+-    "node_modules/lightningcss-freebsd-x64": {
+-      "version": "1.32.0",
+-      "resolved": "https://registry.npmjs.org/lightningcss-freebsd-x64/-/lightningcss-freebsd-x64-1.32.0.tgz",
+-      "integrity": "sha512-JCTigedEksZk3tHTTthnMdVfGf61Fky8Ji2E4YjUTEQX14xiy/lTzXnu1vwiZe3bYe0q+SpsSH/CTeDXK6WHig==",
++    "node_modules/@rollup/rollup-freebsd-x64": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-freebsd-x64/-/rollup-freebsd-x64-4.61.1.tgz",
++      "integrity": "sha512-H5YrdvJaDtI/U9/emrD4b++xkvp3y/JvOe4rizHbxvkyMfRS/CiRYdji+Pl8D0brEaNFWUh1drQxgAGIl6Xudw==",
+       "cpu": [
+         "x64"
+       ],
+       "dev": true,
+-      "license": "MPL-2.0",
++      "license": "MIT",
+       "optional": true,
+       "os": [
+         "freebsd"
++      ]
++    },
++    "node_modules/@rollup/rollup-linux-arm-gnueabihf": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm-gnueabihf/-/rollup-linux-arm-gnueabihf-4.61.1.tgz",
++      "integrity": "sha512-Q8CBCCQtDFrYtXoeUXSrnFXKOnyUhx6bz+SkL6A0E7V8kAiCJ5pamq1WtbfpVGhR5TSpXY6ak3avmDc5fHTyJA==",
++      "cpu": [
++        "arm"
+       ],
+-      "engines": {
+-        "node": ">= 12.0.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
+-      }
++      "dev": true,
++      "libc": [
++        "glibc"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ]
+     },
+-    "node_modules/lightningcss-linux-arm-gnueabihf": {
+-      "version": "1.32.0",
+-      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm-gnueabihf/-/lightningcss-linux-arm-gnueabihf-1.32.0.tgz",
+-      "integrity": "sha512-x6rnnpRa2GL0zQOkt6rts3YDPzduLpWvwAF6EMhXFVZXD4tPrBkEFqzGowzCsIWsPjqSK+tyNEODUBXeeVHSkw==",
++    "node_modules/@rollup/rollup-linux-arm-musleabihf": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm-musleabihf/-/rollup-linux-arm-musleabihf-4.61.1.tgz",
++      "integrity": "sha512-nwnhk1581l0FBVellGcVCAT0Oi06onEA3WB53sf01VO3I0UPBkMH9sXONYME2K0ovXcNayJfNtHfm6mpJElatQ==",
+       "cpu": [
+         "arm"
+       ],
+       "dev": true,
+-      "license": "MPL-2.0",
++      "libc": [
++        "musl"
++      ],
++      "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
++      ]
++    },
++    "node_modules/@rollup/rollup-linux-arm64-gnu": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm64-gnu/-/rollup-linux-arm64-gnu-4.61.1.tgz",
++      "integrity": "sha512-x5Xr49hwt3hdW75UOZm3395YwwzPyauktslv29KpWL/T+vVAzoT3azLcTWv0eMciBNrx+DYjH4paehHoLpPvpg==",
++      "cpu": [
++        "arm64"
+       ],
+-      "engines": {
+-        "node": ">= 12.0.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
+-      }
++      "dev": true,
++      "libc": [
++        "glibc"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ]
+     },
+-    "node_modules/lightningcss-linux-arm64-gnu": {
+-      "version": "1.32.0",
+-      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm64-gnu/-/lightningcss-linux-arm64-gnu-1.32.0.tgz",
+-      "integrity": "sha512-0nnMyoyOLRJXfbMOilaSRcLH3Jw5z9HDNGfT/gwCPgaDjnx0i8w7vBzFLFR1f6CMLKF8gVbebmkUN3fa/kQJpQ==",
++    "node_modules/@rollup/rollup-linux-arm64-musl": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm64-musl/-/rollup-linux-arm64-musl-4.61.1.tgz",
++      "integrity": "sha512-unMS3H73DpaoPyyEVPjGKleM/s0mkmsauTENpw4INQY8y4+IuLNjkueQ5QCtC0D3N38Y38yhAU8OoZ20S2Tm6w==",
+       "cpu": [
+         "arm64"
+       ],
+       "dev": true,
++      "libc": [
++        "musl"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ]
++    },
++    "node_modules/@rollup/rollup-linux-loong64-gnu": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-loong64-gnu/-/rollup-linux-loong64-gnu-4.61.1.tgz",
++      "integrity": "sha512-zNZzGRnAhwjFEYmvphJRV5XaQGjs62cCmeYYHUT//NbvEnHauw+I85nGG+SiVg5ld4GX8D1IbKIX+ozITQnhMQ==",
++      "cpu": [
++        "loong64"
++      ],
++      "dev": true,
+       "libc": [
+         "glibc"
+       ],
+-      "license": "MPL-2.0",
++      "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
++      ]
++    },
++    "node_modules/@rollup/rollup-linux-loong64-musl": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-loong64-musl/-/rollup-linux-loong64-musl-4.61.1.tgz",
++      "integrity": "sha512-LdpWGL8X209B2SIvWjqlc8VZgM6PKfontSerGepuldQmHYrAOtnMCXeJkxXGbC+PPZVOuu5czJo7fNV6aeW8rQ==",
++      "cpu": [
++        "loong64"
+       ],
+-      "engines": {
+-        "node": ">= 12.0.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
+-      }
++      "dev": true,
++      "libc": [
++        "musl"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ]
+     },
+-    "node_modules/lightningcss-linux-arm64-musl": {
+-      "version": "1.32.0",
+-      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm64-musl/-/lightningcss-linux-arm64-musl-1.32.0.tgz",
+-      "integrity": "sha512-UpQkoenr4UJEzgVIYpI80lDFvRmPVg6oqboNHfoH4CQIfNA+HOrZ7Mo7KZP02dC6LjghPQJeBsvXhJod/wnIBg==",
++    "node_modules/@rollup/rollup-linux-ppc64-gnu": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-ppc64-gnu/-/rollup-linux-ppc64-gnu-4.61.1.tgz",
++      "integrity": "sha512-EC5kTtNaNGOmbMGqar8dvJy6y/hg99GAwjfBz++pxZhQATXGcRjd6c5en5wcbru0vkRmiMGsQKdMJOOf6sza4g==",
+       "cpu": [
+-        "arm64"
++        "ppc64"
++      ],
++      "dev": true,
++      "libc": [
++        "glibc"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ]
++    },
++    "node_modules/@rollup/rollup-linux-ppc64-musl": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-ppc64-musl/-/rollup-linux-ppc64-musl-4.61.1.tgz",
++      "integrity": "sha512-8hiwp6D4acEcNK78I4rP0/XtS1sknWIAMJBPdR4l6zUtyTm5KiTDr5bXmWt4foY7nAN7AThDHgkLIEZOWKbzWw==",
++      "cpu": [
++        "ppc64"
+       ],
+       "dev": true,
+       "libc": [
+         "musl"
+       ],
+-      "license": "MPL-2.0",
++      "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
++      ]
++    },
++    "node_modules/@rollup/rollup-linux-riscv64-gnu": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-riscv64-gnu/-/rollup-linux-riscv64-gnu-4.61.1.tgz",
++      "integrity": "sha512-10dh/h/BqA7DuMPWSxkR8uks18FRwnwOEqr5zOTEl+NOwP/OMzKX8OFR/Of9xxDA7D5qef1Nzar5WDD2kCCr1g==",
++      "cpu": [
++        "riscv64"
+       ],
+-      "engines": {
+-        "node": ">= 12.0.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
+-      }
++      "dev": true,
++      "libc": [
++        "glibc"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ]
+     },
+-    "node_modules/lightningcss-linux-x64-gnu": {
+-      "version": "1.32.0",
+-      "resolved": "https://registry.npmjs.org/lightningcss-linux-x64-gnu/-/lightningcss-linux-x64-gnu-1.32.0.tgz",
+-      "integrity": "sha512-V7Qr52IhZmdKPVr+Vtw8o+WLsQJYCTd8loIfpDaMRWGUZfBOYEJeyJIkqGIDMZPwPx24pUMfwSxxI8phr/MbOA==",
++    "node_modules/@rollup/rollup-linux-riscv64-musl": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-riscv64-musl/-/rollup-linux-riscv64-musl-4.61.1.tgz",
++      "integrity": "sha512-YKJ5lg35DP17gcAOggnihe+APw9HLyj1Xn7gsmGumBJAUDa6NGXNixJzmkWLhcK9TOuuyQjdamzvJefkO7qHZQ==",
+       "cpu": [
+-        "x64"
++        "riscv64"
++      ],
++      "dev": true,
++      "libc": [
++        "musl"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ]
++    },
++    "node_modules/@rollup/rollup-linux-s390x-gnu": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-s390x-gnu/-/rollup-linux-s390x-gnu-4.61.1.tgz",
++      "integrity": "sha512-Mlil5G2Jj6a7B3LWGctg+XPL9vdXYuzCtNXfxOQ0nPjc2m6ueUktocPGH9bnAM0bNRKb/bAWTujUU7IJQdQA+g==",
++      "cpu": [
++        "s390x"
+       ],
+       "dev": true,
+       "libc": [
+         "glibc"
+       ],
+-      "license": "MPL-2.0",
++      "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
++      ]
++    },
++    "node_modules/@rollup/rollup-linux-x64-gnu": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-x64-gnu/-/rollup-linux-x64-gnu-4.61.1.tgz",
++      "integrity": "sha512-bVWIOIk6pV01p4CdUbPP7CJ/434z+OooYjDuFcR+44N35YvKUC66G8MGnvcWx5mWKW3g61J+t74l3Kj15Kwn2Q==",
++      "cpu": [
++        "x64"
+       ],
+-      "engines": {
+-        "node": ">= 12.0.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
+-      }
++      "dev": true,
++      "libc": [
++        "glibc"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ]
+     },
+-    "node_modules/lightningcss-linux-x64-musl": {
+-      "version": "1.32.0",
+-      "resolved": "https://registry.npmjs.org/lightningcss-linux-x64-musl/-/lightningcss-linux-x64-musl-1.32.0.tgz",
+-      "integrity": "sha512-bYcLp+Vb0awsiXg/80uCRezCYHNg1/l3mt0gzHnWV9XP1W5sKa5/TCdGWaR/zBM2PeF/HbsQv/j2URNOiVuxWg==",
++    "node_modules/@rollup/rollup-linux-x64-musl": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-x64-musl/-/rollup-linux-x64-musl-4.61.1.tgz",
++      "integrity": "sha512-qy5pBvZbqNFheBz61R1rzsezjm0J7O2oNGoWtGoY89SZYLUfxAJTBAqDChqAIdB4rCiIbi9nF7yZ83GnNiLwSw==",
+       "cpu": [
+         "x64"
+       ],
+       "dev": true,
+       "libc": [
+         "musl"
+       ],
+-      "license": "MPL-2.0",
++      "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
++      ]
++    },
++    "node_modules/@rollup/rollup-openbsd-x64": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-openbsd-x64/-/rollup-openbsd-x64-4.61.1.tgz",
++      "integrity": "sha512-E83TXjI4zm0+5f2qO+UOudaCYIhYwpJ5jq6YCZNIZ+6CbfhKrkAGezeiASBL9ElxAxFsRS9ZhESv8mfnj6TKeg==",
++      "cpu": [
++        "x64"
+       ],
+-      "engines": {
+-        "node": ">= 12.0.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
+-      }
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "openbsd"
++      ]
++    },
++    "node_modules/@rollup/rollup-openharmony-arm64": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-openharmony-arm64/-/rollup-openharmony-arm64-4.61.1.tgz",
++      "integrity": "sha512-fbWnKqVkjrJN38vNe3ahkbk6iejS/3b0Nt7EEtPpE6RBacZcGXNKbzfHN3GUUlXOPghUg0j6XUGrtjX9z1sIvA==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "openharmony"
++      ]
+     },
+-    "node_modules/lightningcss-win32-arm64-msvc": {
+-      "version": "1.32.0",
+-      "resolved": "https://registry.npmjs.org/lightningcss-win32-arm64-msvc/-/lightningcss-win32-arm64-msvc-1.32.0.tgz",
+-      "integrity": "sha512-8SbC8BR40pS6baCM8sbtYDSwEVQd4JlFTOlaD3gWGHfThTcABnNDBda6eTZeqbofalIJhFx0qKzgHJmcPTnGdw==",
++    "node_modules/@rollup/rollup-win32-arm64-msvc": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-win32-arm64-msvc/-/rollup-win32-arm64-msvc-4.61.1.tgz",
++      "integrity": "sha512-ArMl38iVAbk0New1ogihQNY6iphLi4ZaRsa037gUzv5yeKPY8TD3Dmy4x2RNC1VztU/uqm+G+/RwFrSka3Oy2g==",
+       "cpu": [
+         "arm64"
+       ],
+       "dev": true,
+-      "license": "MPL-2.0",
++      "license": "MIT",
+       "optional": true,
+       "os": [
+         "win32"
++      ]
++    },
++    "node_modules/@rollup/rollup-win32-ia32-msvc": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-win32-ia32-msvc/-/rollup-win32-ia32-msvc-4.61.1.tgz",
++      "integrity": "sha512-0mYtjHS9ucAbcATycCNK9IGBk/cCe/ma7EmSLGZdsxnOA8cjRIyU04wDpVAD9NiOfLUR9KTxdiO53uOkherqjQ==",
++      "cpu": [
++        "ia32"
+       ],
+-      "engines": {
+-        "node": ">= 12.0.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
+-      }
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ]
+     },
+-    "node_modules/lightningcss-win32-x64-msvc": {
+-      "version": "1.32.0",
+-      "resolved": "https://registry.npmjs.org/lightningcss-win32-x64-msvc/-/lightningcss-win32-x64-msvc-1.32.0.tgz",
+-      "integrity": "sha512-Amq9B/SoZYdDi1kFrojnoqPLxYhQ4Wo5XiL8EVJrVsB8ARoC1PWW6VGtT0WKCemjy8aC+louJnjS7U18x3b06Q==",
++    "node_modules/@rollup/rollup-win32-x64-gnu": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-win32-x64-gnu/-/rollup-win32-x64-gnu-4.61.1.tgz",
++      "integrity": "sha512-gK1iCEPfpoSG9wfBihXxvBMi8ZfcWffYkEsC/Eih+iFENTaewvNcrEQ69lIOWYO5pePHKLHHO7nq5AILGO/HQQ==",
+       "cpu": [
+         "x64"
+       ],
+       "dev": true,
+-      "license": "MPL-2.0",
++      "license": "MIT",
+       "optional": true,
+       "os": [
+         "win32"
++      ]
++    },
++    "node_modules/@rollup/rollup-win32-x64-msvc": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/@rollup/rollup-win32-x64-msvc/-/rollup-win32-x64-msvc-4.61.1.tgz",
++      "integrity": "sha512-X+zaP2x+j4RXGfbp/seSoRHWnPxzApilDszisZxbYH5C/jTxFhCtDNdPGZb9lJyYPs24wGxruPF7Y+sIXt9Gzw==",
++      "cpu": [
++        "x64"
+       ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ]
++    },
++    "node_modules/@types/babel__core": {
++      "version": "7.20.5",
++      "resolved": "https://registry.npmjs.org/@types/babel__core/-/babel__core-7.20.5.tgz",
++      "integrity": "sha512-qoQprZvz5wQFJwMDqeseRXWv3rqMvhgpbXFfVyWhbx9X47POIA6i/+dXefEmZKoAgOaTdaIgNSMqMIU61yRyzA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/parser": "^7.20.7",
++        "@babel/types": "^7.20.7",
++        "@types/babel__generator": "*",
++        "@types/babel__template": "*",
++        "@types/babel__traverse": "*"
++      }
++    },
++    "node_modules/@types/babel__generator": {
++      "version": "7.27.0",
++      "resolved": "https://registry.npmjs.org/@types/babel__generator/-/babel__generator-7.27.0.tgz",
++      "integrity": "sha512-ufFd2Xi92OAVPYsy+P4n7/U7e68fex0+Ee8gSG9KX7eo084CWiQ4sdxktvdl0bOPupXtVJPY19zk6EwWqUQ8lg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/types": "^7.0.0"
++      }
++    },
++    "node_modules/@types/babel__template": {
++      "version": "7.4.4",
++      "resolved": "https://registry.npmjs.org/@types/babel__template/-/babel__template-7.4.4.tgz",
++      "integrity": "sha512-h/NUaSyG5EyxBIp8YRxo4RMe2/qQgvyowRwVMzhYhBCONbW8PUsg4lkFMrhgZhUe5z3L3MiLDuvyJ/CaPa2A8A==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/parser": "^7.1.0",
++        "@babel/types": "^7.0.0"
++      }
++    },
++    "node_modules/@types/babel__traverse": {
++      "version": "7.28.0",
++      "resolved": "https://registry.npmjs.org/@types/babel__traverse/-/babel__traverse-7.28.0.tgz",
++      "integrity": "sha512-8PvcXf70gTDZBgt9ptxJ8elBeBjcLOAcOtoO/mPJjtji1+CdGbHgm77om1GrsPxsiE+uXIpNSK64UYaIwQXd4Q==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/types": "^7.28.2"
++      }
++    },
++    "node_modules/@types/estree": {
++      "version": "1.0.9",
++      "resolved": "https://registry.npmjs.org/@types/estree/-/estree-1.0.9.tgz",
++      "integrity": "sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/prop-types": {
++      "version": "15.7.15",
++      "resolved": "https://registry.npmjs.org/@types/prop-types/-/prop-types-15.7.15.tgz",
++      "integrity": "sha512-F6bEyamV9jKGAFBEmlQnesRPGOQqS2+Uwi0Em15xenOxHaf2hv6L8YCVn3rPdPJOiJfPiCnLIRyvwVaqMY3MIw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/react": {
++      "version": "18.3.31",
++      "resolved": "https://registry.npmjs.org/@types/react/-/react-18.3.31.tgz",
++      "integrity": "sha512-vfEqpXTvwT91yhmwdfouStN2hSKwTvyRs8qpLfADyrq/kxDw0hZM7Wk9Ug1FELj8hIby+S/+kQCSRFF32nv2Qw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/prop-types": "*",
++        "csstype": "^3.2.2"
++      }
++    },
++    "node_modules/@types/react-dom": {
++      "version": "18.3.7",
++      "resolved": "https://registry.npmjs.org/@types/react-dom/-/react-dom-18.3.7.tgz",
++      "integrity": "sha512-MEe3UeoENYVFXzoXEWsvcpg6ZvlrFNlOQ7EOsvhI3CfAXwzPfO8Qwuxd40nepsYKqyyVQnTdEfv68q91yLcKrQ==",
++      "dev": true,
++      "license": "MIT",
++      "peerDependencies": {
++        "@types/react": "^18.0.0"
++      }
++    },
++    "node_modules/@vitejs/plugin-react": {
++      "version": "4.7.0",
++      "resolved": "https://registry.npmjs.org/@vitejs/plugin-react/-/plugin-react-4.7.0.tgz",
++      "integrity": "sha512-gUu9hwfWvvEDBBmgtAowQCojwZmJ5mcLn3aufeCsitijs3+f2NsrPtlAWIR6OPiqljl96GVCUbLe0HyqIpVaoA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/core": "^7.28.0",
++        "@babel/plugin-transform-react-jsx-self": "^7.27.1",
++        "@babel/plugin-transform-react-jsx-source": "^7.27.1",
++        "@rolldown/pluginutils": "1.0.0-beta.27",
++        "@types/babel__core": "^7.20.5",
++        "react-refresh": "^0.17.0"
++      },
+       "engines": {
+-        "node": ">= 12.0.0"
++        "node": "^14.18.0 || >=16.0.0"
+       },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/parcel"
++      "peerDependencies": {
++        "vite": "^4.2.0 || ^5.0.0 || ^6.0.0 || ^7.0.0"
+       }
+     },
+-    "node_modules/nanoid": {
+-      "version": "3.3.12",
++    "node_modules/baseline-browser-mapping": {
++      "version": "2.10.34",
++      "resolved": "https://registry.npmjs.org/baseline-browser-mapping/-/baseline-browser-mapping-2.10.34.tgz",
++      "integrity": "sha512-IMDedajPifLnHNY0X9n8hKxRTQ6/eTHwr5bDo04WnuqxyKw6LYtQywCuuqPZwhl3aBXMvQpJov42GLCwRRdQzw==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "bin": {
++        "baseline-browser-mapping": "dist/cli.cjs"
++      },
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/browserslist": {
++      "version": "4.28.2",
++      "resolved": "https://registry.npmjs.org/browserslist/-/browserslist-4.28.2.tgz",
++      "integrity": "sha512-48xSriZYYg+8qXna9kwqjIVzuQxi+KYWp2+5nCYnYKPTr0LvD89Jqk2Or5ogxz0NUMfIjhh2lIUX/LyX9B4oIg==",
+       "dev": true,
+       "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/browserslist"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/browserslist"
++        },
+         {
+           "type": "github",
+           "url": "https://github.com/sponsors/ai"
+         }
+       ],
+       "license": "MIT",
++      "dependencies": {
++        "baseline-browser-mapping": "^2.10.12",
++        "caniuse-lite": "^1.0.30001782",
++        "electron-to-chromium": "^1.5.328",
++        "node-releases": "^2.0.36",
++        "update-browserslist-db": "^1.2.3"
++      },
+       "bin": {
+-        "nanoid": "bin/nanoid.cjs"
++        "browserslist": "cli.js"
+       },
+       "engines": {
+-        "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
++        "node": "^6 || ^7 || ^8 || ^9 || ^10 || ^11 || ^12 || >=13.7"
+       }
+     },
+-    "node_modules/picocolors": {
+-      "version": "1.1.1",
++    "node_modules/caniuse-lite": {
++      "version": "1.0.30001797",
++      "resolved": "https://registry.npmjs.org/caniuse-lite/-/caniuse-lite-1.0.30001797.tgz",
++      "integrity": "sha512-l8xKG+gwAIExZGl9FrF7KUwuOmk6wbEPC9Xoy/RtnWv1XG0Q4LFlagaLpUv3Kiza3W/wm27zy0yWJEieYKAP6w==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/browserslist"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/caniuse-lite"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "CC-BY-4.0"
++    },
++    "node_modules/convert-source-map": {
++      "version": "2.0.0",
++      "resolved": "https://registry.npmjs.org/convert-source-map/-/convert-source-map-2.0.0.tgz",
++      "integrity": "sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/csstype": {
++      "version": "3.2.3",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/debug": {
++      "version": "4.4.3",
++      "resolved": "https://registry.npmjs.org/debug/-/debug-4.4.3.tgz",
++      "integrity": "sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "ms": "^2.1.3"
++      },
++      "engines": {
++        "node": ">=6.0"
++      },
++      "peerDependenciesMeta": {
++        "supports-color": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/electron-to-chromium": {
++      "version": "1.5.369",
++      "resolved": "https://registry.npmjs.org/electron-to-chromium/-/electron-to-chromium-1.5.369.tgz",
++      "integrity": "sha512-XM22K9FNaaCOvMMrBn1caIc8v0g6+pKt660ZbfQqUZvfil0hEzr8ZoiY7VcSLGM3L/x3rz5PqZrk+bKOOmVM9w==",
+       "dev": true,
+       "license": "ISC"
+     },
+-    "node_modules/picomatch": {
+-      "version": "4.0.4",
++    "node_modules/esbuild": {
++      "version": "0.21.5",
++      "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.21.5.tgz",
++      "integrity": "sha512-mg3OPMV4hXywwpoDxu3Qda5xCKQi+vCTZq8S9J/EpkhB2HzKXq4SNFZE3+NK93JYxc8VMSep+lOUSC/RVKaBqw==",
+       "dev": true,
++      "hasInstallScript": true,
+       "license": "MIT",
++      "bin": {
++        "esbuild": "bin/esbuild"
++      },
+       "engines": {
+         "node": ">=12"
+       },
+-      "funding": {
+-        "url": "https://github.com/sponsors/jonschlinkert"
++      "optionalDependencies": {
++        "@esbuild/aix-ppc64": "0.21.5",
++        "@esbuild/android-arm": "0.21.5",
++        "@esbuild/android-arm64": "0.21.5",
++        "@esbuild/android-x64": "0.21.5",
++        "@esbuild/darwin-arm64": "0.21.5",
++        "@esbuild/darwin-x64": "0.21.5",
++        "@esbuild/freebsd-arm64": "0.21.5",
++        "@esbuild/freebsd-x64": "0.21.5",
++        "@esbuild/linux-arm": "0.21.5",
++        "@esbuild/linux-arm64": "0.21.5",
++        "@esbuild/linux-ia32": "0.21.5",
++        "@esbuild/linux-loong64": "0.21.5",
++        "@esbuild/linux-mips64el": "0.21.5",
++        "@esbuild/linux-ppc64": "0.21.5",
++        "@esbuild/linux-riscv64": "0.21.5",
++        "@esbuild/linux-s390x": "0.21.5",
++        "@esbuild/linux-x64": "0.21.5",
++        "@esbuild/netbsd-x64": "0.21.5",
++        "@esbuild/openbsd-x64": "0.21.5",
++        "@esbuild/sunos-x64": "0.21.5",
++        "@esbuild/win32-arm64": "0.21.5",
++        "@esbuild/win32-ia32": "0.21.5",
++        "@esbuild/win32-x64": "0.21.5"
++      }
++    },
++    "node_modules/escalade": {
++      "version": "3.2.0",
++      "resolved": "https://registry.npmjs.org/escalade/-/escalade-3.2.0.tgz",
++      "integrity": "sha512-WUj2qlxaQtO4g6Pq5c29GTcWGDyd8itL8zTlipgECz3JesAiiOKotd8JU6otB3PACgG6xkJUyVhboMS+bje/jA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6"
++      }
++    },
++    "node_modules/fsevents": {
++      "version": "2.3.3",
++      "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
++      "integrity": "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",
++      "dev": true,
++      "hasInstallScript": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
++      }
++    },
++    "node_modules/gensync": {
++      "version": "1.0.0-beta.2",
++      "resolved": "https://registry.npmjs.org/gensync/-/gensync-1.0.0-beta.2.tgz",
++      "integrity": "sha512-3hN7NaskYvMDLQY55gnW3NQ+mesEAepTqlg+VEbj7zzqEMBVNhzcGYYeqFo/TlYz6eQiFcp1HcsCZO+nGgS8zg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/js-tokens": {
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz",
++      "integrity": "sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==",
++      "license": "MIT"
++    },
++    "node_modules/jsesc": {
++      "version": "3.1.0",
++      "resolved": "https://registry.npmjs.org/jsesc/-/jsesc-3.1.0.tgz",
++      "integrity": "sha512-/sM3dO2FOzXjKQhJuo0Q173wf2KOo8t4I8vHy6lF9poUp7bKT0/NHE8fPX23PwfhnykfqnC2xRxOnVw5XuGIaA==",
++      "dev": true,
++      "license": "MIT",
++      "bin": {
++        "jsesc": "bin/jsesc"
++      },
++      "engines": {
++        "node": ">=6"
++      }
++    },
++    "node_modules/json5": {
++      "version": "2.2.3",
++      "resolved": "https://registry.npmjs.org/json5/-/json5-2.2.3.tgz",
++      "integrity": "sha512-XmOWe7eyHYH14cLdVPoyg+GOH3rYX++KpzrylJwSW98t3Nk+U8XOl8FWKOgwtzdb8lXGf6zYwDUzeHMWfxasyg==",
++      "dev": true,
++      "license": "MIT",
++      "bin": {
++        "json5": "lib/cli.js"
++      },
++      "engines": {
++        "node": ">=6"
+       }
+     },
++    "node_modules/loose-envify": {
++      "version": "1.4.0",
++      "resolved": "https://registry.npmjs.org/loose-envify/-/loose-envify-1.4.0.tgz",
++      "integrity": "sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q==",
++      "license": "MIT",
++      "dependencies": {
++        "js-tokens": "^3.0.0 || ^4.0.0"
++      },
++      "bin": {
++        "loose-envify": "cli.js"
++      }
++    },
++    "node_modules/lru-cache": {
++      "version": "5.1.1",
++      "resolved": "https://registry.npmjs.org/lru-cache/-/lru-cache-5.1.1.tgz",
++      "integrity": "sha512-KpNARQA3Iwv+jTA0utUVVbrh+Jlrr1Fv0e56GGzAFOXN7dk/FviaDW8LHmK52DlcH4WP2n6gI8vN1aesBFgo9w==",
++      "dev": true,
++      "license": "ISC",
++      "dependencies": {
++        "yallist": "^3.0.2"
++      }
++    },
++    "node_modules/ms": {
++      "version": "2.1.3",
++      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
++      "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/nanoid": {
++      "version": "3.3.12",
++      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.12.tgz",
++      "integrity": "sha512-ZB9RH/39qpq5Vu6Y+NmUaFhQR6pp+M2Xt76XBnEwDaGcVAqhlvxrl3B2bKS5D3NH3QR76v3aSrKaF/Kiy7lEtQ==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "bin": {
++        "nanoid": "bin/nanoid.cjs"
++      },
++      "engines": {
++        "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
++      }
++    },
++    "node_modules/node-releases": {
++      "version": "2.0.47",
++      "resolved": "https://registry.npmjs.org/node-releases/-/node-releases-2.0.47.tgz",
++      "integrity": "sha512-Uzmd6LXpouKo8EUK68IjH4+E01w/hXyV3R3g/geCJo+rXLNfh1xucB+LOzYEOQPSiUK3h/xZf0cQGcSsmyL2Og==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/picocolors": {
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
++      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
++      "dev": true,
++      "license": "ISC"
++    },
+     "node_modules/postcss": {
+       "version": "8.5.15",
++      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.15.tgz",
++      "integrity": "sha512-FfR8sjd4em2T6fb3I2MwAJU7HWVMr9zba+enmQeeWFfCbm+UOC/0X4DS8XtpUTMwWMGbjKYP7xjfNekzyGmB3A==",
+       "dev": true,
+       "funding": [
+         {
+           "type": "opencollective",
+           "url": "https://opencollective.com/postcss/"
+         },
+         {
+           "type": "tidelift",
+           "url": "https://tidelift.com/funding/github/npm/postcss"
+         },
+         {
+           "type": "github",
+           "url": "https://github.com/sponsors/ai"
+         }
+       ],
+       "license": "MIT",
+       "dependencies": {
+         "nanoid": "^3.3.12",
+         "picocolors": "^1.1.1",
+         "source-map-js": "^1.2.1"
+       },
+       "engines": {
+         "node": "^10 || ^12 || >=14"
+       }
+     },
+     "node_modules/react": {
+-      "version": "19.2.7",
+-      "resolved": "https://registry.npmjs.org/react/-/react-19.2.7.tgz",
+-      "integrity": "sha512-HNe9WslTbXmFK8o8cmwgAeJFSBvt1bPdHCVKtaaV+WlAN36mpT4hcRpwbf3fY56ar2oIXzsBpOAiIRHAdY0OlQ==",
++      "version": "18.3.1",
++      "resolved": "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
++      "integrity": "sha512-wS+hAgJShR0KhEvPJArfuPVN1+Hz1t0Y6n5jLrGQbkb4urgPE/0Rve+1kMB1v/oWgHgm4WIcV+i7F2pTVj+2iQ==",
+       "license": "MIT",
++      "dependencies": {
++        "loose-envify": "^1.1.0"
++      },
+       "engines": {
+         "node": ">=0.10.0"
+       }
+     },
+     "node_modules/react-dom": {
+-      "version": "19.2.7",
+-      "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.2.7.tgz",
+-      "integrity": "sha512-t0BRVXvbiE/o20Hfw669rLbMCDWtYZLvmJigy2f0MxsXF+71pxhR3xOkspmsO8h3ZlNzyibAmtCa3l4lYKk6gQ==",
++      "version": "18.3.1",
++      "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz",
++      "integrity": "sha512-5m4nQKp+rZRb09LNH59GM4BxTh9251/ylbKIbpe7TpGxfJ+9kv6BLkLBXIjjspbgbnIBNqlI23tRnTWT0snUIw==",
+       "license": "MIT",
+       "dependencies": {
+-        "scheduler": "^0.27.0"
++        "loose-envify": "^1.1.0",
++        "scheduler": "^0.23.2"
+       },
+       "peerDependencies": {
+-        "react": "^19.2.7"
++        "react": "^18.3.1"
++      }
++    },
++    "node_modules/react-refresh": {
++      "version": "0.17.0",
++      "resolved": "https://registry.npmjs.org/react-refresh/-/react-refresh-0.17.0.tgz",
++      "integrity": "sha512-z6F7K9bV85EfseRCp2bzrpyQ0Gkw1uLoCel9XBVWPg/TjRj94SkJzUTGfOa4bs7iJvBWtQG0Wq7wnI0syw3EBQ==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.10.0"
+       }
+     },
+-    "node_modules/rolldown": {
+-      "version": "1.0.3",
++    "node_modules/rollup": {
++      "version": "4.61.1",
++      "resolved": "https://registry.npmjs.org/rollup/-/rollup-4.61.1.tgz",
++      "integrity": "sha512-I4KW6iuRpuu2uHBLraZ1wNZe0DP7lnRha+VJ9tNaYVaVgKhW0aI3h4RYnoRPeql0flHm/Co55b7snEDcOfOJrA==",
+       "dev": true,
+       "license": "MIT",
+       "dependencies": {
+-        "@oxc-project/types": "=0.133.0",
+-        "@rolldown/pluginutils": "^1.0.0"
++        "@types/estree": "1.0.9"
+       },
+       "bin": {
+-        "rolldown": "bin/cli.mjs"
++        "rollup": "dist/bin/rollup"
+       },
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": ">=18.0.0",
++        "npm": ">=8.0.0"
+       },
+       "optionalDependencies": {
+-        "@rolldown/binding-android-arm64": "1.0.3",
+-        "@rolldown/binding-darwin-arm64": "1.0.3",
+-        "@rolldown/binding-darwin-x64": "1.0.3",
+-        "@rolldown/binding-freebsd-x64": "1.0.3",
+-        "@rolldown/binding-linux-arm-gnueabihf": "1.0.3",
+-        "@rolldown/binding-linux-arm64-gnu": "1.0.3",
+-        "@rolldown/binding-linux-arm64-musl": "1.0.3",
+-        "@rolldown/binding-linux-ppc64-gnu": "1.0.3",
+-        "@rolldown/binding-linux-s390x-gnu": "1.0.3",
+-        "@rolldown/binding-linux-x64-gnu": "1.0.3",
+-        "@rolldown/binding-linux-x64-musl": "1.0.3",
+-        "@rolldown/binding-openharmony-arm64": "1.0.3",
+-        "@rolldown/binding-wasm32-wasi": "1.0.3",
+-        "@rolldown/binding-win32-arm64-msvc": "1.0.3",
+-        "@rolldown/binding-win32-x64-msvc": "1.0.3"
++        "@rollup/rollup-android-arm-eabi": "4.61.1",
++        "@rollup/rollup-android-arm64": "4.61.1",
++        "@rollup/rollup-darwin-arm64": "4.61.1",
++        "@rollup/rollup-darwin-x64": "4.61.1",
++        "@rollup/rollup-freebsd-arm64": "4.61.1",
++        "@rollup/rollup-freebsd-x64": "4.61.1",
++        "@rollup/rollup-linux-arm-gnueabihf": "4.61.1",
++        "@rollup/rollup-linux-arm-musleabihf": "4.61.1",
++        "@rollup/rollup-linux-arm64-gnu": "4.61.1",
++        "@rollup/rollup-linux-arm64-musl": "4.61.1",
++        "@rollup/rollup-linux-loong64-gnu": "4.61.1",
++        "@rollup/rollup-linux-loong64-musl": "4.61.1",
++        "@rollup/rollup-linux-ppc64-gnu": "4.61.1",
++        "@rollup/rollup-linux-ppc64-musl": "4.61.1",
++        "@rollup/rollup-linux-riscv64-gnu": "4.61.1",
++        "@rollup/rollup-linux-riscv64-musl": "4.61.1",
++        "@rollup/rollup-linux-s390x-gnu": "4.61.1",
++        "@rollup/rollup-linux-x64-gnu": "4.61.1",
++        "@rollup/rollup-linux-x64-musl": "4.61.1",
++        "@rollup/rollup-openbsd-x64": "4.61.1",
++        "@rollup/rollup-openharmony-arm64": "4.61.1",
++        "@rollup/rollup-win32-arm64-msvc": "4.61.1",
++        "@rollup/rollup-win32-ia32-msvc": "4.61.1",
++        "@rollup/rollup-win32-x64-gnu": "4.61.1",
++        "@rollup/rollup-win32-x64-msvc": "4.61.1",
++        "fsevents": "~2.3.2"
+       }
+     },
+     "node_modules/scheduler": {
+-      "version": "0.27.0",
+-      "license": "MIT"
++      "version": "0.23.2",
++      "resolved": "https://registry.npmjs.org/scheduler/-/scheduler-0.23.2.tgz",
++      "integrity": "sha512-UOShsPwz7NrMUqhR6t0hWjFduvOzbtv7toDH1/hIrfRNIDBnnBWd0CwJTGvTpngVlmwGCdP9/Zl/tVrDqcuYzQ==",
++      "license": "MIT",
++      "dependencies": {
++        "loose-envify": "^1.1.0"
++      }
++    },
++    "node_modules/semver": {
++      "version": "6.3.1",
++      "resolved": "https://registry.npmjs.org/semver/-/semver-6.3.1.tgz",
++      "integrity": "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA==",
++      "dev": true,
++      "license": "ISC",
++      "bin": {
++        "semver": "bin/semver.js"
++      }
+     },
+     "node_modules/source-map-js": {
+       "version": "1.2.1",
++      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
++      "integrity": "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==",
+       "dev": true,
+       "license": "BSD-3-Clause",
+       "engines": {
+         "node": ">=0.10.0"
+       }
+     },
+-    "node_modules/tinyglobby": {
+-      "version": "0.2.17",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "fdir": "^6.5.0",
+-        "picomatch": "^4.0.4"
+-      },
+-      "engines": {
+-        "node": ">=12.0.0"
+-      },
+-      "funding": {
+-        "url": "https://github.com/sponsors/SuperchupuDev"
+-      }
+-    },
+-    "node_modules/tslib": {
+-      "version": "2.8.1",
+-      "resolved": "https://registry.npmjs.org/tslib/-/tslib-2.8.1.tgz",
+-      "integrity": "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==",
+-      "dev": true,
+-      "license": "0BSD",
+-      "optional": true
+-    },
+     "node_modules/typescript": {
+-      "version": "6.0.3",
+-      "resolved": "https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz",
+-      "integrity": "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==",
++      "version": "5.9.3",
++      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
++      "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
+       "dev": true,
+       "license": "Apache-2.0",
+       "bin": {
+         "tsc": "bin/tsc",
+         "tsserver": "bin/tsserver"
+       },
+       "engines": {
+         "node": ">=14.17"
+       }
+     },
++    "node_modules/update-browserslist-db": {
++      "version": "1.2.3",
++      "resolved": "https://registry.npmjs.org/update-browserslist-db/-/update-browserslist-db-1.2.3.tgz",
++      "integrity": "sha512-Js0m9cx+qOgDxo0eMiFGEueWztz+d4+M3rGlmKPT+T4IS/jP4ylw3Nwpu6cpTTP8R1MAC1kF4VbdLt3ARf209w==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/browserslist"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/browserslist"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "escalade": "^3.2.0",
++        "picocolors": "^1.1.1"
++      },
++      "bin": {
++        "update-browserslist-db": "cli.js"
++      },
++      "peerDependencies": {
++        "browserslist": ">= 4.21.0"
++      }
++    },
+     "node_modules/vite": {
+-      "version": "8.0.16",
+-      "resolved": "https://registry.npmjs.org/vite/-/vite-8.0.16.tgz",
+-      "integrity": "sha512-h9bXPmJichP5fLmVQo3PyaGSDE2n3aPuomeAlVRm0JLmt4rY6zmPKd59HYI4LNW8oTK7tlTsuC7l/m7awx9Jcw==",
++      "version": "5.4.21",
++      "resolved": "https://registry.npmjs.org/vite/-/vite-5.4.21.tgz",
++      "integrity": "sha512-o5a9xKjbtuhY6Bi5S3+HvbRERmouabWbyUcpXXUA1u+GNUKoROi9byOJ8M0nHbHYHkYICiMlqxkg1KkYmm25Sw==",
+       "dev": true,
+       "license": "MIT",
+       "dependencies": {
+-        "lightningcss": "^1.32.0",
+-        "picomatch": "^4.0.4",
+-        "postcss": "^8.5.15",
+-        "rolldown": "1.0.3",
+-        "tinyglobby": "^0.2.17"
++        "esbuild": "^0.21.3",
++        "postcss": "^8.4.43",
++        "rollup": "^4.20.0"
+       },
+       "bin": {
+         "vite": "bin/vite.js"
+       },
+       "engines": {
+-        "node": "^20.19.0 || >=22.12.0"
++        "node": "^18.0.0 || >=20.0.0"
+       },
+       "funding": {
+         "url": "https://github.com/vitejs/vite?sponsor=1"
+       },
+       "optionalDependencies": {
+         "fsevents": "~2.3.3"
+       },
+       "peerDependencies": {
+-        "@types/node": "^20.19.0 || >=22.12.0",
+-        "@vitejs/devtools": "^0.1.18",
+-        "esbuild": "^0.27.0 || ^0.28.0",
+-        "jiti": ">=1.21.0",
+-        "less": "^4.0.0",
+-        "sass": "^1.70.0",
+-        "sass-embedded": "^1.70.0",
+-        "stylus": ">=0.54.8",
+-        "sugarss": "^5.0.0",
+-        "terser": "^5.16.0",
+-        "tsx": "^4.8.1",
+-        "yaml": "^2.4.2"
++        "@types/node": "^18.0.0 || >=20.0.0",
++        "less": "*",
++        "lightningcss": "^1.21.0",
++        "sass": "*",
++        "sass-embedded": "*",
++        "stylus": "*",
++        "sugarss": "*",
++        "terser": "^5.4.0"
+       },
+       "peerDependenciesMeta": {
+         "@types/node": {
+           "optional": true
+         },
+-        "@vitejs/devtools": {
+-          "optional": true
+-        },
+-        "esbuild": {
+-          "optional": true
+-        },
+-        "jiti": {
++        "less": {
+           "optional": true
+         },
+-        "less": {
++        "lightningcss": {
+           "optional": true
+         },
+         "sass": {
+           "optional": true
+         },
+         "sass-embedded": {
+           "optional": true
+         },
+         "stylus": {
+           "optional": true
+         },
+         "sugarss": {
+           "optional": true
+         },
+         "terser": {
+           "optional": true
+-        },
+-        "tsx": {
+-          "optional": true
+-        },
+-        "yaml": {
+-          "optional": true
+         }
+       }
++    },
++    "node_modules/yallist": {
++      "version": "3.1.1",
++      "resolved": "https://registry.npmjs.org/yallist/-/yallist-3.1.1.tgz",
++      "integrity": "sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g==",
++      "dev": true,
++      "license": "ISC"
+     }
+   }
+ }
+diff --git a/web/package.json b/web/package.json
+index 0cf7056..3a4bfcc 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -1,25 +1,27 @@
+ {
+   "name": "local-symphony-web",
+   "private": true,
+   "version": "0.2.0",
+   "type": "module",
+-  "packageManager": "pnpm@9.0.0",
+   "scripts": {
+     "dev": "vite --host 127.0.0.1",
+     "build": "tsc --noEmit && vite build",
+     "preview": "vite preview --host 127.0.0.1",
+     "typecheck": "node scripts/typecheck.mjs",
+     "test": "node scripts/test.mjs"
+   },
++  "engines": {
++    "node": ">=18.0.0"
++  },
+   "dependencies": {
+-    "react": "latest",
+-    "react-dom": "latest"
++    "react": "^18.3.1",
++    "react-dom": "^18.3.1"
+   },
+   "devDependencies": {
+-    "@types/react": "latest",
+-    "@types/react-dom": "latest",
+-    "@vitejs/plugin-react": "latest",
+-    "vite": "latest",
+-    "typescript": "latest"
++    "@types/react": "^18.3.12",
++    "@types/react-dom": "^18.3.1",
++    "@vitejs/plugin-react": "^4.3.4",
++    "vite": "^5.4.10",
++    "typescript": "^5.6.3"
+   }
+ }
+
+exec
+/bin/zsh -lc "git diff -- internal/buildrelease/safety_test.go | sed -n '1,240p'" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+diff --git a/internal/buildrelease/safety_test.go b/internal/buildrelease/safety_test.go
+index c2e66ad..8ba1b64 100644
+--- a/internal/buildrelease/safety_test.go
++++ b/internal/buildrelease/safety_test.go
+@@ -454,7 +454,8 @@ func TestBuildReleaseLockfileEnginesCompatibleWithNode18(t *testing.T) {
+ //   - `">=18"` / `">=18.0.0"` (Node 18 is the floor)
+ //   - `"^18.0.0"` / `"^18"` (Node 18 major only)
+ //   - `">=16"` / `">=14"` / etc. (Node 18 is above the floor)
+-//   - `">=18 || ..."` multi-clause where every clause allows Node 18
++//   - `"^18 || >=20"` multi-clause where AT LEAST ONE clause
++//     allows Node 18 (npm honours the first matching clause)
+ //   - `""` (empty) — treated as no constraint
+ //
+ // It returns false (incompatible) for shapes that hard-exclude
+@@ -465,15 +466,18 @@ func node18Compatible(constraint string) bool {
+ 	if trimmed == "" {
+ 		return true
+ 	}
+-	// Split on `||` for multi-clause constraints. Every clause
+-	// must be Node-18-compatible for the whole constraint to be.
++	// Split on `||` for multi-clause constraints. AT LEAST ONE
++	// clause must be Node-18-compatible for the whole constraint
++	// to be (npm applies the first matching clause; a package
++	// advertising "^18 || >=20" is installable on Node 18 via the
++	// first clause).
+ 	for _, clause := range strings.Split(trimmed, "||") {
+ 		clause = strings.TrimSpace(clause)
+-		if !node18CompatibleClause(clause) {
+-			return false
++		if node18CompatibleClause(clause) {
++			return true
+ 		}
+ 	}
+-	return true
++	return false
+ }
+ 
+ func node18CompatibleClause(clause string) bool {
+
+exec
+/bin/zsh -lc "git show 4cd80ec:internal/buildrelease/safety_test.go | nl -ba | sed -n '420,500p'" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+   420		// at Node 20 or higher. Soft ranges that include Node 18 are
+   421		// allowed.
+   422		disallowed := []string{}
+   423		for installPath, pkg := range lockfile.Packages {
+   424			// The empty key (installPath == "") is the workspace root
+   425			// itself; its engines.node field is a top-level package
+   426			// constraint, not a transitive one. We still want to
+   427			// check it because the workspace root's `engines` is
+   428			// what npm actually uses to refuse installs.
+   429			rawEngines, ok := pkg.Engines.(map[string]any)
+   430			if !ok || rawEngines == nil {
+   431				continue
+   432			}
+   433			nodeRaw, ok := rawEngines["node"]
+   434			if !ok {
+   435				continue
+   436			}
+   437			nodeConstraint, ok := nodeRaw.(string)
+   438			if !ok {
+   439				continue
+   440			}
+   441			if !node18Compatible(nodeConstraint) {
+   442				disallowed = append(disallowed, fmt.Sprintf("%s@%s (%s) engines.node=%q", pkg.Name, pkg.Version, installPath, nodeConstraint))
+   443			}
+   444		}
+   445		if len(disallowed) > 0 {
+   446			t.Fatalf("web/package-lock.json contains %d package(s) whose engines.node excludes Node 18 (the documented supported runtime). R2's `npm install --package-lock-only` resolved to these on a non-Node-18 host:\n  %s\n\nPin the offending top-level deps in web/package.json to Node-18-compatible versions (Vite ^5.4.x, @vitejs/plugin-react ^4.3.x, React 18) and regenerate the lockfile on Node 18, OR bump docs/RELEASE_NOTES.md to declare the new minimum.", len(disallowed), strings.Join(disallowed, "\n  "))
+   447		}
+   448	}
+   449	
+   450	// node18Compatible reports whether a single `engines.node`
+   451	// constraint string allows installation on Node 18. The supported
+   452	// shapes are:
+   453	//
+   454	//   - `">=18"` / `">=18.0.0"` (Node 18 is the floor)
+   455	//   - `"^18.0.0"` / `"^18"` (Node 18 major only)
+   456	//   - `">=16"` / `">=14"` / etc. (Node 18 is above the floor)
+   457	//   - `">=18 || ..."` multi-clause where every clause allows Node 18
+   458	//   - `""` (empty) — treated as no constraint
+   459	//
+   460	// It returns false (incompatible) for shapes that hard-exclude
+   461	// Node 18, e.g. `^20`, `>=20`, `>=20.19.0`, `>=22.12.0`,
+   462	// `^20.19.0 || >=22.12.0`, etc.
+   463	func node18Compatible(constraint string) bool {
+   464		trimmed := strings.TrimSpace(constraint)
+   465		if trimmed == "" {
+   466			return true
+   467		}
+   468		// Split on `||` for multi-clause constraints. Every clause
+   469		// must be Node-18-compatible for the whole constraint to be.
+   470		for _, clause := range strings.Split(trimmed, "||") {
+   471			clause = strings.TrimSpace(clause)
+   472			if !node18CompatibleClause(clause) {
+   473				return false
+   474			}
+   475		}
+   476		return true
+   477	}
+   478	
+   479	func node18CompatibleClause(clause string) bool {
+   480		clause = strings.TrimSpace(clause)
+   481		if clause == "" {
+   482			return true
+   483		}
+   484		// Strip a leading comparator.
+   485		comparator := ""
+   486		rest := clause
+   487		for _, prefix := range []string{">=", "<=", "==", "!=", ">", "<", "^", "~"} {
+   488			if strings.HasPrefix(rest, prefix) {
+   489				comparator = prefix
+   490				rest = strings.TrimSpace(strings.TrimPrefix(rest, prefix))
+   491				break
+   492			}
+   493		}
+   494		// The remaining token is a version. We only care about the
+   495		// major version.
+   496		if rest == "" {
+   497			return true
+   498		}
+   499		// Strip a leading `v` if present.
+   500		if rest[0] == 'v' || rest[0] == 'V' {
+
+exec
+/bin/zsh -lc "git show 4cd80ec:web/package-lock.json | python3 - <<'PY'
+import sys,json
+p=json.load(sys.stdin)
+for name in ['node_modules/@vitejs/plugin-react','node_modules/vite','node_modules/react','node_modules/react-dom','node_modules/@types/react','node_modules/@types/react-dom','node_modules/typescript']:
+    x=p['packages'].get(name)
+    print(name, x.get('version'), x.get('engines'), x.get('peerDependencies'))
+PY" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ exited 1 in 0ms:
+Traceback (most recent call last):
+  File "<stdin>", line 5, in <module>
+NameError: name 'true' is not defined
+
+exec
+/bin/zsh -lc "python3 - <<'PY'
+import json, subprocess
+s=subprocess.check_output(['git','show','4cd80ec:web/package-lock.json'])
+p=json.loads(s)
+for name in ['node_modules/@vitejs/plugin-react','node_modules/vite','node_modules/react','node_modules/react-dom','node_modules/@types/react','node_modules/@types/react-dom','node_modules/typescript']:
+    x=p['packages'].get(name)
+    print(name, x.get('version'), x.get('engines'), x.get('peerDependencies'))
+PY" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 127ms:
+node_modules/@vitejs/plugin-react 4.7.0 {'node': '^14.18.0 || >=16.0.0'} {'vite': '^4.2.0 || ^5.0.0 || ^6.0.0 || ^7.0.0'}
+node_modules/vite 5.4.21 {'node': '^18.0.0 || >=20.0.0'} {'@types/node': '^18.0.0 || >=20.0.0', 'less': '*', 'lightningcss': '^1.21.0', 'sass': '*', 'sass-embedded': '*', 'stylus': '*', 'sugarss': '*', 'terser': '^5.4.0'}
+node_modules/react 18.3.1 {'node': '>=0.10.0'} None
+node_modules/react-dom 18.3.1 None {'react': '^18.3.1'}
+node_modules/@types/react 18.3.31 None None
+node_modules/@types/react-dom 18.3.7 None {'@types/react': '^18.0.0'}
+node_modules/typescript 5.9.3 {'node': '>=14.17'} None
+
+exec
+/bin/zsh -lc "find web/src -type f -maxdepth 5 -print | sort | xargs sed -n '1,220p' | grep -n \"useOptimistic\\|useActionState\\|useFormStatus\\|ref as prop\\|React\\.use\\|use(\" || true
+rg \"react|React|createRoot|use[A-Z]|forwardRef|useFormStatus|useActionState|useOptimistic|use\\(\" web -n" in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ succeeded in 0ms:
+web/src/api.ts:160:  pauseDispatch: (issueRef: string, reason: string) =>
+web/src/main.tsx:1:import React from 'react';
+web/src/main.tsx:2:import { createRoot } from 'react-dom/client';
+web/src/main.tsx:11:createRoot(root).render(
+web/src/main.tsx:12:  <React.StrictMode>
+web/src/main.tsx:14:  </React.StrictMode>
+web/src/App.tsx:1:import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+web/src/App.tsx:51:const dispatchPauseDefaultReason = 'operator paused dispatch';
+web/src/App.tsx:208:function dispatchPauseResumeReason(input: string, isResuming: boolean): string {
+web/src/App.tsx:211:  return isResuming ? dispatchResumeDefaultReason : dispatchPauseDefaultReason;
+web/src/App.tsx:357:function useRoute(): RouteState {
+web/src/App.tsx:358:  const [route, setRoute] = useState<RouteState>(() => parseRoute());
+web/src/App.tsx:359:  useEffect(() => {
+web/src/App.tsx:367:function useDashboardData() {
+web/src/App.tsx:368:  const [data, setData] = useState<DashboardData>(emptyData);
+web/src/App.tsx:369:  const [loading, setLoading] = useState(true);
+web/src/App.tsx:370:  const [mutating, setMutating] = useState(false);
+web/src/App.tsx:371:  const [error, setError] = useState<string | null>(null);
+web/src/App.tsx:372:  const [authenticated, setAuthenticated] = useState(false);
+web/src/App.tsx:373:  const [authError, setAuthError] = useState(false);
+web/src/App.tsx:374:  const [authMessage, setAuthMessage] = useState<string | null>(null);
+web/src/App.tsx:375:  const [authResetKey, setAuthResetKey] = useState(0);
+web/src/App.tsx:376:  const [daemonUnavailable, setDaemonUnavailable] = useState(false);
+web/src/App.tsx:377:  const [sseState, setSseState] = useState<'connecting' | 'connected' | 'reconnecting' | 'disabled'>('connecting');
+web/src/App.tsx:378:  const maxSeqRef = useRef(0);
+web/src/App.tsx:379:  const authEpochRef = useRef(0);
+web/src/App.tsx:380:  const authenticatedRef = useRef(false);
+web/src/App.tsx:381:  const exchangePromiseRef = useRef<Promise<void> | null>(null);
+web/src/App.tsx:382:  const refreshTimerRef = useRef<number | null>(null);
+web/src/App.tsx:384:  const markUnauthenticated = useCallback(() => {
+web/src/App.tsx:395:  const mergeEventBatch = useCallback((incoming: RunEvent[]) => {
+web/src/App.tsx:404:  const loadIncrementalEvents = useCallback(async () => {
+web/src/App.tsx:417:  const bootstrapSession = useCallback(async (): Promise<boolean> => {
+web/src/App.tsx:444:  const loadAll = useCallback(async () => {
+web/src/App.tsx:505:  const scheduleSummaryRefresh = useCallback(() => {
+web/src/App.tsx:513:  useEffect(() => {
+web/src/App.tsx:525:  useEffect(() => {
+web/src/App.tsx:555:  const runMutation = useCallback(async <T,>(operation: () => Promise<T>): Promise<T | null> => {
+web/src/App.tsx:577:function Section({ title, children, actions }: { title: string; children: ReactNode; actions?: ReactNode }) {
+web/src/App.tsx:589:function EmptyState({ title, body, action }: { title: string; body: string; action?: ReactNode }) {
+web/src/App.tsx:599:function Banner({ kind, children }: { kind: 'error' | 'warning' | 'info' | 'success'; children: ReactNode }) {
+web/src/App.tsx:603:function Pill({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'neutral' | 'good' | 'warning' | 'danger' | 'muted' }) {
+web/src/App.tsx:607:function KeyValue({ rows }: { rows: Array<[string, ReactNode]> }) {
+web/src/App.tsx:643:  meta?: ReactNode;
+web/src/App.tsx:644:  actions?: ReactNode;
+web/src/App.tsx:659:function MetricStrip({ items }: { items: Array<{ label: string; value: ReactNode; tone?: 'neutral' | 'good' | 'warning' | 'danger' | 'muted' }> }) {
+web/src/App.tsx:682:  children: ReactNode;
+web/src/App.tsx:779:  const groups = useMemo(() => buildQueueGroups(data), [data]);
+web/src/App.tsx:780:  const [selectedIssueRef, setSelectedIssueRef] = useState<string | null>(null);
+web/src/App.tsx:783:  useEffect(() => {
+web/src/App.tsx:972:  const [pauseReason, setPauseReason] = useState('');
+web/src/App.tsx:973:  const [comment, setComment] = useState('');
+web/src/App.tsx:974:  const [blocker, setBlocker] = useState('');
+web/src/App.tsx:975:  const [target, setTarget] = useState<IssueState>('Ready');
+web/src/App.tsx:976:  const [transitionReason, setTransitionReason] = useState('');
+web/src/App.tsx:977:  const [duplicateOf, setDuplicateOf] = useState('');
+web/src/App.tsx:978:  const [reviewReason, setReviewReason] = useState('operator review decision');
+web/src/App.tsx:979:  const [localMessage, setLocalMessage] = useState<string | null>(null);
+web/src/App.tsx:981:  useEffect(() => {
+web/src/App.tsx:982:    setPauseReason('');
+web/src/App.tsx:1016:  async function pauseResume() {
+web/src/App.tsx:1017:    const reason = dispatchPauseResumeReason(pauseReason, selectedIssue.dispatch_paused);
+web/src/App.tsx:1019:    const result = await perform(label, () => selectedIssue.dispatch_paused ? api.resumeDispatch(selectedIssue.identifier, reason) : api.pauseDispatch(selectedIssue.identifier, reason));
+web/src/App.tsx:1020:    if (result) setPauseReason('');
+web/src/App.tsx:1072:          <input value={pauseReason} onChange={(event) => setPauseReason(event.target.value)} placeholder={selectedIssue.dispatch_paused ? dispatchResumeDefaultReason : dispatchPauseDefaultReason} />
+web/src/App.tsx:1074:        <button type="button" onClick={() => void pauseResume()} disabled={active && !selectedIssue.dispatch_paused}>
+web/src/App.tsx:1150:function MetricCard({ label, value, helper, tone }: { label: string; value: ReactNode; helper: string; tone: 'neutral' | 'good' | 'warning' | 'danger' | 'muted' }) {
+web/src/App.tsx:1178:  const byState = useMemo(() => {
+web/src/App.tsx:1224:  const [title, setTitle] = useState('');
+web/src/App.tsx:1225:  const [description, setDescription] = useState('');
+web/src/App.tsx:1226:  const [acceptance, setAcceptance] = useState('');
+web/src/App.tsx:1227:  const [priority, setPriority] = useState(3);
+web/src/App.tsx:1228:  const [labels, setLabels] = useState('');
+web/src/App.tsx:1283:  const [target, setTarget] = useState<IssueState>('Ready');
+web/src/App.tsx:1284:  const [reason, setReason] = useState('');
+web/src/App.tsx:1285:  const [duplicateOf, setDuplicateOf] = useState('');
+web/src/App.tsx:1356:  const [comment, setComment] = useState('');
+web/src/App.tsx:1357:  const [blocker, setBlocker] = useState('');
+web/src/App.tsx:1358:  const [pauseReason, setPauseReason] = useState('');
+web/src/App.tsx:1359:  const [fetchedIssue, setFetchedIssue] = useState<Issue | null>(null);
+web/src/App.tsx:1360:  const [missingIssueRef, setMissingIssueRef] = useState<string | null>(null);
+web/src/App.tsx:1361:  const [issueLoadError, setIssueLoadError] = useState<string | null>(null);
+web/src/App.tsx:1363:  useEffect(() => {
+web/src/App.tsx:1368:  useEffect(() => {
+web/src/App.tsx:1422:  async function pauseResume(paused: boolean) {
+web/src/App.tsx:1423:    const reason = dispatchPauseResumeReason(pauseReason, paused);
+web/src/App.tsx:1424:    const result = await runMutation(() => paused ? api.resumeDispatch(selectedIssue.identifier, reason) : api.pauseDispatch(selectedIssue.identifier, reason));
+web/src/App.tsx:1425:    if (result) setPauseReason('');
+web/src/App.tsx:1512:                <input value={pauseReason} onChange={(event) => setPauseReason(event.target.value)} placeholder="Required by API for pause/resume; default text will be used if omitted" />
+web/src/App.tsx:1515:                <button type="button" onClick={() => void pauseResume(issue.dispatch_paused)} disabled={Boolean(issue.active_run_id)}>
+web/src/App.tsx:1552:  const [title, setTitle] = useState(issue.title);
+web/src/App.tsx:1553:  const [description, setDescription] = useState(issue.description);
+web/src/App.tsx:1554:  const [acceptance, setAcceptance] = useState(issue.acceptance_criteria.join('\n'));
+web/src/App.tsx:1555:  const [priority, setPriority] = useState(issue.priority);
+web/src/App.tsx:1556:  const [labels, setLabels] = useState(issue.labels.join(', '));
+web/src/App.tsx:1558:  useEffect(() => {
+web/src/App.tsx:1665:  const [reason, setReason] = useState('operator cancelled run');
+web/src/App.tsx:1666:  const [fetchedRun, setFetchedRun] = useState<RunAttempt | null>(null);
+web/src/App.tsx:1667:  const [fetchedRunEvents, setFetchedRunEvents] = useState<RunEvent[]>([]);
+web/src/App.tsx:1668:  const [missingRunId, setMissingRunId] = useState<string | null>(null);
+web/src/App.tsx:1669:  const [runLoadError, setRunLoadError] = useState<string | null>(null);
+web/src/App.tsx:1671:  useEffect(() => {
+web/src/App.tsx:1677:  useEffect(() => {
+web/src/App.tsx:1701:  useEffect(() => {
+web/src/App.tsx:1854:  const [reason, setReason] = useState('operator decision');
+web/src/App.tsx:1897:  const [issueRef, setIssueRef] = useState(defaultIssue);
+web/src/App.tsx:1898:  const [review, setReview] = useState<ReviewPacketSummary | null>(null);
+web/src/App.tsx:1899:  const [loading, setLoading] = useState(false);
+web/src/App.tsx:1900:  const [error, setError] = useState<string | null>(null);
+web/src/App.tsx:1901:  const [reason, setReason] = useState('operator review decision');
+web/src/App.tsx:1902:  const [artifactContent, setArtifactContent] = useState<Record<string, { title: string; text: string; refused?: boolean }>>({});
+web/src/App.tsx:1904:  useEffect(() => {
+web/src/App.tsx:1908:  useEffect(() => {
+web/src/App.tsx:1915:  const loadReview = useCallback(async (ref: string) => {
+web/src/App.tsx:1937:  useEffect(() => {
+web/src/App.tsx:2076:  const [validation, setValidation] = useState<WorkflowValidateResponse | null>(null);
+web/src/App.tsx:2077:  const [preview, setPreview] = useState<WorkflowRenderPreviewResponse | null>(null);
+web/src/App.tsx:2078:  const [localError, setLocalError] = useState<string | null>(null);
+web/src/App.tsx:2080:  useEffect(() => {
+web/src/App.tsx:2183:  const [exportResult, setExportResult] = useState<{ artifact_id: string; path: string } | null>(null);
+web/src/App.tsx:2250:  const route = useRoute();
+web/src/App.tsx:2251:  const { data, loading, mutating, error, authenticated, authError, authMessage, authResetKey, daemonUnavailable, sseState, reload, runMutation, markUnauthenticated } = useDashboardData();
+web/src/App.tsx:2253:  let content: ReactNode;
+web/tsconfig.json:4:    "useDefineForClassFields": true,
+web/tsconfig.json:17:    "jsx": "react-jsx"
+web/package.json:17:    "react": "^18.3.1",
+web/package.json:18:    "react-dom": "^18.3.1"
+web/package.json:21:    "@types/react": "^18.3.12",
+web/package.json:22:    "@types/react-dom": "^18.3.1",
+web/package.json:23:    "@vitejs/plugin-react": "^4.3.4",
+web/package-lock.json:11:        "react": "^18.3.1",
+web/package-lock.json:12:        "react-dom": "^18.3.1"
+web/package-lock.json:15:        "@types/react": "^18.3.12",
+web/package-lock.json:16:        "@types/react-dom": "^18.3.1",
+web/package-lock.json:17:        "@vitejs/plugin-react": "^4.3.4",
+web/package-lock.json:227:    "node_modules/@babel/plugin-transform-react-jsx-self": {
+web/package-lock.json:229:      "resolved": "https://registry.npmjs.org/@babel/plugin-transform-react-jsx-self/-/plugin-transform-react-jsx-self-7.29.7.tgz",
+web/package-lock.json:243:    "node_modules/@babel/plugin-transform-react-jsx-source": {
+web/package-lock.json:245:      "resolved": "https://registry.npmjs.org/@babel/plugin-transform-react-jsx-source/-/plugin-transform-react-jsx-source-7.29.7.tgz",
+web/package-lock.json:1203:    "node_modules/@types/react": {
+web/package-lock.json:1205:      "resolved": "https://registry.npmjs.org/@types/react/-/react-18.3.31.tgz",
+web/package-lock.json:1214:    "node_modules/@types/react-dom": {
+web/package-lock.json:1216:      "resolved": "https://registry.npmjs.org/@types/react-dom/-/react-dom-18.3.7.tgz",
+web/package-lock.json:1221:        "@types/react": "^18.0.0"
+web/package-lock.json:1224:    "node_modules/@vitejs/plugin-react": {
+web/package-lock.json:1226:      "resolved": "https://registry.npmjs.org/@vitejs/plugin-react/-/plugin-react-4.7.0.tgz",
+web/package-lock.json:1232:        "@babel/plugin-transform-react-jsx-self": "^7.27.1",
+web/package-lock.json:1233:        "@babel/plugin-transform-react-jsx-source": "^7.27.1",
+web/package-lock.json:1236:        "react-refresh": "^0.17.0"
+web/package-lock.json:1550:    "node_modules/react": {
+web/package-lock.json:1552:      "resolved": "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
+web/package-lock.json:1562:    "node_modules/react-dom": {
+web/package-lock.json:1564:      "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz",
+web/package-lock.json:1572:        "react": "^18.3.1"
+web/package-lock.json:1575:    "node_modules/react-refresh": {
+web/package-lock.json:1577:      "resolved": "https://registry.npmjs.org/react-refresh/-/react-refresh-0.17.0.tgz",
+web/vite.config.ts:2:import react from '@vitejs/plugin-react';
+web/vite.config.ts:5:  plugins: [react()],
+web/README.md:3:This directory contains the React/TypeScript dashboard for the Local Symphony v1 local control plane. The dashboard uses only REST/SSE endpoints under `/api/v1`; it does not read SQLite, Git, workspaces, artifacts, Codex logs, or Tool Gateway state directly.
+web/scripts/typecheck.mjs:23:const hasReactDeps = existsSync(new URL('../node_modules/react', import.meta.url));
+web/scripts/typecheck.mjs:24:if (!hasReactDeps) {
+web/scripts/test.mjs:66:  'dispatch pause issue': { ui: /Dispatch pause issue/s, api: /pauseDispatch:[\s\S]*\/dispatch-pause/s },
+web/scripts/test.mjs:168:if (!/authEpochRef\s*=\s*useRef\(0\)/s.test(app)) throw new Error('dashboard must track auth epoch for protected data requests');
+
+exec
+/bin/zsh -lc 'tmp=$(mktemp -d); git archive 4cd80ec | tar -x -C "$tmp"; cd "$tmp" && go test ./internal/buildrelease -run TestBuildReleaseLockfileEnginesCompatibleWithNode18 -count=1' in /Users/xiquandai/Documents/code/local-symphony-d5-release
+ exited 1 in 1652ms:
+--- FAIL: TestBuildReleaseLockfileEnginesCompatibleWithNode18 (0.02s)
+    safety_test.go:387: not in a git worktree (stat /var/folders/5j/2r880lbs0lbdvd2qsgtqy4yr0000gn/T/tmp.s1qkTKsCk5/.git: no such file or directory); falling back to in-place repoRoot. Run the clean-tarball spec for authoritative CI-equivalent verification.
+    safety_test.go:446: web/package-lock.json contains 1 package(s) whose engines.node excludes Node 18 (the documented supported runtime). R2's `npm install --package-lock-only` resolved to these on a non-Node-18 host:
+          @5.4.21 (node_modules/vite) engines.node="^18.0.0 || >=20.0.0"
+        
+        Pin the offending top-level deps in web/package.json to Node-18-compatible versions (Vite ^5.4.x, @vitejs/plugin-react ^4.3.x, React 18) and regenerate the lockfile on Node 18, OR bump docs/RELEASE_NOTES.md to declare the new minimum.
+FAIL
+FAIL	local-symphony/internal/buildrelease	1.008s
+FAIL
+
+codex
+The newly added build-release safety test rejects the Node-18-compatible Vite engine range in the lockfile introduced by this same commit, causing the focused Go test to fail.
+
+Review comment:
+
+- [P1] Accept any Node-18-compatible engine disjunct — /Users/xiquandai/Documents/code/local-symphony-d5-release/internal/buildrelease/safety_test.go:470-474
+  When the lockfile contains a valid semver OR range like Vite's `^18.0.0 || >=20.0.0`, Node 18 is allowed by the first clause, but this loop rejects the package as soon as it sees the `>=20.0.0` clause. As committed, `go test ./internal/buildrelease -run TestBuildReleaseLockfileEnginesCompatibleWithNode18` fails against the new lockfile, so the new regression test breaks CI instead of validating the intended fix.
+The newly added build-release safety test rejects the Node-18-compatible Vite engine range in the lockfile introduced by this same commit, causing the focused Go test to fail.
+
+Review comment:
+
+- [P1] Accept any Node-18-compatible engine disjunct — /Users/xiquandai/Documents/code/local-symphony-d5-release/internal/buildrelease/safety_test.go:470-474
+  When the lockfile contains a valid semver OR range like Vite's `^18.0.0 || >=20.0.0`, Node 18 is allowed by the first clause, but this loop rejects the package as soon as it sees the `>=20.0.0` clause. As committed, `go test ./internal/buildrelease -run TestBuildReleaseLockfileEnginesCompatibleWithNode18` fails against the new lockfile, so the new regression test breaks CI instead of validating the intended fix.
