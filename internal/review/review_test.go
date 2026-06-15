@@ -147,6 +147,43 @@ func TestGenerateInsertsReviewPacketWithinOuterTransaction(t *testing.T) {
 	}
 }
 
+func TestGenerateUpdatesExistingPromptSnapshotContextHash(t *testing.T) {
+	st := newReviewTestStore(t)
+	issue, run := prepareReviewRun(t, st)
+	wfID, err := st.CreateWorkflowSnapshot("valid", filepath.Join(st.RepoRoot, "WORKFLOW.md"), `{}`, "prompt-hash", "[]")
+	if err != nil {
+		t.Fatalf("CreateWorkflowSnapshot: %v", err)
+	}
+	if err := st.AttachWorkflowSnapshot(run.ID, wfID); err != nil {
+		t.Fatalf("AttachWorkflowSnapshot: %v", err)
+	}
+	root := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID)
+	if _, err := st.CreatePromptSnapshot(run.ID, wfID, "stale-context-hash", "rendered-hash", root); err != nil {
+		t.Fatalf("CreatePromptSnapshot: %v", err)
+	}
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	ctx := map[string]any{"issue_identifier": issue.Identifier, "run_id": run.ID}
+	cb, err := json.MarshalIndent(ctx, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal expected prompt context: %v", err)
+	}
+	wantHash := sha256Hex(cb)
+	row, err := st.Project.QueryOne(`SELECT context_hash, redacted_prompt_path FROM prompt_snapshots WHERE run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("query prompt snapshot: %v", err)
+	}
+	if got := row["context_hash"].String(); got != wantHash {
+		t.Fatalf("context_hash = %q, want %q", got, wantHash)
+	}
+	if got := row["redacted_prompt_path"].String(); got != filepath.Join(root, "prompt/rendered_prompt.redacted.md") {
+		t.Fatalf("redacted_prompt_path = %q, want rendered prompt path", got)
+	}
+}
+
 func TestGenerateOmitsTrackedProtectedDiffFromPatch(t *testing.T) {
 	st := newReviewTestStore(t)
 	workspace := initGitWorkspace(t)

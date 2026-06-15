@@ -148,15 +148,15 @@ func TestSafeSummaryToMarkdownIncludesReasonSafeMetadata(t *testing.T) {
 
 func TestSafeSummaryScanDoesNotFalsePositiveOnLegitimateText(t *testing.T) {
 	s := &SafeSummary{
-		ReviewPacketID:   "rp_x",
-		Status:           "generated",
-		Summary:          "Reviewed the codex launch flow and patched the approval loop.",
-		Acceptance:       []string{"Verified end-to-end with smoke test."},
-		Tests:            []string{"go test ./..."},
-		Risks:            []string{"None observed."},
-		Verification:     []string{"Manual smoke test"},
-		ChangedFiles:     []string{"internal/agent/codex/codex.go"},
-		HowToContinue:    "Mark Done after final review.",
+		ReviewPacketID: "rp_x",
+		Status:         "generated",
+		Summary:        "Reviewed the codex launch flow and patched the approval loop.",
+		Acceptance:     []string{"Verified end-to-end with smoke test."},
+		Tests:          []string{"go test ./..."},
+		Risks:          []string{"None observed."},
+		Verification:   []string{"Manual smoke test"},
+		ChangedFiles:   []string{"internal/agent/codex/codex.go"},
+		HowToContinue:  "Mark Done after final review.",
 	}
 	if err := s.Seal(); err != nil {
 		t.Fatalf("Seal: %v", err)
@@ -336,6 +336,29 @@ func TestReworkSafeSummaryUsesPreviousRunFields(t *testing.T) {
 	}
 	if summary.RunID != prev.ID {
 		t.Fatalf("RunID = %q, want %q (rework safe summary must use prev run id)", summary.RunID, prev.ID)
+	}
+}
+
+func TestReworkSafeSummaryRequiresPacketForSelectedPreviousRun(t *testing.T) {
+	st := newReviewTestStore(t)
+	issue, reviewedRun := prepareReviewRun(t, st)
+	if _, err := (Generator{Store: st}).Generate(reviewedRun.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	prevWithoutPacket := &core.RunAttempt{
+		ID:               core.NewID("run_"),
+		IssueID:          issue.ID,
+		Status:           core.RunCompleted,
+		SourceIssueState: core.StateReady,
+	}
+	cur := &core.RunAttempt{
+		ID:               core.NewID("run_"),
+		IssueID:          issue.ID,
+		Status:           core.RunRenderingPrompt,
+		SourceIssueState: core.StateRework,
+	}
+	if _, err := BuildSafeSummaryFromIssueWithPrev(st, issue, cur, prevWithoutPacket); err == nil {
+		t.Fatal("BuildSafeSummaryFromIssueWithPrev used another run's packet for a previous run with no review packet")
 	}
 }
 

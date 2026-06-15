@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const fallbackAppSchema = `PRAGMA foreign_keys = ON;
@@ -128,6 +129,103 @@ func MigrateAppSchema(database *DB) error {
 		return err
 	}
 	return nil
+}
+
+const reworkSnapshotsDDL = `CREATE TABLE IF NOT EXISTS rework_snapshots (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL UNIQUE,
+  issue_id TEXT NOT NULL,
+  prompt_snapshot_id TEXT,
+  previous_run_id TEXT,
+  review_packet_id TEXT,
+  base_ref TEXT,
+  base_sha TEXT,
+  cumulative_diff_sha TEXT,
+  prompt_hash TEXT NOT NULL,
+  review_reason TEXT NOT NULL,
+  safe_summary_sha256 TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
+  FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY(prompt_snapshot_id) REFERENCES prompt_snapshots(id) ON DELETE SET NULL,
+  FOREIGN KEY(previous_run_id) REFERENCES run_attempts(id) ON DELETE SET NULL,
+  FOREIGN KEY(review_packet_id) REFERENCES review_packets(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rework_snapshots_issue_created ON rework_snapshots(issue_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rework_snapshots_review_packet ON rework_snapshots(review_packet_id);
+`
+
+const runAttemptsWithManualReworkDDL = `CREATE TABLE run_attempts_new (
+  id TEXT PRIMARY KEY,
+  issue_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+  workspace_id TEXT,
+  workflow_snapshot_id TEXT,
+  status TEXT NOT NULL CHECK (status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running','completed','completed_without_handoff','failed','cancelled')),
+  dispatch_reason TEXT NOT NULL DEFAULT 'manual' CHECK (dispatch_reason IN ('manual','scheduler','manual_recovery','manual_rework')),
+  source_issue_state TEXT NOT NULL CHECK (source_issue_state IN ('Ready','Rework')),
+  runner_kind TEXT NOT NULL CHECK (runner_kind IN ('fake','codex')),
+  base_ref_config TEXT,
+  base_ref TEXT,
+  base_sha TEXT,
+  branch_name TEXT,
+  failure_code TEXT,
+  failure_message TEXT,
+  started_at TEXT,
+  ended_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL,
+  FOREIGN KEY(workflow_snapshot_id) REFERENCES workflow_snapshots(id) ON DELETE SET NULL,
+  UNIQUE(issue_id, attempt_no)
+);
+`
+
+const copyRunAttemptsSQL = `INSERT INTO run_attempts_new(
+  id, issue_id, attempt_no, workspace_id, workflow_snapshot_id, status, dispatch_reason,
+  source_issue_state, runner_kind, base_ref_config, base_ref, base_sha, branch_name,
+  failure_code, failure_message, started_at, ended_at, created_at, updated_at
+) SELECT
+  id, issue_id, attempt_no, workspace_id, workflow_snapshot_id, status, dispatch_reason,
+  source_issue_state, runner_kind, base_ref_config, base_ref, base_sha, branch_name,
+  failure_code, failure_message, started_at, ended_at, created_at, updated_at
+FROM run_attempts;
+`
+
+// MigrateProjectSchema brings existing v1 project DBs up to the current D4/R16
+// project schema additions without changing the externally supported schema version.
+func MigrateProjectSchema(database *DB) error {
+	if err := ensureReworkSnapshotsTable(database); err != nil {
+		return err
+	}
+	return ensureRunAttemptsManualRework(database)
+}
+
+func ensureReworkSnapshotsTable(database *DB) error {
+	return database.ExecScript(reworkSnapshotsDDL)
+}
+
+func ensureRunAttemptsManualRework(database *DB) error {
+	exists, err := tableExists(database, "run_attempts")
+	if err != nil || !exists {
+		return err
+	}
+	row, err := database.QueryOne(`SELECT sql FROM sqlite_master WHERE type='table' AND name='run_attempts'`)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(row["sql"].String(), "manual_rework") {
+		return nil
+	}
+	return database.ExecScript(`PRAGMA foreign_keys=OFF;
+` + runAttemptsWithManualReworkDDL + copyRunAttemptsSQL + `
+DROP TABLE run_attempts;
+ALTER TABLE run_attempts_new RENAME TO run_attempts;
+CREATE INDEX IF NOT EXISTS idx_run_attempts_issue_created ON run_attempts(issue_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_run_attempts_status ON run_attempts(status);
+PRAGMA foreign_keys=ON;
+`)
 }
 
 const runtimeOwnerEventsDDL = `CREATE TABLE IF NOT EXISTS runtime_owner_events (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, event_type TEXT NOT NULL, actor_type TEXT NOT NULL, data_json TEXT NOT NULL, redacted INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);

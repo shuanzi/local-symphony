@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -191,6 +192,10 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		redactedMeta := fmt.Sprintf("# redacted\n\nThe rendered rework prompt is not persisted to disk in raw form.\n\n- redaction: metadata-only\n- prompt_length_bytes: %d\n- prompt_sha256: %s\n- review_reason_redacted: false (see rework_snapshots row)\n", promptLen, promptHashHex)
 		if err := os.WriteFile(filepath.Join(promptDir, "rework_prompt.redacted.md"), []byte(redactedMeta), 0o644); err != nil {
 			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("write redacted rework prompt: %v", err), core.RunFailed)
+			return nil
+		}
+		if err := os.WriteFile(filepath.Join(promptDir, "rendered_prompt.redacted.md"), []byte(redactedMeta), 0o644); err != nil {
+			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("write redacted rendered prompt: %v", err), core.RunFailed)
 			return nil
 		}
 		// ph now refers to the hash of the prompt *with* rework
@@ -423,8 +428,49 @@ func (o Orchestrator) computeCumulativeDiffSHA(issue *core.Issue, run *core.RunA
 	// diagnostic correlation between successive reworks.
 	statusOut, _ := exec.Command("git", "-C", root, "status", "--porcelain=v1", "-z", "-uall").Output()
 	diffOut, _ := exec.Command("git", "-C", root, "diff", "HEAD").Output()
-	h := sha256.Sum256([]byte(baseSHA + "\x00" + head + "\x00" + string(statusOut) + "\x00" + string(diffOut)))
+	untrackedDigest := cumulativeUntrackedDigest(root)
+	h := sha256.Sum256([]byte(baseSHA + "\x00" + head + "\x00" + string(statusOut) + "\x00" + string(diffOut) + "\x00" + untrackedDigest))
 	return hex.EncodeToString(h[:])
+}
+
+func cumulativeUntrackedDigest(root string) string {
+	out, err := exec.Command("git", "-C", root, "ls-files", "--others", "--exclude-standard", "-z").Output()
+	if err != nil || len(out) == 0 {
+		return ""
+	}
+	paths := strings.Split(string(out), "\x00")
+	paths = paths[:len(paths)-1]
+	sort.Strings(paths)
+	h := sha256.New()
+	for _, rel := range paths {
+		if rel == "" {
+			continue
+		}
+		path := filepath.Join(root, rel)
+		info, err := os.Lstat(path)
+		if err != nil {
+			continue
+		}
+		_, _ = h.Write([]byte(rel))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(info.Mode().String()))
+		_, _ = h.Write([]byte{0})
+		if info.Mode().IsRegular() {
+			f, err := os.Open(path)
+			if err == nil {
+				fh := sha256.New()
+				_, _ = io.Copy(fh, f)
+				_ = f.Close()
+				_, _ = h.Write(fh.Sum(nil))
+			}
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			if target, err := os.Readlink(path); err == nil {
+				_, _ = h.Write([]byte(target))
+			}
+		}
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func runnerForRun(run *core.RunAttempt, wf *config.Workflow) agentrunner.Runner {

@@ -230,6 +230,9 @@ func InitProject(repoRoot, issuePrefix string) (*Store, error) {
 	if err := db.MigrateAppSchema(s.App); err != nil {
 		return nil, err
 	}
+	if err := db.MigrateProjectSchema(s.Project); err != nil {
+		return nil, err
+	}
 	if err := validateSchemaVersion(s.App, s.AppDBPath); err != nil {
 		return nil, err
 	}
@@ -300,6 +303,9 @@ func Open(repoRoot string) (*Store, error) {
 		}
 	}
 	if err := db.MigrateAppSchema(s.App); err != nil {
+		return nil, err
+	}
+	if err := db.MigrateProjectSchema(s.Project); err != nil {
 		return nil, err
 	}
 	if err := validateSchemaVersion(s.App, s.AppDBPath); err != nil {

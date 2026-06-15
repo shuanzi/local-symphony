@@ -147,7 +147,7 @@ func (g Generator) Generate(runID string) (string, error) {
 			var pid string
 			if lookupErr == nil {
 				pid = existing["id"].String()
-				if err := tx.Exec(`UPDATE prompt_snapshots SET workflow_snapshot_id=COALESCE(workflow_snapshot_id, ?), runtime_envelope_version=?, tool_manifest_version=?, context_hash=COALESCE(context_hash, ?), context_json_path=?, redacted_prompt_path=?, prompt_meta_json_path=?, tool_manifest_path=? WHERE id=?`, *run.WorkflowSnapshotID, "v1", "v1", promptContextHash, filepath.Join(root, "prompt/context.json"), filepath.Join(root, "prompt/rendered_prompt.redacted.md"), filepath.Join(root, "prompt/prompt_meta.json"), filepath.Join(root, "prompt/tool_manifest.md"), pid); err != nil {
+				if err := tx.Exec(`UPDATE prompt_snapshots SET workflow_snapshot_id=COALESCE(workflow_snapshot_id, ?), runtime_envelope_version=?, tool_manifest_version=?, context_hash=?, context_json_path=?, redacted_prompt_path=?, prompt_meta_json_path=?, tool_manifest_path=? WHERE id=?`, *run.WorkflowSnapshotID, "v1", "v1", promptContextHash, filepath.Join(root, "prompt/context.json"), filepath.Join(root, "prompt/rendered_prompt.redacted.md"), filepath.Join(root, "prompt/prompt_meta.json"), filepath.Join(root, "prompt/tool_manifest.md"), pid); err != nil {
 					return reviewPacketError("update prompt snapshot", err)
 				}
 			} else {

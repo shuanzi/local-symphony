@@ -55,17 +55,17 @@ type SafeSummary struct {
 // redaction policy has a single source of truth inside the review
 // package for the safe summary DTO.
 var rawArtifactRefusalKinds = map[string]struct{}{
-	"codex_log":         {},
-	"codex_events":      {},
-	"prompt_snapshot":   {},
-	"prompt_rendered":   {},
-	"prompt_context":    {},
-	"secret_artifact":   {},
-	"secrets":           {},
-	"codex_final_dump":  {},
-	"raw_codex_log":     {},
-	"raw_prompt":        {},
-	"raw_prompt_log":    {},
+	"codex_log":        {},
+	"codex_events":     {},
+	"prompt_snapshot":  {},
+	"prompt_rendered":  {},
+	"prompt_context":   {},
+	"secret_artifact":  {},
+	"secrets":          {},
+	"codex_final_dump": {},
+	"raw_codex_log":    {},
+	"raw_prompt":       {},
+	"raw_prompt_log":   {},
 }
 
 // refusalKindBlocklist is used to scan structured payloads (e.g. JSON
@@ -320,12 +320,7 @@ func latestReviewPacketForRun(s *store.Store, issue *core.Issue, run *core.RunAt
 	}
 	row, err := s.Project.QueryOne(`SELECT id, issue_id, run_id, handoff_id, packet_no, status, root_path, review_md_path, review_json_path, patch_path, changed_files_path, untracked_files_path, diffstat_path, prompt_snapshot_id, failure_code, failure_message, created_at FROM review_packets WHERE issue_id=? AND run_id=? ORDER BY packet_no DESC LIMIT 1`, issue.ID, run.ID)
 	if err != nil {
-		// Fallback to the latest packet for the issue if the per-run
-		// lookup misses (e.g. multi-run review flow).
-		row, err = s.Project.QueryOne(`SELECT id, issue_id, run_id, handoff_id, packet_no, status, root_path, review_md_path, review_json_path, patch_path, changed_files_path, untracked_files_path, diffstat_path, prompt_snapshot_id, failure_code, failure_message, created_at FROM review_packets WHERE issue_id=? ORDER BY packet_no DESC LIMIT 1`, issue.ID)
-		if err != nil {
-			return nil, core.NewError(core.ErrReviewPacketRequired, "review packet required", nil)
-		}
+		return nil, core.NewError(core.ErrReviewPacketRequired, "review packet required", nil)
 	}
 	return row, nil
 }

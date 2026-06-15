@@ -418,6 +418,65 @@ func TestCumulativeDiffHashCoversUncommittedChanges(t *testing.T) {
 	}
 }
 
+func TestCumulativeDiffHashCoversUntrackedFileContentChanges(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_RUNNER_KIND", "")
+	st, issue, prev := newReworkDispatchIssueWithGitWorkspace(t)
+
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("first\n"), 0o644); err != nil {
+		t.Fatalf("write first untracked content: %v", err)
+	}
+	hashFirst := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha")
+	if hashFirst == "" {
+		t.Fatal("cumulative diff SHA is empty for first untracked content")
+	}
+	if err := os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("second\n"), 0o644); err != nil {
+		t.Fatalf("write second untracked content: %v", err)
+	}
+	hashSecond := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha")
+	if hashSecond == "" {
+		t.Fatal("cumulative diff SHA is empty for second untracked content")
+	}
+	if hashSecond == hashFirst {
+		t.Fatalf("cumulative_diff_sha ignored untracked file bytes (%q == %q)", hashSecond, hashFirst)
+	}
+}
+
+func TestReworkPromptSnapshotRedactedPathExistsWhenBeforeRunFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SYMPHONY_RUNNER_KIND", "")
+	st, issue, _ := newReworkDispatchIssue(t)
+	body := `---
+hooks:
+  before_run: "sh -c 'exit 17'"
+---
+Do the work.
+`
+	if err := os.WriteFile(filepath.Join(st.RepoRoot, "WORKFLOW.md"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	res, err := (Orchestrator{Store: st}).DispatchIssue(issue.Identifier, "manual")
+	if err != nil {
+		t.Fatalf("DispatchIssue: %v", err)
+	}
+	if res.Run.Status != core.RunFailed {
+		t.Fatalf("run status = %s, want %s", res.Run.Status, core.RunFailed)
+	}
+	row, err := st.Project.QueryOne(`SELECT redacted_prompt_path FROM prompt_snapshots WHERE run_id=?`, res.Run.ID)
+	if err != nil {
+		t.Fatalf("query prompt snapshot: %v", err)
+	}
+	path := row["redacted_prompt_path"].String()
+	if path == "" {
+		t.Fatal("redacted_prompt_path is empty")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("redacted_prompt_path does not exist before review packet generation: %s: %v", path, err)
+	}
+}
+
 // TestRedactedArtifactDoesNotContainRawPrompt verifies that the
 // rework-prompt redacted artifact written under
 // .symphony/artifacts/<identifier>/<run>/prompt/rework_prompt.redacted.md
@@ -460,8 +519,8 @@ func TestRedactedArtifactDoesNotContainRawPrompt(t *testing.T) {
 	// or safe summary markdown).
 	for _, marker := range []string{
 		"Please cover the empty input edge case.", // review reason prose
-		"Initial implementation done.",             // handoff summary
-		"# Previous Review Packet (Safe Summary)",  // safe summary header
+		"Initial implementation done.",            // handoff summary
+		"# Previous Review Packet (Safe Summary)", // safe summary header
 	} {
 		if strings.Contains(body, marker) {
 			t.Fatalf("redacted artifact leaked raw prompt marker %q\n---\n%s\n---", marker, body)

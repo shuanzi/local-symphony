@@ -93,6 +93,64 @@ CREATE TABLE IF NOT EXISTS runtime_descriptors (project_id TEXT PRIMARY KEY, api
 	}
 }
 
+func TestMigrateProjectSchemaAddsReworkSnapshotsAndAllowsManualRework(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "project.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	const legacy = `PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_name', 'v1_project');
+INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '1');
+CREATE TABLE IF NOT EXISTS issues (id TEXT PRIMARY KEY);
+INSERT OR REPLACE INTO issues(id) VALUES('iss_1');
+CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS workflow_snapshots (id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS run_attempts (
+  id TEXT PRIMARY KEY,
+  issue_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK(attempt_no>0),
+  workspace_id TEXT,
+  workflow_snapshot_id TEXT,
+  status TEXT NOT NULL,
+  dispatch_reason TEXT NOT NULL DEFAULT 'manual' CHECK(dispatch_reason IN ('manual','scheduler','manual_recovery')),
+  source_issue_state TEXT NOT NULL,
+  runner_kind TEXT NOT NULL,
+  base_ref_config TEXT,
+  base_ref TEXT,
+  base_sha TEXT,
+  branch_name TEXT,
+  failure_code TEXT,
+  failure_message TEXT,
+  started_at TEXT,
+  ended_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(issue_id, attempt_no)
+);
+`
+	if err := d.ExecScript(legacy); err != nil {
+		t.Fatalf("exec legacy schema: %v", err)
+	}
+
+	if err := MigrateProjectSchema(d); err != nil {
+		t.Fatalf("MigrateProjectSchema: %v", err)
+	}
+	got := tableColumnNames(t, d, "rework_snapshots")
+	for _, want := range []string{"id", "run_id", "issue_id", "prompt_hash", "review_reason", "safe_summary_sha256"} {
+		if _, ok := got[want]; !ok {
+			t.Fatalf("rework_snapshots missing column %q after migration; have %v", want, sortedKeys(got))
+		}
+	}
+	if err := d.Exec(`INSERT INTO run_attempts(id,issue_id,attempt_no,status,dispatch_reason,source_issue_state,runner_kind,created_at,updated_at) VALUES('run_rework','iss_1',1,'pending','manual_rework','Rework','fake','2026-06-15T00:00:00Z','2026-06-15T00:00:00Z')`); err != nil {
+		t.Fatalf("manual_rework dispatch_reason rejected after migration: %v", err)
+	}
+	if err := MigrateProjectSchema(d); err != nil {
+		t.Fatalf("MigrateProjectSchema idempotent: %v", err)
+	}
+}
+
 func tableColumnNames(t *testing.T, d *DB, table string) map[string]struct{} {
 	t.Helper()
 	rows, err := d.Query(`PRAGMA table_info(` + table + `)`)
