@@ -2,59 +2,59 @@
 // of scripts/build-release.sh as required by the D5 codex review
 // rounds 1 + 2:
 //
-//   F1-r0 [P1] (R1)  scripts/build-release.sh must not data-destructively
-//                    delete the repo's `web/` source tree. Two
-//                    protections: (a) early-exit guard rejecting
-//                    OUT_DIR that equals or falls under a dangerous
-//                    source subdir of $ROOT; (b) the destructive
-//                    `rm -rf` is scoped to $OUT_DIR/web/dist.
+//	F1-r0 [P1] (R1)  scripts/build-release.sh must not data-destructively
+//	                 delete the repo's `web/` source tree. Two
+//	                 protections: (a) early-exit guard rejecting
+//	                 OUT_DIR that equals or falls under a dangerous
+//	                 source subdir of $ROOT; (b) the destructive
+//	                 `rm -rf` is scoped to $OUT_DIR/web/dist.
 //
-//   F2-r0 [P2] (R1)  web install must be deterministic — frozen install
-//                    against the committed web/package-lock.json. The
-//                    script must invoke `npm ci` (not `npm install`).
+//	F2-r0 [P2] (R1)  web install must be deterministic — frozen install
+//	                 against the committed web/package-lock.json. The
+//	                 script must invoke `npm ci` (not `npm install`).
 //
-//   F1-r2 [P1] (R2)  The R1 guard overreached by rejecting "every child
-//                    of $ROOT" — the documented default
-//                    `bash scripts/build-release.sh` uses
-//                    OUT_DIR=$ROOT/dist, which is a legitimate
-//                    output location. The guard must allow $ROOT/dist
-//                    and reject only source subdirs (web/,
-//                    scripts/, internal/, cmd/, docs/, schemas/,
-//                    api/, etc.).
+//	F1-r2 [P1] (R2)  The R1 guard overreached by rejecting "every child
+//	                 of $ROOT" — the documented default
+//	                 `bash scripts/build-release.sh` uses
+//	                 OUT_DIR=$ROOT/dist, which is a legitimate
+//	                 output location. The guard must allow $ROOT/dist
+//	                 and reject only source subdirs (web/,
+//	                 scripts/, internal/, cmd/, docs/, schemas/,
+//	                 api/, etc.).
 //
-//   F2-r2 [P1] (R2)  R1's "use npm ci" fix is meaningless if
-//                    web/package-lock.json is excluded by .gitignore
-//                    — a clean checkout / git archive / CI will not
-//                    have the lockfile, and `npm ci` fails
-//                    immediately. The lockfile must be tracked.
+//	F2-r2 [P1] (R2)  R1's "use npm ci" fix is meaningless if
+//	                 web/package-lock.json is excluded by .gitignore
+//	                 — a clean checkout / git archive / CI will not
+//	                 have the lockfile, and `npm ci` fails
+//	                 immediately. The lockfile must be tracked.
 //
-//   F3-r2 [P2] (R2)  The R1 `if [ ! -d $ROOT/web/node_modules ]` guard
-//                    skips `npm ci` when node_modules already
-//                    exists. That means a developer's stale
-//                    node_modules (from a previous `pnpm install` or
-//                    a `latest`-resolved `npm install`) gets
-//                    packaged into the release. `npm ci` must run
-//                    unconditionally.
+//	F3-r2 [P2] (R2)  The R1 `if [ ! -d $ROOT/web/node_modules ]` guard
+//	                 skips `npm ci` when node_modules already
+//	                 exists. That means a developer's stale
+//	                 node_modules (from a previous `pnpm install` or
+//	                 a `latest`-resolved `npm install`) gets
+//	                 packaged into the release. `npm ci` must run
+//	                 unconditionally.
 //
-//   PR23-P2-1 [P2]   The pre-guard `mkdir -p "$OUT_DIR"` runs
-//                    BEFORE the overlap check. When the caller
-//                    points OUT_DIR at a rejected path
-//                    (e.g. $ROOT/web/forbidden), the directory
-//                    is created on disk before the guard
-//                    rejects the run. The guard is supposed
-//                    to be fail-closed; creating rejected
-//                    paths is a side effect that violates
-//                    that contract. Fix: defer `mkdir -p`
-//                    until after the overlap check accepts
-//                    the target.
+//	PR23-P2-1 [P2]   The pre-guard `mkdir -p "$OUT_DIR"` runs
+//	                 BEFORE the overlap check. When the caller
+//	                 points OUT_DIR at a rejected path
+//	                 (e.g. $ROOT/web/forbidden), the directory
+//	                 is created on disk before the guard
+//	                 rejects the run. The guard is supposed
+//	                 to be fail-closed; creating rejected
+//	                 paths is a side effect that violates
+//	                 that contract. Fix: defer `mkdir -p`
+//	                 until after the overlap check accepts
+//	                 the target.
 //
 // Tests in this package exercise the script in two modes:
 //
-//   * **In-isolated-tempdir tests (F1-r0)**: the script is COPIED
+//   - **In-isolated-tempdir tests (F1-r0)**: the script is COPIED
 //     to a fresh tmp workdir so the script's auto-derived $ROOT is
 //     the tmp dir, never the real repo.
 //
-//   * **In-clean-git-archive tests (F2-r2)**: `git archive HEAD` is
+//   - **In-clean-git-archive tests (F2-r2)**: `git archive HEAD` is
 //     extracted to a t.TempDir() so the test sees exactly what a CI
 //     fresh checkout would see. This catches a class of bugs where
 //     the developer's working tree has untracked-but-on-disk state
@@ -68,6 +68,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -394,6 +395,135 @@ func TestBuildReleaseAlwaysRunsNpmCi(t *testing.T) {
 	}
 }
 
+func TestBuildReleaseNpmCiIncludesDevDependencies(t *testing.T) {
+	root := repoRoot(t)
+	b, err := os.ReadFile(filepath.Join(root, "scripts", "build-release.sh"))
+	if err != nil {
+		t.Fatalf("read script: %v", err)
+	}
+	script := stripShellComments(string(b))
+
+	for _, line := range strings.Split(script, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		for i := 0; i+1 < len(fields); i++ {
+			if fields[i] == "npm" && fields[i+1] == "ci" {
+				for _, field := range fields[i+2:] {
+					if field == "--include=dev" {
+						return
+					}
+				}
+				t.Fatalf("scripts/build-release.sh calls npm ci without --include=dev:\n  %s\nNODE_ENV=production would omit Vite/TypeScript dev dependencies.", strings.TrimSpace(line))
+			}
+		}
+	}
+	t.Fatalf("scripts/build-release.sh does not call npm ci")
+}
+
+func TestBuildReleaseFailsEarlyForCGOCrossCompileWithoutCrossCompiler(t *testing.T) {
+	root := t.TempDir()
+	copyMinimumWebTree(t, root)
+	copyMinimumGoModule(t, root)
+	binDir := filepath.Join(root, "fake-bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir fake-bin: %v", err)
+	}
+	logPath := filepath.Join(root, "go-invocations.log")
+	stub := fmt.Sprintf(`#!/usr/bin/env bash
+echo "$@" >> %q
+if [ "$1" = "env" ]; then
+  shift
+  for key in "$@"; do
+    case "$key" in
+      GOHOSTOS) echo %q ;;
+      GOHOSTARCH) echo %q ;;
+      *) echo "" ;;
+    esac
+  done
+  exit 0
+fi
+exit 99
+`, logPath, runtime.GOOS, runtime.GOARCH)
+	if err := os.WriteFile(filepath.Join(binDir, "go"), []byte(stub), 0o755); err != nil {
+		t.Fatalf("write fake go: %v", err)
+	}
+	targetOS, targetArch := nonHostTarget()
+	out, exit := runIsolatedScriptWithRoot(t, root, filepath.Join(root, "dist"),
+		"GOOS="+targetOS,
+		"GOARCH="+targetArch,
+		"CGO_ENABLED=1",
+		"CC=",
+		"CC_FOR_TARGET=",
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+
+	if exit != 2 {
+		t.Fatalf("CGO cross compile without CC/CC_FOR_TARGET should fail early with exit 2, got %d.\nOutput:\n%s", exit, out)
+	}
+	if !strings.Contains(out, "CC_FOR_TARGET") || !strings.Contains(out, "CGO") {
+		t.Fatalf("early failure should explain the missing cross C compiler. Output:\n%s", out)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read go invocation log: %v", err)
+	}
+	if strings.Contains(string(logData), "build") {
+		t.Fatalf("script invoked go build instead of failing before compilation. go log:\n%s\nOutput:\n%s", string(logData), out)
+	}
+}
+
+func TestBuildReleaseMapsCCForTargetToCCForCGOCrossCompile(t *testing.T) {
+	root := t.TempDir()
+	copyMinimumWebTree(t, root)
+	copyMinimumGoModule(t, root)
+	binDir := filepath.Join(root, "fake-bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir fake-bin: %v", err)
+	}
+	logPath := filepath.Join(root, "go-invocations.log")
+	stub := fmt.Sprintf(`#!/usr/bin/env bash
+echo "$@ CC=${CC:-}" >> %q
+if [ "$1" = "env" ]; then
+  shift
+  for key in "$@"; do
+    case "$key" in
+      GOHOSTOS) echo %q ;;
+      GOHOSTARCH) echo %q ;;
+      *) echo "" ;;
+    esac
+  done
+  exit 0
+fi
+exit 0
+`, logPath, runtime.GOOS, runtime.GOARCH)
+	if err := os.WriteFile(filepath.Join(binDir, "go"), []byte(stub), 0o755); err != nil {
+		t.Fatalf("write fake go: %v", err)
+	}
+	targetOS, targetArch := nonHostTarget()
+	out, exit := runIsolatedScriptWithRoot(t, root, filepath.Join(root, "dist"),
+		"GOOS="+targetOS,
+		"GOARCH="+targetArch,
+		"CGO_ENABLED=1",
+		"CC=",
+		"CC_FOR_TARGET=target-gcc",
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+
+	if exit != 0 {
+		t.Fatalf("CGO cross compile with CC_FOR_TARGET should reach go build, got exit %d.\nOutput:\n%s", exit, out)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read go invocation log: %v", err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "build") {
+		t.Fatalf("script did not invoke go build. go log:\n%s\nOutput:\n%s", log, out)
+	}
+	if !strings.Contains(log, "build -trimpath") || !strings.Contains(log, "CC=target-gcc") {
+		t.Fatalf("go build did not receive CC from CC_FOR_TARGET. go log:\n%s\nOutput:\n%s", log, out)
+	}
+}
+
 // F2-r2 — rewritten to use `git archive` so a developer's stray
 // web/package-lock.json on disk cannot mask a missing-in-source
 // lockfile. The test extracts `git archive HEAD` to a t.TempDir()
@@ -476,11 +606,11 @@ func TestBuildReleaseLockfileEnginesCompatibleWithNode18(t *testing.T) {
 	// (one per installed package, keyed by install path).
 	var lockfile struct {
 		Packages map[string]struct {
-			Name      string `json:"name"`
-			Version   string `json:"version"`
-			Engines   any    `json:"engines"`
-			HasBin    any    `json:"hasBin"`
-			Resolved  string `json:"resolved"`
+			Name     string `json:"name"`
+			Version  string `json:"version"`
+			Engines  any    `json:"engines"`
+			HasBin   any    `json:"hasBin"`
+			Resolved string `json:"resolved"`
 		} `json:"packages"`
 	}
 	if err := json.Unmarshal(plData, &lockfile); err != nil {
@@ -490,16 +620,8 @@ func TestBuildReleaseLockfileEnginesCompatibleWithNode18(t *testing.T) {
 		t.Fatalf("web/package-lock.json has no `packages` key; lockfile is malformed")
 	}
 	// The supported Node 18 contract: any `engines.node` field
-	// that appears must be one of:
-	//   - absent (the package has no Node engine constraint)
-	//   - a `>=X` form where X is < 20 (Node 18 is allowed)
-	//   - a `^X.Y.Z` form where the major version is 18 or earlier
-	//   - a multi-clause `A || B` form where every clause meets
-	//     the same rule
-	//
-	// The test only flags a hard exclusion: a clause that starts
-	// at Node 20 or higher. Soft ranges that include Node 18 are
-	// allowed.
+	// that appears must either be absent or include at least one
+	// semver alternative that permits a Node 18 runtime.
 	disallowed := []string{}
 	for installPath, pkg := range lockfile.Packages {
 		// The empty key (installPath == "") is the workspace root
@@ -524,7 +646,7 @@ func TestBuildReleaseLockfileEnginesCompatibleWithNode18(t *testing.T) {
 		}
 	}
 	if len(disallowed) > 0 {
-		t.Fatalf("web/package-lock.json contains %d package(s) whose engines.node excludes Node 18 (the documented supported runtime). R2's `npm install --package-lock-only` resolved to these on a non-Node-18 host:\n  %s\n\nPin the offending top-level deps in web/package.json to Node-18-compatible versions (Vite ^5.4.x, @vitejs/plugin-react ^4.3.x, React 18) and regenerate the lockfile on Node 18, OR bump docs/RELEASE_NOTES.md to declare the new minimum.", len(disallowed), strings.Join(disallowed, "\n  "))
+		t.Fatalf("web/package-lock.json contains %d package(s) whose engines.node excludes Node 18 (the documented supported runtime):\n  %s\n\nPin the offending top-level deps in web/package.json to Node-18-compatible versions (Vite ^5.4.x, @vitejs/plugin-react ^4.3.x, React 18) and regenerate the lockfile on Node 18, OR bump docs/RELEASE_NOTES.md to declare the new minimum.", len(disallowed), strings.Join(disallowed, "\n  "))
 	}
 }
 
@@ -561,64 +683,136 @@ func node18Compatible(constraint string) bool {
 	return false
 }
 
+func TestNode18CompatibleRejectsRangesThatExcludeNode18(t *testing.T) {
+	tests := []struct {
+		constraint string
+		want       bool
+	}{
+		{">=18", true},
+		{"^18.0.0 || >=20.0.0", true},
+		{">=16 <19", true},
+		{"<=16", false},
+		{"<18", false},
+		{">=16 <18", false},
+		{"~20", false},
+		{"20.0.0", false},
+		{"=20.0.0", false},
+		{"^20.19.0 || >=22.12.0", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.constraint, func(t *testing.T) {
+			if got := node18Compatible(tt.constraint); got != tt.want {
+				t.Fatalf("node18Compatible(%q) = %v, want %v", tt.constraint, got, tt.want)
+			}
+		})
+	}
+}
+
 func node18CompatibleClause(clause string) bool {
 	clause = strings.TrimSpace(clause)
 	if clause == "" {
 		return true
 	}
-	// Strip a leading comparator.
+	constraints := nodeEngineConstraintTokens(clause)
+	if len(constraints) == 0 {
+		return true
+	}
+	for _, constraint := range constraints {
+		if !node18ConstraintAllowsNode18(constraint) {
+			return false
+		}
+	}
+	return true
+}
+
+func nodeEngineConstraintTokens(clause string) []string {
+	fields := strings.Fields(clause)
+	tokens := make([]string, 0, len(fields))
+	for i := 0; i < len(fields); i++ {
+		field := fields[i]
+		if isComparatorOnly(field) && i+1 < len(fields) {
+			tokens = append(tokens, field+fields[i+1])
+			i++
+			continue
+		}
+		tokens = append(tokens, field)
+	}
+	return tokens
+}
+
+func isComparatorOnly(s string) bool {
+	switch s {
+	case ">=", "<=", "==", "!=", ">", "<", "=", "^", "~":
+		return true
+	default:
+		return false
+	}
+}
+
+func node18ConstraintAllowsNode18(token string) bool {
+	comparator, major, ok := parseNodeEngineToken(token)
+	if !ok {
+		return true
+	}
+	switch comparator {
+	case "", "=", "==":
+		return major == 18
+	case "!=":
+		return true
+	case ">=", ">":
+		return major <= 18
+	case "<":
+		return major > 18
+	case "<=":
+		return major >= 18
+	case "^", "~":
+		return major == 18
+	default:
+		return true
+	}
+}
+
+func parseNodeEngineToken(token string) (string, int, bool) {
+	token = strings.TrimSpace(token)
 	comparator := ""
-	rest := clause
-	for _, prefix := range []string{">=", "<=", "==", "!=", ">", "<", "^", "~"} {
+	rest := token
+	for _, prefix := range []string{">=", "<=", "==", "!=", ">", "<", "=", "^", "~"} {
 		if strings.HasPrefix(rest, prefix) {
 			comparator = prefix
 			rest = strings.TrimSpace(strings.TrimPrefix(rest, prefix))
 			break
 		}
 	}
-	// The remaining token is a version. We only care about the
-	// major version.
 	if rest == "" {
-		return true
+		return "", 0, false
 	}
-	// Strip a leading `v` if present.
 	if rest[0] == 'v' || rest[0] == 'V' {
 		rest = rest[1:]
 	}
-	// Take the first dotted chunk as the major version.
 	major := ""
 	for _, c := range rest {
-		if c == '.' || c == '-' || c == ' ' {
+		if c == '.' || c == '-' || c == ' ' || c == 'x' || c == 'X' {
 			break
 		}
 		if c < '0' || c > '9' {
-			return true // unparseable: be conservative but allow
+			return "", 0, false
 		}
 		major += string(c)
 	}
 	if major == "" {
-		return true
+		return "", 0, false
 	}
-	// Major < 20 means Node 18 is allowed; the comparator only
-	// matters when it tightens the constraint. The only comparator
-	// that *excludes* Node 18 is a `>` or `>=` whose major is >=20
-	// (Node 18 is below the floor). A bare version like `20.0.0`
-	// is a `=` — allow it (the package would refuse to install
-	// on Node 18, but that's a package-side decision, not an
-	// engine gate; the npm registry treats a bare version as
-	// "equal-or-greater-implied"). To stay aligned with the
-	// R3 finding — which specifically rejects `^20.19.0` and
-	// `>=22.12.0` — we treat the comparison more strictly: any
-	// `>=X` or `^X` where X's major >= 20 fails.
-	switch comparator {
-	case ">=", ">", "^":
-		// Major is the floor or required major. If floor >= 20,
-		// Node 18 is not allowed.
-		if majorInt(major) >= 20 {
-			return false
-		}
+	return comparator, majorInt(major), true
+}
+
+func nonHostTarget() (string, string) {
+	if runtime.GOOS != "linux" {
+		return "linux", runtime.GOARCH
 	}
-	return true
+	if runtime.GOARCH != "arm64" {
+		return runtime.GOOS, "arm64"
+	}
+	return runtime.GOOS, "amd64"
 }
 
 func majorInt(s string) int {

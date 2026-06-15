@@ -12,8 +12,12 @@
 #
 # Usage:
 #   bash scripts/build-release.sh              # build for the host's GOOS/GOARCH
-#   GOOS=darwin GOARCH=arm64 bash scripts/build-release.sh
+#   CC_FOR_TARGET=o64-clang GOOS=darwin GOARCH=amd64 bash scripts/build-release.sh
+#   CC=x86_64-linux-gnu-gcc GOOS=linux GOARCH=amd64 bash scripts/build-release.sh
 #   OUT_DIR=/tmp/release bash scripts/build-release.sh
+#
+# Non-host CGO builds require a cross C compiler via CC_FOR_TARGET or CC.
+# SQLite uses CGO, so the script keeps CGO_ENABLED=1 by default.
 #
 # This script is best-effort: the dashboard build is skipped if `npm` is not on
 # PATH. In that case the Go binary is still produced and the user can drop a
@@ -90,14 +94,34 @@ else
   esac
 fi
 
+CGO_ENABLED_VALUE="${CGO_ENABLED:-1}"
+HOST_GOOS=$(go env GOHOSTOS)
+HOST_GOARCH=$(go env GOHOSTARCH)
+GO_BUILD_CC="${CC:-}"
+if [ "$CGO_ENABLED_VALUE" != "0" ] && { [ "$GOOS_VALUE" != "$HOST_GOOS" ] || [ "$GOARCH_VALUE" != "$HOST_GOARCH" ]; }; then
+  if [ -z "${CC_FOR_TARGET:-}" ] && [ -z "${CC:-}" ]; then
+    echo "[build-release] refusing to run: CGO cross-compile target=${GOOS_VALUE}/${GOARCH_VALUE} from host=${HOST_GOOS}/${HOST_GOARCH} requires CC_FOR_TARGET or CC to point at a target C compiler" >&2
+    echo "[build-release] example: CC_FOR_TARGET=x86_64-linux-gnu-gcc GOOS=linux GOARCH=amd64 bash scripts/build-release.sh" >&2
+    exit 2
+  fi
+  if [ -z "$GO_BUILD_CC" ] && [ -n "${CC_FOR_TARGET:-}" ]; then
+    GO_BUILD_CC="$CC_FOR_TARGET"
+  fi
+fi
+
 # The overlap guard has accepted OUT_DIR. Only NOW is it safe to
 # create the directory on disk. (D5 codex review PR23-P2-1.)
 mkdir -p "$OUT_DIR"
 
 echo "[build-release] target=${GOOS_VALUE}/${GOARCH_VALUE}"
 echo "[build-release] go build -> $BIN_PATH"
-GOOS="$GOOS_VALUE" GOARCH="$GOARCH_VALUE" CGO_ENABLED="${CGO_ENABLED:-1}" \
-  go build -trimpath -o "$BIN_PATH" ./cmd/symphony
+if [ -n "$GO_BUILD_CC" ]; then
+  CC="$GO_BUILD_CC" GOOS="$GOOS_VALUE" GOARCH="$GOARCH_VALUE" CGO_ENABLED="$CGO_ENABLED_VALUE" \
+    go build -trimpath -o "$BIN_PATH" ./cmd/symphony
+else
+  GOOS="$GOOS_VALUE" GOARCH="$GOARCH_VALUE" CGO_ENABLED="$CGO_ENABLED_VALUE" \
+    go build -trimpath -o "$BIN_PATH" ./cmd/symphony
+fi
 
 if [ "${SKIP_WEB:-0}" = "1" ]; then
   echo "[build-release] SKIP_WEB=1 set, skipping dashboard build"
@@ -110,7 +134,7 @@ else
     # `pnpm install` or a `latest`-resolved `npm install`) would
     # otherwise get packaged into the release. (D5 codex review
     # F3-r2 [P2].)
-    (cd "$ROOT/web" && npm ci --no-audit --no-fund)
+    (cd "$ROOT/web" && npm ci --include=dev --no-audit --no-fund)
     (cd "$ROOT/web" && npm run build)
     # Only clean the script's own $OUT_DIR/web/dist target. A blanket
     # `rm -rf "$OUT_DIR/web"` would erase unrelated user data the

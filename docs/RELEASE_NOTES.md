@@ -29,11 +29,12 @@ bash scripts/build-release.sh
 ```
 
 Cross-compile (note: CGO must remain enabled because the SQLite binding is
-CGO-based):
+CGO-based, so non-host targets require a target C compiler via
+`CC_FOR_TARGET` or `CC`):
 
 ```bash
-GOOS=darwin GOARCH=arm64 bash scripts/build-release.sh
-GOOS=linux  GOARCH=amd64 bash scripts/build-release.sh
+CC_FOR_TARGET=o64-clang GOOS=darwin GOARCH=amd64 bash scripts/build-release.sh
+CC=x86_64-linux-gnu-gcc GOOS=linux GOARCH=amd64 bash scripts/build-release.sh
 ```
 
 ## 2. Supported platforms
@@ -80,7 +81,7 @@ platform. Real Windows support is explicitly out of scope for v1.1 WIP.
 | Git                    | 2.30+            | Used for worktree, branch, and diff generation. |
 | Python (validate_contracts) | 3.10+        | Required only for `scripts/validate_contracts.py`. |
 | Node.js (web build)    | 18+ (LTS)        | Required only to produce `web/dist/`. The prebuilt `web/dist` shipped under `dist/web/dist/` needs no Node at runtime. |
-| npm                    | bundled          | The web build does not pin pnpm in CI; the lockfile uses pnpm but `npm install && npm run build` works equivalently. |
+| npm                    | bundled          | The web build uses the committed `web/package-lock.json` with `npm ci --include=dev`, then `npm run build`. |
 | Codex CLI              | not required     | Real Codex integration is fixture-gated and is off by default. See §6. |
 
 ## 4. Release-blocking checklist
