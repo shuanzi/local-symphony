@@ -4,11 +4,11 @@
 
 | 类别 | 标记 | 触发方式 | 涉及段 |
 |---|---|---|---|
-| **fake acceptance** | `[fake]` | 默认 CI / `bash scripts/acceptance-local.sh` / `go test ./internal/...` | A0 / A0a / A0b / A1 / A2 / A3 / A3a / A4 / A4a / A4a.1 / A4b / A5 / A6 / A7 / A9 / A9a |
+| **fake acceptance** | `[fake]` | 默认 CI / `go test ./internal/...`；`bash scripts/acceptance-local.sh` 只覆盖本地构建 + daemon-backed A1/A2/A9 主路径冒烟 | A0 / A0a / A0b / A1 / A2 / A3 / A3a / A4 / A4a / A4a.1 / A4b / A5 / A6 / A7 / A9 / A9a |
 | **安全回归** | `[security-regression]` | 默认 CI / `go test ./internal/security ./internal/observability` | A8 |
 | **real Codex opt-in acceptance** | `[real-codex-opt-in]` | 显式 `SYMPHONY_TEST_CODEX=1` | A10 |
 
-`[fake]` 与 `[security-regression]` 不依赖本机真实 Codex；`[real-codex-opt-in]` 必须 fixture 齐备且显式 opt-in，否则按 `unsupported_codex_version` 失败（fail-closed）。详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
+`[fake]` 与 `[security-regression]` 不依赖本机真实 Codex；`acceptance-local.sh` 是本地主路径 smoke，不运行 A0-A9a 的全部 fake rejection matrix；`[real-codex-opt-in]` 必须 fixture 齐备且显式 opt-in，否则按 `unsupported_codex_version` 失败（fail-closed）。详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
 
 ---
 

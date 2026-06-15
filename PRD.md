@@ -271,7 +271,7 @@ Codex Runner 使用 `codex app-server`。v1 要求 Codex adapter 是 version-fix
 
 真实 Codex adapter 是 v1 release scope，但真实 Codex 兼容性必须通过 committed fixture gate 进入；没有匹配 fixture 的本机 Codex 版本只阻断 real Codex dispatch，不影响 fake runner 主路径和默认 CI。默认测试使用 fake runner。Real Codex tests 只在显式设置 `SYMPHONY_TEST_CODEX=1` 时运行。
 
-> **阶段 D 收口状态（2026-06-09）**：D3 / R14 codex availability diagnostics 已 ship——`symphony status` / `/api/v1/state` / `/api/v1/diagnostics` 现在会暴露本机 Codex 可用性（installed / available / unsupported_version / not_installed 等 reason），5 轮 codex review 0 finding 收口。Real Codex dispatch 在 fixtures 缺失时 fail-closed with `unsupported_codex_version`。D5 / R13 release layout 已 ship（主体 + R1 修复 + R2 修复 commit 均落地；R2 review 文档待生成）。详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
+> **阶段 D 收口状态（2026-06-09）**：D3 / R14 codex availability diagnostics 已 ship 到 diagnostics surface——`symphony diagnostics` / `GET /api/v1/diagnostics` 暴露 `codex.available`、`codex.version` 与 `codex.support.{cli,model,sandbox}`。当前 diagnostics contract 不包含 Codex `reason` / `status` 字段；`symphony status` 与 `GET /api/v1/state` 不承诺合成或暴露 Codex availability/reason。Real Codex dispatch 在 fixtures 缺失时 fail-closed with `unsupported_codex_version`。D5 / R13 release layout 已 ship（主体 + R1 修复 + R2 修复 commit 均落地；R2 review 文档待生成）。详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
 
 ### 8.5 WORKFLOW.md 与 Prompt
 
@@ -521,7 +521,7 @@ CLI 全局 flags 至少包括 `--project <path>`、`--api-url <url>`、`--json`�
 
 CLI exit codes 必须采用 TECH_SPEC 11.1 的 0-9 映射；尤其 daemon/gateway unavailable 为 3，auth failure 为 4，permission/policy denial 为 5，not found 为 6，state conflict 为 7，timeout 为 8，workflow/config error 为 9；API `error.code=approval_not_pending` 必须映射为 7。
 
-`symphony status` 使用 `/api/v1/state` 输出与 Overview 对齐的 concise project/daemon/workflow/run/approval/review/paused/Codex/failure 状态；daemon 不可用时只能降级到 `/health` 可用性信息或报错。
+`symphony status` 使用 `/api/v1/state` 输出与 Overview 对齐的 concise project/daemon/workflow/run/approval/review/paused/failure 状态；daemon 不可用时只能降级到 `/health` 可用性信息或报错。Codex availability 与 support projection 属于 diagnostics contract，必须通过 `symphony diagnostics` / `GET /api/v1/diagnostics` 获取，`status` / `state` 不合成 Codex reason 字段。
 
 正常 CLI 是 operator 工具，走 REST API。`symphony tool ...` 是 agent 工具入口，走 Tool Gateway 本地传输，不走 REST `/api/v1`；transport 可为 Unix socket、named pipe 或 loopback HTTP，具体以 TECH_SPEC 为准，并且必须 JSON-only 输出。
 

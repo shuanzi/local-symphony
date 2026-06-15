@@ -6,7 +6,7 @@ Local Symphony 是一个基于 OpenAI Symphony 项目思想改造的本地优先
 
 阶段 D 收口状态（2026-06-09，详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`）：
 
-- **D1 / R10** review packet 结构化投影已 ship；R1 修复落地；R2 review 跑中（2 P2 forwarding）。
+- **D1 / R10** review packet 结构化投影已 ship；R1 修复落地；R2 review 跑中（1 P2 forwarding）。
 - **D3 / R14** codex availability diagnostics 已 ship（5 轮 codex review 0 finding 收口）。
 - **D5 / R13** release packaging 已 ship（主体 + R1 修复 + R2 修复 commit 均落地；R2 review 文档待生成）。
 - **D4 / R16** Rework prompt 上下文产品化准备中；**D2 / R11** Dashboard 产品化补齐准备中。
@@ -530,7 +530,7 @@ localhost
 
 ### 真实 Codex 不运行
 
-这是 v1 的预期行为。当前真实 Codex adapter 是 fixture-gated skeleton；默认测试与验收使用 fake runner。**D3 / R14** codex availability diagnostics 已 ship：`symphony diagnostics` / `/api/v1/diagnostics` 现在会暴露本机 Codex 可用性（installed / available / unsupported_version / not_installed 等 reason），未配置支持 fixture 的版本在启动真实 `codex app-server` 进程前以 `unsupported_codex_version` 失败。Real Codex integration test 仍只通过 `SYMPHONY_TEST_CODEX=1` 显式开启。
+这是 v1 的预期行为。当前真实 Codex adapter 是 fixture-gated skeleton；默认测试与验收使用 fake runner。**D3 / R14** codex availability diagnostics 已 ship 到 diagnostics surface：`symphony diagnostics` / `/api/v1/diagnostics` 暴露 `codex.available`、`codex.version` 与 `codex.support.{cli,model,sandbox}`。当前 diagnostics contract 不包含 Codex `reason` / `status` 字段；`symphony status` 与 `/api/v1/state` 不承诺合成或暴露 Codex availability/reason。未配置支持 fixture 的版本在启动真实 `codex app-server` 进程前以 `unsupported_codex_version` 失败。Real Codex integration test 仍只通过 `SYMPHONY_TEST_CODEX=1` 显式开启。
 
 ## 15. 清理本地数据
 

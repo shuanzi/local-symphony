@@ -468,9 +468,6 @@ components:
         paused_issues:
           type: array
           items: { type: object, additionalProperties: true }
-        codex:
-          type: object
-          additionalProperties: true
         recent_failures:
           type: array
           items: { type: object, additionalProperties: true }
