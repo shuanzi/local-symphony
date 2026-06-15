@@ -655,16 +655,13 @@ func TestIsSyntheticSentinelStringDistinguishesVersionAndSentinel(t *testing.T) 
 		// correctly rejects them.
 		{value: "protocol-SYNTHETIC_PROMPT_BODY-v1", sentinel: true},
 		{value: "schema-SYNTHETIC_CODEX_LOG-2024", sentinel: true},
-		// Embedded sentinels whose trailing `_xxx` suffix
-		// contains lowercase letters are NOT detected —
-		// the word-boundary regex requires the sentinel
-		// body to be a continuous run of [A-Z0-9_], and
-		// the contract validator's identical regex agrees.
-		// Operators / fixture authors who plant a poisoned
-		// value should follow the same convention as the
-		// rest of the codebase: upper-snake-case body.
-		{value: "v1.0.0+SYNTHETIC_OWNER_NONCE_xxx", sentinel: false},
-		{value: "SYNTHETIC_PROMPT_BODY_do_not_leak", sentinel: false},
+		// Lowercase-suffixed repo sentinel fixture values
+		// must also be detected. These can otherwise poison
+		// scalar compatibility metadata and echo through
+		// diagnostics / state / status.
+		{value: "v1.0.0+SYNTHETIC_OWNER_NONCE_xxx", sentinel: true},
+		{value: "SYNTHETIC_PROMPT_BODY_do_not_leak", sentinel: true},
+		{value: "SYNTHETIC_PROMPT_BODY_do_not_leak_in_diagnostics", sentinel: true},
 		// Bare prefix is not a sentinel.
 		{value: "SYNTHETIC_", sentinel: false},
 		// Lowercase prefix is not a sentinel.
@@ -688,6 +685,55 @@ func TestIsSyntheticSentinelStringDistinguishesVersionAndSentinel(t *testing.T) 
 // preflight must surface
 // `ReasonMetadataProtoSentinel`, and the diagnostics envelope
 // must never see the sentinel.
+
+func TestValidateCompatibilityMetadataRejectsLowercaseSuffixedScalarSentinels(t *testing.T) {
+	base := CompatibilityMetadata{
+		CodexVersion:           "1.2.3",
+		ProtocolVersion:        "protocol-v1",
+		SchemaVersion:          "schema-v1",
+		SupportedNotifications: []string{"handoff"},
+		SupportedRequests:      []string{"initialize"},
+	}
+	cases := []struct {
+		name    string
+		version string
+		mutate  func(*CompatibilityMetadata)
+	}{
+		{
+			name: "protocol_version",
+			mutate: func(metadata *CompatibilityMetadata) {
+				metadata.ProtocolVersion = syntheticPromptBody
+			},
+		},
+		{
+			name: "schema_version",
+			mutate: func(metadata *CompatibilityMetadata) {
+				metadata.SchemaVersion = syntheticPromptBody
+			},
+		},
+		{
+			name:    "codex_version",
+			version: syntheticPromptBody,
+			mutate: func(metadata *CompatibilityMetadata) {
+				metadata.CodexVersion = syntheticPromptBody
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			metadata := base
+			version := tc.version
+			if version == "" {
+				version = base.CodexVersion
+			}
+			tc.mutate(&metadata)
+			if err := validateCompatibilityMetadata(version, metadata); err == nil {
+				t.Fatalf("validateCompatibilityMetadata accepted lowercase-suffixed sentinel in %s", tc.name)
+			}
+		})
+	}
+}
+
 func TestRunPreflightRejectsSentinelShapedProtocolVersion(t *testing.T) {
 	root := t.TempDir()
 	version := "9.9.9-poison"
@@ -1200,6 +1246,7 @@ func TestVerifyEmbeddedSentinelTeamLeadRepro(t *testing.T) {
 		{value: "vSYNTHETIC_OWNER_NONCE", sentinel: true},
 		{value: "protocol_SYNTHETIC_PROMPT_BODY", sentinel: true},
 		{value: "schema_SYNTHETIC_API_SECRET", sentinel: true},
+		{value: "SYNTHETIC_PROMPT_BODY_do_not_leak_in_diagnostics", sentinel: true},
 		{value: "protocol-test-v1", sentinel: false},
 		{value: "1.2.3", sentinel: false},
 	}

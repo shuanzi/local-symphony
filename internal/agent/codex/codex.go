@@ -1882,92 +1882,28 @@ func validateCompatibilityMetadata(version string, metadata CompatibilityMetadat
 // scalar fields are operator-visible strings that surface in
 // the dashboard's "Codex" card.
 //
-// The detector is intentionally narrow: a string is a sentinel
-// only when it has the `SYNTHETIC_` prefix and the remainder
-// consists entirely of uppercase letters, digits, or
-// underscores. Plain version strings ("1.2.3", "v1.2.3",
-// "protocol-test-v1", "schema-2024-01") never match.
-// syntheticSentinelBody + the manual prefix / suffix
-// checks together mirror the SYNTHETIC_SENTINEL_RE
-// regex in scripts/validate_contracts.py
-// (r"\bSYNTHETIC_[A-Z0-9_]+\b") for the case the
-// contract validator cares about (test golden fixture
-// redaction), with the round-5 widening that an
-// underscore or lowercase letter BEFORE the `S` is also
-// a valid boundary. The contract validator's regex is
-// not the runtime gate's source of truth: the validator
-// runs over test fixture files, the gate runs over
-// operator-supplied runtime fixtures, and the two
-// surfaces have different threat models.
-//
-// Round-3 fix: the previous hand-written detector required
-// the string to START with `SYNTHETIC_`, which missed
-// embedded matches like `protocol-SYNTHETIC_PROMPT_BODY-v1`.
-// The word-boundary regex matches the sentinel anywhere in
-// the value as long as it is bounded by non-identifier
-// characters (or the start/end of the string).
-//
-// Round-5 fix (PR #24 review, F3): the previous `\b` regex
-// only fires on a non-word / word transition. The `_`
-// character is a word character, so a sentinel preceded by
-// an underscore (e.g. `protocol_SYNTHETIC_PROMPT_BODY`,
-// `schema_SYNTHETIC_API_SECRET`) was NOT detected. A
-// poisoned fixture can plant raw prompt / raw Codex log /
-// raw secret content in a scalar metadata field (the
-// version identifiers) using snake_case prefixes; the
-// detector has to flag those. The fix narrows the prefix
-// boundary to "the character immediately before the `S` is
-// either start-of-string or NOT in `[A-Z0-9]`". This adds
-// `_` and lowercase letters to the unsafe boundary set on
-// the prefix side (and start-of-string is always
-// acceptable) while preserving the suffix rule: the
-// sentinel body — greedily extended to include any
-// trailing underscores — must be terminated by a non-word
-// character so trailing-lowercase sentinels like
-// `SYNTHETIC_PROMPT_BODY_do_not_leak` and
-// `v1.0.0+SYNTHETIC_OWNER_NONCE_xxx` (which the round-1
-// detector correctly rejected) keep their
-// `sentinel: false` classification. Go's regexp engine
-// does not support lookbehind, so the prefix check is
-// done manually via `syntheticSentinelBody` (the body
-// regex) + `isSafePrefixChar` (the prefix check) and the
-// suffix is the standard `\b` semantics.
-var syntheticSentinelBody = regexp.MustCompile(`SYNTHETIC_[A-Z0-9_]+`)
-
-// isSyntheticSentinelString reports whether s carries a
-// synthetic-sentinel-shaped substring. The detector is the
-// regex `syntheticSentinelBody` (see above) applied to the
-// whole value, with a manual prefix / suffix boundary
-// check. The shape detector runs at the
-// compatibility-metadata gate so a poisoned fixture that
-// plants raw prompt / raw Codex log / raw secret content
-// into a version identifier (protocol_version /
-// schema_version / codex_version) is rejected before the
-// preflight success path could echo it back through
-// diagnostics / `symphony status`.
-//
 // The detector is intentionally narrow: a string is a
 // sentinel only when it contains the `SYNTHETIC_` prefix
-// followed by one or more uppercase letters / digits /
-// underscores, with an unsafe boundary on either side.
+// followed by one or more uppercase / digit segments joined by
+// single underscores, with an unsafe boundary on either side.
 // "Unsafe" means the character before the `S` is either
 // start-of-string or NOT in `[A-Z0-9]` (this is the
 // round-5 widening: an underscore or a lowercase letter
 // before the `S` is now treated as a boundary), and the
-// character after the body is either end-of-string or NOT
-// in `[A-Z0-9_]`. Plain version strings ("1.2.3",
+// character after the body is either end-of-string or not an
+// uppercase/digit continuation. Lowercase suffixes such as
+// "SYNTHETIC_PROMPT_BODY_do_not_leak" are therefore rejected
+// as synthetic sentinels instead of being treated as benign
+// version identifiers. Plain version strings ("1.2.3",
 // "v1.2.3", "protocol-test-v1", "schema-2024-01") never
-// match. Trailing-lowercase sentinels like
-// "SYNTHETIC_PROMPT_BODY_do_not_leak" (whose body
-// `SYNTHETIC_PROMPT_BODY` is followed by a `_`, which
-// IS in `[A-Z0-9_]`) keep their `sentinel: false`
-// classification. The contract validator's
-// `SYNTHETIC_SENTINEL_RE` in `scripts/validate_contracts.py`
-// is a separate helper; it tests the
-// redaction-golden-fixture surface (test input files), not
-// runtime fixture compatibility, so the runtime gate can
-// be strictly more permissive than the golden-fixture
-// validator without breaking round-trip semantics.
+// match. The contract validator's `SYNTHETIC_SENTINEL_RE` in
+// `scripts/validate_contracts.py` is a separate helper; it
+// tests the redaction-golden-fixture surface (test input
+// files), not runtime fixture compatibility, so the runtime
+// gate can be stricter than the golden-fixture validator
+// without breaking round-trip semantics.
+var syntheticSentinelBody = regexp.MustCompile(`SYNTHETIC_[A-Z0-9]+(?:_[A-Z0-9]+)*`)
+
 func isSyntheticSentinelString(s string) bool {
 	if !strings.Contains(s, "SYNTHETIC_") {
 		return false
@@ -1996,27 +1932,15 @@ func isSyntheticSentinelString(s string) bool {
 			// treat as part of a longer identifier.
 			continue
 		}
-		// Suffix check (round-3 semantics preserved):
-		// the body — greedily extended to include any
-		// trailing underscores — must be terminated
-		// by a non-word character (or end-of-string).
-		// This is the `\b` after the body. The
-		// trailing-lowercase cases keep their
-		// `sentinel: false` classification:
-		//   - `SYNTHETIC_PROMPT_BODY_do_not_leak`:
-		//     body greedily extends to
-		//     `SYNTHETIC_PROMPT_BODY_` (including
-		//     the trailing `_`); the next char `d`
-		//     is a word char, so `\b` does not
-		//     match.
-		//   - `v1.0.0+SYNTHETIC_OWNER_NONCE_xxx`:
-		//     body greedily extends to
-		//     `SYNTHETIC_OWNER_NONCE_` (including
-		//     the trailing `_`); the next char `x`
-		//     is a word char, so `\b` does not
-		//     match.
-		if end < len(s) && isWordChar(s[end]) {
-			// Trailing word char: not a boundary.
+		// Suffix check: reject only uppercase/digit
+		// continuations as part of a longer synthetic
+		// identifier. Lowercase suffixes (including the
+		// repo's sentinel fixtures such as
+		// `SYNTHETIC_PROMPT_BODY_do_not_leak`) are
+		// still treated as poisoned synthetic values so
+		// scalar metadata cannot echo them through
+		// diagnostics.
+		if hasSafeSuffixContinuation(s, end) {
 			continue
 		}
 		return true
@@ -2036,14 +1960,21 @@ func isSafePrefixChar(c byte) bool {
 	return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
-// isWordChar reports whether c is an ASCII word
-// character (`[A-Za-z0-9_]`). The suffix boundary is a
-// non-word character; trailing underscores extend the
-// sentinel body greedily, so a trailing-lowercase
-// sentinel like `SYNTHETIC_PROMPT_BODY_do_not_leak`
-// keeps its `sentinel: false` classification.
-func isWordChar(c byte) bool {
-	return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+// hasSafeSuffixContinuation reports whether the character
+// after a matched sentinel body makes it part of a longer
+// all-uppercase synthetic identifier rather than a standalone
+// sentinel. Lowercase suffixes are intentionally not safe:
+// existing poison fixtures use values such as
+// `SYNTHETIC_PROMPT_BODY_do_not_leak_in_diagnostics`.
+func hasSafeSuffixContinuation(s string, end int) bool {
+	if end >= len(s) {
+		return false
+	}
+	c := s[end]
+	if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+		return true
+	}
+	return c == '_' && end+1 < len(s) && ((s[end+1] >= 'A' && s[end+1] <= 'Z') || (s[end+1] >= '0' && s[end+1] <= '9'))
 }
 
 func defaultFixtureRoot() string {
