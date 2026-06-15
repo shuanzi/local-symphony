@@ -1,6 +1,8 @@
 package review
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -12,7 +14,101 @@ import (
 	"local-symphony/internal/store"
 )
 
+func sha256Hex(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+func mustReviewPacketIDForRun(t *testing.T, st *store.Store, runID string) string {
+	t.Helper()
+	row, err := st.Project.QueryOne(`SELECT id FROM review_packets WHERE run_id=? ORDER BY packet_no DESC LIMIT 1`, runID)
+	if err != nil {
+		t.Fatalf("query review packet: %v", err)
+	}
+	return row["id"].String()
+}
+
 const testMaxUntrackedPatchBytes int64 = 1024 * 1024
+
+// TestReviewArtifactMetadataMatchesPostRewrite verifies that the
+// artifacts row stamped for review.json reports size and SHA256 of
+// the *final* on-disk contents (i.e. after the safe_summary post-
+// rewrite). The previous implementation hashed and inserted the
+// review.json metadata before the post-transaction safe_summary
+// rewrite, leaving the artifact row out of sync with the file the
+// next operator (or the follow-on Rework injector) reads.
+func TestReviewArtifactMetadataMatchesPostRewrite(t *testing.T) {
+	st := newReviewTestStore(t)
+	issue, run := prepareReviewRun(t, st)
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	reviewJSONPath := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID, "review.json")
+	contents, err := os.ReadFile(reviewJSONPath)
+	if err != nil {
+		t.Fatalf("read review.json: %v", err)
+	}
+	wantSHA := sha256Hex(contents)
+	wantSize := int64(len(contents))
+
+	arts, err := st.ArtifactsForReview(mustReviewPacketIDForRun(t, st, run.ID))
+	if err != nil {
+		t.Fatalf("ArtifactsForReview: %v", err)
+	}
+	var reviewJSONArt *store.ArtifactRecord
+	for _, a := range arts {
+		if a.Kind == "review_packet" && a.Path == reviewJSONPath {
+			reviewJSONArt = a
+			break
+		}
+	}
+	if reviewJSONArt == nil {
+		t.Fatalf("review.json artifact row not found among %d artifacts", len(arts))
+	}
+	if reviewJSONArt.SHA256 == nil || *reviewJSONArt.SHA256 != wantSHA {
+		t.Fatalf("review.json artifact SHA = %v, want %s (artifact metadata out of sync with on-disk file)", reviewJSONArt.SHA256, wantSHA)
+	}
+	if reviewJSONArt.SizeBytes != wantSize {
+		t.Fatalf("review.json artifact size = %d, want %d (artifact metadata out of sync with on-disk file)", reviewJSONArt.SizeBytes, wantSize)
+	}
+}
+
+// TestSafeSummaryAllowsSecretPathAsChangedFile verifies that
+// legitimate file paths such as "internal/secrets/store.go" are not
+// rejected by the raw-artifact refusal-kind scan. The previous
+// substring-match implementation had a token like "secrets" in the
+// blocklist, which collided with the path "secrets/" in the
+// ChangedFiles field of the safe summary. The blocklist must
+// respect token boundaries (so the substring "secrets" embedded in
+// a path segment is OK as long as it is not a stand-alone marker).
+// PR #27 / D4 F5.
+func TestSafeSummaryAllowsSecretPathAsChangedFile(t *testing.T) {
+	s := &SafeSummary{
+		ReviewPacketID:   "rp_1",
+		PacketNo:         1,
+		RunID:            "run_1",
+		SourceIssueState: string(core.StateReady),
+		Status:           "generated",
+		Summary:          "Refactored the credential storage helper.",
+		Acceptance:       []string{"acceptance-1"},
+		Tests:            []string{"go test ./..."},
+		Risks:            []string{"none"},
+		Verification:     []string{"manual smoke"},
+		ChangedFiles:     []string{"internal/secrets/store.go"},
+		HowToContinue:    "Use Send to Rework with a reason, or Mark Done with an acceptance reason.",
+	}
+	if err := s.Seal(); err != nil {
+		t.Fatalf("Seal rejected legitimate path: %v", err)
+	}
+	md, err := s.ToMarkdown()
+	if err != nil {
+		t.Fatalf("ToMarkdown: %v", err)
+	}
+	if !strings.Contains(md, "internal/secrets/store.go") {
+		t.Fatalf("markdown dropped legitimate path: %s", md)
+	}
+}
 
 func TestGenerateReturnsErrorAndDoesNotInsertPacketWhenReviewArtifactWriteFails(t *testing.T) {
 	st := newReviewTestStore(t)
@@ -48,6 +144,43 @@ func TestGenerateInsertsReviewPacketWithinOuterTransaction(t *testing.T) {
 	}
 	if got.LatestReviewPacketID == nil || *got.LatestReviewPacketID != packetID {
 		t.Fatalf("LatestReviewPacketID = %v, want %s", got.LatestReviewPacketID, packetID)
+	}
+}
+
+func TestGenerateUpdatesExistingPromptSnapshotContextHash(t *testing.T) {
+	st := newReviewTestStore(t)
+	issue, run := prepareReviewRun(t, st)
+	wfID, err := st.CreateWorkflowSnapshot("valid", filepath.Join(st.RepoRoot, "WORKFLOW.md"), `{}`, "prompt-hash", "[]")
+	if err != nil {
+		t.Fatalf("CreateWorkflowSnapshot: %v", err)
+	}
+	if err := st.AttachWorkflowSnapshot(run.ID, wfID); err != nil {
+		t.Fatalf("AttachWorkflowSnapshot: %v", err)
+	}
+	root := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID)
+	if _, err := st.CreatePromptSnapshot(run.ID, wfID, "stale-context-hash", "rendered-hash", root); err != nil {
+		t.Fatalf("CreatePromptSnapshot: %v", err)
+	}
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	ctx := map[string]any{"issue_identifier": issue.Identifier, "run_id": run.ID}
+	cb, err := json.MarshalIndent(ctx, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal expected prompt context: %v", err)
+	}
+	wantHash := sha256Hex(cb)
+	row, err := st.Project.QueryOne(`SELECT context_hash, redacted_prompt_path FROM prompt_snapshots WHERE run_id=?`, run.ID)
+	if err != nil {
+		t.Fatalf("query prompt snapshot: %v", err)
+	}
+	if got := row["context_hash"].String(); got != wantHash {
+		t.Fatalf("context_hash = %q, want %q", got, wantHash)
+	}
+	if got := row["redacted_prompt_path"].String(); got != filepath.Join(root, "prompt/rendered_prompt.redacted.md") {
+		t.Fatalf("redacted_prompt_path = %q, want rendered prompt path", got)
 	}
 }
 

@@ -142,7 +142,7 @@ CREATE TABLE IF NOT EXISTS run_attempts (
   workspace_id TEXT,
   workflow_snapshot_id TEXT,
   status TEXT NOT NULL CHECK (status IN ('pending','preparing_workspace','rendering_prompt','starting_agent','running','completed','completed_without_handoff','failed','cancelled')),
-  dispatch_reason TEXT NOT NULL DEFAULT 'manual' CHECK (dispatch_reason IN ('manual','scheduler','manual_recovery')),
+  dispatch_reason TEXT NOT NULL DEFAULT 'manual' CHECK (dispatch_reason IN ('manual','scheduler','manual_recovery','manual_rework')),
   source_issue_state TEXT NOT NULL CHECK (source_issue_state IN ('Ready','Rework')),
   runner_kind TEXT NOT NULL CHECK (runner_kind IN ('fake','codex')),
   base_ref_config TEXT,
@@ -331,3 +331,34 @@ CREATE TABLE IF NOT EXISTS review_packets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_packets_issue_packet ON review_packets(issue_id, packet_no DESC);
+
+-- D4 / R16: rework snapshot ties the prompt snapshot to the previous
+-- review packet that triggered the rework dispatch. base_sha and
+-- cumulative_diff_sha are stable references for the cumulative diff
+-- semantic (rework preserves the original base_sha and accumulates
+-- diff across iterations). prompt_hash is the SHA256 of the rendered
+-- prompt (after redaction) and is used by diagnostics to correlate
+-- the prompt that was actually sent to the agent.
+CREATE TABLE IF NOT EXISTS rework_snapshots (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL UNIQUE,
+  issue_id TEXT NOT NULL,
+  prompt_snapshot_id TEXT,
+  previous_run_id TEXT,
+  review_packet_id TEXT,
+  base_ref TEXT,
+  base_sha TEXT,
+  cumulative_diff_sha TEXT,
+  prompt_hash TEXT NOT NULL,
+  review_reason TEXT NOT NULL,
+  safe_summary_sha256 TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES run_attempts(id) ON DELETE CASCADE,
+  FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+  FOREIGN KEY(prompt_snapshot_id) REFERENCES prompt_snapshots(id) ON DELETE SET NULL,
+  FOREIGN KEY(previous_run_id) REFERENCES run_attempts(id) ON DELETE SET NULL,
+  FOREIGN KEY(review_packet_id) REFERENCES review_packets(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rework_snapshots_issue_created ON rework_snapshots(issue_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rework_snapshots_review_packet ON rework_snapshots(review_packet_id);

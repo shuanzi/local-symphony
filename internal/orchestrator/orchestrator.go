@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -158,9 +159,69 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, err.Error(), core.RunFailed)
 		return nil
 	}
-	ph := sha256.Sum256([]byte(prompt))
-	ch := sha256.Sum256([]byte(issue.ID + runID))
-	_, _ = o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), filepath.Join(o.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, runID))
+	promptRoot := filepath.Join(o.Store.RepoRoot, ".symphony", "artifacts", issue.Identifier, runID)
+	promptDir := filepath.Join(promptRoot, "prompt")
+	if err := os.MkdirAll(promptDir, 0o755); err != nil {
+		_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("create prompt dir: %v", err), core.RunFailed)
+		return nil
+	}
+	// D4 / R16: when this run was dispatched as a Rework, fetch the
+	// previous review reason and safe summary, and stamp them into
+	// the rendered prompt + a rework_snapshots row. The prompt
+	// snapshot hash reflects the *post-injection* prompt so
+	// diagnostics can correlate what was actually sent to the agent
+	// with the prior review packet.
+	if run.SourceIssueState == core.StateRework {
+		prompt, promptHash, reworkRec, reworkErr := o.injectReworkContext(issue, run, prompt)
+		if reworkErr != nil {
+			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("rework context: %v", reworkErr), core.RunFailed)
+			return nil
+		}
+		// Write a metadata-only redacted artifact (NOT the raw
+		// rendered prompt). PR #27 / D4 F2: the previous
+		// implementation wrote "[redacted]\n" + the full rendered
+		// prompt body, violating the raw-prompt logging boundary
+		// (rendered prompts can echo issue description + workflow
+		// prompt). When a Rework run failed before the review
+		// packet was generated, the file stayed on disk for the
+		// next operator — and the review packet generator never
+		// overwrites this dedicated rework artifact.
+		promptLen := len(prompt)
+		promptHashBytes := sha256.Sum256([]byte(prompt))
+		promptHashHex := hex.EncodeToString(promptHashBytes[:])
+		redactedMeta := fmt.Sprintf("# redacted\n\nThe rendered rework prompt is not persisted to disk in raw form.\n\n- redaction: metadata-only\n- prompt_length_bytes: %d\n- prompt_sha256: %s\n- review_reason_redacted: false (see rework_snapshots row)\n", promptLen, promptHashHex)
+		if err := os.WriteFile(filepath.Join(promptDir, "rework_prompt.redacted.md"), []byte(redactedMeta), 0o644); err != nil {
+			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("write redacted rework prompt: %v", err), core.RunFailed)
+			return nil
+		}
+		if err := os.WriteFile(filepath.Join(promptDir, "rendered_prompt.redacted.md"), []byte(redactedMeta), 0o644); err != nil {
+			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("write redacted rendered prompt: %v", err), core.RunFailed)
+			return nil
+		}
+		// ph now refers to the hash of the prompt *with* rework
+		// injection; this is what the agent will actually see.
+		ph := sha256.Sum256([]byte(prompt))
+		ch := sha256.Sum256([]byte(issue.ID + runID))
+		psID, psErr := o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), promptRoot)
+		if psErr == nil && psID != "" {
+			reworkRec.PromptSnapshotID = psID
+			reworkRec.PromptHash = promptHash
+			_, _ = o.Store.CreateReworkSnapshot(reworkRec)
+		}
+	} else {
+		// PR #27 / D4 F2: write a metadata-only redacted artifact
+		// (not the raw rendered prompt). The previous implementation
+		// wrote the full rendered prompt body; a redaction label
+		// does not satisfy the raw-prompt logging boundary.
+		promptLen := len(prompt)
+		promptHashBytes := sha256.Sum256([]byte(prompt))
+		promptHashHex := hex.EncodeToString(promptHashBytes[:])
+		redactedMeta := fmt.Sprintf("# redacted\n\nThe rendered prompt is not persisted to disk in raw form.\n\n- redaction: metadata-only\n- prompt_length_bytes: %d\n- prompt_sha256: %s\n", promptLen, promptHashHex)
+		_ = os.WriteFile(filepath.Join(promptDir, "rendered_prompt.redacted.md"), []byte(redactedMeta), 0o644)
+		ph := sha256.Sum256([]byte(prompt))
+		ch := sha256.Sum256([]byte(issue.ID + runID))
+		_, _ = o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), promptRoot)
+	}
 	active, activeErr = o.runIsActive(runID)
 	if activeErr != nil || !active {
 		return nil
@@ -263,6 +324,153 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		return nil
 	}
 	return o.Store.CompleteRunWithReview(runID, rpID)
+}
+
+// injectReworkContext implements D4 / R16: given a Rework-dispatched
+// run, locate the previous review packet, build a safe summary, and
+// append a deterministic rework envelope (latest review reason + safe
+// summary markdown) to the rendered prompt. It also returns a
+// half-populated ReworkSnapshotRecord (without PromptSnapshotID /
+// final PromptHash) that the caller stamps after CreatePromptSnapshot
+// so the prompt hash matches the post-injection prompt.
+//
+// Cumulative diff semantic: we keep the issue's BaseSHA stable across
+// iterations and re-derive CumulativeDiffSHA from the workspace's
+// current HEAD vs. BaseSHA. If the workspace cannot be resolved, the
+// cumulative diff SHA is left empty and the safe summary reflects
+// only the previous review packet.
+func (o Orchestrator) injectReworkContext(issue *core.Issue, run *core.RunAttempt, basePrompt string) (string, string, store.ReworkSnapshotRecord, error) {
+	emptyRec := store.ReworkSnapshotRecord{RunID: run.ID, IssueID: run.IssueID, ReviewReason: ""}
+	if issue == nil || run == nil {
+		return "", "", emptyRec, fmt.Errorf("issue/run is nil")
+	}
+	// Locate the previous run for the issue. The most recent
+	// non-active, completed run is the one whose review packet is
+	// the previous review packet.
+	prev, err := o.Store.LatestCompletedRunForIssue(issue.ID, run.ID)
+	if err != nil {
+		return "", "", emptyRec, fmt.Errorf("locate previous run: %w", err)
+	}
+	reviewPacketID := ""
+	var prevRun *core.RunAttempt
+	if prev != nil {
+		prevRun = prev
+		if rp, err := o.Store.LatestReviewPacketIDForRun(prev.ID); err == nil {
+			reviewPacketID = rp
+		}
+	}
+	reason := o.Store.LatestReviewReasonForIssue(issue.ID, reviewPacketID)
+	if strings.TrimSpace(reason) == "" {
+		reason = run.DispatchReason
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "manual_rework"
+	}
+	// PR #27 / D4 F3: when the previous run is known, build the
+	// safe summary directly from it. The previous implementation
+	// tried the current run first and only fell back to the
+	// previous run on error; that meant a Rework-dispatched run
+	// (SourceIssueState=Rework, no review packet of its own) would
+	// surface a SafeSummary stamped with the *current* run's
+	// source_issue_state — corrupting snapshot metadata.
+	summary, err := review.BuildSafeSummaryFromIssueWithPrev(o.Store, issue, run, prevRun)
+	if err != nil {
+		return "", "", emptyRec, fmt.Errorf("build safe summary: %w", err)
+	}
+	if reviewPacketID == "" {
+		reviewPacketID = summary.ReviewPacketID
+	}
+	baseSHA := ""
+	if issue.BaseSHA != nil {
+		baseSHA = *issue.BaseSHA
+	}
+	cumulativeDiffSHA := o.computeCumulativeDiffSHA(issue, run, baseSHA)
+	in := codex.ReworkContextInput{
+		Issue:             issue,
+		Run:               run,
+		PreviousRun:       prevRun,
+		ReviewPacketID:    reviewPacketID,
+		ReviewReason:      reason,
+		SafeSummary:       summary,
+		BaseSHA:           baseSHA,
+		CumulativeDiffSHA: cumulativeDiffSHA,
+	}
+	if issue.Workspace != nil {
+		in.WorkspacePath = issue.Workspace.Path
+	}
+	newPrompt, promptHash, err := codex.BuildReworkPrompt(basePrompt, in)
+	if err != nil {
+		return "", "", emptyRec, fmt.Errorf("build rework prompt: %w", err)
+	}
+	rec := codex.BuildReworkSnapshotRecord(promptHash, in, "")
+	return newPrompt, promptHash, rec, nil
+}
+
+func (o Orchestrator) computeCumulativeDiffSHA(issue *core.Issue, run *core.RunAttempt, baseSHA string) string {
+	if issue == nil || issue.Workspace == nil || strings.TrimSpace(issue.Workspace.Path) == "" {
+		return ""
+	}
+	root := issue.Workspace.Path
+	cmd := exec.Command("git", "-C", root, "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	head := strings.TrimSpace(string(out))
+	if head == "" {
+		return ""
+	}
+	// PR #27 / D4 F1: incorporate the worktree's uncommitted state
+	// (status --porcelain + diff content) into the cumulative diff
+	// SHA. Without this, two reworks taken against the same
+	// base+HEAD but with different uncommitted agent work produce
+	// identical cumulative_diff_sha values, which breaks prompt /
+	// diagnostic correlation between successive reworks.
+	statusOut, _ := exec.Command("git", "-C", root, "status", "--porcelain=v1", "-z", "-uall").Output()
+	diffOut, _ := exec.Command("git", "-C", root, "diff", "HEAD").Output()
+	untrackedDigest := cumulativeUntrackedDigest(root)
+	h := sha256.Sum256([]byte(baseSHA + "\x00" + head + "\x00" + string(statusOut) + "\x00" + string(diffOut) + "\x00" + untrackedDigest))
+	return hex.EncodeToString(h[:])
+}
+
+func cumulativeUntrackedDigest(root string) string {
+	out, err := exec.Command("git", "-C", root, "ls-files", "--others", "--exclude-standard", "-z").Output()
+	if err != nil || len(out) == 0 {
+		return ""
+	}
+	paths := strings.Split(string(out), "\x00")
+	paths = paths[:len(paths)-1]
+	sort.Strings(paths)
+	h := sha256.New()
+	for _, rel := range paths {
+		if rel == "" {
+			continue
+		}
+		path := filepath.Join(root, rel)
+		info, err := os.Lstat(path)
+		if err != nil {
+			continue
+		}
+		_, _ = h.Write([]byte(rel))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(info.Mode().String()))
+		_, _ = h.Write([]byte{0})
+		if info.Mode().IsRegular() {
+			f, err := os.Open(path)
+			if err == nil {
+				fh := sha256.New()
+				_, _ = io.Copy(fh, f)
+				_ = f.Close()
+				_, _ = h.Write(fh.Sum(nil))
+			}
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			if target, err := os.Readlink(path); err == nil {
+				_, _ = h.Write([]byte(target))
+			}
+		}
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func runnerForRun(run *core.RunAttempt, wf *config.Workflow) agentrunner.Runner {

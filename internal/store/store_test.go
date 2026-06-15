@@ -869,6 +869,35 @@ func TestOpenInitializesMissingAppDB(t *testing.T) {
 	}
 }
 
+func TestOpenMigratesExistingProjectSchema(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	st, err := InitProject(repoRoot, "TST")
+	if err != nil {
+		t.Fatalf("InitProject: %v", err)
+	}
+	projectDBPath := st.ProjectDBPath
+	st.Close()
+
+	raw, err := db.Open(projectDBPath)
+	if err != nil {
+		t.Fatalf("open raw project db: %v", err)
+	}
+	if err := raw.Exec(`DROP TABLE rework_snapshots`); err != nil {
+		t.Fatalf("drop rework_snapshots: %v", err)
+	}
+	raw.Close()
+
+	opened, err := Open(repoRoot)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer opened.Close()
+	if _, err := opened.Project.QueryOne(`SELECT name FROM sqlite_master WHERE type='table' AND name='rework_snapshots'`); err != nil {
+		t.Fatalf("rework_snapshots was not restored during Open: %v", err)
+	}
+}
+
 func TestGetAndListIssuesPropagateLabelQueryError(t *testing.T) {
 	st := newStoreTestStore(t)
 	issue, err := st.CreateIssue(CreateIssueInput{

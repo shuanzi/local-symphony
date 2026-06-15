@@ -230,6 +230,9 @@ func InitProject(repoRoot, issuePrefix string) (*Store, error) {
 	if err := db.MigrateAppSchema(s.App); err != nil {
 		return nil, err
 	}
+	if err := db.MigrateProjectSchema(s.Project); err != nil {
+		return nil, err
+	}
 	if err := validateSchemaVersion(s.App, s.AppDBPath); err != nil {
 		return nil, err
 	}
@@ -300,6 +303,9 @@ func Open(repoRoot string) (*Store, error) {
 		}
 	}
 	if err := db.MigrateAppSchema(s.App); err != nil {
+		return nil, err
+	}
+	if err := db.MigrateProjectSchema(s.Project); err != nil {
 		return nil, err
 	}
 	if err := validateSchemaVersion(s.App, s.AppDBPath); err != nil {
@@ -1637,6 +1643,164 @@ func (s *Store) CreatePromptSnapshotTx(q TxRunner, runID, wfID, ctxHash, promptH
 	id := core.NewID("ps_")
 	now := core.Now()
 	return id, q.Exec(`INSERT OR REPLACE INTO prompt_snapshots(id,run_id,workflow_snapshot_id,runtime_envelope_version,tool_manifest_version,context_hash,rendered_prompt_hash,context_json_path,redacted_prompt_path,prompt_meta_json_path,tool_manifest_path,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, id, runID, wfID, "v1", "v1", ctxHash, promptHash, filepath.Join(rootPath, "prompt/context.json"), filepath.Join(rootPath, "prompt/rendered_prompt.redacted.md"), filepath.Join(rootPath, "prompt/prompt_meta.json"), filepath.Join(rootPath, "prompt/tool_manifest.md"), now)
+}
+
+// ReworkSnapshotRecord is the D4/R16 metadata tying a Rework dispatch
+// back to the previous review packet. It is purely a pointer table —
+// the rendered prompt, the safe summary markdown, and the redaction
+// policy are owned by the review package and the prompt snapshot
+// table. We never persist raw prompt / log / secret artifact bodies
+// here.
+type ReworkSnapshotRecord struct {
+	ID                string `json:"id"`
+	RunID             string `json:"run_id"`
+	IssueID           string `json:"issue_id"`
+	PromptSnapshotID  string `json:"prompt_snapshot_id,omitempty"`
+	PreviousRunID     string `json:"previous_run_id,omitempty"`
+	ReviewPacketID    string `json:"review_packet_id,omitempty"`
+	BaseRef           string `json:"base_ref,omitempty"`
+	BaseSHA           string `json:"base_sha,omitempty"`
+	CumulativeDiffSHA string `json:"cumulative_diff_sha,omitempty"`
+	PromptHash        string `json:"prompt_hash"`
+	ReviewReason      string `json:"review_reason"`
+	SafeSummarySHA256 string `json:"safe_summary_sha256,omitempty"`
+	CreatedAt         string `json:"created_at"`
+}
+
+// LatestCompletedRunForIssue returns the most recent completed run
+// for issueID other than excludeRunID. Returns nil if no such run
+// exists. Used by the rework prompt injector to locate the previous
+// run whose review packet drives the rework.
+func (s *Store) LatestCompletedRunForIssue(issueID, excludeRunID string) (*core.RunAttempt, error) {
+	rows, err := s.Project.Query(`SELECT r.*, i.identifier AS issue_identifier FROM run_attempts r JOIN issues i ON i.id=r.issue_id WHERE r.issue_id=? AND r.id<>? AND r.status IN ('completed','completed_without_handoff') ORDER BY r.created_at DESC LIMIT 1`, issueID, excludeRunID)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return runFromRow(rows[0]), nil
+}
+
+// LatestReviewPacketIDForRun returns the review_packet id for a given
+// run_id, or an empty string when the run has no review packet yet.
+func (s *Store) LatestReviewPacketIDForRun(runID string) (string, error) {
+	row, err := s.Project.QueryOne(`SELECT id FROM review_packets WHERE run_id=? ORDER BY packet_no DESC LIMIT 1`, runID)
+	if err != nil {
+		return "", err
+	}
+	return row["id"].String(), nil
+}
+
+// LatestReviewReasonForIssue returns the most recent operator review
+// reason that triggered a state transition into Rework (or Mark Done)
+// for issueID. When reviewPacketID is non-empty we prefer the
+// state_history row that points to that packet's run.
+func (s *Store) LatestReviewReasonForIssue(issueID, reviewPacketID string) string {
+	if reviewPacketID != "" {
+		// Walk state_history and find the operator-authored row that
+		// transitions Human Review -> Rework, scoped to the run that
+		// produced this review packet.
+		rows, err := s.Project.Query(`SELECT ish.reason, ish.run_id FROM issue_state_history ish WHERE ish.issue_id=? AND ish.actor_type='operator' AND ish.to_state='Rework' ORDER BY ish.created_at DESC LIMIT 5`, issueID)
+		if err == nil && len(rows) > 0 {
+			for _, r := range rows {
+				rpRows, err := s.Project.Query(`SELECT id FROM review_packets WHERE run_id=?`, r["run_id"].String())
+				if err == nil {
+					for _, rp := range rpRows {
+						if rp["id"].String() == reviewPacketID {
+							return r["reason"].String()
+						}
+					}
+				}
+			}
+		}
+	}
+	// Fallback: most recent operator rework reason for the issue.
+	row, err := s.Project.QueryOne(`SELECT reason FROM issue_state_history WHERE issue_id=? AND actor_type='operator' AND to_state='Rework' ORDER BY created_at DESC LIMIT 1`, issueID)
+	if err != nil {
+		// Last-resort: most recent operator-authored comment.
+		row, err = s.Project.QueryOne(`SELECT body AS reason FROM issue_comments WHERE issue_id=? AND author_type='operator' ORDER BY created_at DESC LIMIT 1`, issueID)
+		if err != nil {
+			return ""
+		}
+	}
+	return row["reason"].String()
+}
+
+// CreateReworkSnapshot persists a Rework metadata record. The prompt
+// hash is the redacted rendered prompt hash so diagnostics can
+// correlate what was sent to the agent with the prior review packet.
+func (s *Store) CreateReworkSnapshot(record ReworkSnapshotRecord) (string, error) {
+	if strings.TrimSpace(record.RunID) == "" {
+		return "", core.NewError(core.ErrInvalidRequest, "run_id is required", nil)
+	}
+	if strings.TrimSpace(record.PromptHash) == "" {
+		return "", core.NewError(core.ErrInvalidRequest, "prompt_hash is required", nil)
+	}
+	if record.CreatedAt == "" {
+		record.CreatedAt = core.Now()
+	}
+	if record.ID == "" {
+		record.ID = core.NewID("rs_")
+	}
+	err := s.Project.Exec(`INSERT INTO rework_snapshots(id,run_id,issue_id,prompt_snapshot_id,previous_run_id,review_packet_id,base_ref,base_sha,cumulative_diff_sha,prompt_hash,review_reason,safe_summary_sha256,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, record.ID, record.RunID, record.IssueID, core.NullableString(record.PromptSnapshotID), core.NullableString(record.PreviousRunID), core.NullableString(record.ReviewPacketID), core.NullableString(record.BaseRef), core.NullableString(record.BaseSHA), core.NullableString(record.CumulativeDiffSHA), record.PromptHash, record.ReviewReason, core.NullableString(record.SafeSummarySHA256), record.CreatedAt)
+	if err != nil {
+		return "", err
+	}
+	return record.ID, nil
+}
+
+// GetReworkSnapshot returns the rework snapshot for a run, or
+// os.ErrNotExist when the run was not dispatched as a rework.
+func (s *Store) GetReworkSnapshot(runID string) (*ReworkSnapshotRecord, error) {
+	row, err := s.Project.QueryOne(`SELECT id, run_id, issue_id, prompt_snapshot_id, previous_run_id, review_packet_id, base_ref, base_sha, cumulative_diff_sha, prompt_hash, review_reason, safe_summary_sha256, created_at FROM rework_snapshots WHERE run_id=?`, runID)
+	if err != nil {
+		return nil, err
+	}
+	return &ReworkSnapshotRecord{
+		ID:                row["id"].String(),
+		RunID:             row["run_id"].String(),
+		IssueID:           row["issue_id"].String(),
+		PromptSnapshotID:  row["prompt_snapshot_id"].String(),
+		PreviousRunID:     row["previous_run_id"].String(),
+		ReviewPacketID:    row["review_packet_id"].String(),
+		BaseRef:           row["base_ref"].String(),
+		BaseSHA:           row["base_sha"].String(),
+		CumulativeDiffSHA: row["cumulative_diff_sha"].String(),
+		PromptHash:        row["prompt_hash"].String(),
+		ReviewReason:      row["review_reason"].String(),
+		SafeSummarySHA256: row["safe_summary_sha256"].String(),
+		CreatedAt:         row["created_at"].String(),
+	}, nil
+}
+
+// ListReworkSnapshotsForIssue returns the rework snapshots for an
+// issue ordered by creation time (oldest first) so callers can
+// reconstruct the cumulative diff trajectory.
+func (s *Store) ListReworkSnapshotsForIssue(issueID string) ([]*ReworkSnapshotRecord, error) {
+	rows, err := s.Project.Query(`SELECT id, run_id, issue_id, prompt_snapshot_id, previous_run_id, review_packet_id, base_ref, base_sha, cumulative_diff_sha, prompt_hash, review_reason, safe_summary_sha256, created_at FROM rework_snapshots WHERE issue_id=? ORDER BY created_at ASC`, issueID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*ReworkSnapshotRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, &ReworkSnapshotRecord{
+			ID:                r["id"].String(),
+			RunID:             r["run_id"].String(),
+			IssueID:           r["issue_id"].String(),
+			PromptSnapshotID:  r["prompt_snapshot_id"].String(),
+			PreviousRunID:     r["previous_run_id"].String(),
+			ReviewPacketID:    r["review_packet_id"].String(),
+			BaseRef:           r["base_ref"].String(),
+			BaseSHA:           r["base_sha"].String(),
+			CumulativeDiffSHA: r["cumulative_diff_sha"].String(),
+			PromptHash:        r["prompt_hash"].String(),
+			ReviewReason:      r["review_reason"].String(),
+			SafeSummarySHA256: r["safe_summary_sha256"].String(),
+			CreatedAt:         r["created_at"].String(),
+		})
+	}
+	return out, nil
 }
 
 func (s *Store) CreateToolToken(runID string, tokenHash string, scope map[string]any, expiresAt string) (string, error) {
