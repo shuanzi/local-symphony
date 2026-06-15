@@ -91,4 +91,4 @@ Default CI uses fake runner only. Real Codex tests run only when explicitly enab
 SYMPHONY_TEST_CODEX=1 go test ./internal/agent/codex -run Integration
 ```
 
-**阶段 D 收口状态（2026-06-09）**：D3 / R14 preflight summary 与 fixture 消费一致（5 轮 codex review 0 finding 收口，HEAD `57c46c0`）。D5 / R13 `scripts/build-release.sh` 永远跑 `npm ci`（R2 修复 commit `cdf08ed`），web 安装与本 fixture policy 互不干扰——web 端不消费 `internal/agent/codex` fixture，real Codex fixture 仍只在 `internal/agent/codex/testdata/` 下。详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
+**阶段 D 收口状态（2026-06-09）**：D3 / R14 preflight summary 与 fixture 消费一致；阶段 D 状态入口以当前 tree 内的 `docs/productization/D6_DOCS_CLOSE_NOTES.md` 为准。D5 / R13 release packaging 与本 fixture policy 互不干扰；当前 tree 不声明 release script 或 web lockfile 行为。web 端不消费 `internal/agent/codex` fixture，real Codex fixture 仍只在 `internal/agent/codex/testdata/` 下。

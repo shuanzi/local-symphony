@@ -2064,7 +2064,7 @@ The prelaunch fixture gate is based only on the installed Codex version and comm
 
 Default CI MUST use `internal/agent/fake`. Real Codex tests MUST be opt-in through `SYMPHONY_TEST_CODEX=1`.
 
-> **阶段 D 收口状态（2026-06-09）**：D3 / R14 codex availability diagnostics 已 ship。`internal/agent/codex` 暴露 preflight summary（installed / available / unsupported_version / not_installed 等 reason）；`internal/observability` 在 `Diagnostics` payload 中暴露 `codex` 子对象；`internal/cli` + `internal/httpapi` 在 `symphony status` 与 `GET /api/v1/state` 中暴露 codex availability；`api/openapi.yaml` / `schemas/diagnostics.schema.json` / `web/src/types.ts` / `web/src/App.tsx` 同步（dashboard Overview 链接到 Diagnostics）。5 轮 codex review 0 finding 收口，HEAD `57c46c0`。详见 `docs/productization/D3_CODEX_AVAILABILITY_NOTES.md` 与 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
+> **阶段 D 收口状态（2026-06-09）**：D3 / R14 codex availability diagnostics 已 ship。`internal/agent/codex` 暴露 preflight summary（installed / available / unsupported_version / not_installed 等 reason）；`internal/observability` 在 `Diagnostics` payload 中暴露 `codex` 子对象；`internal/cli` + `internal/httpapi` 通过 `symphony diagnostics` 与 `GET /api/v1/diagnostics` 暴露 codex availability；`api/openapi.yaml` / `schemas/diagnostics.schema.json` / `web/src/types.ts` / `web/src/App.tsx` 同步（dashboard Overview 链接到 Diagnostics）。阶段 D 状态入口以当前 tree 内的 `docs/productization/D6_DOCS_CLOSE_NOTES.md` 为准。
 
 ### 10.3 Runner interface
 
@@ -2299,11 +2299,12 @@ Status command:
 ```text
 primary API: GET /api/v1/state
 daemon unavailable: CLI MAY fall back to GET /api/v1/health only to report daemon availability; if health is unavailable too, exit 3
-human output: concise status for daemon, project, workflow, running runs, pending approvals, Human Review, paused issues, Codex availability, and recent failure summary
---json output: envelope-unwrapped stable object with daemon, project, workflow, running_runs, pending_approvals, human_review, paused_issues, codex, and recent_failures fields
+human output: concise status for daemon, project, workflow, running runs, pending approvals, Human Review, paused issues, and recent failure summary
+--json output: envelope-unwrapped stable object with daemon, project, workflow, running_runs, pending_approvals, human_review, paused_issues, and recent_failures fields
 ```
 
 `symphony status --json` MUST return the state object directly, not an API envelope. It MUST NOT invent data from diagnostics; unavailable fields from `/api/v1/state` are `null`, empty lists, or `unknown` according to the field type.
+`symphony status` and `GET /api/v1/state` MUST NOT promise or synthesize Codex availability, support, or reason fields. Codex availability and reason details belong to `symphony diagnostics` and `GET /api/v1/diagnostics`.
 `GET /api/v1/state` `AppState` uses these same field names; legacy `active_runs` remains a compatibility alias for `running_runs` count.
 
 Issue commands:
@@ -4384,11 +4385,10 @@ docs/productization/D6_DOCS_CLOSE_NOTES.md
 
 要点：
 
-- D1 / R10 review packet 结构化投影已 ship；R1 修复 commit `0aee74c` 落地；R2 review 跑中（1 P1 + 2 P2 forwarding，归 D1 实施 agent 跟进）。
-- D3 / R14 codex availability diagnostics 已 ship（5 轮 codex review 0 finding 收口，HEAD `57c46c0`）。
+- D1 / R10 review packet 结构化投影已 ship；R1 修复 commit `0aee74c` 落地；R2 review 跑中（2 P2 forwarding，归 D1 实施 agent 跟进）。
+- D3 / R14 codex availability diagnostics 已 ship；阶段 D 状态入口以 `docs/productization/D6_DOCS_CLOSE_NOTES.md` 为准。
 - D5 / R13 release packaging 已 ship（主体 `573b1f0` + R1 修复 `41dabb6` + R2 修复 `cdf08ed` 均落地，R2 review 文档待生成）。
 - C3 数据层 5 轮 review 0 finding；协调层 shutdown-ordering 1 P1 留作 C5 daemon lifecycle design problem。
 - C4 trust 边界专项 4 项（fail-open 反复 / validation 区分 / 镜像未去重 / project_id 不匹配可观测性）留作 v1.1 收口后续。
 
 D6 范围内**不修改**任何代码、schema、test；仅做文档同步。
-
