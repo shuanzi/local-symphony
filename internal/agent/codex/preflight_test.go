@@ -469,11 +469,34 @@ func TestRunPreflightScrubberStripsSentinels(t *testing.T) {
 			t.Fatalf("scrubbed failure details leak sentinel %q in: %s", sentinel, body)
 		}
 	}
+	for _, suffix := range []string{"do_not_leak_in_diagnostics"} {
+		if strings.Contains(body, suffix) {
+			t.Fatalf("scrubbed failure details leak lowercase sentinel suffix %q in: %s", suffix, body)
+		}
+	}
 	if !strings.Contains(body, "[REDACTED]") {
 		t.Fatalf("scrubbed output should contain [REDACTED], got: %s", body)
 	}
 	if !strings.Contains(body, "42") {
 		t.Fatalf("scrubbed output should preserve non-string scalars, got: %s", body)
+	}
+}
+
+func TestScrubbedForDiagnosticsIncludesLowercaseSentinelSuffix(t *testing.T) {
+	input := "codex " + syntheticPromptBody + " stderr " + syntheticCodexLog + "/tail"
+	got := scrubbedForDiagnostics(input)
+
+	for _, leaked := range []string{
+		"SYNTHETIC_PROMPT_BODY",
+		"SYNTHETIC_CODEX_LOG",
+		"do_not_leak_in_diagnostics",
+	} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("scrubber leaked %q in %q", leaked, got)
+		}
+	}
+	if got != "codex [REDACTED] stderr [REDACTED]/tail" {
+		t.Fatalf("scrubbedForDiagnostics() = %q, want lowercase suffix fully redacted", got)
 	}
 }
 

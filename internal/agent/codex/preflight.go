@@ -783,10 +783,13 @@ func redactedFailureDetails(details map[string]any) map[string]any {
 }
 
 // scrubbedForDiagnostics removes any synthetic-sentinel-shaped
-// substring (uppercase letters / digits / underscores following the
+// substring (ASCII letters / digits / underscores following the
 // literal `SYNTHETIC_` prefix) and replaces the run with
-// `[REDACTED]`. The same pattern is used by the redaction golden
-// fixtures; keeping the substitution identical lets tests assert
+// `[REDACTED]`. Lowercase suffixes are included because repo sentinel
+// fixtures intentionally append lowercase payload markers such as
+// `_do_not_leak_in_diagnostics`; leaving that suffix behind would still
+// expose the poisoned prompt/log/secret payload. The same pattern is used
+// by the redaction golden fixtures; keeping the substitution identical lets tests assert
 // against a stable surface.
 //
 // Rationale: a poisoned compatibility.json or --version output could
@@ -806,13 +809,18 @@ func scrubbedForDiagnostics(value string) string {
 			return value
 		}
 		end := idx + len(sentinel)
-		for end < len(value) && (value[end] == '_' ||
-			(value[end] >= 'A' && value[end] <= 'Z') ||
-			(value[end] >= '0' && value[end] <= '9')) {
+		for end < len(value) && isSyntheticSentinelRedactionByte(value[end]) {
 			end++
 		}
 		value = value[:idx] + "[REDACTED]" + value[end:]
 	}
+}
+
+func isSyntheticSentinelRedactionByte(b byte) bool {
+	return b == '_' ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= '0' && b <= '9')
 }
 
 // PreflightSummaryToJSON is a tiny convenience used by tests that
