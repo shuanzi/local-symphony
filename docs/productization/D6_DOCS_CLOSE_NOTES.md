@@ -109,4 +109,4 @@ v1 禁项清单（D6 范围内未引入）：
 ❌ raw prompt / raw Codex log / raw secret 暴露
 ```
 
-D6 以文档同步为主，附带少量 schema/contract 同步（`schemas/review_packet.schema.json` 新增 SafeSummary 字段，`api/openapi.yaml` 新增 ReviewPacketSafeSummary schema）；未触碰 Go 实现代码、test、dashboard 前端逻辑。
+D6 以文档同步为主，附带少量 contract 清理（`api/openapi.yaml` 移除 `AppState.codex` 字段）；未触碰 Go 实现代码、test、dashboard 前端逻辑。

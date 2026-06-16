@@ -4,7 +4,7 @@
 
 | 类别 | 标记 | 触发方式 | 涉及段 |
 |---|---|---|---|
-| **fake acceptance** | `[fake]` | 默认 CI / `go test ./internal/...` + `python3 scripts/validate_contracts.py` + `cd web && pnpm test`；`bash scripts/acceptance-local.sh` 只覆盖本地构建 + daemon-backed A1/A2/A9 主路径冒烟 | A0 / A0a / A0b / A1 / A2 / A3 / A3a / A4 / A4a / A4a.1 / A4b / A5 / A6 / A7 / A9 / A9a |
+| **fake acceptance** | `[fake]` | 默认 CI / `go test ./internal/...` + `python3 scripts/validate_contracts.py` + `cd web && pnpm typecheck && pnpm test`；`bash scripts/acceptance-local.sh` 只覆盖本地构建 + daemon-backed A1/A2/A9 主路径冒烟 | A0 / A0a / A0b / A1 / A2 / A3 / A3a / A4 / A4a / A4a.1 / A4b / A5 / A6 / A7 / A9 / A9a |
 | **安全回归** | `[security-regression]` | 默认 CI / `go test ./internal/security ./internal/observability ./internal/httpapi ./internal/toolgateway ./internal/agent/codex ./internal/store` | A8 |
 | **real Codex opt-in acceptance** | `[real-codex-opt-in]` | 显式 `SYMPHONY_TEST_CODEX=1` | A10 |
 
