@@ -650,11 +650,10 @@ func testdataFixtureRoot(t *testing.T) string {
 // sentinel-shaped, and synthetic-sentinel-shaped values (both
 // whole-token and embedded matches) must be flagged.
 //
-// The detector is a word-boundary regex identical to the
-// SYNTHETIC_SENTINEL_RE regex in scripts/validate_contracts.py;
-// a poisoned fixture that survives the gate would also
-// survive the contract validator, so the two layers agree
-// on what a sentinel-shaped value looks like.
+// The detector is stricter than the redaction-golden-fixture
+// SYNTHETIC_SENTINEL_RE regex in scripts/validate_contracts.py:
+// runtime compatibility metadata is fail-closed so a poisoned
+// scalar cannot hide the sentinel behind an alphanumeric prefix.
 func TestIsSyntheticSentinelStringDistinguishesVersionAndSentinel(t *testing.T) {
 	cases := []struct {
 		value    string
@@ -678,6 +677,12 @@ func TestIsSyntheticSentinelStringDistinguishesVersionAndSentinel(t *testing.T) 
 		// correctly rejects them.
 		{value: "protocol-SYNTHETIC_PROMPT_BODY-v1", sentinel: true},
 		{value: "schema-SYNTHETIC_CODEX_LOG-2024", sentinel: true},
+		// Alphanumeric-prefixed sentinels must also be flagged:
+		// these are scalar metadata poison values, not safe
+		// longer identifiers.
+		{value: "v1SYNTHETIC_PROMPT_BODY_do_not_leak_in_diagnostics", sentinel: true},
+		{value: "1SYNTHETIC_PROMPT_BODY_do_not_leak_in_diagnostics", sentinel: true},
+		{value: "ASYNTHETIC_CODEX_LOG_do_not_leak_in_diagnostics", sentinel: true},
 		// Lowercase-suffixed repo sentinel fixture values
 		// must also be detected. These can otherwise poison
 		// scalar compatibility metadata and echo through
@@ -732,6 +737,18 @@ func TestValidateCompatibilityMetadataRejectsLowercaseSuffixedScalarSentinels(t 
 			name: "schema_version",
 			mutate: func(metadata *CompatibilityMetadata) {
 				metadata.SchemaVersion = syntheticPromptBody
+			},
+		},
+		{
+			name: "protocol_version_alphanumeric_prefix",
+			mutate: func(metadata *CompatibilityMetadata) {
+				metadata.ProtocolVersion = "v1" + syntheticPromptBody
+			},
+		},
+		{
+			name: "schema_version_uppercase_prefix",
+			mutate: func(metadata *CompatibilityMetadata) {
+				metadata.SchemaVersion = "A" + syntheticCodexLog
 			},
 		},
 		{
@@ -1241,19 +1258,16 @@ func TestVerifyPanicTeamLeadRepro(t *testing.T) {
 // for the cases team-lead independently verified under
 // the round-3 contract (embedded sentinels with '-' on
 // either side match; plain versions do not), and the
-// round-5 widening adds two more positive cases:
-// `protocol_SYNTHETIC_PROMPT_BODY` (sentinel preceded by
-// underscore) and `vSYNTHETIC_OWNER_NONCE` (sentinel
-// preceded by a lowercase letter) are both flagged.
+// round-5 widening added underscore/lowercase prefixes, and
+// the follow-up hardening rejects alphanumeric-prefixed
+// sentinel bodies as poisoned scalar metadata too.
 // The previous team-lead case
 // `vSYNTHETIC_OWNER_NONCE: false` was the round-3
-// word-boundary argument; the round-5 detector widens
-// the prefix boundary to "not in [A-Z0-9]" so an
-// underscore OR a lowercase letter before the `S` is
-// also a valid boundary. This is the runtime gate's
-// stricter position vs. the Python contract regex
-// (which the contract validator uses for redaction
-// golden fixture validation, a different threat
+// word-boundary argument; the runtime gate now treats
+// every prefix before the `SYNTHETIC_` body as unsafe
+// scalar metadata. This is stricter than the Python
+// contract regex (which the contract validator uses for
+// redaction golden fixture validation, a different threat
 // surface).
 func TestVerifyEmbeddedSentinelTeamLeadRepro(t *testing.T) {
 	cases := []struct {
@@ -1262,11 +1276,13 @@ func TestVerifyEmbeddedSentinelTeamLeadRepro(t *testing.T) {
 	}{
 		{value: "protocol-SYNTHETIC_PROMPT_BODY-v1", sentinel: true},
 		{value: "schema-SYNTHETIC_LOG", sentinel: true},
-		// Round-5 widening: a sentinel preceded by an
-		// underscore or a lowercase letter is now a
-		// positive match. The runtime gate treats
-		// both as a valid prefix boundary.
+		// Round-5 widening plus follow-up hardening: any
+		// prefix before the sentinel body is treated as
+		// poisoned scalar metadata, including lowercase,
+		// digits, and uppercase letters.
 		{value: "vSYNTHETIC_OWNER_NONCE", sentinel: true},
+		{value: "1SYNTHETIC_OWNER_NONCE", sentinel: true},
+		{value: "ASYNTHETIC_OWNER_NONCE", sentinel: true},
 		{value: "protocol_SYNTHETIC_PROMPT_BODY", sentinel: true},
 		{value: "schema_SYNTHETIC_API_SECRET", sentinel: true},
 		{value: "SYNTHETIC_PROMPT_BODY_do_not_leak_in_diagnostics", sentinel: true},

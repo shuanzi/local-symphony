@@ -1866,42 +1866,27 @@ func validateCompatibilityMetadata(version string, metadata CompatibilityMetadat
 // isSyntheticSentinelString reports whether s carries the
 // synthetic-sentinel shape (an UPPER_SNAKE_CASE token prefixed
 // with `SYNTHETIC_`). The shape detector runs at the
-// compatibility-metadata gate so a poisoned fixture that plants
-// raw prompt / raw Codex log / raw secret content into a
-// version identifier (protocol_version / schema_version /
-// codex_version) is rejected before the preflight success path
-// could echo it back through diagnostics / `symphony status`.
+// compatibility metadata source gate, before values are projected
+// into diagnostics/status. It is deliberately fail-closed: any
+// occurrence of the sentinel body is rejected, including values
+// where the sentinel is embedded after an alphanumeric prefix such
+// as `v1SYNTHETIC_PROMPT_BODY` or `ASYNTHETIC_CODEX_LOG`.
 //
-// This complements the `scrubbedForDiagnostics` family that the
-// diagnostics layer uses: that helper masks the value in the
-// envelope, this helper rejects the value at the source. The
-// gate path wins for fixture-controlled scalars because the
-// success-path copy of `selected.Metadata` would otherwise
-// publish a poisoned identifier verbatim — and unlike
-// SupportedNotifications (a list of protocol method names) the
-// scalar fields are operator-visible strings that surface in
-// the dashboard's "Codex" card.
-//
-// The detector is intentionally narrow: a string is a
-// sentinel only when it contains the `SYNTHETIC_` prefix
-// followed by one or more uppercase / digit segments joined by
-// single underscores, with an unsafe boundary on either side.
-// "Unsafe" means the character before the `S` is either
-// start-of-string or NOT in `[A-Z0-9]` (this is the
-// round-5 widening: an underscore or a lowercase letter
-// before the `S` is now treated as a boundary), and the
-// character after the body is either end-of-string or not an
-// uppercase/digit continuation. Lowercase suffixes such as
-// "SYNTHETIC_PROMPT_BODY_do_not_leak" are therefore rejected
-// as synthetic sentinels instead of being treated as benign
-// version identifiers. Plain version strings ("1.2.3",
-// "v1.2.3", "protocol-test-v1", "schema-2024-01") never
-// match. The contract validator's `SYNTHETIC_SENTINEL_RE` in
-// `scripts/validate_contracts.py` is a separate helper; it
-// tests the redaction-golden-fixture surface (test input
-// files), not runtime fixture compatibility, so the runtime
-// gate can be stricter than the golden-fixture validator
-// without breaking round-trip semantics.
+// The detector is intentionally narrow about the sentinel body and
+// suffix. A string is a sentinel when it contains the `SYNTHETIC_`
+// prefix followed by one or more uppercase / digit segments joined
+// by single underscores, unless the body continues with another
+// uppercase/digit segment. Lowercase suffixes such as
+// `SYNTHETIC_PROMPT_BODY_do_not_leak` are rejected as synthetic
+// sentinels instead of being treated as benign version identifiers.
+// Plain version strings ("1.2.3", "v1.2.3",
+// "protocol-test-v1", "schema-2024-01") never match. The
+// contract validator's `SYNTHETIC_SENTINEL_RE` in
+// `scripts/validate_contracts.py` is a separate helper; it tests
+// the redaction-golden-fixture surface (test input files), not
+// runtime fixture compatibility, so the runtime gate can be
+// stricter than the golden-fixture validator without breaking
+// round-trip semantics.
 var syntheticSentinelBody = regexp.MustCompile(`SYNTHETIC_[A-Z0-9]+(?:_[A-Z0-9]+)*`)
 
 func isSyntheticSentinelString(s string) bool {
@@ -1910,28 +1895,16 @@ func isSyntheticSentinelString(s string) bool {
 	}
 	matches := syntheticSentinelBody.FindAllStringIndex(s, -1)
 	for _, m := range matches {
-		start, end := m[0], m[1]
-		// Prefix check (round-5 widening): the
-		// character before the `S` is either
-		// start-of-string (always a boundary) OR is
-		// not an uppercase letter / digit. This widens
-		// the round-3 `\b`-based rule so an
-		// underscore or a lowercase letter before the
-		// `S` is also a valid boundary. Without this
-		// widening, a fixture could plant
-		// `protocol_SYNTHETIC_PROMPT_BODY` in
-		// `protocol_version` and slip past the gate;
-		// the success path would then echo the raw
-		// sentinel into the diagnostics envelope. An
-		// uppercase letter or digit immediately before
-		// the `S` is unusual enough that we treat it
-		// as part of a longer identifier
-		// (e.g. `1SYNTHETIC_X`, `ASYNTHETIC_X`).
-		if start > 0 && isSafePrefixChar(s[start-1]) {
-			// Uppercase letter or digit prefix:
-			// treat as part of a longer identifier.
-			continue
-		}
+		_, end := m[0], m[1]
+		// Prefixes are not trusted boundaries. A poisoned
+		// compatibility.json can prefix scalar metadata with
+		// a digit or letter (for example
+		// `v1SYNTHETIC_PROMPT_BODY_do_not_leak`) and the
+		// scalar success path would otherwise echo the raw
+		// value into diagnostics/status. Treat any matched
+		// sentinel body as poisoned, regardless of the byte
+		// before `SYNTHETIC_`.
+		//
 		// Suffix check: reject only uppercase/digit
 		// continuations as part of a longer synthetic
 		// identifier. Lowercase suffixes (including the
@@ -1946,18 +1919,6 @@ func isSyntheticSentinelString(s string) bool {
 		return true
 	}
 	return false
-}
-
-// isSafePrefixChar reports whether a character before a
-// sentinel `S` is treated as "part of a longer
-// identifier" — i.e., the sentinel is NOT a standalone
-// token. The safe set is uppercase letters and digits;
-// the round-5 fix adds an underscore, lowercase letters,
-// and any other non-`[A-Z0-9]` character to the unsafe
-// (boundary) set, so `protocol_SYNTHETIC_X` is now
-// detected.
-func isSafePrefixChar(c byte) bool {
-	return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 // hasSafeSuffixContinuation reports whether the character
