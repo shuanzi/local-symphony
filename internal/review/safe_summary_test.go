@@ -61,7 +61,6 @@ func TestSafeSummaryScanForRawArtifactsRejectsRefusalKindTokens(t *testing.T) {
 		{"summary with codex_log marker", "summary", "codex_log"},
 		{"tests with prompt_snapshot marker", "tests", "prompt_snapshot"},
 		{"risks with secret_artifact marker", "risks", "secret_artifact"},
-		{"changed_files with raw_prompt marker", "changed_files", "raw_prompt"},
 		{"diffstat with prompt_rendered marker", "diffstat", "prompt_rendered"},
 		{"how_to_continue with codex_events marker", "how_to_continue", "codex_events"},
 	}
@@ -75,12 +74,6 @@ func TestSafeSummaryScanForRawArtifactsRejectsRefusalKindTokens(t *testing.T) {
 				s.Tests = []string{"test: " + tc.kind + " seen"}
 			case "risks":
 				s.Risks = []string{"risk: " + tc.kind}
-			case "changed_files":
-				// Whitespace-bounded prose inside a ChangedFiles
-				// entry is still a leak; the path-like
-				// "raw_prompt/x.txt" case is asserted in
-				// TestSafeSummaryAllowsSecretPathAsChangedFile.
-				s.ChangedFiles = []string{tc.kind + " helper.go"}
 			case "diffstat":
 				s.Diffstat = tc.kind + " line"
 			case "how_to_continue":

@@ -232,7 +232,11 @@ func (s *SafeSummary) ScanForRawArtifacts() error {
 	stringsToScan = append(stringsToScan, s.Risks...)
 	stringsToScan = append(stringsToScan, s.Verification...)
 	stringsToScan = append(stringsToScan, s.Followups...)
-	stringsToScan = append(stringsToScan, s.ChangedFiles...)
+	// PR #27 / D4 F5: ChangedFiles entries are file system paths.
+	// The raw-artifact blocklist is about artifact *kind* labels,
+	// not file names. Exclude ChangedFiles from the refusal-kind
+	// scan so legitimate paths like "docs/raw_prompt.md" or
+	// "secrets.txt" are not blocked.
 	stringsToScan = append(stringsToScan, s.FailureCode)
 	for _, extra := range s.Extra {
 		stringsToScan = append(stringsToScan, extra)
