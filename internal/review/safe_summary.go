@@ -54,6 +54,10 @@ type SafeSummary struct {
 // is duplicated here so review does not import agent/codex and so the
 // redaction policy has a single source of truth inside the review
 // package for the safe summary DTO.
+// Note: "secrets" is intentionally excluded because it appears in
+// ordinary English prose (e.g. risk note: "exposes secrets in logs")
+// and causes false-positive rejections. "secret_artifact" covers the
+// artifact-kind case.
 var rawArtifactRefusalKinds = map[string]struct{}{
 	"codex_log":        {},
 	"codex_events":     {},
@@ -61,7 +65,6 @@ var rawArtifactRefusalKinds = map[string]struct{}{
 	"prompt_rendered":  {},
 	"prompt_context":   {},
 	"secret_artifact":  {},
-	"secrets":          {},
 	"codex_final_dump": {},
 	"raw_codex_log":    {},
 	"raw_prompt":       {},

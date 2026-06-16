@@ -175,7 +175,7 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	var reworkRec store.ReworkSnapshotRecord
 	var reworkErr error
 	if run.SourceIssueState == core.StateRework {
-		prompt, promptHash, reworkRec, reworkErr = o.injectReworkContext(issue, run, prompt)
+		prompt, promptHash, reworkRec, reworkErr = o.injectReworkContext(issue, run, prompt, wf)
 		if reworkErr != nil {
 			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("rework context: %v", reworkErr), core.RunFailed)
 			return nil
@@ -342,7 +342,7 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 // current HEAD vs. BaseSHA. If the workspace cannot be resolved, the
 // cumulative diff SHA is left empty and the safe summary reflects
 // only the previous review packet.
-func (o Orchestrator) injectReworkContext(issue *core.Issue, run *core.RunAttempt, basePrompt string) (string, string, store.ReworkSnapshotRecord, error) {
+func (o Orchestrator) injectReworkContext(issue *core.Issue, run *core.RunAttempt, basePrompt string, wf *config.Workflow) (string, string, store.ReworkSnapshotRecord, error) {
 	emptyRec := store.ReworkSnapshotRecord{RunID: run.ID, IssueID: run.IssueID, ReviewReason: ""}
 	if issue == nil || run == nil {
 		return "", "", emptyRec, fmt.Errorf("issue/run is nil")
@@ -387,7 +387,7 @@ func (o Orchestrator) injectReworkContext(issue *core.Issue, run *core.RunAttemp
 	if issue.BaseSHA != nil {
 		baseSHA = *issue.BaseSHA
 	}
-	cumulativeDiffSHA := o.computeCumulativeDiffSHA(issue, run, baseSHA)
+	cumulativeDiffSHA := o.computeCumulativeDiffSHA(issue, run, baseSHA, wf.Config.Approvals.ProtectedPaths)
 	in := codex.ReworkContextInput{
 		Issue:             issue,
 		Run:               run,
@@ -409,7 +409,40 @@ func (o Orchestrator) injectReworkContext(issue *core.Issue, run *core.RunAttemp
 	return newPrompt, promptHash, rec, nil
 }
 
-func (o Orchestrator) computeCumulativeDiffSHA(issue *core.Issue, run *core.RunAttempt, baseSHA string) string {
+// filteredTrackedDiff returns the git diff of tracked changes against
+// HEAD, omitting any files that match security.IsProtectedPath. This
+// prevents protected-tracked files (e.g. committed-but-modified .env)
+// from leaking their content into cumulative_diff_sha hashes that are
+// persisted in rework_snapshots.
+func filteredTrackedDiff(root string, protectedPaths []string) []byte {
+	diffOut, _ := exec.Command("git", "-C", root, "diff", "HEAD").Output()
+	if len(diffOut) == 0 {
+		return diffOut
+	}
+	namesOut, err := exec.Command("git", "-C", root, "diff", "--name-only", "HEAD").Output()
+	if err != nil {
+		return diffOut
+	}
+	names := strings.Split(strings.TrimSpace(string(namesOut)), "\n")
+	safe := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name != "" && !security.IsProtectedPathWithConfig(name, protectedPaths) {
+			safe = append(safe, name)
+		}
+	}
+	if len(safe) == 0 {
+		return nil
+	}
+	args := append([]string{"-C", root, "diff", "HEAD", "--"}, safe...)
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return diffOut
+	}
+	return out
+}
+
+func (o Orchestrator) computeCumulativeDiffSHA(issue *core.Issue, run *core.RunAttempt, baseSHA string, protectedPaths []string) string {
 	if issue == nil || issue.Workspace == nil || strings.TrimSpace(issue.Workspace.Path) == "" {
 		return ""
 	}
@@ -430,8 +463,8 @@ func (o Orchestrator) computeCumulativeDiffSHA(issue *core.Issue, run *core.RunA
 	// identical cumulative_diff_sha values, which breaks prompt /
 	// diagnostic correlation between successive reworks.
 	statusOut, _ := exec.Command("git", "-C", root, "status", "--porcelain=v1", "-z", "-uall").Output()
-	diffOut, _ := exec.Command("git", "-C", root, "diff", "HEAD").Output()
-	untrackedDigest := cumulativeUntrackedDigest(root)
+	diffOut := filteredTrackedDiff(root, protectedPaths)
+	untrackedDigest := cumulativeUntrackedDigest(root, protectedPaths)
 	h := sha256.Sum256([]byte(baseSHA + "\x00" + head + "\x00" + string(statusOut) + "\x00" + string(diffOut) + "\x00" + untrackedDigest))
 	return hex.EncodeToString(h[:])
 }
@@ -440,24 +473,15 @@ func (o Orchestrator) computeCumulativeDiffSHA(issue *core.Issue, run *core.RunA
 // untracked file path looks like a protected secret/credential file
 // whose content must not be hashed into cumulative_diff_sha.
 // Uses security.IsProtectedPath (the same logic as reviewSafePath
-// in internal/review) plus additional name-based heuristics for
-// files that may not be covered by the default ProtectedPaths
-// patterns (e.g. files with "secret", "token", "key", "credential"
-// in their name).
-func isProtectedUntrackedPath(rel string) bool {
-	if security.IsProtectedPath(rel) {
-		return true
-	}
-	base := strings.ToLower(filepath.Base(rel))
-	for _, keyword := range []string{"secret", "token", "key", "credential"} {
-		if strings.Contains(base, keyword) {
-			return true
-		}
-	}
-	return false
+// in internal/review). Substring heuristics for keywords like
+// "secret", "token", "key", "credential" are intentionally NOT used
+// because they cause false positives on ordinary files
+// (e.g. test_tokenizer.go, api_key_utils.go, tokenbucket.go).
+func isProtectedUntrackedPath(rel string, protectedPaths []string) bool {
+	return security.IsProtectedPathWithConfig(rel, protectedPaths)
 }
 
-func cumulativeUntrackedDigest(root string) string {
+func cumulativeUntrackedDigest(root string, protectedPaths []string) string {
 	out, err := exec.Command("git", "-C", root, "ls-files", "--others", "--exclude-standard", "-z").Output()
 	if err != nil || len(out) == 0 {
 		return ""
@@ -475,7 +499,7 @@ func cumulativeUntrackedDigest(root string) string {
 		// must not leak into cumulative_diff_sha which is
 		// persisted in rework_snapshots and rendered into
 		// prompts. See isProtectedUntrackedPath below.
-		if isProtectedUntrackedPath(rel) {
+		if isProtectedUntrackedPath(rel, protectedPaths) {
 			continue
 		}
 		path := filepath.Join(root, rel)

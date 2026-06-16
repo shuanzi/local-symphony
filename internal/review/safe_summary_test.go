@@ -195,7 +195,6 @@ func TestSafeSummaryRefusalKindBlocklistIsStable(t *testing.T) {
 		"raw_prompt",
 		"raw_prompt_log",
 		"secret_artifact",
-		"secrets",
 	}
 	got := refusalKindBlocklist()
 	if len(got) != len(want) {

@@ -483,6 +483,23 @@ func IsProtectedPath(path string) bool {
 	return false
 }
 
+// IsProtectedPathWithConfig checks whether a path is protected, using
+// both the built-in IsProtectedPath rules and the supplied additional
+// glob patterns. Patterns support **/suffix, prefix/**, and
+// filepath.Match syntax.
+func IsProtectedPathWithConfig(path string, extraPatterns []string) bool {
+	if IsProtectedPath(path) {
+		return true
+	}
+	path = filepath.ToSlash(strings.TrimSpace(path))
+	for _, pattern := range extraPatterns {
+		if protectedPatternMatches(pattern, path) {
+			return true
+		}
+	}
+	return false
+}
+
 func ContainedPath(root, rel string) (string, error) {
 	if rel == "" || filepath.IsAbs(rel) {
 		return "", errors.New("path must be workspace-relative")

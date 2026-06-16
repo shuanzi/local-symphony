@@ -395,7 +395,7 @@ func TestCumulativeDiffHashCoversUncommittedChanges(t *testing.T) {
 	st, issue, prev := newReworkDispatchIssueWithGitWorkspace(t)
 
 	// Snapshot #1: clean worktree (prev already wrote a commit).
-	hashClean := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha")
+	hashClean := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha", nil)
 	if hashClean == "" {
 		t.Fatal("cumulative diff SHA is empty for clean worktree")
 	}
@@ -406,7 +406,7 @@ func TestCumulativeDiffHashCoversUncommittedChanges(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(ws, "uncommitted.txt"), []byte("dirty\n"), 0o644); err != nil {
 		t.Fatalf("write uncommitted: %v", err)
 	}
-	hashDirty := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha")
+	hashDirty := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha", nil)
 	if hashDirty == "" {
 		t.Fatal("cumulative diff SHA is empty for dirty worktree")
 	}
@@ -427,14 +427,14 @@ func TestCumulativeDiffHashCoversUntrackedFileContentChanges(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("first\n"), 0o644); err != nil {
 		t.Fatalf("write first untracked content: %v", err)
 	}
-	hashFirst := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha")
+	hashFirst := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha", nil)
 	if hashFirst == "" {
 		t.Fatal("cumulative diff SHA is empty for first untracked content")
 	}
 	if err := os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("second\n"), 0o644); err != nil {
 		t.Fatalf("write second untracked content: %v", err)
 	}
-	hashSecond := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha")
+	hashSecond := (Orchestrator{Store: st}).computeCumulativeDiffSHA(issue, prev, "base-sha", nil)
 	if hashSecond == "" {
 		t.Fatal("cumulative diff SHA is empty for second untracked content")
 	}
