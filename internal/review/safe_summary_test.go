@@ -181,6 +181,26 @@ func TestSafeSummaryAllowsBlockedWordsInsideLegitimatePaths(t *testing.T) {
 	}
 }
 
+func TestSafeSummaryAllowsBlockedWordsInPathLikeText(t *testing.T) {
+	s := &SafeSummary{
+		ReviewPacketID: "rp_path_text",
+		Status:         "generated",
+		Summary:        "Reviewed docs/raw_prompt.md and prompt_context.json without exposing raw artifacts.",
+		Tests:          []string{"go test ./internal/review ./docs/raw_prompt.md"},
+		Risks:          []string{"secrets.txt is a changed file name, not an artifact marker."},
+		Verification:   []string{"Checked prompt_context.json metadata path handling."},
+		ChangedFiles: []string{
+			"docs/raw_prompt.md",
+			"secrets.txt",
+			"prompt_context.json",
+		},
+		HowToContinue: "Review the path-like file names only.",
+	}
+	if err := s.Seal(); err != nil {
+		t.Fatalf("Seal rejected path-like text containing blocklisted substrings: %v", err)
+	}
+}
+
 func TestSafeSummaryRefusalKindBlocklistIsStable(t *testing.T) {
 	// Lock the blocklist so a future edit cannot silently relax the
 	// D4 / R16 redaction boundary.

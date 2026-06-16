@@ -181,6 +181,10 @@ func gitCommit(t *testing.T, dir, msg string) {
 	}
 }
 
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
 func TestReworkPromptIncludesLatestReviewReason(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SYMPHONY_RUNNER_KIND", "")
@@ -440,6 +444,155 @@ func TestCumulativeDiffHashCoversUntrackedFileContentChanges(t *testing.T) {
 	}
 	if hashSecond == hashFirst {
 		t.Fatalf("cumulative_diff_sha ignored untracked file bytes (%q == %q)", hashSecond, hashFirst)
+	}
+}
+
+func TestCumulativeUntrackedDigestSkipsProtectedUntrackedFiles(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=env\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "id_rsa"), []byte("SECRET=rsa\n"), 0o600); err != nil {
+		t.Fatalf("write id_rsa: %v", err)
+	}
+
+	if got := cumulativeUntrackedDigest(ws, nil); got != "" {
+		t.Fatalf("cumulative untracked digest hashed protected untracked files: %q", got)
+	}
+}
+
+func TestFilteredTrackedDiffDoesNotReadUnfilteredPatchForProtectedTrackedChange(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=base\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	gitCommit(t, ws, "add env")
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=changed\n"), 0o600); err != nil {
+		t.Fatalf("modify .env: %v", err)
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath git: %v", err)
+	}
+	wrapperDir := t.TempDir()
+	logPath := filepath.Join(wrapperDir, "forbidden.log")
+	wrapper := filepath.Join(wrapperDir, "git")
+	script := "#!/bin/sh\n" +
+		"argc=$#\n" +
+		"cmd1=$1\n" +
+		"cmd2=$2\n" +
+		"if [ \"$1\" = \"-C\" ]; then\n" +
+		"  argc=$(($# - 2))\n" +
+		"  cmd1=$3\n" +
+		"  cmd2=$4\n" +
+		"fi\n" +
+		"if [ \"$cmd1\" = \"diff\" ] && [ \"$cmd2\" = \"HEAD\" ] && [ \"$argc\" -eq 2 ]; then\n" +
+		"  printf 'forbidden unfiltered diff\\n' >> " + shellQuote(logPath) + "\n" +
+		"  printf 'SECRET=changed\\n'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exec " + shellQuote(realGit) + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatalf("write git wrapper: %v", err)
+	}
+	t.Setenv("PATH", wrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_ = filteredTrackedDiff(ws, nil)
+
+	if data, err := os.ReadFile(logPath); err == nil && len(data) > 0 {
+		t.Fatalf("filteredTrackedDiff ran unfiltered git diff HEAD before filtering:\n%s", data)
+	}
+}
+
+func TestFilteredTrackedDiffSkipsProtectedRenameSource(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=tracked\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	gitCommit(t, ws, "add env")
+	if out, err := exec.Command("git", "-C", ws, "mv", ".env", "public.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git mv .env public.txt: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "public.txt"), []byte("SECRET=changed\n"), 0o644); err != nil {
+		t.Fatalf("modify public.txt: %v", err)
+	}
+
+	diff := string(filteredTrackedDiff(ws, nil))
+	if strings.Contains(diff, "SECRET=tracked") || strings.Contains(diff, "SECRET=changed") || strings.Contains(diff, "diff --git a/.env b/public.txt") {
+		t.Fatalf("filtered tracked diff leaked protected rename source:\n%s", diff)
+	}
+}
+
+func TestFilteredTrackedDiffSkipsProtectedCopySource(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=tracked\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	gitCommit(t, ws, "add env")
+	data, err := os.ReadFile(filepath.Join(ws, ".env"))
+	if err != nil {
+		t.Fatalf("read .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "public.txt"), data, 0o644); err != nil {
+		t.Fatalf("copy .env to public.txt: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "add", "public.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add public.txt: %v\n%s", err, out)
+	}
+
+	diff := string(filteredTrackedDiff(ws, nil))
+	if strings.Contains(diff, "SECRET=tracked") || strings.Contains(diff, "diff --git a/.env b/public.txt") || strings.Contains(diff, "diff --git a/public.txt b/public.txt") {
+		t.Fatalf("filtered tracked diff leaked protected copy source:\n%s", diff)
+	}
+}
+
+func TestFilteredTrackedDiffSkipsProtectedDestination(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=new\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "add", ".env").CombinedOutput(); err != nil {
+		t.Fatalf("git add .env: %v\n%s", err, out)
+	}
+
+	diff := string(filteredTrackedDiff(ws, nil))
+	if strings.Contains(diff, "SECRET=new") || strings.Contains(diff, "diff --git a/.env b/.env") {
+		t.Fatalf("filtered tracked diff leaked protected destination:\n%s", diff)
+	}
+}
+
+func TestCumulativeUntrackedDigestSkipsCopyOfDeletedProtectedContent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=tracked\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	gitCommit(t, ws, "add env")
+	data, err := os.ReadFile(filepath.Join(ws, ".env"))
+	if err != nil {
+		t.Fatalf("read .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "public.txt"), data, 0o644); err != nil {
+		t.Fatalf("copy .env to public.txt: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "rm", ".env").CombinedOutput(); err != nil {
+		t.Fatalf("git rm .env: %v\n%s", err, out)
+	}
+
+	if got := cumulativeUntrackedDigest(ws, nil); got != "" {
+		t.Fatalf("cumulative untracked digest hashed copied protected content: %q", got)
 	}
 }
 

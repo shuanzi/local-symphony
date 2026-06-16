@@ -319,26 +319,14 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 }
 
 type protectedDeletedContentSet struct {
-	hashes  map[string]bool
-	unknown bool
+	blockUntracked bool
 }
 
 func (s protectedDeletedContentSet) matchesUntracked(root, path string) bool {
-	if len(s.hashes) == 0 && !s.unknown {
-		return false
-	}
-	data, _, reason, err := readUntrackedPatchData(root, path)
-	if err != nil || reason != nil {
-		return s.unknown
-	}
-	if s.hashes[security.SHA256Bytes(data)] {
-		return true
-	}
-	return s.unknown
+	return s.blockUntracked
 }
 
 func protectedDeletedContent(root string, records []statusPorcelainRecord) protectedDeletedContentSet {
-	set := protectedDeletedContentSet{hashes: map[string]bool{}}
 	for _, record := range records {
 		if !record.deleted() {
 			continue
@@ -348,15 +336,10 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord) prote
 			if path == "" || !security.IsProtectedPath(path) {
 				continue
 			}
-			data, err := gitShowHeadPath(root, path)
-			if err != nil {
-				set.unknown = true
-				continue
-			}
-			set.hashes[security.SHA256Bytes(data)] = true
+			return protectedDeletedContentSet{blockUntracked: true}
 		}
 	}
-	return set
+	return protectedDeletedContentSet{}
 }
 
 type statusPorcelainRecord struct {
@@ -422,11 +405,6 @@ func decodeStatusPath(path string) string {
 		}
 	}
 	return path
-}
-func gitShowHeadPath(root, path string) ([]byte, error) {
-	cmd := exec.Command("git", "show", "HEAD:"+path)
-	cmd.Dir = root
-	return cmd.Output()
 }
 func untrackedInfo(root, path string) UntrackedInfo {
 	path = filepath.ToSlash(path)

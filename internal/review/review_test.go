@@ -354,29 +354,29 @@ func TestGenerateOmitsUntrackedRenameOfProtectedDeletedFile(t *testing.T) {
 	if strings.Contains(patch, "SECRET=original") || strings.Contains(patch, "safe.txt") || strings.Contains(patch, ".env") {
 		t.Fatalf("changes.patch leaked protected filesystem rename:\n%s", patch)
 	}
-	if !strings.Contains(patch, "diff --git a/notes.txt b/notes.txt") || !strings.Contains(patch, "+ordinary untracked") {
-		t.Fatalf("changes.patch missing ordinary untracked file:\n%s", patch)
+	if strings.Contains(patch, "diff --git a/notes.txt b/notes.txt") || strings.Contains(patch, "ordinary untracked") {
+		t.Fatalf("changes.patch included ordinary untracked file while protected deletion exists:\n%s", patch)
 	}
 	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
 	if strings.Contains(changed, "safe.txt") || strings.Contains(changed, ".env") {
 		t.Fatalf("changed-files.txt leaked protected filesystem rename:\n%s", changed)
 	}
-	if !strings.Contains(changed, "notes.txt\n") {
-		t.Fatalf("changed-files.txt missing ordinary untracked file:\n%s", changed)
+	if strings.Contains(changed, "notes.txt\n") {
+		t.Fatalf("changed-files.txt included ordinary untracked file while protected deletion exists:\n%s", changed)
 	}
 	diffstat := readReviewArtifact(t, st, issue, run, "diffstat.txt")
 	if strings.Contains(diffstat, "safe.txt") || strings.Contains(diffstat, ".env") {
 		t.Fatalf("diffstat.txt leaked protected filesystem rename:\n%s", diffstat)
 	}
-	if !strings.Contains(diffstat, "1\t0\tnotes.txt") {
-		t.Fatalf("diffstat.txt missing ordinary untracked file:\n%s", diffstat)
+	if strings.Contains(diffstat, "notes.txt") {
+		t.Fatalf("diffstat.txt included ordinary untracked file while protected deletion exists:\n%s", diffstat)
 	}
 	reviewJSON := readReviewArtifact(t, st, issue, run, "review.json")
 	if strings.Contains(reviewJSON, "SECRET=original") || strings.Contains(reviewJSON, "safe.txt") || strings.Contains(reviewJSON, ".env") {
 		t.Fatalf("review.json leaked protected filesystem rename:\n%s", reviewJSON)
 	}
-	if !strings.Contains(reviewJSON, `"notes.txt"`) {
-		t.Fatalf("review.json missing ordinary untracked file:\n%s", reviewJSON)
+	if strings.Contains(reviewJSON, `"notes.txt"`) {
+		t.Fatalf("review.json included ordinary untracked file while protected deletion exists:\n%s", reviewJSON)
 	}
 }
 
@@ -574,6 +574,38 @@ func TestUntrackedInfoOmitsLargeFileWithoutHashingContents(t *testing.T) {
 	}
 	if patch := syntheticPatch(root, []UntrackedInfo{info}); patch != "" {
 		t.Fatalf("large file synthetic patch = %q, want empty", patch)
+	}
+}
+
+func TestGenerateOmitsUntrackedContentWhenProtectedTrackedFileDeleted(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	secret := "SECRET=protected\n"
+	writeFile(t, workspace, ".env", secret)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	runGit(t, workspace, "rm", ".env")
+	writeFile(t, workspace, "public.txt", secret)
+	writeFile(t, workspace, "notes.txt", "benign note\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"public.txt", "notes.txt"})
+
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	for _, marker := range []string{"SECRET=protected", "benign note", "diff --git a/public.txt b/public.txt", "diff --git a/notes.txt b/notes.txt"} {
+		if strings.Contains(patch, marker) {
+			t.Fatalf("changes.patch included untracked content while protected deletion exists (%q):\n%s", marker, patch)
+		}
+	}
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	for _, path := range []string{"public.txt", "notes.txt"} {
+		if info, ok := untracked[path]; ok && (info.PatchIncluded || info.SHA256 != "") {
+			t.Fatalf("%s untracked info = %+v, want no patch and no sha while protected deletion exists", path, info)
+		}
 	}
 }
 

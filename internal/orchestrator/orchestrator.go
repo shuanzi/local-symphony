@@ -415,31 +415,74 @@ func (o Orchestrator) injectReworkContext(issue *core.Issue, run *core.RunAttemp
 // from leaking their content into cumulative_diff_sha hashes that are
 // persisted in rework_snapshots.
 func filteredTrackedDiff(root string, protectedPaths []string) []byte {
-	diffOut, _ := exec.Command("git", "-C", root, "diff", "HEAD").Output()
-	if len(diffOut) == 0 {
-		return diffOut
-	}
-	namesOut, err := exec.Command("git", "-C", root, "diff", "--name-only", "HEAD").Output()
+	safe, err := filteredTrackedDiffPathspecs(root, protectedPaths)
 	if err != nil {
-		return diffOut
-	}
-	names := strings.Split(strings.TrimSpace(string(namesOut)), "\n")
-	safe := make([]string, 0, len(names))
-	for _, name := range names {
-		name = strings.TrimSpace(name)
-		if name != "" && !security.IsProtectedPathWithConfig(name, protectedPaths) {
-			safe = append(safe, name)
-		}
+		return nil
 	}
 	if len(safe) == 0 {
 		return nil
 	}
-	args := append([]string{"-C", root, "diff", "HEAD", "--"}, safe...)
+	args := append([]string{"-C", root, "diff", "--find-renames", "--find-copies", "--find-copies-harder", "HEAD", "--"}, safe...)
 	out, err := exec.Command("git", args...).Output()
 	if err != nil {
-		return diffOut
+		return nil
 	}
 	return out
+}
+
+func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]string, error) {
+	out, err := exec.Command("git", "-C", root, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "-z", "HEAD").Output()
+	if err != nil || len(out) == 0 {
+		return nil, err
+	}
+	fields := strings.Split(string(out), "\x00")
+	if len(fields) > 0 && fields[len(fields)-1] == "" {
+		fields = fields[:len(fields)-1]
+	}
+	type diffRecord struct {
+		status string
+		paths  []string
+	}
+	records := []diffRecord{}
+	hasProtectedDelete := false
+	for i := 0; i < len(fields); {
+		status := fields[i]
+		i++
+		pathCount := 1
+		if strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C") {
+			pathCount = 2
+		}
+		if i+pathCount > len(fields) {
+			return nil, fmt.Errorf("parse git diff name-status")
+		}
+		paths := fields[i : i+pathCount]
+		i += pathCount
+		records = append(records, diffRecord{status: status, paths: paths})
+		if strings.HasPrefix(status, "D") && security.IsProtectedPathWithConfig(paths[0], protectedPaths) {
+			hasProtectedDelete = true
+		}
+		if (strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C")) && security.IsProtectedPathWithConfig(paths[0], protectedPaths) {
+			hasProtectedDelete = true
+		}
+	}
+	safe := []string{}
+	for _, record := range records {
+		protected := false
+		for _, path := range record.paths {
+			if security.IsProtectedPathWithConfig(path, protectedPaths) {
+				protected = true
+				break
+			}
+		}
+		if protected {
+			continue
+		}
+		if hasProtectedDelete && strings.HasPrefix(record.status, "A") {
+			continue
+		}
+		safe = append(safe, record.paths[len(record.paths)-1])
+	}
+	return safe, nil
 }
 
 func (o Orchestrator) computeCumulativeDiffSHA(issue *core.Issue, run *core.RunAttempt, baseSHA string, protectedPaths []string) string {
@@ -486,10 +529,12 @@ func cumulativeUntrackedDigest(root string, protectedPaths []string) string {
 	if err != nil || len(out) == 0 {
 		return ""
 	}
+	hasDeletedProtected := cumulativeHasDeletedProtected(root, protectedPaths)
 	paths := strings.Split(string(out), "\x00")
 	paths = paths[:len(paths)-1]
 	sort.Strings(paths)
 	h := sha256.New()
+	wrote := false
 	for _, rel := range paths {
 		if rel == "" {
 			continue
@@ -502,11 +547,15 @@ func cumulativeUntrackedDigest(root string, protectedPaths []string) string {
 		if isProtectedUntrackedPath(rel, protectedPaths) {
 			continue
 		}
+		if hasDeletedProtected {
+			continue
+		}
 		path := filepath.Join(root, rel)
 		info, err := os.Lstat(path)
 		if err != nil {
 			continue
 		}
+		wrote = true
 		_, _ = h.Write([]byte(rel))
 		_, _ = h.Write([]byte{0})
 		_, _ = h.Write([]byte(info.Mode().String()))
@@ -526,7 +575,24 @@ func cumulativeUntrackedDigest(root string, protectedPaths []string) string {
 		}
 		_, _ = h.Write([]byte{0})
 	}
+	if !wrote {
+		return ""
+	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func cumulativeHasDeletedProtected(root string, protectedPaths []string) bool {
+	out, err := exec.Command("git", "-C", root, "diff", "--name-only", "--diff-filter=D", "-z", "HEAD").Output()
+	if err != nil || len(out) == 0 {
+		return false
+	}
+	paths := strings.Split(string(out), "\x00")
+	for _, rel := range paths {
+		if rel != "" && security.IsProtectedPathWithConfig(rel, protectedPaths) {
+			return true
+		}
+	}
+	return false
 }
 
 func runnerForRun(run *core.RunAttempt, wf *config.Workflow) agentrunner.Runner {

@@ -495,11 +495,11 @@ func containsCIToken(haystack, needle string) bool {
 		// alnum bytes are NOT treated as boundaries so substrings
 		// inside paths/identifiers do not false-positive.
 		// PR #27 / D4 F5.
-		if i > 0 && !isBoundaryByteCI(haystack[i-1]) {
+		if i > 0 && !isLeftBoundaryCI(haystack, i) {
 			continue
 		}
 		// Right boundary: same rule.
-		if i+nl < hl && !isBoundaryByteCI(haystack[i+nl]) {
+		if i+nl < hl && !isRightBoundaryCI(haystack, i+nl) {
 			continue
 		}
 		match := true
@@ -522,6 +522,38 @@ func containsCIToken(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+func isLeftBoundaryCI(s string, tokenStart int) bool {
+	pos := tokenStart - 1
+	if isPathPunctuationBoundary(s, pos) {
+		return false
+	}
+	return isBoundaryByteCI(s[pos])
+}
+
+func isRightBoundaryCI(s string, tokenEnd int) bool {
+	if isPathPunctuationBoundary(s, tokenEnd) {
+		return false
+	}
+	return isBoundaryByteCI(s[tokenEnd])
+}
+
+func isPathPunctuationBoundary(s string, pos int) bool {
+	if pos <= 0 || pos+1 >= len(s) {
+		return false
+	}
+	if s[pos] != '.' {
+		return false
+	}
+	return isPathNameByteCI(s[pos-1]) && isPathNameByteCI(s[pos+1])
+}
+
+func isPathNameByteCI(b byte) bool {
+	if b >= 'A' && b <= 'Z' {
+		b += 32
+	}
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_' || b == '-'
 }
 
 // isBoundaryByteCI reports whether b is a "boundary" byte — a
