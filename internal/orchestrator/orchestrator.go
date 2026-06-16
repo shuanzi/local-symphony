@@ -171,8 +171,11 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 	// snapshot hash reflects the *post-injection* prompt so
 	// diagnostics can correlate what was actually sent to the agent
 	// with the prior review packet.
+	var promptHash string
+	var reworkRec store.ReworkSnapshotRecord
+	var reworkErr error
 	if run.SourceIssueState == core.StateRework {
-		prompt, promptHash, reworkRec, reworkErr := o.injectReworkContext(issue, run, prompt)
+		prompt, promptHash, reworkRec, reworkErr = o.injectReworkContext(issue, run, prompt)
 		if reworkErr != nil {
 			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("rework context: %v", reworkErr), core.RunFailed)
 			return nil
