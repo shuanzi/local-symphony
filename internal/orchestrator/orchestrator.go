@@ -436,6 +436,27 @@ func (o Orchestrator) computeCumulativeDiffSHA(issue *core.Issue, run *core.RunA
 	return hex.EncodeToString(h[:])
 }
 
+// isProtectedUntrackedPath reports whether a workspace-relative
+// untracked file path looks like a protected secret/credential file
+// whose content must not be hashed into cumulative_diff_sha.
+// Uses security.IsProtectedPath (the same logic as reviewSafePath
+// in internal/review) plus additional name-based heuristics for
+// files that may not be covered by the default ProtectedPaths
+// patterns (e.g. files with "secret", "token", "key", "credential"
+// in their name).
+func isProtectedUntrackedPath(rel string) bool {
+	if security.IsProtectedPath(rel) {
+		return true
+	}
+	base := strings.ToLower(filepath.Base(rel))
+	for _, keyword := range []string{"secret", "token", "key", "credential"} {
+		if strings.Contains(base, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
 func cumulativeUntrackedDigest(root string) string {
 	out, err := exec.Command("git", "-C", root, "ls-files", "--others", "--exclude-standard", "-z").Output()
 	if err != nil || len(out) == 0 {
@@ -447,6 +468,14 @@ func cumulativeUntrackedDigest(root string) string {
 	h := sha256.New()
 	for _, rel := range paths {
 		if rel == "" {
+			continue
+		}
+		// PR #27 / D4 F5c: skip protected untracked files
+		// (e.g. .env, id_rsa, secrets.txt). Their content
+		// must not leak into cumulative_diff_sha which is
+		// persisted in rework_snapshots and rendered into
+		// prompts. See isProtectedUntrackedPath below.
+		if isProtectedUntrackedPath(rel) {
 			continue
 		}
 		path := filepath.Join(root, rel)

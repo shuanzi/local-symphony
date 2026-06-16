@@ -61,7 +61,6 @@ func TestSafeSummaryScanForRawArtifactsRejectsRefusalKindTokens(t *testing.T) {
 		{"summary with codex_log marker", "summary", "codex_log"},
 		{"tests with prompt_snapshot marker", "tests", "prompt_snapshot"},
 		{"risks with secret_artifact marker", "risks", "secret_artifact"},
-		{"diffstat with prompt_rendered marker", "diffstat", "prompt_rendered"},
 		{"how_to_continue with codex_events marker", "how_to_continue", "codex_events"},
 	}
 	for _, tc := range cases {

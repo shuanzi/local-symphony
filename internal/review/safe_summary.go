@@ -224,7 +224,7 @@ func (s *SafeSummary) ScanForRawArtifacts() error {
 		return fmt.Errorf("safe summary is nil")
 	}
 	stringsToScan := []string{
-		s.Summary, s.Diffstat, s.HowToContinue,
+		s.Summary, s.HowToContinue,
 		s.FailureMessage, s.BranchName, s.BaseRef, s.BaseRefConfig, s.BaseSHA, s.HeadSHA, s.Status, s.SourceIssueState,
 	}
 	stringsToScan = append(stringsToScan, s.Acceptance...)
@@ -237,6 +237,13 @@ func (s *SafeSummary) ScanForRawArtifacts() error {
 	// not file names. Exclude ChangedFiles from the refusal-kind
 	// scan so legitimate paths like "docs/raw_prompt.md" or
 	// "secrets.txt" are not blocked.
+	//
+	// D4 F5b: Diffstat contains numstat rows with file system
+	// paths (e.g. "docs/raw_prompt.md" or "secrets.txt"). Those
+	// paths are not artifact kind labels; scanning them triggers
+	// false-positive rejection on blocklist tokens embedded in
+	// path segments. Diffstat is excluded for the same reason
+	// ChangedFiles was — they are both file-path collections.
 	stringsToScan = append(stringsToScan, s.FailureCode)
 	for _, extra := range s.Extra {
 		stringsToScan = append(stringsToScan, extra)
