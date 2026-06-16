@@ -104,6 +104,27 @@ DIAGNOSTICS_DATABASE_VERSION_STATUS_ENUM = ("supported", "unsupported", "unknown
 DIAGNOSTICS_SUPPORT_STATUS_ENUM = ("supported", "unsupported", "unknown")
 DIAGNOSTICS_GIT_STATUS_ENUM = ("clean", "dirty", "unavailable", "unknown")
 DIAGNOSTICS_CHECK_STATUS_ENUM = ("ok", "warning", "error")
+DIAGNOSTICS_CODEX_FAILURE_REASON_ENUM = (
+    "malformed_version",
+    "missing_fixture",
+    "missing_metadata",
+    "malformed_metadata",
+    "metadata_codex_version_mismatch",
+    "experimental_api_not_supported",
+    "metadata_missing_codex_version",
+    "metadata_missing_protocol_version",
+    "metadata_missing_schema_version",
+    "metadata_protocol_version_sentinel",
+    "metadata_schema_version_sentinel",
+    "metadata_codex_version_sentinel",
+    "metadata_missing_supported_notifications",
+    "metadata_missing_supported_requests",
+    "missing_schema_fixture",
+    "missing_transcript_fixture",
+    "invalid_transcript_fixture",
+    "codex_not_installed",
+    "unknown",
+)
 APPROVAL_REQUIRED_FIELDS = frozenset(
     {
         "id",
@@ -141,8 +162,11 @@ DIAGNOSTICS_DEFINITION_REQUIRED_FIELDS = {
     "lastValidConfig": frozenset({"available", "path", "validated_at", "content_hash"}),
     "daemon": frozenset({"pid", "uptime_ms", "runtime_descriptor"}),
     "runtimeDescriptor": frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid", "acquired_at", "heartbeat_at", "heartbeat_ttl_ms", "owner_nonce_fingerprint"}),
-    "codex": frozenset({"available", "version", "support"}),
+    "codex": frozenset({"available", "version", "support", "metadata", "fixture_support", "last_preflight", "warning"}),
     "codexSupport": frozenset({"cli", "model", "sandbox"}),
+    "codexMetadata": frozenset({"codex_version", "protocol_version", "schema_version", "experimental_api", "supported_notifications", "supported_requests"}),
+    "codexFixtureSupport": frozenset({"schema_available", "metadata_available", "transcript_available"}),
+    "codexPreflight": frozenset({"ran_at", "available", "failure_code", "failure_reason", "failure_message"}),
     "git": frozenset({"repository", "worktree"}),
     "gitRepository": frozenset({"is_repo", "root", "branch", "head_sha", "status"}),
     "gitWorktree": frozenset({"path", "branch", "base_ref", "status"}),
@@ -162,8 +186,11 @@ OPENAPI_DIAGNOSTICS_REQUIRED_FIELDS = {
     "DiagnosticsLastValidConfig": frozenset({"available", "path", "validated_at", "content_hash"}),
     "DiagnosticsDaemon": frozenset({"pid", "uptime_ms", "runtime_descriptor"}),
     "DiagnosticsRuntimeDescriptor": frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid", "acquired_at", "heartbeat_at", "heartbeat_ttl_ms", "owner_nonce_fingerprint"}),
-    "DiagnosticsCodex": frozenset({"available", "version", "support"}),
+    "DiagnosticsCodex": frozenset({"available", "version", "support", "metadata", "fixture_support", "last_preflight", "warning"}),
     "DiagnosticsCodexSupport": frozenset({"cli", "model", "sandbox"}),
+    "DiagnosticsCodexMetadata": frozenset({"codex_version", "protocol_version", "schema_version", "experimental_api", "supported_notifications", "supported_requests"}),
+    "DiagnosticsCodexFixtureSupport": frozenset({"schema_available", "metadata_available", "transcript_available"}),
+    "DiagnosticsCodexPreflight": frozenset({"ran_at", "available", "failure_code", "failure_reason", "failure_message"}),
     "DiagnosticsGit": frozenset({"repository", "worktree"}),
     "DiagnosticsGitRepository": frozenset({"is_repo", "root", "branch", "head_sha", "status"}),
     "DiagnosticsGitWorktree": frozenset({"path", "branch", "base_ref", "status"}),
@@ -396,6 +423,33 @@ def assert_const(schema: dict[str, Any], label: str, expected: Any) -> None:
 def assert_enum(schema: dict[str, Any], label: str, expected: tuple[str, ...]) -> None:
     if schema.get("enum") != list(expected):
         fail(f"{label}.enum must be {list(expected)}")
+
+
+def unwrap_one_of_enum(schema: dict[str, Any], label: str) -> dict[str, Any]:
+    """Return the enum branch of a `oneOf` schema that
+    allows either JSON null or one of a closed enum.
+
+    The F1 (round-5) fix changes `failure_reason` to
+    surface as JSON null on the success path. The schema
+    declares the field as
+    `{"oneOf": [{"type": "null"}, {"enum": [...]}]}`.
+    The contract validator's `assert_enum` only inspects
+    a flat enum schema, so this helper walks the `oneOf`
+    and returns the enum branch. If the schema is not
+    a `oneOf` of null-and-enum, the helper returns the
+    input unchanged and the caller will surface a
+    contract mismatch as before.
+    """
+    one_of = schema.get("oneOf")
+    if not isinstance(one_of, list):
+        return schema
+    for branch in one_of:
+        if not isinstance(branch, dict):
+            continue
+        if "enum" in branch:
+            return branch
+    fail(f"{label} oneOf has no enum branch; expected null-or-enum")
+    return schema
 
 
 def assert_non_blank_string_schema(schema: Any, label: str) -> None:
@@ -856,13 +910,42 @@ def validate_diagnostics_schema_contract() -> None:
     assert_required_fields(runtime_descriptor, "schemas/diagnostics.schema.json.$defs.runtimeDescriptor", frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid", "acquired_at", "heartbeat_at", "heartbeat_ttl_ms", "owner_nonce_fingerprint"}))
 
     codex = require_dict(defs.get("codex"), "schemas/diagnostics.schema.json.$defs.codex")
-    assert_required_fields(codex, "schemas/diagnostics.schema.json.$defs.codex", frozenset({"available", "version", "support"}))
+    assert_required_fields(codex, "schemas/diagnostics.schema.json.$defs.codex", frozenset({"available", "version", "support", "metadata", "fixture_support", "last_preflight", "warning"}))
     codex_support = require_dict(defs.get("codexSupport"), "schemas/diagnostics.schema.json.$defs.codexSupport")
     assert_required_fields(codex_support, "schemas/diagnostics.schema.json.$defs.codexSupport", frozenset({"cli", "model", "sandbox"}))
     assert_enum(
         require_dict(defs.get("supportStatus"), "schemas/diagnostics.schema.json.$defs.supportStatus"),
         "schemas/diagnostics.schema.json.$defs.supportStatus",
         DIAGNOSTICS_SUPPORT_STATUS_ENUM,
+    )
+    codex_metadata = require_dict(defs.get("codexMetadata"), "schemas/diagnostics.schema.json.$defs.codexMetadata")
+    assert_required_fields(codex_metadata, "schemas/diagnostics.schema.json.$defs.codexMetadata", frozenset({"codex_version", "protocol_version", "schema_version", "experimental_api", "supported_notifications", "supported_requests"}))
+    codex_fixture = require_dict(defs.get("codexFixtureSupport"), "schemas/diagnostics.schema.json.$defs.codexFixtureSupport")
+    assert_required_fields(codex_fixture, "schemas/diagnostics.schema.json.$defs.codexFixtureSupport", frozenset({"schema_available", "metadata_available", "transcript_available"}))
+    codex_preflight = require_dict(defs.get("codexPreflight"), "schemas/diagnostics.schema.json.$defs.codexPreflight")
+    assert_required_fields(codex_preflight, "schemas/diagnostics.schema.json.$defs.codexPreflight", frozenset({"ran_at", "available", "failure_code", "failure_reason", "failure_message"}))
+    preflight_reason_schema = require_dict(
+        require_dict(codex_preflight.get("properties"), "schemas/diagnostics.schema.json.$defs.codexPreflight.properties").get("failure_reason"),
+        "schemas/diagnostics.schema.json.$defs.codexPreflight.properties.failure_reason",
+    )
+    # F1 (round-5 review): the success path emits
+    # `failure_reason: null` (Go nil), not the empty
+    # string. The schema declares the field as a `oneOf`
+    # of `null` and the canonical failure enum, so the
+    # contract validator walks the oneOf and pulls the
+    # enum branch. Without the unwrap, the validator
+    # would either fail (because the outer shape is
+    # `oneOf`, not `enum`) or silently accept any
+    # failure_reason string (because the outer
+    # `oneOf` has no enum member).
+    preflight_reason_enum = unwrap_one_of_enum(
+        preflight_reason_schema,
+        "schemas/diagnostics.schema.json.$defs.codexPreflight.properties.failure_reason",
+    )
+    assert_enum(
+        preflight_reason_enum,
+        "schemas/diagnostics.schema.json.$defs.codexPreflight.properties.failure_reason",
+        DIAGNOSTICS_CODEX_FAILURE_REASON_ENUM,
     )
 
     git = require_dict(defs.get("git"), "schemas/diagnostics.schema.json.$defs.git")
@@ -1036,13 +1119,37 @@ def validate_openapi_diagnostics_contract(data: dict[str, Any]) -> None:
     assert_required_fields(runtime_descriptor, "OpenAPI DiagnosticsRuntimeDescriptor", frozenset({"api_url", "tool_gateway_endpoint", "daemon_pid", "acquired_at", "heartbeat_at", "heartbeat_ttl_ms", "owner_nonce_fingerprint"}))
 
     codex = require_dict(schemas.get("DiagnosticsCodex"), "OpenAPI DiagnosticsCodex")
-    assert_required_fields(codex, "OpenAPI DiagnosticsCodex", frozenset({"available", "version", "support"}))
+    assert_required_fields(codex, "OpenAPI DiagnosticsCodex", frozenset({"available", "version", "support", "metadata", "fixture_support", "last_preflight", "warning"}))
     codex_support = require_dict(schemas.get("DiagnosticsCodexSupport"), "OpenAPI DiagnosticsCodexSupport")
     assert_required_fields(codex_support, "OpenAPI DiagnosticsCodexSupport", frozenset({"cli", "model", "sandbox"}))
     assert_enum(
         require_dict(schemas.get("DiagnosticsSupportStatus"), "OpenAPI DiagnosticsSupportStatus"),
         "OpenAPI DiagnosticsSupportStatus",
         DIAGNOSTICS_SUPPORT_STATUS_ENUM,
+    )
+    codex_metadata = require_dict(schemas.get("DiagnosticsCodexMetadata"), "OpenAPI DiagnosticsCodexMetadata")
+    assert_required_fields(codex_metadata, "OpenAPI DiagnosticsCodexMetadata", frozenset({"codex_version", "protocol_version", "schema_version", "experimental_api", "supported_notifications", "supported_requests"}))
+    codex_fixture = require_dict(schemas.get("DiagnosticsCodexFixtureSupport"), "OpenAPI DiagnosticsCodexFixtureSupport")
+    assert_required_fields(codex_fixture, "OpenAPI DiagnosticsCodexFixtureSupport", frozenset({"schema_available", "metadata_available", "transcript_available"}))
+    codex_preflight = require_dict(schemas.get("DiagnosticsCodexPreflight"), "OpenAPI DiagnosticsCodexPreflight")
+    assert_required_fields(codex_preflight, "OpenAPI DiagnosticsCodexPreflight", frozenset({"ran_at", "available", "failure_code", "failure_reason", "failure_message"}))
+    openapi_preflight_reason = require_dict(
+        require_dict(codex_preflight.get("properties"), "OpenAPI DiagnosticsCodexPreflight.properties").get("failure_reason"),
+        "OpenAPI DiagnosticsCodexPreflight.properties.failure_reason",
+    )
+    # F1 (round-5 review): see the matching comment in
+    # validate_diagnostics_schema_contract. The OpenAPI
+    # mirror is the same `oneOf`-of-`null`-and-enum
+    # shape, so the contract validator unwraps the
+    # oneOf before checking the enum membership.
+    openapi_preflight_reason_enum = unwrap_one_of_enum(
+        openapi_preflight_reason,
+        "OpenAPI DiagnosticsCodexPreflight.properties.failure_reason",
+    )
+    assert_enum(
+        openapi_preflight_reason_enum,
+        "OpenAPI DiagnosticsCodexPreflight.properties.failure_reason",
+        DIAGNOSTICS_CODEX_FAILURE_REASON_ENUM,
     )
 
     git = require_dict(schemas.get("DiagnosticsGit"), "OpenAPI DiagnosticsGit")

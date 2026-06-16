@@ -263,7 +263,7 @@ export interface Diagnostics {
   database: Record<string, unknown>;
   workflow: Record<string, unknown>;
   daemon: Record<string, unknown>;
-  codex: Record<string, unknown>;
+  codex: CodexAvailability;
   git: Record<string, unknown>;
   redaction: Record<string, unknown>;
   warnings: string[];
@@ -272,6 +272,47 @@ export interface Diagnostics {
   failure_summary: Record<string, unknown>;
   pause_summary: Record<string, unknown>;
   checks: Array<Record<string, unknown>>;
+}
+
+export type CodexSupportStatus = 'supported' | 'unsupported' | 'unknown';
+
+export interface CodexSupport {
+  cli: CodexSupportStatus;
+  model: CodexSupportStatus;
+  sandbox: CodexSupportStatus;
+}
+
+export interface CodexCompatibilityMetadata {
+  codex_version: string;
+  protocol_version: string;
+  schema_version: string;
+  experimental_api: boolean;
+  supported_notifications: string[];
+  supported_requests: string[];
+}
+
+export interface CodexFixtureSupport {
+  schema_available: boolean;
+  metadata_available: boolean;
+  transcript_available: boolean;
+}
+
+export interface CodexPreflight {
+  ran_at: string;
+  available: boolean;
+  failure_code: string | null;
+  failure_reason: string | null;
+  failure_message: string | null;
+}
+
+export interface CodexAvailability {
+  available: boolean;
+  version: string | null;
+  support: CodexSupport;
+  metadata: CodexCompatibilityMetadata | null;
+  fixture_support: CodexFixtureSupport;
+  last_preflight: CodexPreflight;
+  warning: string | null;
 }
 
 export interface Health {

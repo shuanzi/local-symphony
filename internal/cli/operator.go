@@ -235,7 +235,13 @@ func statusData(st *store.Store) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"project_id": st.ProjectID, "repo_root": st.RepoRoot, "issues": issues, "runs": runs}, nil
+	return map[string]any{
+		"project_id": st.ProjectID,
+		"repo_root":  st.RepoRoot,
+		"issues":     issues,
+		"runs":       runs,
+		"codex":      observability.CodexAvailability(st.RepoRoot),
+	}, nil
 }
 
 // statusViaDaemon asks the daemon for the same status payload.

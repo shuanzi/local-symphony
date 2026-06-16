@@ -242,7 +242,13 @@ func (s *Server) state(w http.ResponseWriter) {
 		apiErr(w, err)
 		return
 	}
-	ok(w, map[string]any{"project_id": s.Store.ProjectID, "repo_root": s.Store.RepoRoot, "issues": issues, "runs": runs})
+	ok(w, map[string]any{
+		"project_id": s.Store.ProjectID,
+		"repo_root":  s.Store.RepoRoot,
+		"issues":     issues,
+		"runs":       runs,
+		"codex":      observability.CodexAvailability(s.Store.RepoRoot),
+	})
 }
 func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()

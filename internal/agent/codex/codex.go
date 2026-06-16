@@ -1848,6 +1848,12 @@ func validateCompatibilityMetadata(version string, metadata CompatibilityMetadat
 		return unsupportedCodexVersion("metadata_missing_protocol_version", map[string]any{"codex_version": version})
 	case metadata.SchemaVersion == "":
 		return unsupportedCodexVersion("metadata_missing_schema_version", map[string]any{"codex_version": version})
+	case isSyntheticSentinelString(metadata.ProtocolVersion):
+		return unsupportedCodexVersion("metadata_protocol_version_sentinel", map[string]any{"codex_version": version})
+	case isSyntheticSentinelString(metadata.SchemaVersion):
+		return unsupportedCodexVersion("metadata_schema_version_sentinel", map[string]any{"codex_version": version})
+	case isSyntheticSentinelString(metadata.CodexVersion):
+		return unsupportedCodexVersion("metadata_codex_version_sentinel", map[string]any{"codex_version": version})
 	case len(metadata.SupportedNotifications) == 0:
 		return unsupportedCodexVersion("metadata_missing_supported_notifications", map[string]any{"codex_version": version})
 	case len(metadata.SupportedRequests) == 0:
@@ -1855,6 +1861,81 @@ func validateCompatibilityMetadata(version string, metadata CompatibilityMetadat
 	default:
 		return nil
 	}
+}
+
+// isSyntheticSentinelString reports whether s carries the
+// synthetic-sentinel shape (an UPPER_SNAKE_CASE token prefixed
+// with `SYNTHETIC_`). The shape detector runs at the
+// compatibility metadata source gate, before values are projected
+// into diagnostics/status. It is deliberately fail-closed: any
+// occurrence of the sentinel body is rejected, including values
+// where the sentinel is embedded after an alphanumeric prefix such
+// as `v1SYNTHETIC_PROMPT_BODY` or `ASYNTHETIC_CODEX_LOG`.
+//
+// The detector is intentionally narrow about the sentinel body and
+// suffix. A string is a sentinel when it contains the `SYNTHETIC_`
+// prefix followed by one or more uppercase / digit segments joined
+// by single underscores, unless the body continues with another
+// uppercase/digit segment. Lowercase suffixes such as
+// `SYNTHETIC_PROMPT_BODY_do_not_leak` are rejected as synthetic
+// sentinels instead of being treated as benign version identifiers.
+// Plain version strings ("1.2.3", "v1.2.3",
+// "protocol-test-v1", "schema-2024-01") never match. The
+// contract validator's `SYNTHETIC_SENTINEL_RE` in
+// `scripts/validate_contracts.py` is a separate helper; it tests
+// the redaction-golden-fixture surface (test input files), not
+// runtime fixture compatibility, so the runtime gate can be
+// stricter than the golden-fixture validator without breaking
+// round-trip semantics.
+var syntheticSentinelBody = regexp.MustCompile(`SYNTHETIC_[A-Z0-9]+(?:_[A-Z0-9]+)*`)
+
+func isSyntheticSentinelString(s string) bool {
+	if !strings.Contains(s, "SYNTHETIC_") {
+		return false
+	}
+	matches := syntheticSentinelBody.FindAllStringIndex(s, -1)
+	for _, m := range matches {
+		_, end := m[0], m[1]
+		// Prefixes are not trusted boundaries. A poisoned
+		// compatibility.json can prefix scalar metadata with
+		// a digit or letter (for example
+		// `v1SYNTHETIC_PROMPT_BODY_do_not_leak`) and the
+		// scalar success path would otherwise echo the raw
+		// value into diagnostics/status. Treat any matched
+		// sentinel body as poisoned, regardless of the byte
+		// before `SYNTHETIC_`.
+		//
+		// Suffix check: reject only uppercase/digit
+		// continuations as part of a longer synthetic
+		// identifier. Lowercase suffixes (including the
+		// repo's sentinel fixtures such as
+		// `SYNTHETIC_PROMPT_BODY_do_not_leak`) are
+		// still treated as poisoned synthetic values so
+		// scalar metadata cannot echo them through
+		// diagnostics.
+		if hasSafeSuffixContinuation(s, end) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// hasSafeSuffixContinuation reports whether the character
+// after a matched sentinel body makes it part of a longer
+// all-uppercase synthetic identifier rather than a standalone
+// sentinel. Lowercase suffixes are intentionally not safe:
+// existing poison fixtures use values such as
+// `SYNTHETIC_PROMPT_BODY_do_not_leak_in_diagnostics`.
+func hasSafeSuffixContinuation(s string, end int) bool {
+	if end >= len(s) {
+		return false
+	}
+	c := s[end]
+	if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+		return true
+	}
+	return c == '_' && end+1 < len(s) && ((s[end+1] >= 'A' && s[end+1] <= 'Z') || (s[end+1] >= '0' && s[end+1] <= '9'))
 }
 
 func defaultFixtureRoot() string {
