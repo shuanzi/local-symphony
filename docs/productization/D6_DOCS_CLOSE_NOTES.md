@@ -46,11 +46,11 @@
 
 D1 R1 修复 commit `0aee74c` 修完 R1 的 3 个 finding 后，当前 D6 tree 保留 1 个仍需 D1 owner 处理的 P2 finding。已验证 `schemas/review_packet.schema.json` 不包含 `artifacts` / `ReviewPacketArtifact` 定义，`ReviewPacketArtifact` 仅存在于 `api/openapi.yaml`。
 
-- **P2 #1**：`ReviewPacketArtifact.kind` enum 不完整（`api/openapi.yaml` line 837），当前为 `[review_packet, review_md, review_json, patch, changed_files, untracked_files, diffstat, test_output, agent_final_message, commands, tool_calls, approvals, codex_events, prompt_context, prompt_rendered, prompt_meta, prompt_tool_manifest, other]`，缺少 `prompt_snapshot / codex_log / secret_artifact / secrets / agent_file / diagnostic`（这些值已用于 `artifact_search_index.kind` enum，见同一文件 line 884）。
+- **P2 #1**：`ReviewPacketArtifact.kind` enum 不完整（`api/openapi.yaml` line 837），当前为 `[review_packet, review_md, review_json, patch, changed_files, untracked_files, diffstat, test_output, agent_final_message, commands, tool_calls, approvals, codex_events, prompt_context, prompt_rendered, prompt_meta, prompt_tool_manifest, other]`，缺少 `prompt_snapshot / codex_log / agent_file / diagnostic`（这些值在 `Artifact.kind` enum 中已使用，见同一文件 line 884，但 `secret_artifact` 和 `secrets` 不属于 `ReviewPacketArtifact` 范畴）。
 
 **forwarding to D1 实施 agent**：
 
-1. P2 #1 修法：在 `api/openapi.yaml` 的 `ReviewPacketArtifact.kind` enum 中补上 `prompt_snapshot / codex_log / secret_artifact / secrets / agent_file / diagnostic`。
+1. P2 #1 修法：在 `api/openapi.yaml` 的 `ReviewPacketArtifact.kind` enum 中补上 `prompt_snapshot / codex_log / agent_file / diagnostic`。
 
 D6 范围内**不修**，仅记录。
 
@@ -69,7 +69,7 @@ C3 数据层（schema / nonce / heartbeat / diagnostics / migrated 兼容）经 
 C4 12 commits 收口后留作 v1.1 收口的 4 项已知限制：
 
 1. **fail-open 模式反复在 `repo_root` guard 路径重犯**：round 4 修过一次，round 6 又在同文件 + 镜像 `internal/cli/cli.go` 的 `checkCLISessionRepoRoot` 修第二次。fail-open 注释仍是 repo_root 路径的明显反模式。
-2. **validation failure vs missing file 区分不足**：`logoutRevokeFromFile` 把所有非 `IsNotExist` 错误归为同一 `usable=false` 桶，导致 "validation 失败时 project-scoped 文件被错误删除"。
+2. **validation failure vs missing file 区分不足（已修）**：`logoutRevokeFromFile` 现已返回独立的 `validationFailed` bool（`internal/cli/cli.go:982-1006`）；validation 失败时 `usable=true, validationFailed=true`，调用方保留 project-scoped 文件，不再错误删除。
 3. **镜像检查未去重**：`daemonclient` 和 `cli` 两个包各自有 `checkSessionRepoRoot` / `checkCLISessionRepoRoot` + `normaliseRepoRootForCompare`，修改时必须同时改两边。
 4. **project_id 不匹配的可观测性**：`ReadSessionFile` 在 project_id 不匹配时只返 `ErrUnauthorized`，operator 看到的是"session not valid for this project"——但不能区分 copied-DB / stale session / foreign-bearer-attempt。
 
