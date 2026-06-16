@@ -6,9 +6,9 @@ Local Symphony 是一个基于 OpenAI Symphony 项目思想改造的本地优先
 
 阶段 D 收口状态（2026-06-09，详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`）：
 
-- **D1 / R10** review packet 结构化投影已 ship；R1 修复落地；R2 review 跑中（1 P2 forwarding）。
-- **D3 / R14** codex availability diagnostics 已 ship（5 轮 codex review 0 finding 收口）。
-- **D5 / R13** release packaging 已 ship（主体 + R1 修复 + R2 修复 commit 均落地；R2 review 文档待生成）。
+- **D1 / R10** review packet metadata/artifact surface 已可用；structured projection 仍按 `docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md` 记录为后续补齐项，R2 review 跑中（1 P2 forwarding）。
+- **D3 / R14** diagnostics 已暴露 Codex 占位投影；实际 Codex availability/version/support 检测仍未接入，见 `docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md` 的 R14。
+- **D5 / R13** release packaging 是跨 PR / pending 项；当前 checkout 不包含 `scripts/build-release.sh` 或 `web/package-lock.json`，不声明 release files 已 ship。
 - **D4 / R16** Rework prompt 上下文产品化准备中；**D2 / R11** Dashboard 产品化补齐准备中。
 
 ## 1. 项目能力概览
@@ -145,7 +145,8 @@ WORKFLOW.md                      # 项目 workflow 配置；不存在时自动�
 ~/.symphony/app.db               # 全局 app-level SQLite DB
 ~/.symphony/workspaces/          # 默认 issue worktree 根目录
 ~/.symphony/runtime/             # serve 运行期 descriptor
-~/.symphony/cli-session.json     # serve 启动后写入的本地 CLI session 信息
+~/.symphony/cli-sessions/<project>.json # serve 启动后写入的当前项目 CLI session 信息
+~/.symphony/cli-session.json     # legacy 单文件 session fallback，仅用于兼容旧版本
 ```
 
 查看当前项目状态：
@@ -191,11 +192,11 @@ CLI bearer session 由 `symphony serve` 自动 mint 并落到 `~/.symphony/cli-s
 # 列出本机所有已存 session（多项目场景）
 /path/to/local-symphony/bin/symphony login --list
 
-# 登出当前项目（删除本地 session 文件；不撤销 daemon 端 session）
+# 登出当前项目（先请求 daemon revoke 当前 CLI session；确认后删除本地 session 文件）
 /path/to/local-symphony/bin/symphony login --logout
 ```
 
-`login` 不创建新 session。新 session 必须在 `symphony serve` 启动时由 daemon 端通过 open-token 流程签发。`symphony tool` 命令走独立的 Tool Gateway token 路径，不会被 `login`/`logout` 触发。
+`login` 不创建新 session。新 session 必须在 `symphony serve` 启动时由 daemon 端通过 open-token 流程签发。`login --logout` 会优先调用 daemon revoke 当前 CLI bearer；revoke 已确认、token 不匹配或没有本地 bearer 可撤销时，才删除本地 project-scoped session 文件和 legacy fallback 文件。若 daemon-side revoke 无法确认，则保留本地文件供重试。`symphony tool` 命令走独立的 Tool Gateway token 路径，不会被 `login`/`logout` 触发。
 
 当前 `web/` 是 React/Vite dashboard MVP 和动作合同检查。`symphony serve` 的 `/api/v1/*` 与 `/tool/v1/call` 路由优先于 dashboard 静态资源。根路径只会从可信 dashboard dist 位置读取静态资源：优先使用 `SYMPHONY_DASHBOARD_DIST` 指向的构建产物目录；未设置时从 `symphony` 可执行文件所在目录推导 `web/dist`、`../web/dist`、`../share/local-symphony/web/dist` 等安装位置。被管理项目根目录下的 `web/dist` 不会作为默认候选。
 
@@ -530,7 +531,7 @@ localhost
 
 ### 真实 Codex 不运行
 
-这是 v1 的预期行为。当前真实 Codex adapter 是 fixture-gated skeleton；默认测试与验收使用 fake runner。**D3 / R14** codex availability diagnostics 已 ship 到 diagnostics surface：`symphony diagnostics` / `/api/v1/diagnostics` 暴露 `codex.available`、`codex.version` 与 `codex.support.{cli,model,sandbox}`。当前 diagnostics contract 不包含 Codex `reason` / `status` 字段；`symphony status` 与 `/api/v1/state` 不承诺合成或暴露 Codex availability/reason。未配置支持 fixture 的版本在启动真实 `codex app-server` 进程前以 `unsupported_codex_version` 失败。Real Codex integration test 仍只通过 `SYMPHONY_TEST_CODEX=1` 显式开启。
+这是 v1 的预期行为。当前真实 Codex adapter 是 fixture-gated skeleton；默认测试与验收使用 fake runner。**D3 / R14** diagnostics surface 已有 Codex 投影字段：`symphony diagnostics` / `/api/v1/diagnostics` 暴露 `codex.available`、`codex.version` 与 `codex.support.{cli,model,sandbox}`，但当前实现仍固定为 `available=false`、`version=null`、support unknown，尚未接入真实 Codex availability/version/support 检测。当前 diagnostics contract 不包含 Codex `reason` / `status` 字段；`symphony status` 与 `/api/v1/state` 不承诺合成或暴露 Codex availability/reason。未配置支持 fixture 的版本在启动真实 `codex app-server` 进程前以 `unsupported_codex_version` 失败。Real Codex integration test 仍只通过 `SYMPHONY_TEST_CODEX=1` 显式开启。
 
 ## 15. 清理本地数据
 
@@ -543,7 +544,8 @@ rm -f WORKFLOW.md
 
 # 全局 runtime/session/workspace 数据，按需清理
 rm -rf ~/.symphony/runtime
-rm -f ~/.symphony/cli-session.json
+rm -rf ~/.symphony/cli-sessions
+rm -f ~/.symphony/cli-session.json # legacy fallback，仅旧版本兼容
 rm -rf ~/.symphony/workspaces/<project_id>
 
 # 谨慎：会删除所有 Local Symphony 全局项目索引与 session 数据

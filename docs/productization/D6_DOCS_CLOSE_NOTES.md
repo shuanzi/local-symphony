@@ -4,7 +4,7 @@
 **对应计划**：`docs/productization/V1_REAL_PRODUCTIZATION_EXECUTION_PLAN.md` §7 阶段 D / D6
 **worktree 分支**：`codex/v1-productization-d6-docs`
 **基线**：`main` @ `f15ba39`（v1.1 WIP 收口）
-**阶段状态**：**v1.1 WIP** —— D1 主体 + R1 修复 + R2 review 跑中（1 P2 forwarding）；D3 / R14 5 轮 codex review 0 finding 收口；D5 / R13 主体 + R1 修复 + R2 修复 commit 落地（R2 review 文档待生成）；D2 / D4 准备中；D6 / R15 文档合同收口（本批）。
+**阶段状态**：**v1.1 WIP** —— D1 主体 + R1 修复 + R2 review 跑中（1 P2 forwarding）；D3 / R14 diagnostics surface 已有 Codex 占位投影但真实 availability/version/support 检测未接入；D5 / R13 是跨 PR / pending 项，当前 checkout 不包含 release script 或 `web/package-lock.json`；D2 / D4 准备中；D6 / R15 文档合同收口（本批）。
 
 ## 1. R 项 status note 表
 
@@ -23,7 +23,7 @@
 | R11 | Dashboard 产品化补齐 | D2 | ⏳ D2 准备中 | — | 待启动 |
 | R12 | 安全策略执行 | B3 | ✅ B3 完成 | B3 链 | secret/best-effort/loopback/CSRF/Tool Gateway scope |
 | R13 | Release packaging | D5 | 🟡 D5 进行中 | `573b1f0` + R1 `41dabb6` + R2 `cdf08ed` | 主体 + R1/R2 修复 commit 均落地；R2 review 文档待生成；顺带发现 Windows build issue（pre-existing, `internal/db/schema.go:105/134`），归 D5 / R13 范围 |
-| R14 | Codex availability diagnostics | D3 | ✅ D3 完成 | 分支 `codex/v1-productization-d3-codex-availability`（5 轮 review） | 5 轮 codex review 0 finding 收口（见 D3 PR） |
+| R14 | Codex availability diagnostics | D3 | 🟡 D3 部分完成 / R14 后续补齐 | 分支 `codex/v1-productization-d3-codex-availability`（5 轮 review） | diagnostics surface 字段已接入；当前实现仍固定 `available=false` / `version=null` / support unknown，真实 Codex availability/version/support 检测仍见 gaps 文档 R14 |
 | R15 | 文档合同 | D6 | 🟡 D6 进行中 | 本批 | 本批文档收口 |
 | R16 | Rework prompt 上下文 | D4 | ⏳ D4 准备中 | — | 待启动 |
 | R17 | DB schema guard | A0 | ✅ A0 完成 | A0 链 | `internal/db.MigrateAppSchema` idempotent |
@@ -32,9 +32,9 @@
 
 | 文件 | 状态 | 范围 |
 |---|---|---|
-| `README.md` | M | §1 / §14 状态指针；真实 Codex 不运行段补 D3 / R14 |
+| `README.md` | M | §1 / §14 状态指针；真实 Codex 不运行段补 D3 / R14 当前占位投影与未接真实 availability 检测 |
 | `PRD.md` | M | 头部加 v1 阶段 D 收口状态元数据；§8.4 Codex Runner 段加 D3 / D5 状态注 |
-| `TECH_SPEC.md` | M | 头部加 v1 阶段 D 收口状态元数据；§10 Codex adapter 段补 D3 已 ship；末尾加 D-Phase Close Summary 指针 |
+| `TECH_SPEC.md` | M | 头部加 v1 阶段 D 收口状态元数据；§10 Codex adapter 段补 D3 当前占位投影与未接真实 availability 检测；末尾加 D-Phase Close Summary 指针 |
 | `docs/codex/ADAPTER_MAPPING.md` | M | 头部加 D3 / R14 5 轮 review 收口一致状态 |
 | `docs/codex/FIXTURE_POLICY.md` | M | CI 段补 D3 / R14 preflight 状态；D5 / R13 release packaging 不在本 policy 声明 |
 | `docs/testing/ACCEPTANCE.md` | M | A0–A10 acceptance 分类标签化（fake / 安全回归 / real Codex opt-in）；顶部加分类总览表 |
@@ -109,4 +109,4 @@ v1 禁项清单（D6 范围内未引入）：
 ❌ raw prompt / raw Codex log / raw secret 暴露
 ```
 
-D6 以文档同步为主，附带少量 contract 清理（`api/openapi.yaml` 移除 `AppState.codex` 字段）；未触碰 Go 实现代码、test、dashboard 前端逻辑。
+D6 以文档同步为主，附带少量 contract 清理（`api/openapi.yaml` 移除 `AppState.codex` 字段）和测试合同 manifest 对齐；未触碰 Go 实现代码或 dashboard 前端逻辑。

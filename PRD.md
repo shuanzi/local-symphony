@@ -271,7 +271,7 @@ Codex Runner 使用 `codex app-server`。v1 要求 Codex adapter 是 version-fix
 
 真实 Codex adapter 是 v1 release scope，但真实 Codex 兼容性必须通过 committed fixture gate 进入；没有匹配 fixture 的本机 Codex 版本只阻断 real Codex dispatch，不影响 fake runner 主路径和默认 CI。默认测试使用 fake runner。Real Codex tests 只在显式设置 `SYMPHONY_TEST_CODEX=1` 时运行。
 
-> **阶段 D 收口状态（2026-06-09）**：D3 / R14 codex availability diagnostics 已 ship 到 diagnostics surface——`symphony diagnostics` / `GET /api/v1/diagnostics` 暴露 `codex.available`、`codex.version` 与 `codex.support.{cli,model,sandbox}`。当前 diagnostics contract 不包含 Codex `reason` / `status` 字段；`symphony status` 与 `GET /api/v1/state` 不承诺合成或暴露 Codex availability/reason。Real Codex dispatch 在 fixtures 缺失时 fail-closed with `unsupported_codex_version`。D5 / R13 release layout 已 ship（主体 + R1 修复 + R2 修复 commit 均落地；R2 review 文档待生成）。详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
+> **阶段 D 收口状态（2026-06-09）**：D3 / R14 diagnostics surface 已有 Codex 占位 projection：`symphony diagnostics` / `GET /api/v1/diagnostics` 暴露 `codex.available`、`codex.version` 与 `codex.support.{cli,model,sandbox}`，但当前实现仍固定为 `available=false`、`version=null`、support unknown，真实 Codex availability/version/support 检测仍未接入。当前 diagnostics contract 不包含 Codex `reason` / `status` 字段；`symphony status` 与 `GET /api/v1/state` 不承诺合成或暴露 Codex availability/reason。Real Codex dispatch 在 fixtures 缺失时 fail-closed with `unsupported_codex_version`。D5 / R13 release packaging 是跨 PR / pending 项；当前 checkout 不包含 `scripts/build-release.sh` 或 `web/package-lock.json`，不声明 release files 已 ship。详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
 
 ### 8.5 WORKFLOW.md 与 Prompt
 
@@ -521,7 +521,7 @@ CLI 全局 flags 至少包括 `--project <path>`、`--api-url <url>`、`--json`�
 
 CLI exit codes 必须采用 TECH_SPEC 11.1 的 0-9 映射；尤其 daemon/gateway unavailable 为 3，auth failure 为 4，permission/policy denial 为 5，not found 为 6，state conflict 为 7，timeout 为 8，workflow/config error 为 9；API `error.code=approval_not_pending` 必须映射为 7。
 
-`symphony status` 使用 `/api/v1/state` 输出与 Overview 对齐的 concise project/daemon/workflow/run/approval/review/paused/failure 状态；daemon 不可用时只能降级到 `/health` 可用性信息或报错。Codex availability 与 support projection 属于 diagnostics contract，必须通过 `symphony diagnostics` / `GET /api/v1/diagnostics` 获取，`status` / `state` 不合成 Codex reason 字段。
+`symphony status` 使用 `/api/v1/state` 输出当前 shipped state payload：`project_id`、`repo_root`、`issues` 和 `runs`；daemon 不可用时只能降级到 `/health` 可用性信息或报错。daemon/workflow/approval/review/paused/failure 聚合属于后续 Overview/status 产品化扩展，不由当前 `/api/v1/state` 合同承诺。Codex availability 与 support projection 属于 diagnostics contract，必须通过 `symphony diagnostics` / `GET /api/v1/diagnostics` 获取，`status` / `state` 不合成 Codex availability、support 或 reason 字段。
 
 正常 CLI 是 operator 工具，走 REST API。`symphony tool ...` 是 agent 工具入口，走 Tool Gateway 本地传输，不走 REST `/api/v1`；transport 可为 Unix socket、named pipe 或 loopback HTTP，具体以 TECH_SPEC 为准，并且必须 JSON-only 输出。
 
@@ -568,7 +568,7 @@ Codex-mediated command auto-deny、network auto-deny、protected-path read/write
 
 Tool Gateway `artifact.attach` 命中 protected path 是另一类拒绝：daemon 必须 hard deny 该 tool call、记录 failed tool_call 并向 agent 返回 tool error；不得写入 approval row，也不得由该拒绝本身直接终止 run。若 agent 后续无法恢复或完成任务，run 才按正常失败路径进入终止状态。
 
-Token 生命周期必须可验收：CLI bearer raw token 只写入 `~/.symphony/cli-session.json`，在 OS 支持时权限必须为 current-user only，app DB 只保存 hash；runtime descriptor 不得包含 secret。Open token 必须短 TTL、one-time、hash-only at rest，成功 exchange 后立即失效，重复使用或过期使用返回 unauthorized。CSRF 只强制用于 cookie-authenticated command APIs；只读 state/health 类接口仍必须满足各自 auth 要求，但不得错误要求 CLI bearer 请求携带 CSRF。Tool token 必须绑定 project/issue/run/workspace/allowed_tools/expiry，只能调用固定 Tool Gateway registry；run terminal、operator run cancel、approval `cancel_run`、reconciliation cancel 或 daemon shutdown 时必须 revoke，且不得赋予 REST operator command 权限。
+Token 生命周期必须可验收：CLI bearer raw token 主路径只写入 project-scoped `~/.symphony/cli-sessions/<project>.json`，legacy `~/.symphony/cli-session.json` 仅作为旧版本 fallback/compatibility；在 OS 支持时权限必须为 current-user only，app DB 只保存 hash；runtime descriptor 不得包含 secret。`symphony login --logout` 必须优先请求 daemon 撤销当前 CLI bearer，确认 revoke、token 不匹配或无本地 bearer 可撤销后才删除本地 session 文件；若 daemon-side revoke 无法确认，必须保留本地文件供重试。Open token 必须短 TTL、one-time、hash-only at rest，成功 exchange 后立即失效，重复使用或过期使用返回 unauthorized。CSRF 只强制用于 cookie-authenticated command APIs；只读 state/health 类接口仍必须满足各自 auth 要求，但不得错误要求 CLI bearer 请求携带 CSRF。Tool token 必须绑定 project/issue/run/workspace/allowed_tools/expiry，只能调用固定 Tool Gateway registry；run terminal、operator run cancel、approval `cancel_run`、reconciliation cancel 或 daemon shutdown 时必须 revoke，且不得赋予 REST operator command 权限。
 
 产品文案必须区分三层安全边界：
 
