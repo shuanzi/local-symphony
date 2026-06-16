@@ -611,39 +611,39 @@ bash scripts/acceptance-local.sh
 
 #### C4 v1.1 WIP：trust 边界专项收口
 
-C4 已完成 9 轮 codex review（`7cb9291` / `095b946` / `88a66c3` / `97c2b0a` / `5a7f5bd` / `f358715` / `7f93187` / `eec5c28` / `7fa5a08`）和 6 轮 adversarial review（`5a7f5bd` → `7fa5a08` round 1-5 + `b9af4a6` round 6），覆盖 CLI/daemon session 对齐、auth bypass 修复、loopback 守卫、project_id 守卫、repo_root 守卫、degraded logout 状态追踪、openDescriptor 信任链、logoutRevokeFromFile Discover 路由、login UX、validate workflow 标注、fail-closed repo_root 校验、sticky project-scoped logout 等。C4 收口进入 v1.1 WIP 路线，不再开 round 7。
+C4 已完成 9 轮 codex review 和 6 轮 adversarial review（详见 C4 PR [#22](https://github.com/shuanzi/local-symphony/pull/22) 与 `V1_PHASE_C_ACCEPTANCE.md` §5.2），覆盖 CLI/daemon session 对齐、auth bypass 修复、loopback 守卫、project_id 守卫、repo_root 守卫、degraded logout 状态追踪、openDescriptor 信任链、logoutRevokeFromFile Discover 路由、login UX、validate workflow 标注、fail-closed repo_root 校验、sticky project-scoped logout 等。C4 收口进入 v1.1 WIP 路线，不再开 round 7。
 
 **累计 finding 表**（0 critical / 4 important / 18 minor）：
 
 | 轮次 | 级别 | finding | 状态 |
 |---|---|---|---|
-| codex review 1 (`7cb9291`) | important | auth bypass (CLI bearer 不经 project_id / loopback 校验直接送 daemon) | fixed |
-| codex review 1 (`7cb9291`) | minor | `decodeArray` 不区分 env 优先级 + 修 | fixed |
-| codex review 1 (`7cb9291`) | minor | workflow validate 走 GET 应改 POST | fixed |
-| codex review 1 (`7cb9291`) | minor | URL query 拼接不规范 | fixed |
-| codex review 1 (`7cb9291`) | minor | `symphony login` 缺友好提示 | fixed |
-| codex review 2 (`095b946`) | minor | login probe 缺失（不发 `/auth/session` 探测） | fixed |
-| codex review 2 (`095b946`) | minor | mutating retry 链路不显式 | fixed |
-| codex review 2 (`095b946`) | minor | legacy logout 不识别无 project 文件 | fixed |
-| codex review 3 (`88a66c3`) | minor | err wrap 路径不一致 | fixed |
-| codex review 3 (`88a66c3`) | minor | `symphony login` 失败未统一退出 7 | fixed |
-| codex review 3 (`88a66c3`) | minor | acceptance 缺 poll step | fixed |
-| codex review 3 (`88a66c3`) | minor | fallback schema 与原 schema 不一致 | fixed |
-| codex review 4 (`97c2b0a`) | minor | `workflow validate` 未标 non-mutating | fixed |
-| adversarial round 1 (`5a7f5bd`) | important | project_id 不匹配 → ErrSessionMissing wrap | fixed |
-| adversarial round 1 (`5a7f5bd`) | important | logout 缺 server-side revoke 路径 | fixed |
-| adversarial round 2 (`f358715`) | minor | loopback host guard 不严格 | fixed |
-| adversarial round 2 (`f358715`) | minor | degraded logout 状态不外露 | fixed |
-| adversarial round 2 (`f358715`) | minor | revoke envelope shape 不稳定 | fixed |
-| adversarial round 3 (`7f93187`) | important | `logoutRevokeFromFile` 不走 Discover | fixed |
-| adversarial round 3 (`7f93187`) | minor | project_id guard 在 logout 路径漏写 | fixed |
-| adversarial round 4 (`eec5c28`) | important | session repo_root guard 漏 fail-open | fixed |
-| adversarial round 4 (`eec5c28`) | minor | legacy logout 不按 project_id scoping | fixed |
-| adversarial round 5 (`7fa5a08`) | important | openDescriptor 信任链未走 Discover | fixed |
-| adversarial round 5 (`7fa5a08`) | important | logoutRevoke 不追踪 per-source degrade | fixed |
-| adversarial round 5 (`7fa5a08`) | minor | `loginResolveProject` 不传播 repo_root | fixed |
-| adversarial round 6 (`b9af4a6`) | important | EvalSymlinks 失败 → fail-open（错接外国 bearer） | fixed |
-| adversarial round 6 (`b9af4a6`) | important | logout 删 unvalidated project-scoped 文件 | fixed |
+| codex review 1 | important | auth bypass (CLI bearer 不经 project_id / loopback 校验直接送 daemon) | fixed |
+| codex review 1 | minor | `decodeArray` 不区分 env 优先级 + 修 | fixed |
+| codex review 1 | minor | workflow validate 走 GET 应改 POST | fixed |
+| codex review 1 | minor | URL query 拼接不规范 | fixed |
+| codex review 1 | minor | `symphony login` 缺友好提示 | fixed |
+| codex review 2 | minor | login probe 缺失（不发 `/auth/session` 探测） | fixed |
+| codex review 2 | minor | mutating retry 链路不显式 | fixed |
+| codex review 2 | minor | legacy logout 不识别无 project 文件 | fixed |
+| codex review 3 | minor | err wrap 路径不一致 | fixed |
+| codex review 3 | minor | `symphony login` 失败未统一退出 7 | fixed |
+| codex review 3 | minor | acceptance 缺 poll step | fixed |
+| codex review 3 | minor | fallback schema 与原 schema 不一致 | fixed |
+| codex review 4 | minor | `workflow validate` 未标 non-mutating | fixed |
+| adversarial round 1 | important | project_id 不匹配 → ErrSessionMissing wrap | fixed |
+| adversarial round 1 | important | logout 缺 server-side revoke 路径 | fixed |
+| adversarial round 2 | minor | loopback host guard 不严格 | fixed |
+| adversarial round 2 | minor | degraded logout 状态不外露 | fixed |
+| adversarial round 2 | minor | revoke envelope shape 不稳定 | fixed |
+| adversarial round 3 | important | `logoutRevokeFromFile` 不走 Discover | fixed |
+| adversarial round 3 | minor | project_id guard 在 logout 路径漏写 | fixed |
+| adversarial round 4 | important | session repo_root guard 漏 fail-open | fixed |
+| adversarial round 4 | minor | legacy logout 不按 project_id scoping | fixed |
+| adversarial round 5 | important | openDescriptor 信任链未走 Discover | fixed |
+| adversarial round 5 | important | logoutRevoke 不追踪 per-source degrade | fixed |
+| adversarial round 5 | minor | `loginResolveProject` 不传播 repo_root | fixed |
+| adversarial round 6 | important | EvalSymlinks 失败 → fail-open（错接外国 bearer） | fixed |
+| adversarial round 6 | important | logout 删 unvalidated project-scoped 文件 | fixed |
 
 **已知限制（指向 C5 trust 边界专项 / v1.1 收口）**：
 

@@ -1,6 +1,6 @@
 # Codex Adapter Mapping
 
-**同步状态**：与 D3 / R14 5 轮 codex review 收口一致（HEAD `57c46c0`）。本文件描述的 lifecycle mapping / event normalization 与 `internal/agent/codex` adapter、`internal/orchestrator` 的 dispatcher、`internal/observability` 的 diagnostics、阶段 A → 阶段 D 的 fixture policy 一致。
+**同步状态**：与 D3 / R14 5 轮 codex review 收口一致（分支 `codex/v1-productization-d3-codex-availability`）。本文件描述的 lifecycle mapping / event normalization 与 `internal/agent/codex` adapter、`internal/orchestrator` 的 dispatcher、`internal/observability` 的 diagnostics、阶段 A → 阶段 D 的 fixture policy 一致。
 
 Real Codex integration is not inferred from memory. It must be implemented only against committed protocol fixtures for a specific Codex version.
 

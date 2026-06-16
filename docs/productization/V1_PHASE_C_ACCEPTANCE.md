@@ -133,7 +133,9 @@ C3 owner lock 累计 5 轮 codex 滚动 review，5 轮共 9 finding（前 4 轮�
 
 C4 是阶段 C 的最后一个工作包。CLI over REST 与 daemon session 对齐已通过 9 轮 codex review + 6 轮 adversarial review 收口，C4 内部不再开 round 7，进入 v1.1 WIP 路线（PR [#22](https://github.com/shuanzi/local-symphony/pull/22)）。
 
-### 5.1 C4 commit 链（12 commits，HEAD `b9af4a6`）
+### 5.1 C4 commit 链（12 commits，HEAD of C4 PR #22）
+
+> **注**：以下 commit SHA 为 C4 开发分支 rebase 前的原始 SHA，在当前 `main` / D6 分支上不可达。实际落地提交见 C4 PR [#22](https://github.com/shuanzi/local-symphony/pull/22)。
 
 | Commit | 摘要 |
 |---|---|
@@ -200,7 +202,7 @@ bash scripts/acceptance-local.sh
 python3 scripts/validate_contracts.py
 ```
 
-C4 round 6 (`b9af4a6`) 验证：
+C4 round 6 验证：
 - `go test -count=1 -timeout 120s ./internal/cli ./internal/daemonclient ./internal/httpapi ./internal/security` 全部通过
 - `python3 scripts/validate_contracts.py` 通过
 - `bash scripts/acceptance-local.sh` 通过

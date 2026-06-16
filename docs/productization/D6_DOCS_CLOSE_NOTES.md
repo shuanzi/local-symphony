@@ -11,7 +11,7 @@
 | R | 名称 | 阶段 | 状态 | 实施 commit | 依据 / 备注 |
 |---|---|---|---|---|---|
 | R1 | Runner 抽象 | A | ✅ A 完成 | `2cc1888` 之前 | fake runner / Codex adapter 同一接口 |
-| R2 | Codex fixture gate | A | ✅ A 完成 | D3 链 `90f0ded` 起 | `docs/codex/FIXTURE_POLICY.md` 锁定 |
+| R2 | Codex fixture gate | A | ✅ A 完成 | D3 链（分支 `codex/v1-productization-d3-codex-availability`）起 | `docs/codex/FIXTURE_POLICY.md` 锁定 |
 | R3 | Codex process lifecycle | A | ✅ A 完成 | D3 链 | launch / timeout / redacted stderr |
 | R4 | Codex 事件归一化 | A | ✅ A 完成 | D3 链 | normalized timeline |
 | R5 | Approval API + writeback | B | ✅ B 完成 | B1 链 | stage-B command/file/network approvals |
@@ -23,7 +23,7 @@
 | R11 | Dashboard 产品化补齐 | D2 | ⏳ D2 准备中 | — | 待启动 |
 | R12 | 安全策略执行 | B3 | ✅ B3 完成 | B3 链 | secret/best-effort/loopback/CSRF/Tool Gateway scope |
 | R13 | Release packaging | D5 | 🟡 D5 进行中 | `573b1f0` + R1 `41dabb6` + R2 `cdf08ed` | 主体 + R1/R2 修复 commit 均落地；R2 review 文档待生成；顺带发现 Windows build issue（pre-existing, `internal/db/schema.go:105/134`），归 D5 / R13 范围 |
-| R14 | Codex availability diagnostics | D3 | ✅ D3 完成 | `90f0ded` … `57c46c0` | 5 轮 codex review 0 finding 收口（HEAD `57c46c0`） |
+| R14 | Codex availability diagnostics | D3 | ✅ D3 完成 | 分支 `codex/v1-productization-d3-codex-availability`（5 轮 review） | 5 轮 codex review 0 finding 收口（见 D3 PR） |
 | R15 | 文档合同 | D6 | 🟡 D6 进行中 | 本批 | 本批文档收口 |
 | R16 | Rework prompt 上下文 | D4 | ⏳ D4 准备中 | — | 待启动 |
 | R17 | DB schema guard | A0 | ✅ A0 完成 | A0 链 | `internal/db.MigrateAppSchema` idempotent |
@@ -42,15 +42,15 @@
 
 ## 3. 已知限制
 
-### 3.1 D1 / R10 — R2 review 跑中（1 P2）
+### 3.1 D1 / R10 -- R2 review 跑中（1 P2）
 
-D1 R1 修复 commit `0aee74c` 修完 R1 的 3 个 finding 后，当前 D6 tree 保留 1 个仍需 D1 owner 处理的 P2 finding。已验证 `schemas/review_packet.schema.json` 顶层 `required` 不包含 `artifacts`，因此不再把 top-level `artifacts` 作为 blocker 转交。
+D1 R1 修复 commit `0aee74c` 修完 R1 的 3 个 finding 后，当前 D6 tree 保留 1 个仍需 D1 owner 处理的 P2 finding。已验证 `schemas/review_packet.schema.json` 不包含 `artifacts` / `ReviewPacketArtifact` 定义，`ReviewPacketArtifact` 仅存在于 `api/openapi.yaml`。
 
-- **P2 #1**：`ReviewPacketArtifact.kind` enum 不完整（`schemas/review_packet.schema.json` 与 `api/openapi.yaml`），缺少 `prompt_snapshot / codex_log / secret_artifact / secrets / agent_file / diagnostic`。
+- **P2 #1**：`ReviewPacketArtifact.kind` enum 不完整（`api/openapi.yaml` line 837），当前为 `[review_packet, review_md, review_json, patch, changed_files, untracked_files, diffstat, test_output, agent_final_message, commands, tool_calls, approvals, codex_events, prompt_context, prompt_rendered, prompt_meta, prompt_tool_manifest, other]`，缺少 `prompt_snapshot / codex_log / secret_artifact / secrets / agent_file / diagnostic`（这些值已用于 `artifact_search_index.kind` enum，见同一文件 line 884）。
 
 **forwarding to D1 实施 agent**：
 
-1. P2 #1 修法：用 union of two enums，至少补 `prompt_snapshot / codex_log / secret_artifact / secrets / agent_file / diagnostic`。
+1. P2 #1 修法：在 `api/openapi.yaml` 的 `ReviewPacketArtifact.kind` enum 中补上 `prompt_snapshot / codex_log / secret_artifact / secrets / agent_file / diagnostic`。
 
 D6 范围内**不修**，仅记录。
 
