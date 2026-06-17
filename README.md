@@ -6,8 +6,8 @@ Local Symphony 是一个基于 OpenAI Symphony 项目思想改造的本地优先
 
 阶段 D 收口状态（D6 原始记录为 2026-06-09；本 PR 已同步 2026-06-17 的 `origin/main`，详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`）：
 
-- **D1 / R10** review packet metadata/artifact surface 已可用；structured projection 仍按 `docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md` 记录为后续补齐项，R2 review 跑中（1 P2 forwarding）。
-- **D3 / R14** diagnostics 已暴露 Codex 占位投影；实际 Codex availability/version/support 检测仍未接入，见 `docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md` 的 R14。
+- **D1 / R10** review packet metadata/artifact surface 与 structured projection 已可用：`GET /api/v1/reviews/{issue_ref}` 经 `internal/httpapi.reviewStructuredProjection` 从 review.json 加载 summary/tests/risks/verification/approvals/tool_calls/how_to_continue 并由 dashboard 渲染；R2 review 已收口（原 1 P2 已修：ReviewPacketArtifact.kind enum 已补全 prompt_snapshot/codex_log/agent_file/diagnostic）。
+- **D3 / R14** 已把 Codex availability preflight 接到 diagnostics/status/state surface（`CodexAvailability(...)` 调 `codex.RunPreflight`）。
 - **D5 / R13** release packaging 已随当前 `main` 合入；当前 checkout 包含 `scripts/build-release.sh` 与 `web/package-lock.json`，release artifact 说明见 `docs/RELEASE_NOTES.md`。
 - **D4 / R16** Rework prompt 上下文产品化准备中；**D2 / R11** Dashboard 产品化补齐准备中。
 
@@ -561,7 +561,7 @@ localhost
 
 ### 真实 Codex 不运行
 
-这是 v1 的预期行为。当前真实 Codex adapter 是 fixture-gated skeleton；默认测试与验收使用 fake runner。**D3 / R14** diagnostics surface 已有 Codex 投影字段：`symphony diagnostics` / `/api/v1/diagnostics` 暴露 `codex.available`、`codex.version` 与 `codex.support.{cli,model,sandbox}`，但当前实现仍固定为 `available=false`、`version=null`、support unknown，尚未接入真实 Codex availability/version/support 检测。当前 diagnostics contract 不包含 Codex `reason` / `status` 字段；`symphony status` 与 `/api/v1/state` 不承诺合成或暴露 Codex availability/reason。未配置支持 fixture 的版本在启动真实 `codex app-server` 进程前以 `unsupported_codex_version` 失败。Real Codex integration test 仍只通过 `SYMPHONY_TEST_CODEX=1` 显式开启。
+这是 v1 的预期行为。当前真实 Codex adapter 是 fixture-gated skeleton；默认测试与验收使用 fake runner。**D3 / R14** 已把 Codex availability preflight 接到 diagnostics / status / state surface：`symphony diagnostics` / `/api/v1/diagnostics` 经 `internal/observability.Diagnostics` 调用 `codex.RunPreflight(...)` 投影 `codex.available`、`codex.version`、`codex.support.{cli,model,sandbox}`、fixture metadata 与 `last_preflight`；`symphony status` 与 `GET /api/v1/state` 通过 `observability.CodexAvailability(...)` 暴露同一类 Codex availability projection（有 supported fixture 时报真实 version/support/available，无 fixture 时 `available=false`、`warning=unsupported_codex_version`）。当前 diagnostics/state contract 不含 Codex `reason`/`status` 字段，失败分类通过 nullable `last_preflight.failure_*` 与 `warning` 表达。未配置支持 fixture 的版本在启动真实 `codex app-server` 进程前以 `unsupported_codex_version` 失败。Real Codex integration test 仍只通过 `SYMPHONY_TEST_CODEX=1` 显式开启。
 
 ## 15. 清理本地数据
 

@@ -4,7 +4,7 @@
 **对应计划**：`docs/productization/V1_REAL_PRODUCTIZATION_EXECUTION_PLAN.md` §7 阶段 D / D6
 **worktree 分支**：`codex/v1-productization-d6-docs`
 **基线**：`main` @ `f15ba39`（v1.1 WIP 收口）
-**阶段状态**：**v1.1 WIP** —— D1 主体 + R1 修复 + R2 review 跑中（1 P2 forwarding）；D3 / R14 diagnostics surface 已有 Codex 占位投影但真实 availability/version/support 检测未接入；D5 / R13 已随当前 `main` 合入，当前 checkout 包含 release script 与 `web/package-lock.json`；D2 / D4 准备中；D6 / R15 文档合同收口（本批）。
+**阶段状态**：**v1.1 WIP** —— D1 主体 + R1 修复 + R2 review 已收口（原 1 P2 已修：ReviewPacketArtifact.kind enum 已补全）；D3 / R14 已把 Codex availability preflight 接到 diagnostics/status/state surface（`observability.CodexAvailability(...)` / `Diagnostics` 调 `codex.RunPreflight(...)`）；D5 / R13 已随当前 `main` 合入，当前 checkout 包含 release script 与 `web/package-lock.json`；D2 / D4 准备中；D6 / R15 文档合同收口（本批）。
 
 ## 1. R 项 status note 表
 
@@ -19,11 +19,11 @@
 | R7 | Hook lifecycle | C1 | ✅ C1 完成 | C1 链 | `symphony hook` ready/run/cleanup/wait/finish/cancel |
 | R8 | Scheduler tick + runtime lock | C2+C3 | ✅ C2 完成 / 🟡 C3 v1.1 WIP | `dbf4c6e` … `d8840d2` | C3 数据层 5 轮 review 0 finding；协调层 shutdown-ordering 1 P1 留作 C5 daemon lifecycle |
 | R9 | CLI over REST + daemon session | C4 | 🟡 C4 v1.1 WIP | C4 链见 `docs/productization/V1_PHASE_C_ACCEPTANCE.md` §5.1；已知限制见 §5.3 | 12 commits（5 轮 codex + 6 轮 adversarial + 1 docs）；trust 边界专项 4 项见 §3 已知限制 |
-| R10 | Review Packet API | D1 | 🟡 D1 进行中 | `2cc1888` + R1 `0aee74c` | 主体 + R1 修复落地；**R2 review 跑中**：1 P2 forwarding，见 §3 已知限制 |
+| R10 | Review Packet API | D1 | 🟡 D1 进行中 | `2cc1888` + R1 `0aee74c` | 主体 + R1 修复落地；R2 review 已收口（原 1 P2 已修，见 §3.1） |
 | R11 | Dashboard 产品化补齐 | D2 | ⏳ D2 准备中 | — | 待启动 |
 | R12 | 安全策略执行 | B3 | ✅ B3 完成 | B3 链 | secret/best-effort/loopback/CSRF/Tool Gateway scope |
 | R13 | Release packaging | D5 | ✅ D5 已合入当前 main | `573b1f0` + R1 `41dabb6` + R2 `cdf08ed` + follow-ups | release script、`web/package-lock.json` 与 release notes 已随当前 main 合入；顺带发现 Windows build issue（pre-existing, `internal/db/schema.go:105/134`），归 D5 / R13 范围 |
-| R14 | Codex availability diagnostics | D3 | 🟡 D3 部分完成 / R14 后续补齐 | 分支 `codex/v1-productization-d3-codex-availability`（5 轮 review） | diagnostics surface 字段已接入；当前实现仍固定 `available=false` / `version=null` / support unknown，真实 Codex availability/version/support 检测仍见 gaps 文档 R14 |
+| R14 | Codex availability diagnostics | D3 | 🟡 D3 部分完成 / R14 后续补齐 | 分支 `codex/v1-productization-d3-codex-availability`（5 轮 review） | diagnostics/status/state surface 字段已接入：`CodexAvailability(...)` / `Diagnostics` 调 `codex.RunPreflight(...)`，有 supported fixture 时报真实 version/support/available，无 fixture 时 `available=false` + `warning=unsupported_codex_version` |
 | R15 | 文档合同 | D6 | 🟡 D6 进行中 | 本批 | 本批文档收口 |
 | R16 | Rework prompt 上下文 | D4 | ⏳ D4 准备中 | — | 待启动 |
 | R17 | DB schema guard | A0 | ✅ A0 完成 | A0 链 | `internal/db.MigrateAppSchema` idempotent |
@@ -32,27 +32,22 @@
 
 | 文件 | 状态 | 范围 |
 |---|---|---|
-| `README.md` | M | §1 / §14 状态指针；真实 Codex 不运行段补 D3 / R14 当前占位投影与未接真实 availability 检测 |
+| `README.md` | M | §1 / §14 状态指针；真实 Codex 不运行段对齐 D3 / R14 已接 preflight 的 diagnostics/status/state projection |
 | `PRD.md` | M | 头部加 v1 阶段 D 收口状态元数据；§8.4 Codex Runner 段加 D3 / D5 状态注 |
-| `TECH_SPEC.md` | M | 头部加 v1 阶段 D 收口状态元数据；§10 Codex adapter 段补 D3 当前占位投影与未接真实 availability 检测；末尾加 D-Phase Close Summary 指针 |
+| `TECH_SPEC.md` | M | 头部加 v1 阶段 D 收口状态元数据；§10 Codex adapter 段对齐 D3 / R14 已接 preflight 的 diagnostics/status/state projection；末尾加 D-Phase Close Summary 指针 |
 | `docs/codex/ADAPTER_MAPPING.md` | M | 头部加 D3 / R14 5 轮 review 收口一致状态 |
 | `docs/codex/FIXTURE_POLICY.md` | M | CI 段补 D3 / R14 preflight 状态；D5 / R13 release packaging 不在本 policy 声明 |
 | `docs/testing/ACCEPTANCE.md` | M | A0–A10 acceptance 分类标签化（fake / 安全回归 / real Codex opt-in）；顶部加分类总览表 |
+| `docs/productization/V1_PHASE_C_ACCEPTANCE.md` | M | refs/状态校准（D6 follow-up review，commit `13230ec`） |
+| `docs/productization/V1_REAL_PRODUCTIZATION_EXECUTION_PLAN.md` | M | refs/状态校准（D6 follow-up review，commit `13230ec`） |
+| `docs/testing/CONTRACT_VALIDATION_MANIFEST.json` | M | 测试合同 manifest 对齐（D6 follow-up review，commit `c2cf88d`） |
 | `docs/productization/D6_DOCS_CLOSE_NOTES.md` | A | 本文档（R15 主交付物） |
 
 ## 3. 已知限制
 
-### 3.1 D1 / R10 -- R2 review 跑中（1 P2）
+### 3.1 D1 / R10 — R2 review 已收口（原 1 P2 已修）
 
-D1 R1 修复 commit `0aee74c` 修完 R1 的 3 个 finding 后，当前 D6 tree 保留 1 个仍需 D1 owner 处理的 P2 finding。已验证 `schemas/review_packet.schema.json` 不包含 `artifacts` / `ReviewPacketArtifact` 定义，`ReviewPacketArtifact` 仅存在于 `api/openapi.yaml`。
-
-- **P2 #1**：`ReviewPacketArtifact.kind` enum 不完整（`api/openapi.yaml` line 837），当前为 `[review_packet, review_md, review_json, patch, changed_files, untracked_files, diffstat, test_output, agent_final_message, commands, tool_calls, approvals, codex_events, prompt_context, prompt_rendered, prompt_meta, prompt_tool_manifest, other]`，缺少 `prompt_snapshot / codex_log / agent_file / diagnostic`（这些值在 `Artifact.kind` enum 中已使用，见同一文件 line 884，但 `secret_artifact` 和 `secrets` 不属于 `ReviewPacketArtifact` 范畴）。
-
-**forwarding to D1 实施 agent**：
-
-1. P2 #1 修法：在 `api/openapi.yaml` 的 `ReviewPacketArtifact.kind` enum 中补上 `prompt_snapshot / codex_log / agent_file / diagnostic`。
-
-D6 范围内**不修**，仅记录。
+原 P2 #1（`ReviewPacketArtifact.kind` enum 缺 `prompt_snapshot / codex_log / agent_file / diagnostic`）已在当前 tree 修复：`schemas/review_packet.schema.json` 已定义 `$defs.ReviewPacketArtifact` 与顶层 `artifacts` property；`api/openapi.yaml` 的 `ReviewPacketArtifact.kind` enum（line 841）与 `ReviewPacketSummary.artifacts`（line 915-917）均已含全部 kind 值（含 `secret_artifact`/`secrets`）。本节不再向 D1 owner forwarding。
 
 ### 3.2 D5 / R13 — 已随当前 main 合入
 
@@ -109,4 +104,4 @@ v1 禁项清单（D6 范围内未引入）：
 ❌ raw prompt / raw Codex log / raw secret 暴露
 ```
 
-D6 以文档同步为主，附带少量 contract 清理（`api/openapi.yaml` 移除 `AppState.codex` 字段）和测试合同 manifest 对齐；未触碰 Go 实现代码或 dashboard 前端逻辑。
+D6 以文档同步为主，附带少量 contract 对齐（`api/openapi.yaml` 保留并填充 `AppState.codex` 字段以匹配 `CodexAvailability(...)` 输出）和测试合同 manifest 对齐；未触碰 Go 实现代码或 dashboard 前端逻辑。
