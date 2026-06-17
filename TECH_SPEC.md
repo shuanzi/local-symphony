@@ -4388,7 +4388,7 @@ docs/productization/D6_DOCS_CLOSE_NOTES.md
 
 - D1 / R10 review packet metadata/artifact surface 已可用；structured projection 仍按 gaps 文档记录为后续补齐项，R2 review 跑中（1 P2 forwarding，归 D1 实施 agent 跟进）。
 - D3 / R14 diagnostics surface 已包含 Codex 占位投影；真实 availability/version/support 检测仍未接入，阶段 D 状态入口以 `docs/productization/D6_DOCS_CLOSE_NOTES.md` 为准。
-- D5 / R13 release packaging 是跨 PR / pending 项；当前 checkout 不包含 `scripts/build-release.sh` 或 `web/package-lock.json`，不声明 release files 已 ship。
+- D5 / R13 release packaging 已随当前 `main` 合入；当前 checkout 包含 `scripts/build-release.sh` 与 `web/package-lock.json`，release artifact 说明见 `docs/RELEASE_NOTES.md`。
 - C3 数据层 5 轮 review 0 finding；协调层 shutdown-ordering 1 P1 留作 C5 daemon lifecycle design problem。
 - C4 trust 边界专项 4 项（fail-open 反复 / validation 区分 / 镜像未去重 / project_id 不匹配可观测性）留作 v1.1 收口后续。
 

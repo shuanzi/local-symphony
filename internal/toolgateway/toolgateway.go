@@ -408,7 +408,11 @@ var toolInputKeys = map[string]map[string]bool{
 
 func allowedArtifactKind(kind string) bool {
 	switch kind {
-	case "test_output", "patch", "changed_files", "untracked_files", "diffstat", "prompt_snapshot", "codex_log", "review_packet", "agent_file", "diagnostic", "other":
+	case "test_output", "patch", "changed_files", "untracked_files", "diffstat",
+		"prompt_snapshot", "prompt_rendered", "prompt_context", "prompt_meta", "prompt_tool_manifest",
+		"codex_log", "codex_events",
+		"secret_artifact", "secrets",
+		"review_packet", "agent_file", "diagnostic", "other":
 		return true
 	default:
 		return false

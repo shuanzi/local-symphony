@@ -2,6 +2,7 @@ package review
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,15 @@ import (
 )
 
 const testMaxUntrackedPatchBytes int64 = 1024 * 1024
+
+// originalHome captures the HOME directory before any test has
+// a chance to override it via t.Setenv. Several helpers in this
+// package rely on HOME to redirect project DB paths; that
+// redirecting also breaks python3's site.getusersitepackages()
+// inside the schema-validator subprocess. We freeze the value
+// at process start and use it for the validator subprocess
+// regardless of the test's later HOME mutation.
+var originalHome = os.Getenv("HOME")
 
 func TestGenerateReturnsErrorAndDoesNotInsertPacketWhenReviewArtifactWriteFails(t *testing.T) {
 	st := newReviewTestStore(t)
@@ -484,6 +494,162 @@ func TestGenerateOmitsUntrackedSymlinkTargetsFromPatch(t *testing.T) {
 	}
 }
 
+func TestGenerateWritesStructuredFieldsToReviewJSONArtifact(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	writeFile(t, workspace, "app.txt", "new\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"app.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	var packet map[string]any
+	if err := json.Unmarshal([]byte(readReviewArtifact(t, st, issue, run, "review.json")), &packet); err != nil {
+		t.Fatalf("unmarshal review.json: %v", err)
+	}
+	required := []string{
+		"summary",
+		"acceptance_criteria",
+		"handoff",
+		"changed_files",
+		"diff",
+		"tests",
+		"risks",
+		"verification",
+		"approvals",
+		"tool_calls",
+		"git",
+		"how_to_continue",
+	}
+	for _, key := range required {
+		if _, ok := packet[key]; !ok {
+			t.Fatalf("review.json missing required structured field %q: %#v", key, packet)
+		}
+	}
+	if got, _ := packet["summary"].(string); got != "ready for review" {
+		t.Fatalf("summary = %q, want %q", got, "ready for review")
+	}
+	ac, ok := packet["acceptance_criteria"].([]any)
+	if !ok || len(ac) == 0 || ac[0] != "done" {
+		t.Fatalf("acceptance_criteria = %#v, want at least [done]", packet["acceptance_criteria"])
+	}
+	ht, ok := packet["handoff"].(map[string]any)
+	if !ok {
+		t.Fatalf("handoff field not object: %#v", packet["handoff"])
+	}
+	if ts, _ := ht["target_state"].(string); ts != "Human Review" {
+		t.Fatalf("handoff.target_state = %q, want Human Review", ts)
+	}
+	if diff, _ := packet["diff"].(string); !strings.Contains(diff, "diff --git a/app.txt b/app.txt") {
+		t.Fatalf("diff field missing tracked diff: %q", diff)
+	}
+	if raw, _ := packet["raw_prompt_exposed"].(bool); raw {
+		t.Fatalf("raw_prompt_exposed should be false; got %#v", packet["raw_prompt_exposed"])
+	}
+	if hc, _ := packet["how_to_continue"].(string); !strings.Contains(hc, "Send to Rework") || !strings.Contains(hc, "Mark Done") {
+		t.Fatalf("how_to_continue = %q, want operator guidance mentioning Send to Rework / Mark Done", hc)
+	}
+}
+
+func TestGenerateOmitsLargePatchFromStructuredReviewJSON(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "large.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	largeBody := strings.Repeat("large diff line\n", 9000)
+	writeFile(t, workspace, "large.txt", largeBody)
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"large.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if got := strings.Count(patch, "+large diff line"); got < 8000 {
+		t.Fatalf("changes.patch did not preserve full patch artifact")
+	}
+	var packet map[string]any
+	if err := json.Unmarshal([]byte(readReviewArtifact(t, st, issue, run, "review.json")), &packet); err != nil {
+		t.Fatalf("unmarshal review.json: %v", err)
+	}
+	diff, _ := packet["diff"].(string)
+	if strings.Count(diff, "+large diff line") >= 8000 {
+		t.Fatalf("review.json diff embedded the full large patch; len(diff)=%d", len(diff))
+	}
+	if !strings.Contains(diff, "omitted") || !strings.Contains(diff, "changes.patch") {
+		t.Fatalf("review.json diff = %q, want omission message pointing to changes.patch", diff)
+	}
+}
+
+func TestGenerateOmitsBinaryPatchFromStructuredReviewJSON(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	binaryPath := filepath.Join(workspace, "bin.dat")
+	if err := os.WriteFile(binaryPath, bytesForBinaryPatch(0x04), 0o644); err != nil {
+		t.Fatalf("write base binary file: %v", err)
+	}
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	if err := os.WriteFile(binaryPath, bytesForBinaryPatch(0x09), 0o644); err != nil {
+		t.Fatalf("write changed binary file: %v", err)
+	}
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"bin.dat"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "GIT binary patch") || !strings.Contains(patch, "literal ") {
+		t.Fatalf("changes.patch missing git binary patch content:\n%s", patch)
+	}
+	var packet map[string]any
+	if err := json.Unmarshal([]byte(readReviewArtifact(t, st, issue, run, "review.json")), &packet); err != nil {
+		t.Fatalf("unmarshal review.json: %v", err)
+	}
+	diff, _ := packet["diff"].(string)
+	want := "# Diff omitted from structured review JSON: binary patch content is not embedded. See changes.patch artifact for the full patch.\n"
+	if diff != want {
+		t.Fatalf("review.json diff = %q, want binary omission message pointing to changes.patch", diff)
+	}
+	if strings.Contains(diff, "GIT binary patch") || strings.Contains(diff, "literal ") {
+		t.Fatalf("review.json diff embedded binary patch content: %q", diff)
+	}
+}
+
+func TestReviewFailureDoesNotTransitionIssueToHumanReview(t *testing.T) {
+	st := newReviewTestStore(t)
+	issue, run := prepareReviewRun(t, st)
+	conflictPath := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID, "review.md")
+	if err := os.MkdirAll(conflictPath, 0o755); err != nil {
+		t.Fatalf("create conflicting review.md directory: %v", err)
+	}
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err == nil {
+		t.Fatal("Generate succeeded, want review_packet_failed")
+	}
+	// Simulate the orchestrator's behavior: a review_packet_failed run
+	// is reported through FailRun, not CompleteRunWithReview. Verify
+	// the issue is not advanced to Human Review.
+	if err := st.FailRun(run.ID, core.FailureReviewPacketFailed, err.Error(), core.RunFailed); err != nil {
+		t.Fatalf("FailRun: %v", err)
+	}
+	got, err := st.GetIssue(issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.State == core.StateHumanReview {
+		t.Fatalf("issue state = %s after review packet failure, want not Human Review", got.State)
+	}
+	if !got.DispatchPaused {
+		t.Fatalf("issue dispatch_paused = false after review packet failure, want true")
+	}
+	// No review packet row should be associated with the failed run.
+	assertReviewPacketCount(t, st, run.ID, 0)
+}
+
 func newReviewTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
@@ -591,6 +757,15 @@ func writeFile(t *testing.T, root, rel, data string) {
 	}
 }
 
+func bytesForBinaryPatch(marker byte) []byte {
+	pattern := []byte{0x00, 0x01, 0x02, 0x03, marker, 0x00, 0xff}
+	out := make([]byte, 0, len(pattern)*200)
+	for i := 0; i < 200; i++ {
+		out = append(out, pattern...)
+	}
+	return out
+}
+
 func readReviewArtifact(t *testing.T, st *store.Store, issue *core.Issue, run *core.RunAttempt, name string) string {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID, name))
@@ -615,4 +790,175 @@ func readUntrackedArtifact(t *testing.T, st *store.Store, issue *core.Issue, run
 		out[item.Path] = item
 	}
 	return out
+}
+
+// TestReviewPacketFileSchemaValidatesAgainstGeneratedPacket pins
+// the contract that the review.json artifact written by
+// Generator.Generate actually validates against
+// schemas/review_packet.schema.json. If a future schema change
+// (or a Generator regression) breaks the round-trip, the
+// jsonschema validator surfaces it directly so we catch it
+// before the file ships to operators.
+//
+// The test calls the same Draft202012Validator that
+// scripts/validate_contracts.py uses. We shell out to python3
+// because the project intentionally keeps the in-Go test
+// dependency surface narrow (no jsonschema-go module is
+// imported elsewhere).
+func TestReviewPacketFileSchemaValidatesAgainstGeneratedPacket(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	writeFile(t, workspace, "app.txt", "new\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"app.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	reviewPath := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID, "review.json")
+	if _, err := os.Stat(reviewPath); err != nil {
+		t.Fatalf("review.json missing: %v", err)
+	}
+	schemaPath := filepath.Join(repoRootForReviewTest(t), "schemas", "review_packet.schema.json")
+	validateJSONAgainstSchema(t, schemaPath, reviewPath)
+}
+
+func TestSchemaValidatorScriptMissingJsonschemaReturnsSkipFailure(t *testing.T) {
+	pythonBin, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skipf("python3 not on PATH: %v", err)
+	}
+	blockingSite := t.TempDir()
+	if err := os.WriteFile(filepath.Join(blockingSite, "jsonschema.py"), []byte(`raise ImportError("forced missing jsonschema")`), 0o644); err != nil {
+		t.Fatalf("write jsonschema blocker: %v", err)
+	}
+	cmd := exec.Command(pythonBin, "-c", schemaValidatorScript(blockingSite), "schema.json", "data.json")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("schema validator exited 0 for missing jsonschema; output:\n%s", string(out))
+	}
+	if !strings.Contains(string(out), "__SCHEMA_SKIP__") {
+		t.Fatalf("schema validator output missing skip marker:\n%s", string(out))
+	}
+}
+
+// repoRootForReviewTest walks up from the current working
+// directory until it finds go.mod so the test can locate the
+// schemas/ directory regardless of the test runner's CWD.
+func repoRootForReviewTest(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	dir := wd
+	for i := 0; i < 6; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	t.Fatalf("could not find repo root from %s", wd)
+	return ""
+}
+
+// validateJSONAgainstSchema shells out to python3 and runs the
+// jsonschema Draft202012Validator against the supplied JSON file.
+// The validator is the same one scripts/validate_contracts.py
+// uses, so test failures mirror contract-validation failures.
+//
+// We explicitly prepend the user site-packages directory (where
+// `pip3 install --user jsonschema` lands it) onto sys.path inside
+// the subprocess. The system Python on macOS often does not
+// enable the user site by default when launched without a TTY
+// (site.ENABLE_USER_SITE is false), so the import would otherwise
+// fail even when `pip3 install --user jsonschema` succeeded.
+//
+// The test process may have HOME overridden (e.g. by the
+// review-test helper that uses t.Setenv to isolate state). We
+// pass the original HOME captured at process start to the
+// subprocess so site.getusersitepackages returns the install
+// location rather than a temp directory.
+func validateJSONAgainstSchema(t *testing.T, schemaPath, jsonPath string) {
+	t.Helper()
+	pythonBin, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skipf("python3 not on PATH: %v", err)
+	}
+	if originalHome == "" {
+		t.Skipf("HOME was empty at process start; cannot resolve python user site-packages")
+	}
+	cmd := envWithRealHome(t, pythonBin, originalHome)
+	cmd.Args = append(cmd.Args, "-c", schemaValidatorScript(userSiteForHome(t, pythonBin, originalHome)), schemaPath, jsonPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "__SCHEMA_SKIP__") {
+			t.Skipf("jsonschema unavailable in python3 %q; install with `pip3 install --user jsonschema`:\n%s", pythonBin, string(out))
+		}
+		if strings.Contains(string(out), "__SCHEMA_FAIL__") {
+			t.Fatalf("schema validation failed for %s against %s:\n%s", jsonPath, schemaPath, string(out))
+		}
+		t.Fatalf("schema validation crashed for %s against %s:\n%s", jsonPath, schemaPath, string(out))
+	}
+	if !strings.Contains(string(out), "__SCHEMA_OK__") {
+		t.Fatalf("schema validation did not report OK for %s:\n%s", jsonPath, string(out))
+	}
+}
+
+// schemaValidatorScript returns the python source that loads
+// the schema + data files from argv and runs the jsonschema
+// Draft202012Validator. userSite is prepended to sys.path so
+// the import succeeds even when the subprocess is launched
+// without user-site enabled.
+func schemaValidatorScript(userSite string) string {
+	return fmt.Sprintf(`import json, sys
+sys.path.insert(0, %q)
+try:
+    from jsonschema import Draft202012Validator
+except ImportError as e:
+    print("__SCHEMA_SKIP__:" + str(e))
+    sys.exit(2)
+schema = json.load(open(sys.argv[1]))
+data = json.load(open(sys.argv[2]))
+errors = list(Draft202012Validator(schema).iter_errors(data))
+if errors:
+    lines = []
+    for e in errors[:10]:
+        path = "/".join(str(p) for p in e.absolute_path) or "(root)"
+        lines.append(f"{path}: {e.message}")
+    print("__SCHEMA_FAIL__")
+    print("\n".join(lines))
+    sys.exit(1)
+print("__SCHEMA_OK__")
+`, userSite)
+}
+
+// envWithRealHome returns an *exec.Cmd prepopulated with the
+// parent process's environment plus HOME set to realHome (so the
+// subprocess's site.getusersitepackages() resolves to the
+// real user site rather than a test-isolated temp dir).
+func envWithRealHome(t *testing.T, pythonBin, realHome string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(pythonBin)
+	cmd.Env = append(os.Environ(), "HOME="+realHome)
+	return cmd
+}
+
+// userSiteForHome asks python where its user site lives when
+// HOME is overridden. Returned as a clean path string.
+func userSiteForHome(t *testing.T, pythonBin, realHome string) string {
+	t.Helper()
+	cmd := exec.Command(pythonBin, "-c", "import site; print(site.getusersitepackages())")
+	cmd.Env = append(os.Environ(), "HOME="+realHome)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("query python user site-packages: %v\n%s", err, string(out))
+	}
+	return strings.TrimSpace(string(out))
 }

@@ -1242,9 +1242,9 @@ func printHelp() {
 	fmt.Println(`symphony - local-first agent workflow control plane
 
 Commands:
-  symphony init --issue-prefix LOC
-  symphony serve --project . --addr 127.0.0.1:3777 --no-open
-  symphony open
+  symphony init --project . --issue-prefix LOC
+  symphony serve --project . [--host 127.0.0.1] [--port 7331 | --addr 127.0.0.1:7331] [--no-open]
+  symphony open --project .
   symphony status
   symphony issue create|list|show|update|transition|comment|blocker|duplicate|dispatch|dispatch-pause|dispatch-resume
   symphony run|run list|run show|run events|run cancel
@@ -1255,10 +1255,14 @@ Commands:
   symphony tool issue get|comment|block; artifact attach; followup create; handoff submit --json -
 
 Operator commands prefer the local daemon (symphony serve) and fall back to
-the on-disk store when the daemon is unreachable. The CLI session is minted
-automatically when 'symphony serve' starts; rotate it with
-'symphony tool login' (token path is separate from the operator REST
-session). When no daemon is running and the on-disk store cannot satisfy a
+the on-disk store when the daemon is unreachable. The CLI bearer session is
+minted automatically when 'symphony serve' starts and is written to
+'~/.symphony/cli-sessions/<project>.json' (mode 0600). 'symphony login'
+verifies the current project session against the daemon; 'symphony login
+--list' enumerates every saved session across all projects; 'symphony login
+--logout' deletes the local file and revokes the server-side row. Token
+rotation is available via 'POST /api/v1/auth/cli-token/rotate' on the
+daemon. When no daemon is running and the on-disk store cannot satisfy a
 command, the CLI prints: 'daemon is not running, start with symphony serve
 or run symphony open --help for project init'. The CLI never auto-starts a
 daemon.

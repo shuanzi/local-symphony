@@ -1,0 +1,20 @@
+*** TEAM-LEAD ACTION REQUIRED ***
+
+D5 R2 codex review (commit 41dabb6) found 3 findings, all R1 修复未闭环:
+
+PATH: docs/productization/D5_R2_FIX_REQUIRED.md
+DETAILS:
+  F1-r2 P1: guard 矫枉过正 - 默认 OUT_DIR=$ROOT/dist 被误拒
+           (R1 验证用 OUT_DIR=$PWD 不是默认路径，未发现)
+  F2-r2 P1: npm ci 假修复 - web/package-lock.json 被 .gitignore 排除
+           干净 checkout 找不到 lockfile
+           (你工作机有 lockfile 残留掩盖了问题)
+  F3-r2 P2: [ ! -d $ROOT/web/node_modules ] 守护让 stale 依赖被打包
+           (你工作机有 node_modules 残留让 npm ci 被跳过)
+
+CRITICAL: 这和 D3 R3 panic 是同类问题——工作机残留状态让
+实施 agent 误以为修复正确, CI 干净环境立刻暴露。
+
+REQUIRED: 3 finding 联动修 + 3 个新 test-first 测试
+         + 干净 tarball 下端到端验证
+TARGET: round 3 codex review 0 finding → D5 收口

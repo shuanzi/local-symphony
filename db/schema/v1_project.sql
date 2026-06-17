@@ -263,7 +263,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   issue_id TEXT,
   run_id TEXT,
   review_packet_id TEXT,
-  kind TEXT NOT NULL CHECK (kind IN ('test_output','patch','changed_files','untracked_files','diffstat','prompt_snapshot','codex_log','review_packet','agent_file','diagnostic','other')),
+  kind TEXT NOT NULL CHECK (kind IN ('test_output','patch','changed_files','untracked_files','diffstat','prompt_snapshot','prompt_rendered','prompt_context','prompt_meta','prompt_tool_manifest','codex_log','codex_events','secret_artifact','secrets','review_packet','agent_file','diagnostic','other')),
   path TEXT NOT NULL,
   mime_type TEXT,
   size_bytes INTEGER CHECK (size_bytes IS NULL OR size_bytes >= 0),

@@ -4,7 +4,7 @@
 **对应计划**：`docs/productization/V1_REAL_PRODUCTIZATION_EXECUTION_PLAN.md` §7 阶段 D / D6
 **worktree 分支**：`codex/v1-productization-d6-docs`
 **基线**：`main` @ `f15ba39`（v1.1 WIP 收口）
-**阶段状态**：**v1.1 WIP** —— D1 主体 + R1 修复 + R2 review 跑中（1 P2 forwarding）；D3 / R14 diagnostics surface 已有 Codex 占位投影但真实 availability/version/support 检测未接入；D5 / R13 是跨 PR / pending 项，当前 checkout 不包含 release script 或 `web/package-lock.json`；D2 / D4 准备中；D6 / R15 文档合同收口（本批）。
+**阶段状态**：**v1.1 WIP** —— D1 主体 + R1 修复 + R2 review 跑中（1 P2 forwarding）；D3 / R14 diagnostics surface 已有 Codex 占位投影但真实 availability/version/support 检测未接入；D5 / R13 已随当前 `main` 合入，当前 checkout 包含 release script 与 `web/package-lock.json`；D2 / D4 准备中；D6 / R15 文档合同收口（本批）。
 
 ## 1. R 项 status note 表
 
@@ -22,7 +22,7 @@
 | R10 | Review Packet API | D1 | 🟡 D1 进行中 | `2cc1888` + R1 `0aee74c` | 主体 + R1 修复落地；**R2 review 跑中**：1 P2 forwarding，见 §3 已知限制 |
 | R11 | Dashboard 产品化补齐 | D2 | ⏳ D2 准备中 | — | 待启动 |
 | R12 | 安全策略执行 | B3 | ✅ B3 完成 | B3 链 | secret/best-effort/loopback/CSRF/Tool Gateway scope |
-| R13 | Release packaging | D5 | 🟡 D5 进行中 | `573b1f0` + R1 `41dabb6` + R2 `cdf08ed` | 主体 + R1/R2 修复 commit 均落地；R2 review 文档待生成；顺带发现 Windows build issue（pre-existing, `internal/db/schema.go:105/134`），归 D5 / R13 范围 |
+| R13 | Release packaging | D5 | ✅ D5 已合入当前 main | `573b1f0` + R1 `41dabb6` + R2 `cdf08ed` + follow-ups | release script、`web/package-lock.json` 与 release notes 已随当前 main 合入；顺带发现 Windows build issue（pre-existing, `internal/db/schema.go:105/134`），归 D5 / R13 范围 |
 | R14 | Codex availability diagnostics | D3 | 🟡 D3 部分完成 / R14 后续补齐 | 分支 `codex/v1-productization-d3-codex-availability`（5 轮 review） | diagnostics surface 字段已接入；当前实现仍固定 `available=false` / `version=null` / support unknown，真实 Codex availability/version/support 检测仍见 gaps 文档 R14 |
 | R15 | 文档合同 | D6 | 🟡 D6 进行中 | 本批 | 本批文档收口 |
 | R16 | Rework prompt 上下文 | D4 | ⏳ D4 准备中 | — | 待启动 |
@@ -54,9 +54,9 @@ D1 R1 修复 commit `0aee74c` 修完 R1 的 3 个 finding 后，当前 D6 tree �
 
 D6 范围内**不修**，仅记录。
 
-### 3.2 D5 / R13 — R2 review 文档待生成
+### 3.2 D5 / R13 — 已随当前 main 合入
 
-D5 / R13 release packaging 是跨 PR 跟踪项；当前 D6 tree 包含 `web/pnpm-lock.yaml` 与 `packageManager: pnpm@9.0.0`，但不包含 `package-lock.json` 或 release script，因此本文不声明 `scripts/build-release.sh` / `npm ci` 行为。`docs/productization/D5_CODEX_REVIEW_ROUND2.md` 文档仍待 D5 实施 agent 生成。
+D6 原始基线未声明 `scripts/build-release.sh` / `npm ci` 行为；合入当前 `main` 后，tree 已包含 `scripts/build-release.sh`、`web/package-lock.json`、`docs/RELEASE_NOTES.md` 与 D5 review 记录。本文对 D5 的描述以当前合并后的 main 状态为准。
 
 D5 顺带发现 Windows build issue（pre-existing, `internal/db/schema.go:105/134`）—— 归 D5 / R13 范围，不在 D6 改动面。
 

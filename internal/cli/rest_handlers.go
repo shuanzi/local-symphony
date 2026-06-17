@@ -422,15 +422,7 @@ func approvalDecideViaDaemon(id, decision, reason string) func(*daemonclient.Cli
 // `symphony review path REF`.
 func reviewGetLocal(ref string) func(*store.Store) (any, error) {
 	return func(st *store.Store) (any, error) {
-		row, err := st.ReviewPacketRow(ref)
-		if err != nil {
-			return nil, err
-		}
-		arts, err := st.ArtifactsForReview(row["id"].String())
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"id": row["id"].String(), "run_id": row["run_id"].String(), "packet_no": row["packet_no"].Int(), "status": row["status"].String(), "root_path": row["root_path"].String(), "artifacts": arts}, nil
+		return st.ReviewPacketProjection(ref)
 	}
 }
 

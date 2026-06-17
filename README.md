@@ -4,11 +4,11 @@ Local Symphony 是一个基于 OpenAI Symphony 项目思想改造的本地优先
 
 当前工程是 v1 本地版本，默认使用 fake runner 跑通端到端流程；真实 Codex adapter 目前是 fixture-gated skeleton，未配置受支持 fixture 时会 fail-closed，不会直接启动未知协议版本的 Codex 进程。
 
-阶段 D 收口状态（2026-06-09，详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`）：
+阶段 D 收口状态（D6 原始记录为 2026-06-09；本 PR 已同步 2026-06-17 的 `origin/main`，详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`）：
 
 - **D1 / R10** review packet metadata/artifact surface 已可用；structured projection 仍按 `docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md` 记录为后续补齐项，R2 review 跑中（1 P2 forwarding）。
 - **D3 / R14** diagnostics 已暴露 Codex 占位投影；实际 Codex availability/version/support 检测仍未接入，见 `docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md` 的 R14。
-- **D5 / R13** release packaging 是跨 PR / pending 项；当前 checkout 不包含 `scripts/build-release.sh` 或 `web/package-lock.json`，不声明 release files 已 ship。
+- **D5 / R13** release packaging 已随当前 `main` 合入；当前 checkout 包含 `scripts/build-release.sh` 与 `web/package-lock.json`，release artifact 说明见 `docs/RELEASE_NOTES.md`。
 - **D4 / R16** Rework prompt 上下文产品化准备中；**D2 / R11** Dashboard 产品化补齐准备中。
 
 ## 1. 项目能力概览
@@ -63,8 +63,10 @@ api/openapi.yaml                 # REST / SSE API 合同
 schemas/                         # JSON Schema 合同
 db/schema/                       # SQLite schema 合同
 docs/testing/                    # 验收说明与 contract manifest
-scripts/                         # 合同校验与本地验收脚本
+docs/RELEASE_NOTES.md            # release artifact 布局、版本矩阵、已知限制
+scripts/                         # 合同校验、本地验收、release 构建脚本
 web/                             # React/Vite dashboard MVP 与动作合同检查
+dist/                            # `scripts/build-release.sh` 产物；`symphony[.exe]` + `web/dist/`
 PRD.md                           # 产品需求说明
 TECH_SPEC.md                     # 技术设计说明
 WORKFLOW.md                      # init 后生成的项目 workflow 配置，若已存在则不会覆盖
@@ -104,6 +106,8 @@ python3 -m pip install -r requirements-dev.txt
 
 ## 4. 构建
 
+### 4.1 快速构建（开发期）
+
 在工程根目录执行：
 
 ```bash
@@ -116,6 +120,25 @@ go build -o ./bin/symphony ./cmd/symphony
 ```bash
 go run ./cmd/symphony --help
 ```
+
+### 4.2 Release 构建（推荐用于部署 / 分发）
+
+`scripts/build-release.sh` 会同时编译 Go 二进制并打包已构建好的
+`web/dist`，产物落到 `dist/`：
+
+```bash
+bash scripts/build-release.sh
+tree dist
+# dist/
+# ├── INSTALL.md
+# ├── symphony[.exe]
+# └── web/dist/...
+```
+
+二进制会自动从其所在目录的 `web/dist/` 找到 dashboard 静态资源，
+**不需要在源码树下运行**，也不需要再单独 `npm run build`。支持的
+平台 / 依赖版本 / 跨平台编译 / Windows best-effort 限制详见
+`docs/RELEASE_NOTES.md`。
 
 ## 5. 初始化本地项目
 
@@ -134,6 +157,8 @@ git commit -m init
 
 # 使用已构建的 symphony 二进制初始化项目
 /path/to/local-symphony/bin/symphony init --issue-prefix LOC
+# 或者使用 release artifact:
+/path/to/local-symphony/dist/symphony init --issue-prefix LOC
 ```
 
 初始化后会生成或使用以下本地文件：
@@ -145,14 +170,14 @@ WORKFLOW.md                      # 项目 workflow 配置；不存在时自动�
 ~/.symphony/app.db               # 全局 app-level SQLite DB
 ~/.symphony/workspaces/          # 默认 issue worktree 根目录
 ~/.symphony/runtime/             # serve 运行期 descriptor
-~/.symphony/cli-sessions/<project>.json # serve 启动后写入的当前项目 CLI session 信息
+~/.symphony/cli-sessions/        # per-project CLI bearer session 文件（mode 0600）
 ~/.symphony/cli-session.json     # legacy 单文件 session fallback，仅用于兼容旧版本
 ```
 
 查看当前项目状态：
 
 ```bash
-/path/to/local-symphony/bin/symphony status --project .
+/path/to/local-symphony/dist/symphony status --project .
 ```
 
 ## 6. 启动本地 API / Dashboard GUI
@@ -160,13 +185,16 @@ WORKFLOW.md                      # 项目 workflow 配置；不存在时自动�
 启动本地服务：
 
 ```bash
+# 使用开发期 build
 /path/to/local-symphony/bin/symphony serve --project . --no-open
+# 或使用 release artifact
+/path/to/local-symphony/dist/symphony serve --project . --no-open
 ```
 
 默认绑定 loopback 地址 `127.0.0.1`，端口未指定时由系统分配。也可以指定固定端口：
 
 ```bash
-/path/to/local-symphony/bin/symphony serve --project . --host 127.0.0.1 --port 7331 --no-open
+/path/to/local-symphony/dist/symphony serve --project . --host 127.0.0.1 --port 7331 --no-open
 ```
 
 检查 API：
@@ -180,25 +208,27 @@ curl http://127.0.0.1:7331/api/v1/health
 服务运行时，可查看 runtime descriptor：
 
 ```bash
-/path/to/local-symphony/bin/symphony open --project .
+/path/to/local-symphony/dist/symphony open --project .
 ```
 
 CLI bearer session 由 `symphony serve` 自动 mint 并落到 `~/.symphony/cli-sessions/<project>.json`（权限 `0600`）。`symphony login` 用来验证当前 session 是否被 daemon 识别：
 
 ```bash
 # 探测当前项目的 session 是否有效
-/path/to/local-symphony/bin/symphony login --project .
+/path/to/local-symphony/dist/symphony login --project .
 
 # 列出本机所有已存 session（多项目场景）
-/path/to/local-symphony/bin/symphony login --list
+/path/to/local-symphony/dist/symphony login --list
 
 # 登出当前项目（先请求 daemon revoke 当前 CLI session；确认后删除本地 session 文件）
-/path/to/local-symphony/bin/symphony login --logout
+/path/to/local-symphony/dist/symphony login --logout
 ```
 
 `login` 不创建新 session。新 session 必须在 `symphony serve` 启动时由 daemon 端通过 open-token 流程签发。`login --logout` 会优先调用 daemon revoke 当前 CLI bearer；revoke 已确认、token 不匹配或没有本地 bearer 可撤销时，才删除本地 project-scoped session 文件和 legacy fallback 文件。若 daemon-side revoke 无法确认，则保留本地文件供重试。`symphony tool` 命令走独立的 Tool Gateway token 路径，不会被 `login`/`logout` 触发。
 
 当前 `web/` 是 React/Vite dashboard MVP 和动作合同检查。`symphony serve` 的 `/api/v1/*` 与 `/tool/v1/call` 路由优先于 dashboard 静态资源。根路径只会从可信 dashboard dist 位置读取静态资源：优先使用 `SYMPHONY_DASHBOARD_DIST` 指向的构建产物目录；未设置时从 `symphony` 可执行文件所在目录推导 `web/dist`、`../web/dist`、`../share/local-symphony/web/dist` 等安装位置。被管理项目根目录下的 `web/dist` 不会作为默认候选。
+
+> Release artifact（`bash scripts/build-release.sh` 产物）会同时把 `symphony[.exe]` 与 `web/dist/` 放在同一个 `dist/` 目录下，所以安装后立即可用。详见 `docs/RELEASE_NOTES.md`。
 
 ## 7. 本地 issue 主流程
 
@@ -552,6 +582,14 @@ rm -rf ~/.symphony/workspaces/<project_id>
 rm -f ~/.symphony/app.db
 ```
 
+## 15.1 Release artifact
+
+```bash
+bash scripts/build-release.sh
+# 产物落到 dist/：symphony[.exe] + web/dist/ + INSTALL.md
+# 详见 docs/RELEASE_NOTES.md
+```
+
 ## 16. 文档与合同关系
 
 ```text
@@ -561,6 +599,7 @@ api/openapi.yaml          # REST / SSE API 可执行合同
 db/schema/*.sql           # SQLite schema 合同
 schemas/*.schema.json     # DTO / event / diagnostics / review / workflow / tool schema
 docs/testing/*.md         # 验收与 failure code 说明
+docs/RELEASE_NOTES.md     # release artifact 布局、版本矩阵、已知限制
 docs/agent_work_orders/   # M0-M8 implementation work orders
 ```
 

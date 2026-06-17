@@ -4,10 +4,66 @@
   "title": "Review Packet File",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "ReviewPacketArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path",
+        "artifact_id",
+        "redacted",
+        "content_url",
+        "raw_prompt_exposed",
+        "raw_codex_log_exposed",
+        "raw_secret_exposed"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "test_output",
+            "patch",
+            "changed_files",
+            "untracked_files",
+            "diffstat",
+            "prompt_snapshot",
+            "prompt_rendered",
+            "prompt_context",
+            "prompt_meta",
+            "prompt_tool_manifest",
+            "codex_log",
+            "codex_events",
+            "secret_artifact",
+            "secrets",
+            "review_packet",
+            "review_md",
+            "review_json",
+            "agent_final_message",
+            "commands",
+            "tool_calls",
+            "approvals",
+            "agent_file",
+            "diagnostic",
+            "other"
+          ]
+        },
+        "path": { "type": "string" },
+        "artifact_id": { "type": "string", "pattern": "^art_" },
+        "redacted": { "type": "boolean" },
+        "content_url": { "type": ["string", "null"] },
+        "raw_prompt_exposed": { "type": "boolean" },
+        "raw_codex_log_exposed": { "type": "boolean" },
+        "raw_secret_exposed": { "type": "boolean" }
+      }
+    }
+  },
   "required": [
     "id",
     "packet_no",
     "status",
+    "summary",
+    "acceptance_criteria",
     "issue",
     "run",
     "git",
@@ -15,9 +71,16 @@
     "handoff",
     "changed_files",
     "untracked_files",
+    "diff",
+    "tests",
+    "risks",
+    "verification",
     "approvals",
     "tool_calls",
-    "prompt_snapshot",
+    "how_to_continue",
+    "raw_prompt_exposed",
+    "raw_codex_log_exposed",
+    "raw_secret_exposed",
     "failure_code",
     "failure_message",
     "created_at"
@@ -37,6 +100,15 @@
         "partial",
         "failed"
       ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "issue": {
       "type": "object",
@@ -292,12 +364,49 @@
         "additionalProperties": true
       }
     },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ReviewPacketArtifact" }
+    },
     "tool_calls": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": true
       }
+    },
+    "diff": {
+      "type": "string"
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "verification": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "how_to_continue": {
+      "type": "string"
+    },
+    "raw_prompt_exposed": {
+      "type": "boolean"
+    },
+    "raw_codex_log_exposed": {
+      "type": "boolean"
+    },
+    "raw_secret_exposed": {
+      "type": "boolean"
     },
     "prompt_snapshot": {
       "type": "object",
