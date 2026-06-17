@@ -2064,7 +2064,7 @@ The prelaunch fixture gate is based only on the installed Codex version and comm
 
 Default CI MUST use `internal/agent/fake`. Real Codex tests MUST be opt-in through `SYMPHONY_TEST_CODEX=1`.
 
-> **阶段 D 收口状态（2026-06-09）**：D3 / R14 已把 Codex diagnostics 字段接到 diagnostics surface，但当前 tree 的 `internal/observability.Diagnostics` 仍固定输出 `codex.available=false`、`codex.version=null` 与 `codex.support.{cli,model,sandbox}=unknown`；真实 Codex availability/version/support 检测仍按 `docs/productization/V1_REAL_PRODUCTIZATION_GAPS.md` 的 R14 作为后续补齐项。当前 diagnostics contract 不包含 Codex `reason` / `status` 字段；`symphony status` 与 `GET /api/v1/state` 不承诺合成或暴露 Codex availability/reason。`api/openapi.yaml` / `schemas/diagnostics.schema.json` / `web/src/types.ts` / `web/src/App.tsx` 同步（dashboard Overview 链接到 Diagnostics）。阶段 D 状态入口以当前 tree 内的 `docs/productization/D6_DOCS_CLOSE_NOTES.md` 为准。
+> **阶段 D 收口状态（2026-06-09；已按当前 tree 校准）**：D3 / R14 已把 Codex availability preflight 接到 diagnostics/status/state surfaces：`internal/observability.Diagnostics` 调用 `codex.RunPreflight(...)` 并投影 `codex.available`、`codex.version`、`codex.support.{cli,model,sandbox}`、fixture metadata/support 与 `last_preflight`；`symphony status` 与 `GET /api/v1/state` 通过 `observability.CodexAvailability(...)` 暴露同一类 Codex availability projection。当前 diagnostics contract 仍不包含 Codex `reason` / `status` 字段，失败分类通过 nullable `last_preflight.failure_*` 与 `warning=unsupported_codex_version` 表达；状态面不得额外合成 diagnostics 未定义的 Codex 字段。`api/openapi.yaml` / `schemas/diagnostics.schema.json` / `web/src/types.ts` / `web/src/App.tsx` 同步（dashboard Overview 链接到 Diagnostics）。阶段 D 状态入口以当前 tree 内的 `docs/productization/D6_DOCS_CLOSE_NOTES.md` 为准。
 
 ### 10.3 Runner interface
 
@@ -2300,11 +2300,11 @@ Status command:
 primary API: GET /api/v1/state
 daemon unavailable: CLI MAY fall back to GET /api/v1/health only to report daemon availability; if health is unavailable too, exit 3
 human output: concise status for the shipped state payload: project id, repo root, recent issues, and runs
---json output: envelope-unwrapped stable object with project_id, repo_root, issues, and runs fields
+--json output: envelope-unwrapped stable object with project_id, repo_root, issues, runs, and codex fields
 ```
 
-`symphony status --json` MUST return the state object directly, not an API envelope. It MUST NOT invent data from diagnostics. The shipped `/api/v1/state` payload currently contains `project_id`, `repo_root`, `issues`, and `runs`; non-required `AppState` schema fields are compatibility/future expansion slots and are not promised by `symphony status` until the implementation populates them.
-`symphony status` and `GET /api/v1/state` MUST NOT promise or synthesize Codex availability, support, or reason fields. Codex availability/support projection belongs to `symphony diagnostics` and `GET /api/v1/diagnostics`; diagnostics does not promise Codex reason/status fields.
+`symphony status --json` MUST return the state object directly, not an API envelope. It MUST NOT invent data from diagnostics. The shipped `/api/v1/state` payload currently contains `project_id`, `repo_root`, `issues`, `runs`, and `codex`; non-required `AppState` schema fields such as daemon/workflow/running-runs/approval/review/paused/failure overview sections are compatibility/future expansion slots and are not promised by `symphony status` until the implementation populates them.
+`symphony status` and `GET /api/v1/state` expose Codex availability/support through `observability.CodexAvailability(...)`. They MUST NOT synthesize additional Codex fields that the diagnostics/state contracts do not define; diagnostics does not promise Codex reason/status fields.
 `GET /api/v1/state` `AppState` uses the shipped field names above.
 
 Issue commands:
