@@ -341,7 +341,6 @@ func latestReviewPacketForRun(s *store.Store, issue *core.Issue, run *core.RunAt
 
 func hydrateSafeSummaryFromArtifacts(summary *SafeSummary, root string) error {
 	reviewJSONPath := filepath.Join(root, "review.json")
-	reviewMDPath := filepath.Join(root, "review.md")
 	diffstatPath := filepath.Join(root, "diffstat.txt")
 	changedPath := filepath.Join(root, "changed-files.txt")
 	if data, err := os.ReadFile(reviewJSONPath); err == nil {
@@ -359,13 +358,14 @@ func hydrateSafeSummaryFromArtifacts(summary *SafeSummary, root string) error {
 			}
 		}
 	}
-	if data, err := os.ReadFile(reviewMDPath); err == nil {
-		// Pull out the "Summary" section only; the full markdown
-		// may contain echoed handoff prose and we want to avoid
-		// pulling in `raw_prompt`-style lines if the markdown
-		// generator ever embeds one.
-		summary.Summary = extractSection(string(data), "## Summary", summary.Summary)
-	}
+	// D4 / R16: review.json handoff.summary is the structured source of
+	// truth. The previous implementation OVERWROTE summary.Summary by
+	// re-reading review.md's `## Summary` section and truncating it at
+	// the first `\n## ` sub-heading. Because renderMarkdown injects
+	// h.Summary verbatim after `## Summary`, a summary containing a
+	// `## ` sub-heading (e.g. "Implemented parser\n\n## Edge cases...")
+	// was truncated to just the text before that sub-heading, dropping
+	// the rest. We no longer re-read review.md for the summary.
 	if data, err := os.ReadFile(diffstatPath); err == nil {
 		summary.Diffstat = strings.TrimSpace(string(data))
 	}
@@ -425,22 +425,6 @@ func splitNonEmptyLines(s string) []string {
 		out = append(out, line)
 	}
 	return out
-}
-
-func extractSection(md, header, fallback string) string {
-	idx := strings.Index(md, header)
-	if idx < 0 {
-		return fallback
-	}
-	rest := md[idx+len(header):]
-	if nl := strings.Index(rest, "\n## "); nl >= 0 {
-		rest = rest[:nl]
-	}
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return fallback
-	}
-	return rest
 }
 
 func safeSummaryToolCallCount(s *store.Store, runID string) int {

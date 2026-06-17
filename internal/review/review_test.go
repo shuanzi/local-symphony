@@ -332,6 +332,18 @@ func TestGenerateDoesNotReincludeProtectedRenameFromHandoff(t *testing.T) {
 	}
 }
 
+// TestGenerateOmitsUntrackedRenameOfProtectedDeletedFile verifies the
+// FAIL-CLOSED behavior restored by D4 / R16 round 3: a filesystem rename
+// of a protected file to an untracked name (safe.txt) DELETES the
+// tracked .env, which is a protected delete. Because the protected
+// file's pre-deletion worktree content (the bytes that could have been
+// copied into an untracked file) is unrecoverable when unstaged
+// modifications existed and undetectable after deletion, ALL
+// non-path-protected untracked content is suppressed (denied) — both the
+// renamed safe.txt (verbatim copy of the deleted secret) AND the
+// unrelated notes.txt (different content). Protected bytes never appear
+// in any artifact. The round-2 content-hash-match premise (notes.txt
+// preserved) is no longer valid under the security-first decision.
 func TestGenerateOmitsUntrackedRenameOfProtectedDeletedFile(t *testing.T) {
 	st := newReviewTestStore(t)
 	workspace := initGitWorkspace(t)
@@ -351,32 +363,42 @@ func TestGenerateOmitsUntrackedRenameOfProtectedDeletedFile(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
-	if strings.Contains(patch, "SECRET=original") || strings.Contains(patch, "safe.txt") || strings.Contains(patch, ".env") {
-		t.Fatalf("changes.patch leaked protected filesystem rename:\n%s", patch)
-	}
-	if strings.Contains(patch, "diff --git a/notes.txt b/notes.txt") || strings.Contains(patch, "ordinary untracked") {
-		t.Fatalf("changes.patch included ordinary untracked file while protected deletion exists:\n%s", patch)
+	// Fail-closed: protected bytes AND ALL untracked content (both the
+	// renamed safe.txt and the unrelated notes.txt) must be suppressed
+	// from changes.patch.
+	for _, marker := range []string{"SECRET=original", "safe.txt", ".env", "diff --git a/notes.txt b/notes.txt", "ordinary untracked"} {
+		if strings.Contains(patch, marker) {
+			t.Fatalf("changes.patch leaked content in fail-closed (protected-delete) mode (%q):\n%s", marker, patch)
+		}
 	}
 	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
-	if strings.Contains(changed, "safe.txt") || strings.Contains(changed, ".env") {
-		t.Fatalf("changed-files.txt leaked protected filesystem rename:\n%s", changed)
-	}
-	if strings.Contains(changed, "notes.txt\n") {
-		t.Fatalf("changed-files.txt included ordinary untracked file while protected deletion exists:\n%s", changed)
+	for _, marker := range []string{"safe.txt", ".env", "notes.txt"} {
+		if strings.Contains(changed, marker) {
+			t.Fatalf("changed-files.txt leaked content in fail-closed mode (%q):\n%s", marker, changed)
+		}
 	}
 	diffstat := readReviewArtifact(t, st, issue, run, "diffstat.txt")
-	if strings.Contains(diffstat, "safe.txt") || strings.Contains(diffstat, ".env") {
-		t.Fatalf("diffstat.txt leaked protected filesystem rename:\n%s", diffstat)
-	}
-	if strings.Contains(diffstat, "notes.txt") {
-		t.Fatalf("diffstat.txt included ordinary untracked file while protected deletion exists:\n%s", diffstat)
+	for _, marker := range []string{"safe.txt", ".env", "notes.txt"} {
+		if strings.Contains(diffstat, marker) {
+			t.Fatalf("diffstat.txt leaked content in fail-closed mode (%q):\n%s", marker, diffstat)
+		}
 	}
 	reviewJSON := readReviewArtifact(t, st, issue, run, "review.json")
-	if strings.Contains(reviewJSON, "SECRET=original") || strings.Contains(reviewJSON, "safe.txt") || strings.Contains(reviewJSON, ".env") {
-		t.Fatalf("review.json leaked protected filesystem rename:\n%s", reviewJSON)
+	if strings.Contains(reviewJSON, "SECRET=original") {
+		t.Fatalf("review.json leaked protected filesystem rename bytes:\n%s", reviewJSON)
 	}
-	if strings.Contains(reviewJSON, `"notes.txt"`) {
-		t.Fatalf("review.json included ordinary untracked file while protected deletion exists:\n%s", reviewJSON)
+	if strings.Contains(reviewJSON, `"notes.txt"`) || strings.Contains(reviewJSON, `"safe.txt"`) {
+		t.Fatalf("review.json leaked untracked content in fail-closed mode:\n%s", reviewJSON)
+	}
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	for _, path := range []string{"safe.txt", "notes.txt"} {
+		info, ok := untracked[path]
+		if !ok {
+			continue
+		}
+		if info.PatchIncluded || info.SHA256 != "" {
+			t.Fatalf("%s untracked info = %+v in fail-closed mode, want no patch and no sha", path, info)
+		}
 	}
 }
 
@@ -577,6 +599,17 @@ func TestUntrackedInfoOmitsLargeFileWithoutHashingContents(t *testing.T) {
 	}
 }
 
+// TestGenerateOmitsUntrackedContentWhenProtectedTrackedFileDeleted
+// verifies the FAIL-CLOSED behavior of D4 / R16 round 3: after deleting
+// a protected tracked .env, ALL non-path-protected untracked content is
+// suppressed (denied) from the review packet — both the verbatim copy
+// (public.txt) AND the unrelated safe file (notes.txt). Because the
+// protected file's pre-deletion worktree content (the bytes that could
+// have been copied into an untracked file) is unrecoverable when unstaged
+// modifications existed and undetectable after deletion, content-hash
+// matching cannot be made safe; we fail closed. Protected bytes never
+// appear in any artifact. The round-2 premise (notes.txt preserved) is
+// no longer valid under the security-first decision.
 func TestGenerateOmitsUntrackedContentWhenProtectedTrackedFileDeleted(t *testing.T) {
 	st := newReviewTestStore(t)
 	workspace := initGitWorkspace(t)
@@ -586,6 +619,129 @@ func TestGenerateOmitsUntrackedContentWhenProtectedTrackedFileDeleted(t *testing
 	runGit(t, workspace, "add", ".")
 	runGit(t, workspace, "commit", "-m", "base")
 
+	// UNSTAGED deletion (protected delete) → fail closed.
+	if err := os.Remove(filepath.Join(workspace, ".env")); err != nil {
+		t.Fatalf("rm .env: %v", err)
+	}
+	writeFile(t, workspace, "public.txt", secret)
+	writeFile(t, workspace, "notes.txt", "benign note\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"public.txt", "notes.txt"})
+
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	// Fail-closed: protected bytes AND ALL untracked content (both the
+	// verbatim-copy public.txt and the unrelated notes.txt) must be
+	// suppressed from changes.patch.
+	for _, marker := range []string{"SECRET=protected", "diff --git a/public.txt b/public.txt", "diff --git a/notes.txt b/notes.txt", "benign note"} {
+		if strings.Contains(patch, marker) {
+			t.Fatalf("changes.patch leaked content in fail-closed (protected-delete) mode (%q):\n%s", marker, patch)
+		}
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	for _, marker := range []string{"public.txt", "notes.txt"} {
+		if strings.Contains(changed, marker) {
+			t.Fatalf("changed-files.txt leaked untracked content in fail-closed mode (%q):\n%s", marker, changed)
+		}
+	}
+	diffstat := readReviewArtifact(t, st, issue, run, "diffstat.txt")
+	for _, marker := range []string{"public.txt", "notes.txt"} {
+		if strings.Contains(diffstat, marker) {
+			t.Fatalf("diffstat.txt leaked untracked content in fail-closed mode (%q):\n%s", marker, diffstat)
+		}
+	}
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	for _, path := range []string{"public.txt", "notes.txt"} {
+		info, ok := untracked[path]
+		if !ok {
+			continue
+		}
+		if info.PatchIncluded || info.SHA256 != "" {
+			t.Fatalf("%s untracked info = %+v in fail-closed mode, want no patch and no sha", path, info)
+		}
+	}
+	// review.json must not leak protected bytes or untracked content.
+	reviewJSON := readReviewArtifact(t, st, issue, run, "review.json")
+	if strings.Contains(reviewJSON, "SECRET=protected") {
+		t.Fatalf("review.json leaked protected bytes:\n%s", reviewJSON)
+	}
+	if strings.Contains(reviewJSON, `"notes.txt"`) || strings.Contains(reviewJSON, `"public.txt"`) {
+		t.Fatalf("review.json leaked untracked content in fail-closed mode:\n%s", reviewJSON)
+	}
+}
+
+// TestGenerateKeepsUntrackedContentWhenNoProtectedDelete proves the COMMON
+// case keeps full content-level correlation in the review packet: with NO
+// protected file deleted, an untracked notes.txt appears in
+// changes.patch / changed-files.txt / diffstat.txt / untracked-files.json
+// with its content and sha. This is the counterpart to the fail-closed
+// tests above and guards against regressing common-case behavior when
+// tightening the protected-delete path. (The round-2 "keeps unrelated
+// untracked when protected deleted" premise is no longer valid under the
+// security-first fail-closed decision; that scenario is now covered by
+// TestGenerateOmitsUntrackedContentWhenProtectedTrackedFileDeleted.)
+func TestGenerateKeepsUntrackedContentWhenNoProtectedDelete(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// NO protected file is deleted (no .env at all) → no fail-closed →
+	// untracked content is preserved.
+	writeFile(t, workspace, "notes.txt", "benign note\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"notes.txt"})
+
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/notes.txt b/notes.txt") || !strings.Contains(patch, "+benign note") {
+		t.Fatalf("changes.patch dropped untracked notes.txt (no protected delete):\n%s", patch)
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if !strings.Contains(changed, "notes.txt\n") {
+		t.Fatalf("changed-files.txt dropped untracked notes.txt (no protected delete):\n%s", changed)
+	}
+	diffstat := readReviewArtifact(t, st, issue, run, "diffstat.txt")
+	if !strings.Contains(diffstat, "notes.txt") {
+		t.Fatalf("diffstat.txt dropped untracked notes.txt (no protected delete):\n%s", diffstat)
+	}
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	info, ok := untracked["notes.txt"]
+	if !ok {
+		t.Fatalf("untracked-files.json dropped notes.txt (no protected delete): %+v", untracked)
+	}
+	if !info.PatchIncluded || info.SHA256 == "" {
+		t.Fatalf("notes.txt untracked info = %+v, want patch included and sha", info)
+	}
+}
+
+// TestGenerateFailsClosedOnStagedProtectedDelete codifies the FAIL-CLOSED
+// behavior in review.go for a STAGED protected deletion. Round 3
+// generalized fail-closed to ANY protected delete (staged OR unstaged)
+// because the pre-deletion worktree content is unrecoverable when
+// unstaged modifications existed and undetectable after deletion; the
+// unstaged variant is covered by
+// TestGenerateOmitsUntrackedContentWhenProtectedTrackedFileDeleted. Here,
+// with a staged `git rm`, matchesUntracked returns true for EVERY
+// non-path-protected untracked file, so ALL untracked content — both the
+// benign notes.txt and the verbatim-copy public.txt — is suppressed (no
+// patch, no sha), and the protected "SECRET=..." bytes never appear.
+func TestGenerateFailsClosedOnStagedProtectedDelete(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	secret := "SECRET=protected\n"
+	writeFile(t, workspace, ".env", secret)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// STAGED deletion: `git rm` removes the index entry → protected
+	// content set is unknown → fail closed (suppress all untracked).
 	runGit(t, workspace, "rm", ".env")
 	writeFile(t, workspace, "public.txt", secret)
 	writeFile(t, workspace, "notes.txt", "benign note\n")
@@ -596,15 +752,28 @@ func TestGenerateOmitsUntrackedContentWhenProtectedTrackedFileDeleted(t *testing
 		t.Fatalf("Generate: %v", err)
 	}
 	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	// In fail-closed mode ALL untracked content is suppressed: neither
+	// the benign notes.txt nor the verbatim-copy public.txt appears.
 	for _, marker := range []string{"SECRET=protected", "benign note", "diff --git a/public.txt b/public.txt", "diff --git a/notes.txt b/notes.txt"} {
 		if strings.Contains(patch, marker) {
-			t.Fatalf("changes.patch included untracked content while protected deletion exists (%q):\n%s", marker, patch)
+			t.Fatalf("changes.patch leaked untracked content in fail-closed (staged-delete) mode (%q):\n%s", marker, patch)
 		}
 	}
 	untracked := readUntrackedArtifact(t, st, issue, run)
 	for _, path := range []string{"public.txt", "notes.txt"} {
-		if info, ok := untracked[path]; ok && (info.PatchIncluded || info.SHA256 != "") {
-			t.Fatalf("%s untracked info = %+v, want no patch and no sha while protected deletion exists", path, info)
+		info, ok := untracked[path]
+		if !ok {
+			continue
+		}
+		if info.PatchIncluded || info.SHA256 != "" {
+			t.Fatalf("%s untracked info = %+v in fail-closed mode, want no patch and no sha", path, info)
+		}
+	}
+	// Protected bytes must never appear anywhere in the packet.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		if strings.Contains(art, "SECRET=protected") {
+			t.Fatalf("%s leaked protected bytes in fail-closed mode:\n%s", name, art)
 		}
 	}
 }
@@ -780,4 +949,698 @@ func readUntrackedArtifact(t *testing.T, st *store.Store, issue *core.Issue, run
 		out[item.Path] = item
 	}
 	return out
+}
+
+// TestGenerateFailsClosedOnProtectedRename codifies the round-4 FAIL-CLOSED
+// behavior in review.go for a STAGED protected RENAME (`git mv .env
+// renamed.txt`, an `R` porcelain record, NOT a `D` record). Round 3's
+// delete-only check did not see the `R` record as a deletion, so an
+// untracked file holding the copied protected bytes (with filler to avoid
+// git's rename/copy detection) was preserved → leak. Round 4 makes a
+// protected R/C source trigger fail-closed too: matchesUntracked returns
+// true for EVERY non-path-protected untracked file, so ALL untracked
+// content — both the benign notes.txt and the copy-of-protected
+// public.txt — is suppressed (no patch, no sha), and the protected
+// "SECRET=..." bytes never appear anywhere in the packet.
+func TestGenerateFailsClosedOnProtectedRename(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=original\n")
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// Staged RENAME of the protected file → R porcelain record (NOT D).
+	runGit(t, workspace, "mv", ".env", "renamed.txt")
+	// public.txt is an untracked copy of the protected bytes with filler
+	// (avoids git's copy detection); notes.txt is benign. Under round 3
+	// the R record did not trigger fail-closed, so public.txt leaked;
+	// round 4 suppresses both.
+	var pb strings.Builder
+	for i := 0; i < 20; i++ {
+		pb.WriteString("filler line 0123456789\n")
+	}
+	pb.WriteString("SECRET=original\n")
+	writeFile(t, workspace, "public.txt", pb.String())
+	writeFile(t, workspace, "notes.txt", "benign note\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"public.txt", "notes.txt"})
+
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	// In fail-closed mode ALL untracked content is suppressed: neither
+	// the benign notes.txt nor the copy-of-protected public.txt appears,
+	// and the rename itself does not leak SECRET.
+	for _, marker := range []string{
+		"SECRET=original",
+		"benign note",
+		"diff --git a/public.txt b/public.txt",
+		"diff --git a/notes.txt b/notes.txt",
+		"diff --git a/.env b/renamed.txt",
+	} {
+		if strings.Contains(patch, marker) {
+			t.Fatalf("changes.patch leaked content in fail-closed (protected-rename) mode (%q):\n%s", marker, patch)
+		}
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	for _, marker := range []string{"public.txt", "notes.txt"} {
+		if strings.Contains(changed, marker) {
+			t.Fatalf("changed-files.txt leaked untracked content in fail-closed (protected-rename) mode (%q):\n%s", marker, changed)
+		}
+	}
+	diffstat := readReviewArtifact(t, st, issue, run, "diffstat.txt")
+	for _, marker := range []string{"public.txt", "notes.txt"} {
+		if strings.Contains(diffstat, marker) {
+			t.Fatalf("diffstat.txt leaked untracked content in fail-closed (protected-rename) mode (%q):\n%s", marker, diffstat)
+		}
+	}
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	for _, path := range []string{"public.txt", "notes.txt"} {
+		info, ok := untracked[path]
+		if !ok {
+			continue
+		}
+		if info.PatchIncluded || info.SHA256 != "" {
+			t.Fatalf("%s untracked info = %+v in fail-closed (protected-rename) mode, want no patch and no sha", path, info)
+		}
+	}
+	// Protected bytes must never appear anywhere in the packet.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		if strings.Contains(art, "SECRET=original") {
+			t.Fatalf("%s leaked protected bytes in fail-closed (protected-rename) mode:\n%s", name, art)
+		}
+	}
+}
+
+// TestGenerateFailsClosedOnProtectedDeleteStagesAddedCopy codifies the
+// D4 / R16 round-5 fix for P1 leak #1 in review.go's collectChanges path.
+//
+// Scenario: a protected tracked .env is deleted (staged `git rm`) and its
+// bytes are copied into a NEW public file that is STAGED as an addition
+// (`cp .env public.txt; git add public.txt`). `git status --porcelain`
+// reports this as `D .env` + `A public.txt` (porcelain does NOT detect
+// that public.txt is a copy/rename of .env). Round 4's fail-closed
+// (protectedDeletedContent.unknown=true from the protected `D .env`)
+// suppressed only UNTRACKED (??) files; the tracked `A public.txt` still
+// entered `changed`, so gitx.DiffBinaryPaths emitted `SECRET=...` into
+// changes.patch / diffstat.txt / review.json.
+//
+// Round 5 makes the fail-closed SKIP ALL tracked A records when
+// unknown=true (mirroring the orchestrator's
+// filteredTrackedDiffPathspecs), so the staged `A public.txt` is denied
+// and its protected bytes never appear in any artifact. An unrelated
+// benign untracked file (notes.txt) is also suppressed by the existing
+// untracked fail-closed.
+func TestGenerateFailsClosedOnProtectedDeleteStagesAddedCopy(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	secret := "SECRET=original\n"
+	writeFile(t, workspace, ".env", secret)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// STAGED delete of the protected file (D .env) + STAGED add of a
+	// public file holding the copied protected bytes (A public.txt).
+	// Porcelain reports these as two independent records; the A record
+	// is the leak vector closed by round 5.
+	runGit(t, workspace, "rm", ".env")
+	writeFile(t, workspace, "public.txt", secret)
+	runGit(t, workspace, "add", "public.txt")
+	// notes.txt is a benign untracked file (suppressed by the existing
+	// untracked fail-closed).
+	writeFile(t, workspace, "notes.txt", "benign note\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"public.txt", "notes.txt"})
+
+	_, err := (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// The staged A public.txt MUST be suppressed: no patch, no
+	// changed-files entry, no diffstat entry — and no protected bytes
+	// anywhere in the packet.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"SECRET=original",
+			"diff --git a/public.txt b/public.txt",
+			"public.txt",
+			"benign note",
+			"diff --git a/notes.txt b/notes.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked content in fail-closed (protected-delete + staged-added-copy) mode (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	for _, path := range []string{"public.txt", "notes.txt"} {
+		info, ok := untracked[path]
+		if !ok {
+			continue
+		}
+		if info.PatchIncluded || info.SHA256 != "" {
+			t.Fatalf("%s untracked info = %+v in fail-closed mode, want no patch and no sha", path, info)
+		}
+	}
+}
+
+// TestGenerateSkipsAddedCopyOfRemainingProtectedFile codifies the D4 / R16
+// round-5 fix for P1 leak #2 in review.go's collectChanges path.
+//
+// Scenario: a protected tracked .env is copied verbatim into a NEW public
+// file that is STAGED as an addition, while the source .env REMAINS
+// (`cp .env public.txt; git add public.txt`, no delete). `git status
+// --porcelain` reports ONLY `A public.txt` (porcelain does NOT detect
+// copies, and there is no D/R record), so protectedDeletedContent.unknown
+// stays false and round 4's fail-closed does not trigger. The A record
+// passed the per-record reviewSafePath check (public.txt is not itself a
+// protected path) and entered `changed`, so gitx.DiffBinaryPaths emitted
+// the copied `SECRET=...` bytes into changes.patch / review.json.
+//
+// Round 5 adds a copy-aware pre-check via `git diff --name-status
+// --find-copies-harder`, which reports `C100 .env public.txt` (source
+// first, destination second) for a verbatim copy even when the source
+// remains. collectChanges now skips A destinations whose R/C source is
+// protected, so public.txt is denied and its bytes never appear. An
+// unrelated benign tracked-added file (feature.txt) is KEPT to prove the
+// common-case correlation is preserved.
+func TestGenerateSkipsAddedCopyOfRemainingProtectedFile(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	secret := "SECRET=original\n"
+	writeFile(t, workspace, ".env", secret)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// Verbatim copy of the protected file into a new public file, source
+	// .env REMAINS. Staged add. Porcelain reports only `A public.txt`;
+	// --find-copies-harder reports `C100 .env public.txt`.
+	writeFile(t, workspace, "public.txt", secret)
+	runGit(t, workspace, "add", "public.txt")
+	// feature.txt is an unrelated benign tracked-added file (NOT a copy
+	// of any protected file). It MUST be kept in changed/changes.patch
+	// to prove common-case correlation survives the copy-aware skip.
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"public.txt", "feature.txt"})
+
+	// Sanity: confirm git would detect this copy via --find-copies-harder
+	// (guards the test against a git version that does not).
+	out, err := exec.Command("git", "-C", workspace, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "-z", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("find-copies-harder probe failed: %v", err)
+	}
+	if !strings.Contains(string(out), "C100\x00.env\x00public.txt") {
+		t.Fatalf("git did not detect the verbatim copy as C100 .env public.txt; test premise invalid:\n%q", string(out))
+	}
+
+	_, err = (Generator{Store: st}).Generate(run.ID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// The copy destination public.txt MUST be suppressed everywhere;
+	// protected bytes never appear. The unrelated feature.txt MUST be
+	// kept (common-case correlation preserved).
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"SECRET=original",
+			"diff --git a/public.txt b/public.txt",
+			"public.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked protected-copy content (copy with source remaining) (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated tracked-added feature.txt (common-case correlation broken):\n%s", patch)
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if !strings.Contains(changed, "feature.txt\n") {
+		t.Fatalf("changed-files.txt dropped unrelated tracked-added feature.txt (common-case correlation broken):\n%s", changed)
+	}
+	if strings.Contains(changed, "public.txt") {
+		t.Fatalf("changed-files.txt kept protected-copy destination public.txt:\n%s", changed)
+	}
+}
+
+// TestGenerateSkipsAddedCopyOfModifiedProtectedFile codifies the D4 / R16
+// round-6 fix for the modified-source-copy P1 leak in review.go's
+// collectChanges path (the A-record variant).
+//
+// Scenario: a protected tracked .env is committed (SECRET=old), MODIFIED to
+// SECRET=new, then copied verbatim into a new public file (`cp .env
+// public.txt`, `git add public.txt`), source .env REMAINS. `git diff
+// --name-status --find-copies-harder HEAD` reports `M .env` + `A public.txt`
+// — NOT a `C` record — because --find-copies-harder compares the copy
+// against the unmodified HEAD blob, but the copy holds the modified
+// (workspace) bytes. Round 5's protectedCopyDestinations (--find-copies-
+// harder) check therefore does NOT flag public.txt, so the A record entered
+// `changed` and gitx.DiffBinaryPaths emitted the copied modified protected
+// bytes (SECRET=new) into changes.patch / review.json.
+//
+// Round 6 closes this: matchesAddedTracked content-hash-matches public.txt's
+// WORKSPACE content against existingProtectedContentHashes (workspace +
+// HEAD + index of all existing protected files); public.txt's content
+// (SECRET=new) matches .env's WORKSPACE hash (SECRET=new) → denied. An
+// unrelated safe added feature.txt IS kept.
+func TestGenerateSkipsAddedCopyOfModifiedProtectedFile(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=old\n")
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// MODIFY the protected file (the bytes that will be copied).
+	writeFile(t, workspace, ".env", "SECRET=new\n")
+	// Verbatim copy of the MODIFIED protected workspace bytes into a new
+	// public file. Source .env REMAINS.
+	modified, err := os.ReadFile(filepath.Join(workspace, ".env"))
+	if err != nil {
+		t.Fatalf("read modified .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "public.txt"), modified, 0o644); err != nil {
+		t.Fatalf("write public.txt: %v", err)
+	}
+	runGit(t, workspace, "add", "public.txt")
+	// Unrelated safe added file — MUST be kept.
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"public.txt", "feature.txt"})
+
+	// Sanity: confirm git does NOT detect this as a C record (guards the
+	// test premise — the round-5 --find-copies-harder check must NOT fire).
+	probe, err := exec.Command("git", "-C", workspace, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "-z", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("name-status probe: %v", err)
+	}
+	if strings.Contains(string(probe), "C") {
+		t.Fatalf("git unexpectedly detected a C record for modified-source copy; test premise invalid:\n%q", string(probe))
+	}
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// public.txt (copy of MODIFIED protected content) MUST be suppressed
+	// everywhere; the modified protected bytes never appear. The unrelated
+	// feature.txt MUST be kept (common-case correlation preserved).
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"SECRET=new",
+			"diff --git a/public.txt b/public.txt",
+			"public.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked modified-protected-copy content (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated tracked-added feature.txt (common-case correlation broken):\n%s", patch)
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if !strings.Contains(changed, "feature.txt") {
+		t.Fatalf("changed-files.txt dropped unrelated tracked-added feature.txt (common-case correlation broken):\n%s", changed)
+	}
+}
+
+// TestGenerateSuppressesUntrackedCopyOfExistingProtectedContent codifies the
+// D4 / R16 round-6 fix for the untracked modified-source-copy P1 leak in
+// review.go's collectChanges path (the untracked ?? variant).
+//
+// Scenario: a protected tracked .env is committed (SECRET=old), MODIFIED to
+// SECRET=new, and an untracked safe.txt is a verbatim copy of the modified
+// .env (safe.txt = SECRET=new). Source .env REMAINS. Round 4/5 preserved
+// safe.txt with its content (PatchIncluded=true, sha=...) since
+// matchesUntracked returned false (no protected delete), so the modified
+// protected bytes entered changes.patch (via syntheticPatch) /
+// untracked-files.json (sha). Round 6 content-hash-matches safe.txt's
+// content against existingProtectedContentHashes (includes .env's workspace
+// hash = SECRET=new) → matchesUntracked returns true → safe.txt is denied
+// (no patch, no sha, no listing). An unrelated untracked notes.txt IS
+// present with its content.
+func TestGenerateSuppressesUntrackedCopyOfExistingProtectedContent(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=old\n")
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// MODIFY the protected file.
+	writeFile(t, workspace, ".env", "SECRET=new\n")
+	// safe.txt is a verbatim copy of the modified protected workspace bytes
+	// (untracked). Source .env REMAINS.
+	modified, err := os.ReadFile(filepath.Join(workspace, ".env"))
+	if err != nil {
+		t.Fatalf("read modified .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "safe.txt"), modified, 0o644); err != nil {
+		t.Fatalf("write safe.txt (copy of modified .env): %v", err)
+	}
+	// Unrelated untracked notes.txt — MUST be present with its content.
+	writeFile(t, workspace, "notes.txt", "plain note\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"safe.txt", "notes.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// safe.txt (untracked copy of MODIFIED protected content) MUST NOT
+	// appear in the patch or with a sha; the modified protected bytes
+	// never appear anywhere. notes.txt MUST be present with its content.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		if strings.Contains(art, "SECRET=new") {
+			t.Fatalf("%s leaked untracked modified-protected-copy content (SECRET=new):\n%s", name, art)
+		}
+		if strings.Contains(art, "diff --git a/safe.txt b/safe.txt") {
+			t.Fatalf("%s leaked safe.txt synthetic patch (copy of modified protected content):\n%s", name, art)
+		}
+	}
+	// safe.txt must either be absent from the untracked artifact or present
+	// WITHOUT content (no patch, no sha). notes.txt must be present WITH
+	// content (patch included, sha set).
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	if info, ok := untracked["safe.txt"]; ok {
+		if info.PatchIncluded || info.SHA256 != "" {
+			t.Fatalf("safe.txt untracked info = %+v; want no patch and no sha (copy of modified protected content suppressed)", info)
+		}
+	}
+	notesInfo, ok := untracked["notes.txt"]
+	if !ok {
+		t.Fatalf("untracked artifact dropped unrelated notes.txt (common-case correlation broken): %+v", untracked)
+	}
+	if !notesInfo.PatchIncluded || notesInfo.SHA256 == "" {
+		t.Fatalf("notes.txt untracked info = %+v; want patch included and sha set (unrelated safe content preserved)", notesInfo)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/notes.txt b/notes.txt") || !strings.Contains(patch, "+plain note") {
+		t.Fatalf("changes.patch dropped unrelated untracked notes.txt content (common-case correlation broken):\n%s", patch)
+	}
+}
+
+// TestGenerateSkipsAddedCopyOfIgnoredProtectedFile codifies the D4 / R16
+// round-7 fix A for review.go's collectChanges path (A-record variant of the
+// ignored-protected-file leak).
+//
+// Scenario: a protected .env is IGNORED by .gitignore (the common case — .env
+// is typically gitignored), so it is UNTRACKED and never appears in `git
+// ls-files` or `git ls-files --others --exclude-standard`. It is then copied
+// verbatim into a new public file (`cp .env public.txt`, `git add public.txt`),
+// while the source .env REMAINS (ignored). Round 6's existingProtectedContent
+// Hashes enumerated only tracked + untracked-non-ignored files, so the ignored
+// .env was never hashed into the set → public.txt was treated as safe and its
+// protected bytes leaked into changes.patch / review.json.
+//
+// Round 7 fix A adds a THIRD enumeration: `git ls-files --others --ignored
+// --exclude-standard -z`, which lists ignored files. The ignored .env is now
+// enumerated, its WORKSPACE content is hashed into existingHashes, and
+// public.txt's content matches → matchesAddedTracked denies it. An unrelated
+// safe added feature.txt IS kept.
+func TestGenerateSkipsAddedCopyOfIgnoredProtectedFile(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	// Make .env gitignored (the common ignored-secret setup).
+	writeFile(t, workspace, ".gitignore", ".env\n")
+	runGit(t, workspace, "add", ".gitignore")
+	runGit(t, workspace, "commit", "-m", "add gitignore")
+	// Protected .env (ignored, untracked). Real content so its workspace hash
+	// is in existingHashes.
+	writeFile(t, workspace, ".env", "SECRET=x\n")
+
+	// Sanity: confirm .env is IGNORED (guards the test premise). The non-
+	// ignored enumeration must NOT list it; the ignored enumeration MUST.
+	nonIgnored, err := exec.Command("git", "-C", workspace, "ls-files", "--others", "--exclude-standard", "-z").Output()
+	if err != nil {
+		t.Fatalf("ls-files --others --exclude-standard probe: %v", err)
+	}
+	if strings.Contains(string(nonIgnored), ".env") {
+		t.Fatalf("test premise invalid: .env not actually ignored by --others --exclude-standard:\n%q", string(nonIgnored))
+	}
+	ignored, err := exec.Command("git", "-C", workspace, "ls-files", "--others", "--ignored", "--exclude-standard", "-z").Output()
+	if err != nil {
+		t.Fatalf("ls-files --ignored probe: %v", err)
+	}
+	if !strings.Contains(string(ignored), ".env") {
+		t.Fatalf("test premise invalid: .env not listed by --others --ignored --exclude-standard:\n%q", string(ignored))
+	}
+
+	// Verbatim copy of the ignored protected .env into a new public file.
+	writeFile(t, workspace, "public.txt", "SECRET=x\n")
+	runGit(t, workspace, "add", "public.txt")
+	// Unrelated safe added file — MUST be kept.
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"public.txt", "feature.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// public.txt (copy of IGNORED protected content) MUST be suppressed
+	// everywhere; the protected bytes never appear. The unrelated feature.txt
+	// MUST be kept (common-case correlation preserved).
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"SECRET=x",
+			"diff --git a/public.txt b/public.txt",
+			"public.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked ignored-protected-copy content (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated tracked-added feature.txt (common-case correlation broken):\n%s", patch)
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if !strings.Contains(changed, "feature.txt") {
+		t.Fatalf("changed-files.txt dropped unrelated tracked-added feature.txt (common-case correlation broken):\n%s", changed)
+	}
+}
+
+// TestGenerateSuppressesUntrackedCopyOfIgnoredProtectedFile codifies the D4
+// / R16 round-7 fix A for review.go's collectChanges path (the untracked ??
+// variant of the ignored-protected-file leak).
+//
+// Scenario: a protected .env is IGNORED by .gitignore (untracked + ignored),
+// then copied verbatim into an untracked safe.txt, while .env REMAINS. Round
+// 6 did not enumerate ignored files, so the ignored .env's content was not in
+// existingHashes and safe.txt (a copy of the protected content) was preserved
+// with its content (patch + sha), leaking the protected bytes. Round 7 fix A
+// enumerates ignored files so .env's workspace hash is in existingHashes →
+// matchesUntracked returns true → safe.txt denied. An unrelated untracked
+// notes.txt IS present with its content.
+func TestGenerateSuppressesUntrackedCopyOfIgnoredProtectedFile(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	writeFile(t, workspace, ".gitignore", ".env\n")
+	runGit(t, workspace, "add", ".gitignore")
+	runGit(t, workspace, "commit", "-m", "add gitignore")
+	// Protected .env ignored, untracked, with real content.
+	writeFile(t, workspace, ".env", "SECRET=x\n")
+
+	// Sanity: confirm .env is ignored.
+	nonIgnored, err := exec.Command("git", "-C", workspace, "ls-files", "--others", "--exclude-standard", "-z").Output()
+	if err != nil {
+		t.Fatalf("ls-files --others --exclude-standard probe: %v", err)
+	}
+	if strings.Contains(string(nonIgnored), ".env") {
+		t.Fatalf("test premise invalid: .env not actually ignored:\n%q", string(nonIgnored))
+	}
+	ignored, err := exec.Command("git", "-C", workspace, "ls-files", "--others", "--ignored", "--exclude-standard", "-z").Output()
+	if err != nil {
+		t.Fatalf("ls-files --ignored probe: %v", err)
+	}
+	if !strings.Contains(string(ignored), ".env") {
+		t.Fatalf("test premise invalid: .env not listed by --ignored:\n%q", string(ignored))
+	}
+
+	// safe.txt is an untracked verbatim copy of the ignored protected .env.
+	writeFile(t, workspace, "safe.txt", "SECRET=x\n")
+	// Unrelated untracked notes.txt — MUST be present with its content.
+	writeFile(t, workspace, "notes.txt", "plain note\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"safe.txt", "notes.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// safe.txt (untracked copy of IGNORED protected content) MUST NOT appear
+	// in the patch or with a sha; the protected bytes never appear. notes.txt
+	// MUST be present with its content.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		if strings.Contains(art, "SECRET=x") {
+			t.Fatalf("%s leaked untracked ignored-protected-copy content (SECRET=x):\n%s", name, art)
+		}
+		if strings.Contains(art, "diff --git a/safe.txt b/safe.txt") {
+			t.Fatalf("%s leaked safe.txt synthetic patch (copy of ignored protected content):\n%s", name, art)
+		}
+	}
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	if info, ok := untracked["safe.txt"]; ok {
+		if info.PatchIncluded || info.SHA256 != "" {
+			t.Fatalf("safe.txt untracked info = %+v; want no patch and no sha (copy of ignored protected content suppressed)", info)
+		}
+	}
+	notesInfo, ok := untracked["notes.txt"]
+	if !ok {
+		t.Fatalf("untracked artifact dropped unrelated notes.txt (common-case correlation broken): %+v", untracked)
+	}
+	if !notesInfo.PatchIncluded || notesInfo.SHA256 == "" {
+		t.Fatalf("notes.txt untracked info = %+v; want patch included and sha set (unrelated safe content preserved)", notesInfo)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/notes.txt b/notes.txt") || !strings.Contains(patch, "+plain note") {
+		t.Fatalf("changes.patch dropped unrelated untracked notes.txt content (common-case correlation broken):\n%s", patch)
+	}
+}
+
+// TestGenerateKeepsEmptyFileWhenProtectedHasNoBlob codifies the D4 / R16
+// round-7 fix B for review.go's collectChanges path (A-record variant of the
+// empty-file false-suppression).
+//
+// Scenario: a protected .env exists in the workspace (real content) but is
+// UNTRACKED (NOT ignored here so it IS enumerated) — no HEAD/index version.
+// `git show HEAD:.env`/`:.env` both FAIL (non-zero exit, no stdout). Round 6's
+// reviewHashGitBlob ignored cmd.Wait()'s error and returned sha256("") as a
+// VALID protected hash. An unrelated EMPTY added file (empty.txt, 0 bytes)
+// then matched that synthetic empty hash and was WRONGLY SUPPRESSED. Round 7
+// fix B treats a non-nil Wait error as ok=false, so sha256("") is NOT a
+// protected hash and empty.txt is KEPT.
+func TestGenerateKeepsEmptyFileWhenProtectedHasNoBlob(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	// Protected .env untracked with REAL content (workspace hash in set) but
+	// NO HEAD/index version.
+	writeFile(t, workspace, ".env", "SECRET=real\n")
+	// Sanity: confirm `git show HEAD:.env` FAILS (non-zero exit) — the
+	// premise of fix B.
+	if out, err := exec.Command("git", "-C", workspace, "show", "HEAD:.env").CombinedOutput(); err == nil {
+		t.Fatalf("test premise invalid: git show HEAD:.env succeeded on an untracked file:\n%s", string(out))
+	}
+	// An unrelated EMPTY added file (0 bytes). Its sha256("") must NOT match
+	// any protected hash → MUST be kept.
+	if err := os.WriteFile(filepath.Join(workspace, "empty.txt"), []byte{}, 0o644); err != nil {
+		t.Fatalf("write empty.txt: %v", err)
+	}
+	runGit(t, workspace, "add", "empty.txt")
+	// A non-empty unrelated added file, kept to prove normal correlation.
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"empty.txt", "feature.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	// The empty file MUST be kept (NOT wrongly suppressed by a synthetic
+	// sha256("") protected hash).
+	if !strings.Contains(patch, "diff --git a/empty.txt b/empty.txt") {
+		t.Fatalf("changes.patch wrongly suppressed unrelated empty added file (fix B regression):\n%s", patch)
+	}
+	// The non-empty unrelated file MUST be kept.
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") {
+		t.Fatalf("changes.patch dropped unrelated safe added feature.txt:\n%s", patch)
+	}
+	// The protected .env bytes must never leak anywhere.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		if strings.Contains(art, "SECRET=real") {
+			t.Fatalf("%s leaked protected .env bytes:\n%s", name, art)
+		}
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if !strings.Contains(changed, "empty.txt") {
+		t.Fatalf("changed-files.txt dropped unrelated empty added file (fix B regression):\n%s", changed)
+	}
+	if !strings.Contains(changed, "feature.txt") {
+		t.Fatalf("changed-files.txt dropped unrelated safe added feature.txt:\n%s", changed)
+	}
+}
+
+// TestGenerateKeepsEmptyUntrackedFileWhenProtectedHasNoBlob codifies the D4
+// / R16 round-7 fix B for review.go's collectChanges path (untracked ??
+// variant of the empty-file false-suppression).
+//
+// Scenario: a protected .env exists in the workspace (real content) but is
+// UNTRACKED (no HEAD/index version). An unrelated EMPTY untracked file
+// (empty.txt, 0 bytes) is present. Round 6's reviewHashGitBlob returned
+// sha256("") for the absent .env blob, so empty.txt's sha256("") matched and
+// it was WRONGLY SUPPRESSED (denied: no patch, no sha, no listing). Round 7
+// fix B makes the absent-blob lookup return ok=false, so sha256("") is NOT a
+// protected hash and empty.txt is KEPT with its (empty) content hashed.
+func TestGenerateKeepsEmptyUntrackedFileWhenProtectedHasNoBlob(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	// Protected .env untracked with real content (workspace hash in set).
+	writeFile(t, workspace, ".env", "SECRET=real\n")
+	// Sanity: confirm `git show HEAD:.env` FAILS.
+	if out, err := exec.Command("git", "-C", workspace, "show", "HEAD:.env").CombinedOutput(); err == nil {
+		t.Fatalf("test premise invalid: git show HEAD:.env succeeded on an untracked file:\n%s", string(out))
+	}
+	// Unrelated EMPTY untracked file (0 bytes) — MUST be kept (not suppressed).
+	if err := os.WriteFile(filepath.Join(workspace, "empty.txt"), []byte{}, 0o644); err != nil {
+		t.Fatalf("write empty.txt: %v", err)
+	}
+	// Unrelated non-empty untracked file, kept to prove normal correlation.
+	writeFile(t, workspace, "notes.txt", "plain note\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"empty.txt", "notes.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	// empty.txt MUST be present WITH its sha (its content hashed, not
+	// suppressed). An empty file has no patch body but must still be LISTED
+	// with a sha — the opposite of round 6's false suppression.
+	emptyInfo, ok := untracked["empty.txt"]
+	if !ok {
+		t.Fatalf("untracked artifact dropped unrelated empty.txt (fix B regression): %+v", untracked)
+	}
+	// sha256 of empty content — must be set (proving it was hashed and kept,
+	// not sentinel-suppressed).
+	wantSha := sha256Hex(nil)
+	if emptyInfo.SHA256 != wantSha {
+		t.Fatalf("empty.txt untracked info = %+v; want sha %s (empty file KEPT and hashed, not suppressed)", emptyInfo, wantSha)
+	}
+	// notes.txt MUST be present with content.
+	notesInfo, ok := untracked["notes.txt"]
+	if !ok {
+		t.Fatalf("untracked artifact dropped unrelated notes.txt (common-case correlation broken): %+v", untracked)
+	}
+	if !notesInfo.PatchIncluded || notesInfo.SHA256 == "" {
+		t.Fatalf("notes.txt untracked info = %+v; want patch included and sha set (unrelated safe content preserved)", notesInfo)
+	}
+	// The protected .env bytes must never leak anywhere.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		if strings.Contains(art, "SECRET=real") {
+			t.Fatalf("%s leaked protected .env bytes:\n%s", name, art)
+		}
+	}
 }

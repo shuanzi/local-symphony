@@ -439,3 +439,68 @@ func TestBuildSafeSummaryRejectsReviewPacketsWithRawRefusalKinds(t *testing.T) {
 		t.Fatal("BuildSafeSummaryFromRun accepted review.json with codex_log marker")
 	}
 }
+
+// TestBuildSafeSummaryPreservesHandoffSummaryWithMarkdownHeadings
+// verifies D4 / R16 finding #5: when handoff.summary contains a `## `
+// sub-heading (e.g. "Implemented parser\n\n## Edge cases\n- foo"), the
+// safe summary MUST preserve the full value. The previous
+// implementation overwrote summary.Summary by re-reading review.md's
+// `## Summary` section and truncating it at the first `\n## `
+// sub-heading, dropping "## Edge cases..." and leaving only
+// "Implemented parser". review.json handoff.summary is now the sole
+// source of truth for the summary field.
+func TestBuildSafeSummaryPreservesHandoffSummaryWithMarkdownHeadings(t *testing.T) {
+	st := newReviewTestStore(t)
+	issue, run := prepareReviewRun(t, st)
+	// Generate a real packet so the schema and foreign keys are wired
+	// up and review.md / review.json exist on disk.
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	root := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID)
+	jpath := filepath.Join(root, "review.json")
+	mdpath := filepath.Join(root, "review.md")
+
+	fullSummary := "Implemented parser\n\n## Edge cases\n- foo"
+	// Inject the sub-heading-bearing summary into review.json's
+	// handoff.summary (the structured source of truth).
+	data, err := os.ReadFile(jpath)
+	if err != nil {
+		t.Fatalf("read review.json: %v", err)
+	}
+	var packet map[string]any
+	if err := json.Unmarshal(data, &packet); err != nil {
+		t.Fatalf("unmarshal review.json: %v", err)
+	}
+	handoff, _ := packet["handoff"].(map[string]any)
+	handoff["summary"] = fullSummary
+	packet["handoff"] = handoff
+	jb, _ := json.MarshalIndent(packet, "", "  ")
+	if err := os.WriteFile(jpath, jb, 0o644); err != nil {
+		t.Fatalf("write review.json: %v", err)
+	}
+	// Mirror renderMarkdown's output so review.md's `## Summary` section
+	// contains the same sub-heading-bearing text. The OLD extractSection
+	// would truncate this at the first `\n## ` (i.e. before
+	// "## Edge cases"), yielding only "Implemented parser".
+	md, err := os.ReadFile(mdpath)
+	if err != nil {
+		t.Fatalf("read review.md: %v", err)
+	}
+	mdString := string(md)
+	if !strings.Contains(mdString, "## Summary") {
+		t.Fatalf("review.md missing ## Summary section: %s", mdString)
+	}
+	mdString = strings.Replace(mdString, "## Summary\nready for review", "## Summary\n"+fullSummary, 1)
+	if err := os.WriteFile(mdpath, []byte(mdString), 0o644); err != nil {
+		t.Fatalf("write review.md: %v", err)
+	}
+
+	summary, err := BuildSafeSummaryFromRun(st, run.ID)
+	if err != nil {
+		t.Fatalf("BuildSafeSummaryFromRun: %v", err)
+	}
+	if summary.Summary != fullSummary {
+		t.Fatalf("summary.Summary = %q, want %q (full handoff.summary must be preserved, not truncated at first markdown sub-heading)", summary.Summary, fullSummary)
+	}
+}

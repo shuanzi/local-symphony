@@ -256,6 +256,26 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 	denied := map[string]bool{}
 	if records, err := statusPorcelainRecords(root); err == nil {
 		protectedDeleted := protectedDeletedContent(root, records)
+		// D4 / R16 round 5 — copy-aware protected-copy detection for
+		// TRACKED ADDED (A) records. `git status --porcelain` detects
+		// renames (R) but NOT copies (C): a verbatim copy of a protected
+		// file whose source REMAINS (`cp .env public.txt && git add
+		// public.txt`, no delete) is reported by porcelain as a plain
+		// `A public.txt`, NOT a `C` record. The per-record reviewSafePath
+		// check below only rejects records whose OWN path is protected, so
+		// such an A record passes through, enters `changed`, and
+		// gitx.DiffBinaryPaths emits its patch — which contains the copied
+		// protected bytes — into changes.patch / diffstat.txt / review.json.
+		// `--find-copies-harder` makes git report the copy as `C100 .env
+		// public.txt` (source first, destination second), so we can detect
+		// the protected source and SKIP the destination A record. This
+		// mirrors the orchestrator's filteredTrackedDiffPathspecs.
+		//
+		// copyDestFailClosed is true when the name-status enumeration fails
+		// or is malformed: we cannot prove no A record is a protected copy,
+		// so the caller fails closed (skips ALL tracked A records).
+		copyDestinations, copyDestOK := protectedCopyDestinations(root)
+		copyDestFailClosed := !copyDestOK
 		for _, record := range records {
 			if len(record.paths) == 0 {
 				continue
@@ -281,6 +301,63 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 			if record.code == "??" && protectedDeleted.matchesUntracked(root, safePaths[0]) {
 				denied[safePaths[0]] = true
 				continue
+			}
+			// D4 / R16 round 5/6 — fail-closed + copy-aware + content-hash
+			// skip for TRACKED ADDED (A) records. The `changed` list feeds
+			// gitx.DiffBinaryPaths, whose patch would emit the added file's
+			// bytes. An A file may hold copied protected bytes in three cases
+			// that porcelain alone cannot detect:
+			//
+			//   (a) A protected tracked file was deleted/renamed/copied
+			//       (protectedDeleted.unknown=true): the A file could be a
+			//       copy of the protected bytes (e.g. `rm .env; cp .env
+			//       public.txt; git add public.txt`). Round 4's fail-closed
+			//       only suppressed UNTRACKED (??) files in this case; the
+			//       staged `A public.txt` still entered `changed` and leaked.
+			//       Round 5 made the fail-closed skip ALL tracked A records
+			//       when unknown=true (mirrors the orchestrator).
+			//
+			//   (b) A protected file is copied VERBATIM FROM HEAD but the
+			//       source REMAINS (unknown=false): porcelain reports the
+			//       copy as `A` (porcelain does not detect copies). Round 5
+			//       detects this via --find-copies-harder (copyDestinations
+			//       holds the A destinations whose R/C source is protected)
+			//       and skips them.
+			//
+			//   (c) A protected file is MODIFIED then copied while the source
+			//       REMAINS (unknown=false): `git diff --find-copies-harder
+			//       HEAD` compares the copy against the unmodified HEAD blob,
+			//       so a copy of the MODIFIED (workspace) bytes is reported as
+			//       `M .env` + `A public.txt` — NOT a `C` record — and
+			//       copyDestinations does NOT flag it. Round 6 closes this:
+			//       matchesAddedTracked content-hash-matches the A file's
+			//       WORKSPACE content against existingHashes (workspace +
+			//       HEAD + index of all existing protected files) and skips
+			//       on a match.
+			//
+			// An unrelated A file (no protected operation, not a protected
+			// copy) is KEPT — its patch is safe and correlation is preserved
+			// in the common case.
+			//
+			// Residual risk (documented, matches orchestrator behavior): a
+			// "filler copy" — a copy with enough added/changed content that
+			// its hash does NOT match any recoverable protected version — is
+			// an undetected deliberate-evasion leak when the source REMAINS
+			// (unknown=false). When unknown=true (protected
+			// delete/rename/copy) the fail-closed skip of ALL A records
+			// covers even filler copies. This mirrors the orchestrator,
+			// which also cannot detect filler copies when the source remains.
+			if record.code != "??" && isAddedRecord(record.code) {
+				dst := safePaths[len(safePaths)-1]
+				// (a) fail-closed on protected delete/rename/copy or
+				//     --find-copies-harder enumeration failure; (b) verbatim-
+				//     from-HEAD copy fast-path; (c) round-6 content-hash
+				//     match against existing protected content (covers the
+				//     modified-source copy).
+				if protectedDeleted.unknown || copyDestFailClosed || copyDestinations[dst] || protectedDeleted.matchesAddedTracked(root, dst) {
+					denied[dst] = true
+					continue
+				}
 			}
 			for _, path := range safePaths {
 				if !contains(changed, path) {
@@ -318,28 +395,346 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 	return changed, untracked, denied
 }
 
+// protectedDeletedContentSet carries the fail-closed decision AND the
+// existing-protected-content hash set for the review packet's
+// untracked-file and added-tracked-file handling.
+//
+// D4 / R16 round 4 — SECURITY-FIRST, fail-closed on ANY protected
+// delete, rename, or copy.
+//
+// Round 1/2 content-hash-matched untracked files against the deleted
+// protected file's HEAD/index bytes. Round 2 found P1 leak #1: when a
+// protected file is MODIFIED WITH UNSTAGED EDITS before being deleted
+// (e.g. edit .env to SECRET=new WITHOUT `git add`, copy it to safe.txt,
+// then `rm .env`), the worktree bytes (SECRET=new) are GONE and
+// unrecoverable; `git show :.env` returns the old index/HEAD blob
+// (SECRET=old), so a copy holding the modified bytes does NOT match the
+// hash set and is let through → protected bytes enter changes.patch /
+// review.json. The root cause is that the pre-deletion WORKTREE content
+// — the only bytes that could have been copied — is fundamentally
+// unrecoverable when unstaged modifications existed, and after deletion
+// this is UNDETECTABLE (index==HEAD looks identical whether the file
+// was unmodified-then-deleted or unstaged-modified-then-deleted).
+//
+// Round 4 found P1 leak #3: a protected file staged as a RENAME/COPY
+// (`git mv .env renamed.txt`, an `R` porcelain record) was invisible
+// to round 3's delete-only check, so unknown stayed false and an
+// untracked file holding the copied bytes was preserved → leak. A
+// protected rename/copy is just as dangerous as a delete, so the
+// fail-closed must trigger on protected R/C sources too.
+//
+// Content-hash matching therefore CANNOT be made safe in the
+// protected-delete/rename/copy case. We fail closed: when ANY protected
+// tracked file is deleted, renamed, or copied, unknown=true and
+// matchesUntracked returns true for EVERY non-path-protected untracked
+// file, so collectChanges suppresses (denies) ALL of them — protected
+// bytes never appear in any review artifact.
+//
+// D4 / R16 round 6 — closes the MODIFIED-source-copy P1 leak. When NO
+// protected file is deleted/renamed/copied (the common case,
+// unknown=false) but a protected file is MODIFIED then copied into a new
+// untracked file OR a new tracked-added (A) file while the source REMAINS
+// (edit .env, `cp .env safe.txt` or `cp .env public.txt && git add
+// public.txt`), `git diff --find-copies-harder HEAD` reports `M .env` +
+// `A public.txt` (or just the untracked file) — NOT a `C` record — so
+// the round-5 copy-aware --find-copies-harder check does not fire and
+// the copied modified protected bytes leaked into changes.patch /
+// review.json / untracked-files.json. The protected source REMAINS, so
+// its content is fully recoverable (workspace + HEAD + index); we build
+// existingHashes = the union of SHA256 hashes of all recoverable versions
+// of all existing protected files, and content-hash-match each untracked
+// file and each A record's workspace content against it: on a match we
+// suppress (deny); otherwise we preserve (full content-level correlation
+// in the common case). See existingProtectedContentHashes for the full
+// rationale and the documented filler-copy residual risk.
+//
+// This is the user-approved P1>P2 trade-off: P1 security (never leak
+// protected bytes) wins over P2 content-level diagnostic correlation,
+// but ONLY in the (uncommon) protected-delete/rename/copy case; the
+// common case keeps full correlation.
 type protectedDeletedContentSet struct {
-	blockUntracked bool
+	// existingHashes is the set of SHA256 content hashes of all
+	// recoverable versions (workspace + HEAD + index) of all existing
+	// protected files. Populated ONLY when unknown=false (no protected
+	// delete/rename/copy — all protected files REMAIN). Empty (non-nil)
+	// when there are no protected files at all → no untracked/A file can
+	// match → all preserved. nil when unknown=true (unused; we deny all).
+	existingHashes map[string]bool
+	unknown        bool
 }
 
+// matchesUntracked reports whether an untracked file must be suppressed
+// (denied) from the review packet.
+//   - When unknown (a protected tracked file was deleted/renamed/copied)
+//     it returns true for every file — fail-closed (no content read).
+//   - When not unknown and existingHashes is empty (no protected files
+//     exist at all) it returns false — full correlation.
+//   - When not unknown and existingHashes is non-empty, it content-hash-
+//     matches the untracked file's content against existingHashes: a match
+//     means the file is a copy of existing protected content (including a
+//     MODIFIED protected source) → suppress; otherwise preserve. On read
+//     error / binary / large / symlink it returns true (fail closed for
+//     that file — cannot prove it is safe).
 func (s protectedDeletedContentSet) matchesUntracked(root, path string) bool {
-	return s.blockUntracked
+	if s.unknown {
+		// A protected tracked file was deleted/renamed/copied →
+		// suppress (deny) this untracked file without reading its
+		// content (it could be a copy of modified-then-deleted/renamed/
+		// copied protected bytes).
+		return true
+	}
+	if len(s.existingHashes) == 0 {
+		// No protected files exist → no protected content to match →
+		// preserve (full content-level correlation).
+		return false
+	}
+	data, _, reason, err := readUntrackedPatchData(root, path)
+	if err != nil {
+		// stat/read failure → cannot prove it is not a copy of protected
+		// content → fail closed for this file.
+		return true
+	}
+	if reason != nil || data == nil {
+		// Symlink, binary, large, or non-regular file: its CONTENT cannot
+		// be a verbatim byte-for-byte copy of a (small text) protected
+		// file that readUntrackedPatchData would return data for, and the
+		// patch path already omits these (PatchIncluded=false, no sha).
+		// Preserve the file in the untracked list (path-level correlation,
+		// no byte leak) rather than denying it — matches the pre-round-6
+		// behavior for symlinks/binary/large untracked files.
+		return false
+	}
+	if s.existingHashes[security.SHA256Bytes(data)] {
+		// Untracked file's content matches a recoverable version of an
+		// existing protected file → it is a copy of protected content
+		// (including a MODIFIED protected source) → suppress.
+		return true
+	}
+	return false
 }
 
+// protectedDeletedContent returns the protected-content decision set.
+//
+// First, as round 4: if ANY deleted/renamed/copied status-porcelain
+// record touches a protected path → return {existingHashes: nil,
+// unknown: true} (fail-closed). The pre-operation worktree content of a
+// protected file is unrecoverable when unstaged modifications existed
+// and undetectable after the operation, so there is no safe content set
+// to build; we fail closed immediately on any protected delete OR
+// protected rename/copy source.
+//
+// Else (no protected delete/rename/copy — all protected files REMAIN):
+// round 6 builds existingHashes = the set of SHA256 hashes of all
+// recoverable versions (workspace + HEAD + index) of all existing
+// protected files (tracked + untracked-protected), so matchesUntracked
+// and collectChanges can content-hash-match untracked files and A
+// records against it. This closes the MODIFIED-source-copy leak (a copy
+// of a protected file that was MODIFIED before being copied, while the
+// source remains). Returns an empty (non-nil) existingHashes set when
+// there are no protected files at all.
+//
+// D4 / R16 round 4: a protected file staged as a RENAME or COPY (an `R`
+// or `C` porcelain record, NOT `D`) is just as dangerous as a delete —
+// its bytes are moved/copied to a new path and can be further copied
+// into an untracked file, and the pre-rename/copy worktree content is
+// equally unrecoverable when unstaged modifications existed. So the
+// fail-closed must trigger on protected R/C sources too, not just
+// protected D records. For an R/C record, parseStatusPorcelainZ stores
+// the SOURCE path at record.paths[0] and the DESTINATION at
+// record.paths[1]; we check the source.
 func protectedDeletedContent(root string, records []statusPorcelainRecord) protectedDeletedContentSet {
 	for _, record := range records {
-		if !record.deleted() {
+		if record.deleted() {
+			for _, candidate := range record.paths {
+				path := reviewCleanPath(candidate)
+				if path == "" || !security.IsProtectedPath(path) {
+					continue
+				}
+				// A protected tracked file was deleted. Its
+				// pre-deletion worktree content (the bytes that could
+				// have been copied into an untracked file) is
+				// unrecoverable when unstaged modifications existed,
+				// and undetectable after deletion. Fail closed: deny
+				// ALL non-path-protected untracked files.
+				return protectedDeletedContentSet{existingHashes: nil, unknown: true}
+			}
 			continue
 		}
-		for _, candidate := range record.paths {
-			path := reviewCleanPath(candidate)
+		if record.renamedOrCopied() {
+			// For an R/C record, parseStatusPorcelainZ stores the
+			// SOURCE path at paths[0]. If the source is protected, the
+			// protected bytes were moved/copied to a new path and could
+			// be further copied into an untracked file; the
+			// pre-rename/copy worktree content is unrecoverable when
+			// unstaged modifications existed. Fail closed.
+			if len(record.paths) == 0 {
+				continue
+			}
+			path := reviewCleanPath(record.paths[0])
 			if path == "" || !security.IsProtectedPath(path) {
 				continue
 			}
-			return protectedDeletedContentSet{blockUntracked: true}
+			return protectedDeletedContentSet{existingHashes: nil, unknown: true}
 		}
 	}
-	return protectedDeletedContentSet{}
+	// No protected delete/rename/copy — all protected files REMAIN.
+	// Build the existing-protected-content hash set so callers can
+	// content-hash-match untracked files and A records against it.
+	return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root), unknown: false}
+}
+
+// existingProtectedContentHashes builds the set of SHA256 content hashes of
+// ALL recoverable versions of EVERY protected file that currently exists in
+// the worktree (tracked OR untracked-protected). Mirrors the orchestrator's
+// helper of the same name; replicated here because orchestrator and review
+// are separate packages (each owns its own protected-path logic).
+//
+// D4 / R16 round 6 — closes the MODIFIED-source-copy P1 leak. See the
+// orchestrator's existingProtectedContentHashes for the full rationale.
+// In short: when a protected file is NOT deleted/renamed/copied-away (the
+// source REMAINS), its content is recoverable from three versions —
+// workspace (os.ReadFile), HEAD (`git show HEAD:<path>`), index
+// (`git show :<path>`). A copy of the protected file (into an untracked
+// file or an A record) will match ONE of these versions, so we union their
+// SHA256 hashes and content-hash-match against the set.
+//
+// Candidate protected files are enumerated from THREE sources so a protected
+// file is never missed:
+//   - `git ls-files -z` (tracked);
+//   - `git ls-files --others --exclude-standard -z` (untracked, NOT ignored);
+//   - `git ls-files --others --ignored --exclude-standard -z` (IGNORED files).
+//
+// The third enumeration is essential: a protected file IGNORED by .gitignore
+// (the common case — .env is typically gitignored) is OMITTED by the second
+// enumeration, so without the third an ignored protected .env is never hashed
+// into the set and a copy of it (staged or untracked) is wrongly treated as
+// safe and emitted into changes.patch / review.json (D4/R16 round-7 fix A).
+// Each enumerated path whose IsProtectedPath is true is a protected file.
+// For each, all three versions are streamed into a sha256 hasher (bounded
+// memory via io.Copy); read errors are skipped (a version may be absent).
+//
+// Residual risk (documented): a "filler copy" — an untracked/A file whose
+// content is protected content + extra filler, so its hash does NOT match
+// any protected version — is a deliberate content-obfuscation evasion this
+// cannot detect when the source REMAINS. When the source is
+// deleted/renamed/copied-away (unknown=true) the fail-closed branch
+// suppresses ALL untracked + ALL A, covering even filler copies.
+//
+// Returns an empty (non-nil) set when no protected files exist.
+func existingProtectedContentHashes(root string) map[string]bool {
+	set := map[string]bool{}
+	// Enumerate candidate protected files: tracked + untracked-non-ignored +
+	// ignored. The ignored enumeration is required so a gitignored protected
+	// .env (which `--others --exclude-standard` omits) is still hashed.
+	candidates := []string{}
+	for _, args := range [][]string{
+		{"ls-files", "-z"},
+		{"ls-files", "--others", "--exclude-standard", "-z"},
+		{"ls-files", "--others", "--ignored", "--exclude-standard", "-z"},
+	} {
+		out, err := exec.Command("git", append([]string{"-C", root}, args...)...).Output()
+		if err != nil {
+			continue
+		}
+		for _, p := range strings.Split(string(out), "\x00") {
+			if p == "" {
+				continue
+			}
+			candidates = append(candidates, p)
+		}
+	}
+	for _, rel := range candidates {
+		if !security.IsProtectedPath(rel) {
+			continue
+		}
+		// (a) workspace version — the modified bytes a `cp` copies.
+		if h, ok := reviewHashWorkspaceFile(filepath.Join(root, rel)); ok {
+			set[h] = true
+		}
+		// (b) HEAD version — the committed bytes.
+		if h, ok := reviewHashGitBlob(root, "HEAD:"+rel); ok {
+			set[h] = true
+		}
+		// (c) index version — the staged bytes.
+		if h, ok := reviewHashGitBlob(root, ":"+rel); ok {
+			set[h] = true
+		}
+	}
+	return set
+}
+
+// reviewHashWorkspaceFile streams a worktree file's content into a sha256
+// hasher (bounded memory via io.Copy) and returns the hex hash. Returns
+// ok=false on any error.
+func reviewHashWorkspaceFile(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", false
+	}
+	return hex.EncodeToString(h.Sum(nil)), true
+}
+
+// reviewHashGitBlob streams `git -C root show <spec>` output into a sha256
+// hasher (bounded memory via io.Copy) and returns the hex hash. Returns
+// ok=false on any error.
+//
+// D4/R16 round-7 fix B: a NON-ZERO exit from `git show` means the blob does
+// not exist (e.g. an untracked/ignored protected file has no HEAD/index
+// version). git writes NO stdout in that case, so io.Copy reads 0 bytes with
+// copyErr=nil — previously the code ignored cmd.Wait()'s error and returned
+// sha256("") as a VALID protected hash, which then matched any unrelated
+// EMPTY added/untracked file and wrongly suppressed it. We now treat a
+// non-nil Wait error (non-zero exit) as ok=false (absent blob): only add a
+// hash when `git show` succeeded (exit 0).
+func reviewHashGitBlob(root, spec string) (string, bool) {
+	cmd := exec.Command("git", "-C", root, "show", spec)
+	r, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", false
+	}
+	if err := cmd.Start(); err != nil {
+		return "", false
+	}
+	h := sha256.New()
+	_, copyErr := io.Copy(h, r)
+	waitErr := cmd.Wait()
+	if copyErr != nil || waitErr != nil {
+		return "", false // git show failed (no such blob, non-zero exit) → absent
+	}
+	return hex.EncodeToString(h.Sum(nil)), true
+}
+
+// matchesAddedTracked reports whether a tracked ADDED (A) file must be
+// suppressed (denied) from the review packet's `changed` list. Mirrors
+// matchesUntracked for the A-record path.
+//   - When unknown (a protected tracked file was deleted/renamed/copied)
+//     it returns true — fail-closed (skip ALL A records).
+//   - When not unknown and existingHashes is empty (no protected files
+//     exist at all) it returns false — full correlation (A kept).
+//   - When not unknown and existingHashes is non-empty, it content-hash-
+//     matches the A file's WORKSPACE content against existingHashes: a
+//     match means the A file is a copy of existing protected content
+//     (including a MODIFIED protected source) → suppress; otherwise keep.
+//     On read error it returns true (fail closed for that file).
+func (s protectedDeletedContentSet) matchesAddedTracked(root, path string) bool {
+	if s.unknown {
+		return true
+	}
+	if len(s.existingHashes) == 0 {
+		return false
+	}
+	h, ok := reviewHashWorkspaceFile(filepath.Join(root, path))
+	if !ok {
+		// Cannot read the A file's workspace bytes → cannot prove it
+		// is safe → fail closed for this file.
+		return true
+	}
+	return s.existingHashes[h]
 }
 
 type statusPorcelainRecord struct {
@@ -350,6 +745,92 @@ type statusPorcelainRecord struct {
 func (r statusPorcelainRecord) renamedOrCopied() bool {
 	return len(r.code) >= 2 && (r.code[0] == 'R' || r.code[1] == 'R' || r.code[0] == 'C' || r.code[1] == 'C')
 }
+
+// isAddedRecord reports whether a porcelain XY code denotes an ADDED
+// tracked file (status A in either the staged-X or worktree-Y column),
+// i.e. a file whose bytes are new to the index/worktree and would be
+// emitted as a `new file` patch by git diff. `??` (untracked) is NOT an
+// added tracked record and is handled separately by collectChanges.
+func isAddedRecord(code string) bool {
+	return len(code) >= 2 && (code[0] == 'A' || code[1] == 'A')
+}
+
+// protectedCopyDestinations runs a copy-aware diff
+// (`git diff --name-status --find-renames --find-copies
+// --find-copies-harder -z HEAD`, the same invocation the orchestrator
+// uses in filteredTrackedDiffPathspecs) and returns the set of
+// DESTINATION paths whose rename/copy SOURCE is a protected path. Such
+// destinations are tracked files (porcelain reports them as `A`, since
+// porcelain does not detect copies) whose bytes are a verbatim copy of a
+// protected file and must be excluded from `changed` so their patch never
+// reaches changes.patch / review.json.
+//
+// D4 / R16 round 5: porcelain detects renames (R) but NOT copies (C). A
+// rename of a protected file is already denied by the per-record
+// reviewSafePath check in collectChanges (the R record's source path is
+// protected → safePaths becomes nil → denied[dst]=true). The GAP is the
+// COPY case: porcelain reports `A <dst>` with no source, so the per-record
+// check passes and the copied protected bytes would leak.
+// --find-copies-harder closes this gap by reporting `C<score> <src> <dst>`
+// (source first, destination second) when a new file is a verbatim (or
+// near-verbatim) copy of an existing tracked blob — including copies whose
+// source REMAINS (which porcelain and plain `--find-renames` never detect).
+//
+// The returned ok flag is false when the name-status enumeration fails or
+// is malformed: collectChanges cannot prove no A record is a protected
+// copy, so it fails closed (skips ALL tracked A records).
+//
+// Residual risk (documented): a copy with enough filler to fall below the
+// similarity threshold is reported as `A` (not `C`), is absent from the
+// returned set, and its content differs from the protected file — an
+// undetected deliberate-evasion leak when the protected source remains.
+// This matches the orchestrator's behavior. When a protected file is
+// deleted/renamed/copied (protectedDeletedContent.unknown=true) the
+// fail-closed skip of ALL A records covers even filler copies.
+func protectedCopyDestinations(root string) (map[string]bool, bool) {
+	out, err := exec.Command("git", "-C", root, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "-z", "HEAD").Output()
+	if err != nil {
+		return nil, false
+	}
+	destinations := map[string]bool{}
+	if len(out) == 0 {
+		return destinations, true
+	}
+	fields := strings.Split(string(out), "\x00")
+	if len(fields) > 0 && fields[len(fields)-1] == "" {
+		fields = fields[:len(fields)-1]
+	}
+	for i := 0; i < len(fields); {
+		status := fields[i]
+		i++
+		pathCount := 1
+		if strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C") {
+			pathCount = 2
+		}
+		if i+pathCount > len(fields) {
+			// Malformed name-status output → cannot prove safety → fail closed.
+			return nil, false
+		}
+		paths := fields[i : i+pathCount]
+		i += pathCount
+		if !strings.HasPrefix(status, "R") && !strings.HasPrefix(status, "C") {
+			continue
+		}
+		// paths[0] is the SOURCE, paths[1] is the DESTINATION. If the
+		// source is protected, the destination is a copy/rename of a
+		// protected file and must be skipped.
+		src := reviewCleanPath(paths[0])
+		if src == "" || !security.IsProtectedPath(src) {
+			continue
+		}
+		dst := reviewCleanPath(paths[1])
+		if dst != "" {
+			destinations[dst] = true
+		}
+	}
+	return destinations, true
+}
+
 func (r statusPorcelainRecord) deleted() bool {
 	return len(r.code) >= 2 && (r.code[0] == 'D' || r.code[1] == 'D')
 }
