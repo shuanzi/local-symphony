@@ -2069,3 +2069,80 @@ func TestFilteredTrackedDiffSkipsCopyViaSymlinkedProtectedFile(t *testing.T) {
 		t.Fatalf("filtered tracked diff dropped unrelated safe added feature.txt (correlation broken):\n%s", diff)
 	}
 }
+
+// TestFilteredTrackedDiffSkipsProtectedBytesInTrackedTypechange codifies the
+// D4 / R16 round-10 fix (codex finding F) for the typechange-on-non-
+// protected-path P1 leak in the orchestrator's cumulative-diff path.
+//
+// Scenario: a protected .env is committed (SECRET=real). An existing tracked
+// NON-protected config.txt is replaced by a symlink whose target text is
+// copied from .env (`rm config.txt; ln -s "$(cat .env)" config.txt`).
+// `git diff --name-status` reports `T config.txt` (non-protected path).
+// `git diff HEAD -- config.txt` emits the symlink target (`+SECRET=real`),
+// hashing the protected bytes into cumulative_diff_sha. Round 8's protected-
+// path typechange fail-closed only fires for typechanges on PROTECTED paths.
+//
+// Round 10: filteredTrackedDiffPathspecs content-hash-checks the emitted
+// bytes of a non-protected T record (symlink target, or workspace content)
+// against existingHashes; a match skips it. An unrelated modified tracked
+// file (feature.txt, old→new) IS kept.
+func TestFilteredTrackedDiffSkipsProtectedBytesInTrackedTypechange(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=real\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "config.txt"), []byte("base config\n"), 0o644); err != nil {
+		t.Fatalf("write config.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "feature.txt"), []byte("old feature\n"), 0o644); err != nil {
+		t.Fatalf("write feature.txt: %v", err)
+	}
+	gitCommit(t, ws, "base")
+	// Replace config.txt with a symlink whose target text IS the protected
+	// .env's content.
+	secret, err := os.ReadFile(filepath.Join(ws, ".env"))
+	if err != nil {
+		t.Fatalf("read .env: %v", err)
+	}
+	if err := os.Remove(filepath.Join(ws, "config.txt")); err != nil {
+		t.Fatalf("rm config.txt: %v", err)
+	}
+	if err := os.Symlink(string(secret), filepath.Join(ws, "config.txt")); err != nil {
+		t.Fatalf("ln -s <secret> config.txt: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "add", "config.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add config.txt: %v\n%s", err, out)
+	}
+	// Unrelated modified tracked file — MUST be kept.
+	if err := os.WriteFile(filepath.Join(ws, "feature.txt"), []byte("new feature\n"), 0o644); err != nil {
+		t.Fatalf("modify feature.txt: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "add", "feature.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add feature.txt: %v\n%s", err, out)
+	}
+
+	// Sanity: confirm git reports a T record on config.txt.
+	probe, err := exec.Command("git", "-C", ws, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "-z", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("name-status probe: %v", err)
+	}
+	if !strings.Contains(string(probe), "T\x00config.txt") {
+		t.Fatalf("config.txt not reported as a typechange (T); test premise invalid:\n%q", string(probe))
+	}
+
+	diff := string(filteredTrackedDiff(ws, nil))
+	// The protected bytes (SECRET=real) emitted via the typechanged
+	// config.txt symlink target MUST NOT enter the diff.
+	if strings.Contains(diff, "SECRET=real") {
+		t.Fatalf("filtered tracked diff leaked protected bytes via tracked typechange config.txt:\n%s", diff)
+	}
+	if strings.Contains(diff, "diff --git a/config.txt b/config.txt") {
+		t.Fatalf("filtered tracked diff included typechanged-protected config.txt:\n%s", diff)
+	}
+	// The unrelated modified feature.txt MUST be kept.
+	if !strings.Contains(diff, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(diff, "+new feature") {
+		t.Fatalf("filtered tracked diff dropped unrelated modified tracked feature.txt (correlation broken):\n%s", diff)
+	}
+}

@@ -547,6 +547,13 @@ func isPathNameByteCI(b byte) bool {
 // bytes are treated as non-boundary so substrings like "secrets"
 // or "prompt_snapshot" inside paths or identifiers do not match
 // the raw-artifact blocklist. PR #27 / D4 F5.
+//
+// D4/R16 round-10 (codex finding E): '=' is treated as a boundary so a
+// raw-artifact marker written in a common key/value form
+// (`kind=raw_prompt`, `artifact=codex_log`) is still detected. '=' does not
+// appear in path segments or identifiers, so this cannot introduce path
+// false positives (paths like docs/raw_prompt.md remain safe via the
+// isPathPunctuationBoundary '.' handling).
 func isBoundaryByteCI(b byte) bool {
 	if b >= 'A' && b <= 'Z' {
 		b += 32
@@ -559,6 +566,8 @@ func isBoundaryByteCI(b byte) bool {
 	case '(', ')', '[', ']', '{', '}':
 		return true
 	case '"', '\'', '`':
+		return true
+	case '=':
 		return true
 	}
 	return false

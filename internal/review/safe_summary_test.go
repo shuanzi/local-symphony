@@ -2,6 +2,7 @@ package review
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,6 +83,58 @@ func TestSafeSummaryScanForRawArtifactsRejectsRefusalKindTokens(t *testing.T) {
 				t.Fatalf("Seal accepted raw artifact marker %q in field %s", tc.kind, tc.field)
 			}
 		})
+	}
+}
+
+// TestSafeSummaryScanRejectsKeyValueDelimitedRefusalKinds codifies the D4 /
+// R16 round-10 fix (codex finding E): a raw-artifact marker written in a
+// common key/value form (`kind=raw_prompt`, `artifact=codex_log`) must be
+// detected. The previous boundary set treated '=' as a non-boundary byte, so
+// the token to the right of '=' was treated as embedded in a larger
+// identifier and `Seal` accepted it, letting `BuildReworkPrompt` render the
+// raw marker into the next prompt. '=' is now a boundary (it does not appear
+// in path segments or identifiers, so this introduces no path false
+// positives — docs/raw_prompt.md remains safe via the '.' handling).
+func TestSafeSummaryScanRejectsKeyValueDelimitedRefusalKinds(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		form  string // e.g. "kind=%s" -> "kind=raw_prompt"
+		kind  string
+	}{
+		{"summary kind=raw_prompt", "summary", "kind=%s", "raw_prompt"},
+		{"summary artifact=codex_log", "summary", "artifact=%s", "codex_log"},
+		{"tests ref=prompt_snapshot", "tests", "ref=%s", "prompt_snapshot"},
+		{"risks source=secret_artifact", "risks", "source=%s", "secret_artifact"},
+		{"how_to_continue type=codex_events", "how_to_continue", "type=%s", "codex_events"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			marker := fmt.Sprintf(tc.form, tc.kind)
+			s := &SafeSummary{ReviewPacketID: "rp_1", Status: "generated", Summary: "ok", HowToContinue: "continue"}
+			switch tc.field {
+			case "summary":
+				s.Summary = "note: " + marker + " here"
+			case "tests":
+				s.Tests = []string{"check " + marker}
+			case "risks":
+				s.Risks = []string{"saw " + marker}
+			case "how_to_continue":
+				s.HowToContinue = "review " + marker + " next"
+			}
+			if err := s.Seal(); err == nil {
+				t.Fatalf("Seal accepted key/value-delimited raw artifact marker %q in field %s", marker, tc.field)
+			}
+		})
+	}
+	// Counterpoint: a legitimate path like docs/raw_prompt.md must STILL be
+	// accepted (the '=' boundary change must not break path handling).
+	s := &SafeSummary{
+		ReviewPacketID: "rp_1", Status: "generated", Summary: "ok", HowToContinue: "continue",
+		ChangedFiles: []string{"docs/raw_prompt.md"},
+	}
+	if err := s.Seal(); err != nil {
+		t.Fatalf("Seal rejected legitimate path docs/raw_prompt.md (path false positive): %v", err)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 
+	"local-symphony/internal/config"
 	"local-symphony/internal/core"
 	"local-symphony/internal/store"
 )
@@ -2102,5 +2103,184 @@ func TestGenerateSuppressesCopyViaSymlinkedProtectedFile(t *testing.T) {
 	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
 	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
 		t.Fatalf("changes.patch dropped unrelated added feature.txt (correlation broken):\n%s", patch)
+	}
+}
+
+// TestGenerateUsesRunSnapshotProtectedPaths codifies the D4 / R16 round-10
+// fix (codex finding D) for the protected-path policy TOCTOU in review.go.
+//
+// Scenario: a run was dispatched with a workflow snapshot whose
+// approvals.protected_paths includes `secrets/**`. Between dispatch and
+// review generation, the live WORKFLOW.md is edited to a policy that does
+// NOT protect `secrets/**` (or removed entirely). Round-9's loadProtectedPaths
+// reloaded the LIVE config, so review collection would use the new (looser)
+// policy and emit `secrets/token.txt` / its copy into changes.patch even
+// though the run was governed by the earlier (stricter) policy.
+//
+// Round-10: loadProtectedPaths reads protected_paths from the run's captured
+// workflow snapshot (workflow_snapshots.config_json), not the live
+// WORKFLOW.md. So a `secrets/token.txt` copy (added public.txt) is still
+// suppressed under the snapshot's `secrets/**` policy, regardless of the
+// live WORKFLOW.md on disk.
+func TestGenerateUsesRunSnapshotProtectedPaths(t *testing.T) {
+	st := newReviewTestStore(t)
+
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "secrets/token.txt", "TOKEN=old\n")
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// MODIFY the custom-protected file and copy into an added public file.
+	writeFile(t, workspace, "secrets/token.txt", "TOKEN=new\n")
+	modified, err := os.ReadFile(filepath.Join(workspace, "secrets/token.txt"))
+	if err != nil {
+		t.Fatalf("read modified secrets/token.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "public.txt"), modified, 0o644); err != nil {
+		t.Fatalf("write public.txt: %v", err)
+	}
+	runGit(t, workspace, "add", "public.txt")
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"public.txt", "feature.txt", "secrets/token.txt"})
+
+	// Build a workflow snapshot config whose protected_paths = ["secrets/**"]
+	// (the policy the run was dispatched under) and attach it to the run.
+	snapCfg := config.Defaults(st.RepoRoot)
+	snapCfg.Approvals.ProtectedPaths = []string{"secrets/**"}
+	cfgJSON, err := json.Marshal(snapCfg)
+	if err != nil {
+		t.Fatalf("marshal snapshot config: %v", err)
+	}
+	wfID, err := st.CreateWorkflowSnapshot("valid", "WORKFLOW.md", string(cfgJSON), "prompt-hash", "[]")
+	if err != nil {
+		t.Fatalf("CreateWorkflowSnapshot: %v", err)
+	}
+	if err := st.AttachWorkflowSnapshot(run.ID, wfID); err != nil {
+		t.Fatalf("AttachWorkflowSnapshot: %v", err)
+	}
+	// Reload run so Generate sees the attached WorkflowSnapshotID.
+	run, err = st.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("GetRun after attach: %v", err)
+	}
+
+	// Now write a LIVE WORKFLOW.md with a DIFFERENT (looser) policy that
+	// does NOT protect secrets/**. Round-9 would have read this; round-10
+	// must ignore it and use the snapshot's secrets/** policy.
+	liveWorkflow := `---
+approvals:
+  protected_paths: []
+---
+Do the work.
+`
+	if err := os.WriteFile(filepath.Join(st.RepoRoot, "WORKFLOW.md"), []byte(liveWorkflow), 0o644); err != nil {
+		t.Fatalf("write live WORKFLOW.md: %v", err)
+	}
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// The snapshot's secrets/** policy must govern: the custom-protected
+	// path and its copy MUST NOT leak, even though the live WORKFLOW.md
+	// does not protect secrets/**. The unrelated feature.txt IS kept.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"TOKEN=new",
+			"TOKEN=old",
+			"secrets/token.txt",
+			"diff --git a/public.txt b/public.txt",
+			"public.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked content under snapshot policy but live WORKFLOW.md (%q) — review used live config instead of run snapshot:\n%s", name, marker, art)
+			}
+		}
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated added feature.txt (correlation broken):\n%s", patch)
+	}
+}
+
+// TestGenerateSuppressesProtectedBytesInTrackedTypechange codifies the D4
+// / R16 round-10 fix (codex finding F) for the typechange-on-non-protected-
+// path P1 leak in review.go's collectChanges.
+//
+// Scenario: a protected .env is committed (SECRET=real). An existing tracked
+// NON-protected file config.txt is REPLACED BY A SYMLINK whose target text is
+// copied from the protected file (`rm config.txt; ln -s "$(cat .env)"
+// config.txt`). Porcelain reports `T config.txt` (typechange on a
+// non-protected path). gitx.DiffBinaryPaths emits the symlink TARGET text
+// (`+SECRET=real`) into changes.patch. Round 8's protected-path typechange
+// fail-closed only fires for typechanges on PROTECTED paths, so this
+// non-protected `T config.txt` fell through into `changed` and leaked.
+//
+// Round 10: collectChanges content-hash-checks the emitted bytes of a
+// non-protected T record (symlink target text, or workspace content for a
+// non-symlink typechange) against existingHashes; a match suppresses it. An
+// unrelated modified tracked file (feature.txt, old→new) IS kept.
+func TestGenerateSuppressesProtectedBytesInTrackedTypechange(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=real\n")
+	writeFile(t, workspace, "config.txt", "base config\n")
+	writeFile(t, workspace, "feature.txt", "old feature\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// Replace the existing tracked config.txt with a symlink whose target
+	// text IS the protected .env's content (`ln -s "$(cat .env)" config.txt`).
+	secret, err := os.ReadFile(filepath.Join(workspace, ".env"))
+	if err != nil {
+		t.Fatalf("read .env: %v", err)
+	}
+	if err := os.Remove(filepath.Join(workspace, "config.txt")); err != nil {
+		t.Fatalf("rm config.txt: %v", err)
+	}
+	if err := os.Symlink(string(secret), filepath.Join(workspace, "config.txt")); err != nil {
+		t.Fatalf("ln -s <secret> config.txt: %v", err)
+	}
+	runGit(t, workspace, "add", "config.txt")
+	// Unrelated modified tracked file — MUST be kept.
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"config.txt", "feature.txt"})
+
+	// Sanity: confirm git reports a T record on config.txt (non-protected).
+	probe, err := exec.Command("git", "-C", workspace, "status", "--porcelain=v1", "-z", "-uall").Output()
+	if err != nil {
+		t.Fatalf("porcelain probe: %v", err)
+	}
+	if !strings.Contains(string(probe), "T") || !strings.Contains(string(probe), "config.txt") {
+		t.Fatalf("config.txt not reported as a typechange (T); test premise invalid:\n%q", string(probe))
+	}
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// The protected bytes (SECRET=real) emitted via the typechanged
+	// config.txt symlink target MUST NOT leak. The unrelated feature.txt
+	// MUST be kept.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"SECRET=real",
+			"diff --git a/config.txt b/config.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked protected bytes via tracked typechange config.txt (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if strings.Contains(changed, "config.txt") {
+		t.Fatalf("changed-files.txt kept typechanged-protected config.txt:\n%s", changed)
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated modified tracked feature.txt (correlation broken):\n%s", patch)
 	}
 }

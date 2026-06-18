@@ -625,6 +625,38 @@ func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]strin
 				}
 			}
 		}
+		// D4/R16 round-10 (codex finding F) — typechange (status T) on a
+		// NON-protected path. A tracked non-protected file whose type
+		// changed (e.g. regular file → symlink) is reported as `T
+		// config.txt`; `git diff HEAD -- config.txt` emits the symlink
+		// TARGET text, so a typechange whose target is copied from a
+		// protected file (`rm config.txt; ln -s "$(cat .env)" config.txt`)
+		// hashes the protected bytes into cumulative_diff_sha. (A
+		// typechange on a PROTECTED path already triggers hashesUnknown
+		// via deletedProtectedContentHashes' --diff-filter=DRCT; this
+		// handles the non-protected path.) Like the M guard, this only
+		// content-hash-checks when !hashesUnknown; we do NOT blanket
+		// fail-closed T records (preserve an unrelated typechange). For a
+		// symlink, hash the target text (what git diff emits); otherwise
+		// hash the workspace file content.
+		if strings.HasPrefix(record.status, "T") {
+			if !hashesUnknown && len(existingHashes) > 0 {
+				dst := record.paths[len(record.paths)-1]
+				h, ok := hashTypechangeEmittedBytes(root, dst)
+				if !ok {
+					// Cannot read the emitted bytes → cannot prove they
+					// are safe → skip (fail closed for THIS file), mirroring
+					// the M guard.
+					continue
+				}
+				if existingHashes[h] {
+					// Emitted bytes match a recoverable version of an
+					// existing protected file → skip so its bytes never
+					// enter the diff.
+					continue
+				}
+			}
+		}
 		safe = append(safe, record.paths[len(record.paths)-1])
 	}
 	return safe, nil
@@ -1117,8 +1149,30 @@ func hashWorkspaceFile(path string) (string, bool) {
 	return hex.EncodeToString(h.Sum(nil)), true
 }
 
-// hashGitBlob streams `git -C root show <spec>` output into a sha256 hasher
-// (bounded memory via io.Copy) and returns the hex hash. Returns ok=false on
+// hashTypechangeEmittedBytes returns the SHA256 of the bytes `git diff HEAD
+// -- <rel>` would EMIT for a typechanged (T) tracked file at root/rel — i.e.
+// the content that would be folded into cumulative_diff_sha. For a regular
+// file → symlink typechange, git diff emits the symlink TARGET text (the
+// stored link target), so we hash os.Readlink's result. For a symlink →
+// regular (or other) typechange, git diff emits the new regular file's
+// content, so we hash the workspace file via hashWorkspaceFile. Returns
+// ok=false when the bytes cannot be read (caller keeps the record — a
+// non-readable typechange cannot be content-matched, and unlike A we do not
+// blanket fail-closed T records on read error; the protected-source
+// fail-closed via hashesUnknown covers the dangerous protected-operation
+// case).
+//
+// D4/R16 round-10 (codex finding F).
+func hashTypechangeEmittedBytes(root, rel string) (string, bool) {
+	full := filepath.Join(root, rel)
+	if target, err := os.Readlink(full); err == nil {
+		// Workspace path is a symlink → git diff emits the target text.
+		h := sha256.Sum256([]byte(target))
+		return hex.EncodeToString(h[:]), true
+	}
+	// Not a symlink → git diff emits the workspace file content.
+	return hashWorkspaceFile(full)
+}
 // any error (spec refers to an absent blob, git failure, etc.).
 //
 // D4/R16 round-7 fix B: a NON-ZERO exit from `git show` means the blob does

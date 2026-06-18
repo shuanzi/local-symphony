@@ -209,3 +209,58 @@ bash scripts/acceptance-local.sh                                                
 - **C-record content-hash check（orchestrator）**：`--find-copies-harder` 把 verbatim copy 报为 `C <src> <dst>`。当受保护文件是 symlink 指向非 protected regular 文件时，copy 的 source 是那个非 protected regular 文件，per-record protected-source check 不触发。把 content-hash check 扩展到 C 目标（与 A 同 fail-closed 语义）使这种 copy 被抑制。C 目标本身是新文件，`hashesUnknown=true` 时 fail-closed 与 A 一致。
 - **review 路径不需要 C-record check**：review 用 porcelain（不 detect copy），verbatim copy 一律报为 `A`，A-record content-hash check 已覆盖。review 的 `protectedCopyDestinations`（用 `--find-copies-harder`）只用于额外标记 protected-source copy，R9-C 已让它用 `IsProtectedPathWithConfig`。
 - **config 替换而非追加**：`applyMap` 对 `protected_paths` 是替换（`c.Approvals.ProtectedPaths = v`），不是追加。这是既有行为，orchestrator 一直如此；R9-C 只让 review 与之一致，不改变 config 语义。
+
+---
+
+## Round 10 — run-snapshot protected-path policy + typechange-on-non-protected-path + `=` delimiter (commit `46e8daa` review)
+
+Codex 第 10 轮 review（针对 commit `46e8daa`）提了 3 个 finding（2 P1 + 1 P2）。
+
+### R10-D — read protected paths from the run snapshot, not the live config (P1)
+
+**问题**：round-9 的 `loadProtectedPaths` 在 review 生成时 `config.Load(repoRoot)` 重读**实时** WORKFLOW.md。若 run dispatch 后、review 生成前 WORKFLOW.md 被编辑/删除，review 用的是新策略而非 run 实际 dispatch 时的策略。`secrets/**` 这种自定义 protected path 可能回落到默认或不同策略 → `collectChanges` 把 protected file/copy emit 进 `changes.patch`/`review.json`，违反 run 实际 governed 的策略（TOCTOU）。
+
+**修复**：`loadProtectedPaths(st, run, repoRoot)` 优先从 run 的 `WorkflowSnapshotID` 读 `workflow_snapshots.config_json`（dispatch 时捕获的 `EffectiveConfig`），解析 `approvals.protected_paths`。只有 snapshot 缺失/不可读（如老 run 无 snapshot）才回退到 `config.Load`（实时），再回退到 `security.DefaultPolicy().ProtectedPaths`。新增 `Store.GetWorkflowSnapshotConfigJSON(wfID)`。
+
+**Regression test**：`TestGenerateUsesRunSnapshotProtectedPaths`。给 run attach 一个 `protected_paths=["secrets/**"]` 的 snapshot，再在 disk 写一个 `protected_paths=[]` 的实时 WORKFLOW.md，验证 review 仍按 snapshot 的 `secrets/**` 策略抑制 protected file/copy，无关 `feature.txt` 保留。
+
+### R10-F — suppress protected bytes in tracked typechanges (P1)
+
+**问题**：受保护文件被复制成一个已 tracked **非保护**文件的 symlink target（`rm config.txt; ln -s "$(cat .env)" config.txt`），porcelain 报 `T config.txt`（**非保护** path 上的 typechange）。round-8 的 protected-path typechange fail-closed 只对**保护** path 上的 `T` 触发；非保护 path 上的 `T` 漏进 `changed`，`git diff HEAD -- config.txt` 把 symlink target 文本（`+SECRET=real`）emit 进 `changes.patch`/`cumulative_diff_sha`。
+
+**修复**：对**非保护** path 上的 `T` record 做 content-hash check —— 读 `git diff` 会 emit 的字节（symlink 则 `os.Readlink` 的 target 文本；否则 workspace 文件内容），hash 后对 `existingHashes` 匹配，命中则 deny/skip。`unknown=true` 时**不** blanket fail-closed `T`（保留无关 typechange，与 M trade-off 一致）。
+- review：`collectChanges` 新增 `T` 分支 + `matchesTypechangeTracked`。
+- orchestrator：`filteredTrackedDiffPathspecs` 新增 `T` 分支 + `hashTypechangeEmittedBytes`。
+
+**Regression test**：`TestGenerateSuppressesProtectedBytesInTrackedTypechange`（review）/ `TestFilteredTrackedDiffSkipsProtectedBytesInTrackedTypechange`（orchestrator）。验证 `T config.txt`（symlink target = secret）被抑制、`SECRET=real` 不泄漏、无关 `M feature.txt` 保留。
+
+### R10-E — treat `=` as a raw-marker boundary (P2)
+
+**问题**：`safe_summary.go` 的 `isBoundaryByteCI` 不把 `=` 当 boundary，所以 `kind=raw_prompt` / `artifact=codex_log` 这种 key/value 形态的 raw-artifact marker 不被 `scanRefusalKind` 识别 → `Seal` 接受 → `BuildReworkPrompt` 把 raw marker 渲染进下一个 prompt，绕过 D4 raw-prompt/log 屏蔽。
+
+**修复**：`isBoundaryByteCI` 增加 `=` 为 boundary 字节。`=` 不出现在 path segment 或 identifier 中，所以不会引入 path false positive（`docs/raw_prompt.md` 仍由 `isPathPunctuationBoundary` 的 `.` 处理保护）。
+
+**Regression test**：`TestSafeSummaryScanRejectsKeyValueDelimitedRefusalKinds`。验证 `kind=raw_prompt`/`artifact=codex_log`/`ref=prompt_snapshot`/`source=secret_artifact`/`type=codex_events` 均被 `Seal` 拒绝，且 `docs/raw_prompt.md` 合法路径仍被接受。
+
+### 验收对照（Round 10）
+
+| Finding | Severity | Regression test | 修复位置 | 状态 |
+| --- | --- | --- | --- | --- |
+| R10-D run-snapshot protected-path policy | P1 | `TestGenerateUsesRunSnapshotProtectedPaths` | `internal/review/review.go` `loadProtectedPaths(st,run,repoRoot)` + `internal/store/store.go` `GetWorkflowSnapshotConfigJSON` | ✅ |
+| R10-F typechange-on-non-protected-path | P1 | `TestGenerateSuppressesProtectedBytesInTrackedTypechange` / `TestFilteredTrackedDiffSkipsProtectedBytesInTrackedTypechange` | `internal/review/review.go` `matchesTypechangeTracked` + `internal/orchestrator/orchestrator.go` `hashTypechangeEmittedBytes` + `T` 分支 | ✅ |
+| R10-E `=` delimiter | P2 | `TestSafeSummaryScanRejectsKeyValueDelimitedRefusalKinds` | `internal/review/safe_summary.go` `isBoundaryByteCI` 加 `=` | ✅ |
+
+### 验收门禁（Round 10）
+
+```
+go test ./...                                                                       PASS
+python3 scripts/validate_contracts.py                                               PASS (contract validation passed)
+go vet ./internal/review/ ./internal/orchestrator/ ./internal/store/                PASS
+bash scripts/acceptance-local.sh                                                    PASS (acceptance-local passed)
+```
+
+### 设计权衡说明（Round 10）
+
+- **snapshot 优先于 live config**：review 必须用 run dispatch 时捕获的策略，而非实时 WORKFLOW.md。snapshot 的 `config_json` 是 dispatch 时 `EffectiveConfig` 的精确快照。回退链（snapshot → live `config.Load` → `DefaultPolicy`）保证老 run（无 snapshot）不崩，且回退仍用 defaults（安全）。
+- **`T` record 不 blanket fail-closed**：与 M 一致——`unknown=true` 时保留无关 typechange（如 app 配置文件类型变更），仅 `unknown=false` 时对 emit 字节做 content-hash match。"protected delete 字节被塞进非保护 path 的 typechange symlink target" 是 `unknown=true` 下的 residual evasion，A/untracked 的 fail-closed 不覆盖 typechange——这是有意识接受的残余风险（与 M 同类），与 finding 描述的 source-REMAINS 场景一致。
+- **`=` boundary 不影响 path**：`=` 不在 path segment / identifier 中出现，加它只影响 key/value prose 形态。path 中的 `.` 仍由 `isPathPunctuationBoundary` 特殊处理（path 内的点不是 boundary）。

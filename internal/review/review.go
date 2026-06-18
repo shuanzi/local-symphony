@@ -67,7 +67,7 @@ func (g Generator) Generate(runID string) (string, error) {
 	// included in the protected-content hash set. config.Load falls back
 	// to Defaults (which include the built-in protected paths) when
 	// WORKFLOW.md is absent or unreadable, so this never returns nil.
-	protectedPaths := loadProtectedPaths(g.Store.RepoRoot)
+	protectedPaths := loadProtectedPaths(g.Store, run, g.Store.RepoRoot)
 	changed, untracked, deniedChanged := collectChanges(issue.Workspace.Path, protectedPaths)
 	if len(handoff.ChangedFiles) > 0 {
 		for _, f := range handoff.ChangedFiles {
@@ -261,20 +261,45 @@ func (g Generator) Generate(runID string) (string, error) {
 	return finalID, nil
 }
 
-// loadProtectedPaths returns the workflow's configured protected_paths
-// (approvals.protected_paths), falling back to the built-in defaults when
-// WORKFLOW.md is absent or unreadable. D4/R16 round-9: review collection
-// honors the same configured protected-path policy the orchestrator uses
-// (IsProtectedPathWithConfig), so custom protected paths such as
-// `secrets/**` are protected in review artifacts too. config.Load never
-// returns a nil Config (it falls back to Defaults), so the returned slice
-// is always usable.
-func loadProtectedPaths(repoRoot string) []string {
-	wf, err := config.Load(repoRoot)
-	if wf == nil || err != nil {
-		return security.DefaultPolicy().ProtectedPaths
+// loadProtectedPaths returns the protected_paths policy that governs THIS
+// run, for use by review collection (IsProtectedPathWithConfig).
+//
+// D4/R16 round-9: review collection honors the workflow's configured
+// protected_paths, not just the built-in defaults, so custom protected
+// paths such as `secrets/**` are protected in review artifacts too.
+//
+// D4/R16 round-10 (codex finding D): read the policy from the run's
+// CAPTURED workflow snapshot (run.WorkflowSnapshotID → workflow_snapshots
+// .config_json), NOT a fresh config.Load of the live WORKFLOW.md. A
+// WORKFLOW.md edit/removal between dispatch and review generation would
+// otherwise change which paths were protected for this run, letting a
+// protected file/copy leak into changes.patch / review.json under a
+// different policy than the one the run was dispatched under. The snapshot
+// config_json is the exact EffectiveConfig captured at dispatch time.
+//
+// Fallbacks (only when the snapshot is absent/unreadable, e.g. a run
+// dispatched before workflow snapshots existed): config.Load(repoRoot)
+// (live WORKFLOW.md, falling back to Defaults internally), then the
+// built-in DefaultPolicy().ProtectedPaths. These fallbacks never return
+// nil, so the returned slice is always usable.
+func loadProtectedPaths(st *store.Store, run *core.RunAttempt, repoRoot string) []string {
+	if run != nil && run.WorkflowSnapshotID != nil && *run.WorkflowSnapshotID != "" {
+		if cfgJSON, err := st.GetWorkflowSnapshotConfigJSON(*run.WorkflowSnapshotID); err == nil && cfgJSON != "" {
+			var cfg struct {
+				Approvals struct {
+					ProtectedPaths []string `json:"protected_paths"`
+				} `json:"approvals"`
+			}
+			if jsonErr := json.Unmarshal([]byte(cfgJSON), &cfg); jsonErr == nil && cfg.Approvals.ProtectedPaths != nil {
+				return cfg.Approvals.ProtectedPaths
+			}
+		}
 	}
-	return wf.Config.Approvals.ProtectedPaths
+	// Fallback: live config (matches the orchestrator's config.Load path).
+	if wf, err := config.Load(repoRoot); wf != nil && err == nil {
+		return wf.Config.Approvals.ProtectedPaths
+	}
+	return security.DefaultPolicy().ProtectedPaths
 }
 
 func collectChanges(root string, protectedPaths []string) ([]string, []UntrackedInfo, map[string]bool) {
@@ -406,6 +431,27 @@ func collectChanges(root string, protectedPaths []string) ([]string, []Untracked
 				// unknown=true fail-closed covers only for A/untracked.
 				dst := safePaths[len(safePaths)-1]
 				if protectedDeleted.matchesModifiedTracked(root, dst) {
+					denied[dst] = true
+					continue
+				}
+			}
+			if record.code != "??" && record.typechange() {
+				// D4/R16 round-10 (codex finding F) — typechange-on-non-
+				// protected-path guard. A tracked non-protected file whose
+				// type changes (e.g. regular file → symlink) is reported as
+				// `T config.txt`. gitx.DiffBinaryPaths emits the symlink
+				// TARGET text into changes.patch (`+SECRET=...`), so a
+				// typechange whose target is copied from a protected file
+				// (`rm config.txt; ln -s "$(cat .env)" config.txt`) leaks
+				// the protected bytes. (A typechange on a PROTECTED path is
+				// already fail-closed by protectedDeletedContent.unknown;
+				// this guard handles the NON-protected path case.) Like the
+				// M guard, this only content-hash-checks when unknown=false
+				// (source REMAINS); when unknown=true we do NOT blanket
+				// fail-closed T records (preserve an unrelated typechange),
+				// matching the M trade-off.
+				dst := safePaths[len(safePaths)-1]
+				if protectedDeleted.matchesTypechangeTracked(root, dst) {
 					denied[dst] = true
 					continue
 				}
@@ -913,6 +959,59 @@ func (s protectedDeletedContentSet) matchesModifiedTracked(root, path string) bo
 	if !ok {
 		// Cannot read the M file's workspace bytes → cannot prove it
 		// is safe → fail closed for THIS file only.
+		return true
+	}
+	return s.existingHashes[h]
+}
+
+// matchesTypechangeTracked reports whether a tracked TYPECHANGED (T) file on
+// a NON-protected path must be suppressed (denied) from the review packet's
+// `changed` list.
+//
+// D4/R16 round-10 (codex finding F) — typechange-on-non-protected-path
+// guard. A tracked non-protected file whose type changed (e.g. regular file
+// → symlink) is reported by porcelain as `T config.txt`; gitx.DiffBinaryPaths
+// emits the symlink TARGET text into changes.patch. A typechange whose
+// target is copied from a protected file (`rm config.txt; ln -s "$(cat
+// .env)" config.txt`) therefore leaks the protected bytes. (A typechange on
+// a PROTECTED path is already fail-closed via
+// protectedDeletedContent.unknown=true; this handles the non-protected path.)
+//
+// Like matchesModifiedTracked this does NOT blanket fail-closed when
+// unknown=true (an unrelated typechange is preserved, matching the M
+// trade-off). When unknown=false it reads the symlink target via os.Readlink
+// (the target text is what `git diff` emits), hashes it, and suppresses on a
+// match against existingHashes. A non-symlink typechange (e.g. symlink →
+// regular) returns false (its content is the regular file's bytes, handled
+// by the normal path; and a symlink→regular typechange's emitted content is
+// the regular file's, which is safe unless it matches protected content —
+// covered by reading the workspace content via reviewHashWorkspaceFile).
+func (s protectedDeletedContentSet) matchesTypechangeTracked(root, path string) bool {
+	if s.unknown {
+		return false
+	}
+	if len(s.existingHashes) == 0 {
+		return false
+	}
+	full := filepath.Join(root, path)
+	// A typechange may be regular→symlink or symlink→regular (or other).
+	// Read whatever workspace bytes `git diff` would emit: for a symlink,
+	// that is the target text (os.Readlink); for a regular file, the file
+	// content. Hash and match either against existingHashes.
+	if target, err := os.Readlink(full); err == nil {
+		// Workspace path is a symlink → emitted content is the target text.
+		h := security.SHA256Bytes([]byte(target))
+		if s.existingHashes[h] {
+			return true
+		}
+		// The target text did not match; a symlink whose target is a path
+		// (the common case) is safe to keep.
+		return false
+	}
+	// Not a symlink (e.g. symlink→regular typechange): hash the workspace
+	// file content and match. On read error fail closed for THIS file.
+	h, ok := reviewHashWorkspaceFile(full)
+	if !ok {
 		return true
 	}
 	return s.existingHashes[h]

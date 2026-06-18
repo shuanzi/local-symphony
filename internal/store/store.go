@@ -1635,6 +1635,21 @@ func (s *Store) CreateWorkflowSnapshot(status, sourcePath, configJSON, promptHas
 func (s *Store) AttachWorkflowSnapshot(runID, wfID string) error {
 	return s.Project.Exec(`UPDATE run_attempts SET workflow_snapshot_id=?, updated_at=? WHERE id=?`, wfID, core.Now(), runID)
 }
+
+// GetWorkflowSnapshotConfigJSON returns the config_json captured for the
+// workflow snapshot at dispatch time. D4/R16 round-10: review collection
+// must use the run's captured protected-path policy (the snapshot's
+// approvals.protected_paths), NOT a fresh config.Load of the live
+// WORKFLOW.md, so a WORKFLOW.md edit/removal between dispatch and review
+// generation cannot change which paths were protected for THIS run.
+// Returns "" when the snapshot does not exist (caller falls back).
+func (s *Store) GetWorkflowSnapshotConfigJSON(wfID string) (string, error) {
+	row, err := s.Project.QueryOne(`SELECT config_json FROM workflow_snapshots WHERE id=?`, wfID)
+	if err != nil {
+		return "", err
+	}
+	return row["config_json"].String(), nil
+}
 func (s *Store) CreatePromptSnapshot(runID, wfID, ctxHash, promptHash, rootPath string) (string, error) {
 	return s.CreatePromptSnapshotTx(s.Project, runID, wfID, ctxHash, promptHash, rootPath)
 }
