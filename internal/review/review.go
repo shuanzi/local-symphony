@@ -349,12 +349,36 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 			// which also cannot detect filler copies when the source remains.
 			if record.code != "??" && isAddedRecord(record.code) {
 				dst := safePaths[len(safePaths)-1]
-				// (a) fail-closed on protected delete/rename/copy or
-				//     --find-copies-harder enumeration failure; (b) verbatim-
-				//     from-HEAD copy fast-path; (c) round-6 content-hash
-				//     match against existing protected content (covers the
-				//     modified-source copy).
+				// (a) fail-closed on protected delete/rename/copy/typechange
+				//     or --find-copies-harder enumeration failure; (b)
+				//     verbatim-from-HEAD copy fast-path; (c) round-6
+				//     content-hash match against existing protected content
+				//     (covers the modified-source copy).
 				if protectedDeleted.unknown || copyDestFailClosed || copyDestinations[dst] || protectedDeleted.matchesAddedTracked(root, dst) {
+					denied[dst] = true
+					continue
+				}
+			}
+			if record.code != "??" && isModifiedTrackedRecord(record.code) {
+				// D4/R16 round-8 — modified-tracked-copy guard. A tracked
+				// non-protected file whose workspace content was overwritten
+				// with protected bytes (`cp .env config.txt`, config.txt
+				// already tracked → `M config.txt`) would otherwise enter
+				// `changed` and gitx.DiffBinaryPaths would emit the protected
+				// bytes into changes.patch. This is the source-REMAINS case
+				// the review finding describes, so it only fires when
+				// unknown=false (no protected delete/rename/copy/typechange):
+				// existingHashes is built and a content-hash match suppresses
+				// the M record. When unknown=true we do NOT fail-closed M
+				// records (unlike A) — an unrelated in-progress modification
+				// such as app.txt old→new is preserved, matching the
+				// user-approved trade-off codified by
+				// TestGenerateDoesNotReincludeProtectedRenameFromHandoff. A
+				// protected delete whose bytes were copied onto a tracked M
+				// file in the same worktree is a residual evasion the
+				// unknown=true fail-closed covers only for A/untracked.
+				dst := safePaths[len(safePaths)-1]
+				if protectedDeleted.matchesModifiedTracked(root, dst) {
 					denied[dst] = true
 					continue
 				}
@@ -473,8 +497,19 @@ type protectedDeletedContentSet struct {
 //     matches the untracked file's content against existingHashes: a match
 //     means the file is a copy of existing protected content (including a
 //     MODIFIED protected source) → suppress; otherwise preserve. On read
-//     error / binary / large / symlink it returns true (fail closed for
-//     that file — cannot prove it is safe).
+//     error it returns true (fail closed for that file — cannot prove it
+//     is safe).
+//
+// D4/R16 round-8 fix: when readUntrackedPatchData returns BYTES (data !=
+// nil) — which happens for BOTH text files AND small binary files whose
+// content contains a NUL byte (reason == binaryOrLarge but data still
+// holds the bytes) — the hash check runs against existingHashes. The
+// previous code returned false (preserve) as soon as reason != nil, so a
+// small binary copy of a protected file was preserved and untrackedInfo
+// stamped sha=SHA256Bytes(data), leaking a content-derived fingerprint of
+// the protected bytes. Only when data == nil (symlink / non-regular /
+// larger than maxUntrackedPatchBytes — no bytes returned, and untrackedInfo
+// leaves sha="") does it preserve without a hash check.
 func (s protectedDeletedContentSet) matchesUntracked(root, path string) bool {
 	if s.unknown {
 		// A protected tracked file was deleted/renamed/copied →
@@ -488,28 +523,45 @@ func (s protectedDeletedContentSet) matchesUntracked(root, path string) bool {
 		// preserve (full content-level correlation).
 		return false
 	}
-	data, _, reason, err := readUntrackedPatchData(root, path)
+	data, _, _, err := readUntrackedPatchData(root, path)
 	if err != nil {
 		// stat/read failure → cannot prove it is not a copy of protected
 		// content → fail closed for this file.
 		return true
 	}
-	if reason != nil || data == nil {
-		// Symlink, binary, large, or non-regular file: its CONTENT cannot
-		// be a verbatim byte-for-byte copy of a (small text) protected
-		// file that readUntrackedPatchData would return data for, and the
-		// patch path already omits these (PatchIncluded=false, no sha).
-		// Preserve the file in the untracked list (path-level correlation,
-		// no byte leak) rather than denying it — matches the pre-round-6
-		// behavior for symlinks/binary/large untracked files.
+	if data == nil {
+		// readUntrackedPatchData returned NO bytes: a symlink, a
+		// non-regular file, or a file larger than maxUntrackedPatchBytes.
+		// Such a file cannot be a verbatim byte-for-byte copy of a (small
+		// text) protected file, and the patch path already omits these
+		// (PatchIncluded=false, and untrackedInfo sets sha="" because
+		// data==nil). Preserve it in the untracked list (path-level
+		// correlation, no byte leak) rather than denying it — matches the
+		// pre-round-6 behavior for symlinks/non-regular/large untracked
+		// files.
 		return false
 	}
+	// data != nil: readUntrackedPatchData returned the file's bytes (up to
+	// maxUntrackedPatchBytes). This covers BOTH text files (reason==nil)
+	// AND small BINARY files whose content contains a NUL byte (reason ==
+	// binaryOrLarge, but data still holds the actual bytes). The binary
+	// case is the D4/R16 round-8 fix: a small binary copy of a protected
+	// file (e.g. a protected .env that happens to contain a NUL) must be
+	// content-hash-matched against existingHashes BEFORE preserving — the
+	// previous code returned false on reason!=nil and untrackedInfo then
+	// stamped sha=SHA256Bytes(data), leaking a content-derived fingerprint
+	// of the protected bytes into untracked-files.json / review.json.
 	if s.existingHashes[security.SHA256Bytes(data)] {
-		// Untracked file's content matches a recoverable version of an
-		// existing protected file → it is a copy of protected content
-		// (including a MODIFIED protected source) → suppress.
+		// Untracked file's content (text OR binary) matches a recoverable
+		// version of an existing protected file → it is a copy of protected
+		// content (including a MODIFIED protected source) → suppress.
 		return true
 	}
+	// data != nil but no protected-content match: a legitimate binary or
+	// text file. When reason != nil (binary) the patch path omits it
+	// (PatchIncluded=false) BUT untrackedInfo still stamps sha — that sha
+	// is of NON-protected content, so it is safe to emit (it cannot be
+	// reversed to protected bytes). Preserve for correlation.
 	return false
 }
 
@@ -542,6 +594,15 @@ func (s protectedDeletedContentSet) matchesUntracked(root, path string) bool {
 // protected D records. For an R/C record, parseStatusPorcelainZ stores
 // the SOURCE path at record.paths[0] and the DESTINATION at
 // record.paths[1]; we check the source.
+//
+// D4 / R16 round 8: a protected TYPECHANGE (a `T` porcelain record — a
+// tracked file whose type changed, e.g. regular file → symlink) is
+// treated the same way. The pre-typechange worktree bytes (the modified
+// content that could have been copied) are unrecoverable once the regular
+// file is replaced, and a copy would only match the now-absent modified
+// bytes — not the HEAD/index/symlink-target versions a content-hash check
+// builds — so content-hash matching cannot be made safe. A `T` record
+// carries a single path; we check it.
 func protectedDeletedContent(root string, records []statusPorcelainRecord) protectedDeletedContentSet {
 	for _, record := range records {
 		if record.deleted() {
@@ -567,6 +628,28 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord) prote
 			// be further copied into an untracked file; the
 			// pre-rename/copy worktree content is unrecoverable when
 			// unstaged modifications existed. Fail closed.
+			if len(record.paths) == 0 {
+				continue
+			}
+			path := reviewCleanPath(record.paths[0])
+			if path == "" || !security.IsProtectedPath(path) {
+				continue
+			}
+			return protectedDeletedContentSet{existingHashes: nil, unknown: true}
+		}
+		if record.typechange() {
+			// D4/R16 round-8: a protected tracked file whose TYPE changed
+			// (a `T` porcelain record — e.g. a regular file modified then
+			// replaced by a symlink) is just as dangerous as a delete: the
+			// pre-typechange WORKTREE content (the modified bytes that
+			// could have been copied into an added/untracked file) is
+			// unrecoverable once the regular file is gone, and a copy of it
+			// would only match the now-absent modified bytes, not the
+			// HEAD/index/symlink-target versions a content-hash check
+			// builds. Fail closed so ALL untracked + ALL A/M records are
+			// suppressed. A `T` record carries a single path (the
+			// typechanged file); parseStatusPorcelainZ stores it at
+			// paths[0].
 			if len(record.paths) == 0 {
 				continue
 			}
@@ -666,7 +749,25 @@ func existingProtectedContentHashes(root string) map[string]bool {
 // reviewHashWorkspaceFile streams a worktree file's content into a sha256
 // hasher (bounded memory via io.Copy) and returns the hex hash. Returns
 // ok=false on any error.
+//
+// D4/R16 round-8 fix: Lstat first and refuse to open non-regular files
+// (FIFOs, devices) and symlinks. A protected path that is a FIFO, a device,
+// or a symlink to a never-ending source such as /dev/zero would otherwise
+// block os.Open/io.Copy indefinitely during review packet generation. This
+// mirrors readUntrackedPatchData's Lstat+IsRegular guard. ok=false here
+// means "no hash added" — callers treat an absent hash as fail-closed
+// (cannot prove the file is not protected content), which is the safe
+// outcome for a special file.
 func reviewHashWorkspaceFile(path string) (string, bool) {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return "", false
+	}
+	// Skip symlinks (could target a protected file or a blocking device) and
+	// non-regular files (FIFO/device/socket would block on Open/Read).
+	if !st.Mode().IsRegular() {
+		return "", false
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", false
@@ -712,8 +813,8 @@ func reviewHashGitBlob(root, spec string) (string, bool) {
 // matchesAddedTracked reports whether a tracked ADDED (A) file must be
 // suppressed (denied) from the review packet's `changed` list. Mirrors
 // matchesUntracked for the A-record path.
-//   - When unknown (a protected tracked file was deleted/renamed/copied)
-//     it returns true — fail-closed (skip ALL A records).
+//   - When unknown (a protected tracked file was deleted/renamed/copied/
+//     typechanged) it returns true — fail-closed (skip ALL A records).
 //   - When not unknown and existingHashes is empty (no protected files
 //     exist at all) it returns false — full correlation (A kept).
 //   - When not unknown and existingHashes is non-empty, it content-hash-
@@ -737,6 +838,48 @@ func (s protectedDeletedContentSet) matchesAddedTracked(root, path string) bool 
 	return s.existingHashes[h]
 }
 
+// matchesModifiedTracked reports whether a tracked MODIFIED (M) file must
+// be suppressed (denied) from the review packet's `changed` list.
+//
+// D4/R16 round-8 — modified-tracked-copy guard. A tracked non-protected
+// file whose workspace content was overwritten with protected bytes (`cp
+// .env config.txt`, config.txt already tracked → porcelain reports
+// `M config.txt`) has workspace content matching an existing protected
+// version's hash, so it is suppressed here. This is the source-REMAINS
+// case the review finding describes.
+//
+// Unlike matchesAddedTracked, this does NOT fail-closed when unknown=true.
+// When a protected file is deleted/renamed/copied/typechanged, existingHashes
+// is nil (the pre-operation protected bytes are unrecoverable), so a
+// content-hash check is impossible; but fail-closing ALL M records would
+// drop unrelated in-progress modifications (e.g. app.txt old→new during a
+// protected rename), breaking the user-approved trade-off codified by
+// TestGenerateDoesNotReincludeProtectedRenameFromHandoff. So:
+//   - When unknown → return false (keep the M record; the A/untracked
+//     fail-closed already covers the copy-of-protected-byte risk for new
+//     files).
+//   - When not unknown and existingHashes is empty → false (no protected
+//     content to match → keep).
+//   - When not unknown and existingHashes is non-empty → content-hash-match
+//     the M file's workspace content; suppress on a match. On read error
+//     return true (fail closed for THIS file — cannot prove it is safe),
+//     which is narrower than fail-closing all M records.
+func (s protectedDeletedContentSet) matchesModifiedTracked(root, path string) bool {
+	if s.unknown {
+		return false
+	}
+	if len(s.existingHashes) == 0 {
+		return false
+	}
+	h, ok := reviewHashWorkspaceFile(filepath.Join(root, path))
+	if !ok {
+		// Cannot read the M file's workspace bytes → cannot prove it
+		// is safe → fail closed for THIS file only.
+		return true
+	}
+	return s.existingHashes[h]
+}
+
 type statusPorcelainRecord struct {
 	code  string
 	paths []string
@@ -746,6 +889,15 @@ func (r statusPorcelainRecord) renamedOrCopied() bool {
 	return len(r.code) >= 2 && (r.code[0] == 'R' || r.code[1] == 'R' || r.code[0] == 'C' || r.code[1] == 'C')
 }
 
+// typechange reports whether a porcelain XY code denotes a TYPECHANGE (T)
+// — a tracked file whose type changed (e.g. regular file → symlink, or
+// symlink → regular file). D4/R16 round-8: a protected typechange is
+// treated as fail-closed (same as delete/rename/copy) because the
+// pre-typechange worktree bytes are unrecoverable.
+func (r statusPorcelainRecord) typechange() bool {
+	return len(r.code) >= 2 && (r.code[0] == 'T' || r.code[1] == 'T')
+}
+
 // isAddedRecord reports whether a porcelain XY code denotes an ADDED
 // tracked file (status A in either the staged-X or worktree-Y column),
 // i.e. a file whose bytes are new to the index/worktree and would be
@@ -753,6 +905,18 @@ func (r statusPorcelainRecord) renamedOrCopied() bool {
 // added tracked record and is handled separately by collectChanges.
 func isAddedRecord(code string) bool {
 	return len(code) >= 2 && (code[0] == 'A' || code[1] == 'A')
+}
+
+// isModifiedTrackedRecord reports whether a porcelain XY code denotes a
+// MODIFIED tracked file (status M in either the staged-X or worktree-Y
+// column). D4/R16 round-8: a tracked non-protected file whose workspace
+// content is overwritten with protected bytes (e.g. `cp .env config.txt`
+// where config.txt is already tracked) is reported by porcelain as
+// `M config.txt`, NOT `A`, so the round-5/6 A-only protected-content
+// check missed it and gitx.DiffBinaryPaths emitted the protected bytes
+// into changes.patch. The content-hash check now covers M records too.
+func isModifiedTrackedRecord(code string) bool {
+	return len(code) >= 2 && (code[0] == 'M' || code[1] == 'M')
 }
 
 // protectedCopyDestinations runs a copy-aware diff

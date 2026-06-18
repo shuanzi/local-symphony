@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"local-symphony/internal/core"
@@ -1642,5 +1643,279 @@ func TestGenerateKeepsEmptyUntrackedFileWhenProtectedHasNoBlob(t *testing.T) {
 		if strings.Contains(art, "SECRET=real") {
 			t.Fatalf("%s leaked protected .env bytes:\n%s", name, art)
 		}
+	}
+}
+
+// TestGenerateSuppressesModifiedTrackedCopyOfProtectedFile codifies the
+// D4 / R16 round-8 fix for the modified-tracked-copy P1 leak in review.go's
+// collectChanges path.
+//
+// Scenario: a protected tracked .env is committed (SECRET=old), MODIFIED to
+// SECRET=new, and an EXISTING tracked non-protected file config.txt is
+// OVERWRITTEN with the modified protected bytes (`cp .env config.txt`,
+// config.txt already tracked → porcelain reports `M config.txt`, NOT `A`).
+// Source .env REMAINS. Round 5/6's protected-content check only ran for
+// ADDED (A) records, so the `M config.txt` record passed through, entered
+// `changed`, and gitx.DiffBinaryPaths emitted the protected bytes
+// (SECRET=new) into changes.patch / diffstat.txt / review.json.
+//
+// Round 8 extends the content-hash check to MODIFIED (M) records:
+// config.txt's workspace content (SECRET=new) matches .env's workspace hash
+// in existingHashes → the M record is denied. An unrelated modified tracked
+// file (feature.txt, old→new feature) IS kept — the M check is content-hash,
+// not fail-closed-all.
+func TestGenerateSuppressesModifiedTrackedCopyOfProtectedFile(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=old\n")
+	writeFile(t, workspace, "config.txt", "base config\n")
+	writeFile(t, workspace, "feature.txt", "old feature\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// MODIFY the protected file (the bytes that will be copied).
+	writeFile(t, workspace, ".env", "SECRET=new\n")
+	// Overwrite the EXISTING tracked config.txt with the modified protected
+	// bytes. porcelain reports this as `M config.txt`, not `A`.
+	modified, err := os.ReadFile(filepath.Join(workspace, ".env"))
+	if err != nil {
+		t.Fatalf("read modified .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "config.txt"), modified, 0o644); err != nil {
+		t.Fatalf("overwrite config.txt with protected bytes: %v", err)
+	}
+	runGit(t, workspace, "add", "config.txt")
+	// Unrelated modified tracked file — MUST be kept (M check is content-
+	// hash, not blanket fail-closed).
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"config.txt", "feature.txt"})
+
+	// Sanity: confirm git reports config.txt as M (not A) — guards the test
+	// premise (the round-5/6 A-only check must NOT fire).
+	probe, err := exec.Command("git", "-C", workspace, "status", "--porcelain=v1", "-z", "-uall").Output()
+	if err != nil {
+		t.Fatalf("porcelain probe: %v", err)
+	}
+	if !strings.Contains(string(probe), "M  config.txt") && !strings.Contains(string(probe), "MM config.txt") {
+		t.Fatalf("config.txt not reported as a modified tracked (M) record; test premise invalid:\n%q", string(probe))
+	}
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// config.txt (modified-tracked copy of MODIFIED protected content) MUST
+	// be suppressed everywhere; the modified protected bytes never appear.
+	// The unrelated feature.txt MUST be kept.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"SECRET=new",
+			"diff --git a/config.txt b/config.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked modified-tracked-protected-copy content (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+	// config.txt must be absent from changed-files (denied).
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if strings.Contains(changed, "config.txt") {
+		t.Fatalf("changed-files.txt kept denied modified-tracked-protected-copy config.txt:\n%s", changed)
+	}
+	// The unrelated modified feature.txt MUST be kept.
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated modified tracked feature.txt (correlation broken):\n%s", patch)
+	}
+	if !strings.Contains(changed, "feature.txt") {
+		t.Fatalf("changed-files.txt dropped unrelated modified tracked feature.txt:\n%s", changed)
+	}
+}
+
+// TestGenerateFailsClosedOnProtectedTypechange codifies the D4 / R16 round-8
+// fix for the protected-typechange P1 leak in review.go's
+// protectedDeletedContent path.
+//
+// Scenario: a protected tracked .env is committed (SECRET=old), MODIFIED to
+// SECRET=new, copied into a new added public.txt, then the protected .env is
+// REPLACED BY A SYMLINK (`rm .env; ln -s public.txt .env`). porcelain reports
+// `T .env` (a typechange: regular file → symlink) plus `A public.txt`. Round
+// 4/5/6 only triggered fail-closed on protected D/R/C records, so a protected
+// `T` left unknown=false and the added public.txt (a copy of the now-
+// unrecoverable modified .env bytes) was kept → SECRET=new leaked into
+// changes.patch / review.json.
+//
+// Round 8 treats a protected `T` like a protected D/R/C: unknown=true →
+// fail-closed suppresses ALL untracked + ALL A records. The modified
+// protected bytes never appear in any artifact.
+func TestGenerateFailsClosedOnProtectedTypechange(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=old\n")
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// MODIFY the protected file, copy into a new added file, then replace
+	// .env with a symlink → typechange (T) on the protected path.
+	writeFile(t, workspace, ".env", "SECRET=new\n")
+	modified, err := os.ReadFile(filepath.Join(workspace, ".env"))
+	if err != nil {
+		t.Fatalf("read modified .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "public.txt"), modified, 0o644); err != nil {
+		t.Fatalf("write public.txt (copy of modified .env): %v", err)
+	}
+	runGit(t, workspace, "add", "public.txt")
+	if err := os.Remove(filepath.Join(workspace, ".env")); err != nil {
+		t.Fatalf("rm .env: %v", err)
+	}
+	if err := os.Symlink("public.txt", filepath.Join(workspace, ".env")); err != nil {
+		t.Fatalf("symlink .env -> public.txt: %v", err)
+	}
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"public.txt"})
+
+	// Sanity: confirm git reports a T record on .env (guards the test
+	// premise — the round-4/5/6 D/R/C-only check must NOT fire).
+	probe, err := exec.Command("git", "-C", workspace, "status", "--porcelain=v1", "-z", "-uall").Output()
+	if err != nil {
+		t.Fatalf("porcelain probe: %v", err)
+	}
+	if !strings.Contains(string(probe), "T .env") && !strings.Contains(string(probe), "T  .env") {
+		t.Fatalf("protected .env not reported as a typechange (T); test premise invalid:\n%q", string(probe))
+	}
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// The copied modified protected bytes (SECRET=new) must never appear in
+	// any artifact; public.txt (A record) is suppressed by fail-closed.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"SECRET=new",
+			"diff --git a/public.txt b/public.txt",
+			"public.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked protected-typechange copy content (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+}
+
+// TestGenerateSuppressesBinaryUntrackedCopyOfProtectedContent codifies the
+// D4 / R16 round-8 fix for the binary untracked protected-copy P2 leak in
+// review.go's matchesUntracked path.
+//
+// Scenario: a protected tracked .env holds BINARY content (contains a NUL
+// byte) and is copied verbatim into an untracked safe.txt. readUntrackedPatch
+// Data returns (data, size, binaryOrLarge, nil) — data != nil AND reason !=
+// nil. Round 6's matchesUntracked returned false as soon as reason != nil
+// (before the existingHashes check), so safe.txt was preserved and
+// untrackedInfo stamped sha=SHA256Bytes(data), leaking a content-derived
+// fingerprint of the protected bytes into untracked-files.json / review.json.
+//
+// Round 8: when data != nil (bytes were returned — text OR binary), the
+// hash check runs against existingHashes; a match suppresses the file (no
+// patch, no sha). An unrelated untracked text file (notes.txt) IS kept.
+func TestGenerateSuppressesBinaryUntrackedCopyOfProtectedContent(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=old\n")
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// Protected file with BINARY content (NUL byte). cp into an untracked
+	// safe.txt — a small binary copy of the protected file.
+	binarySecret := []byte("SECRET=binary\x00\x01\x02\n")
+	if err := os.WriteFile(filepath.Join(workspace, ".env"), binarySecret, 0o600); err != nil {
+		t.Fatalf("write binary .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "safe.txt"), binarySecret, 0o644); err != nil {
+		t.Fatalf("write safe.txt (binary copy of .env): %v", err)
+	}
+	// Unrelated untracked text file — MUST be present with its content.
+	writeFile(t, workspace, "notes.txt", "plain note\n")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"safe.txt", "notes.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// The protected binary bytes (and their SHA256 fingerprint) must not
+	// leak anywhere. Assert neither the raw marker nor the content hash of
+	// the protected bytes appears in any artifact.
+	wantSecretHash := sha256Hex(binarySecret)
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		if strings.Contains(art, "SECRET=binary") {
+			t.Fatalf("%s leaked binary protected bytes:\n%s", name, art)
+		}
+		if strings.Contains(art, wantSecretHash) {
+			t.Fatalf("%s leaked binary protected-bytes SHA256 fingerprint (%s):\n%s", name, wantSecretHash, art)
+		}
+		if strings.Contains(art, "diff --git a/safe.txt b/safe.txt") {
+			t.Fatalf("%s leaked safe.txt synthetic patch (binary protected copy):\n%s", name, art)
+		}
+	}
+	// safe.txt must be absent or present WITHOUT content (no patch, no sha).
+	// notes.txt must be present WITH content.
+	untracked := readUntrackedArtifact(t, st, issue, run)
+	if info, ok := untracked["safe.txt"]; ok {
+		if info.PatchIncluded || info.SHA256 != "" {
+			t.Fatalf("safe.txt untracked info = %+v; want no patch and no sha (binary protected copy suppressed)", info)
+		}
+	}
+	notesInfo, ok := untracked["notes.txt"]
+	if !ok {
+		t.Fatalf("untracked artifact dropped unrelated notes.txt (correlation broken): %+v", untracked)
+	}
+	if !notesInfo.PatchIncluded || notesInfo.SHA256 == "" {
+		t.Fatalf("notes.txt untracked info = %+v; want patch included and sha set (unrelated safe content preserved)", notesInfo)
+	}
+}
+
+// TestReviewHashWorkspaceFileSkipsSpecialFiles codifies the D4 / R16 round-8
+// fix for the special-file blocking P2 in review.go's reviewHashWorkspaceFile.
+//
+// A protected path that is a FIFO, device, or symlink must NOT be opened +
+// io.Copy'd (a FIFO/device can block indefinitely; a symlink could target a
+// blocking source). The helper now Lstat's first and returns ok=false for
+// non-regular files and symlinks. This test exercises the helper directly
+// (not via Generate) so it cannot hang the suite on a FIFO.
+func TestReviewHashWorkspaceFileSkipsSpecialFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// FIFO.
+	fifoPath := filepath.Join(dir, ".env")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	if _, ok := reviewHashWorkspaceFile(fifoPath); ok {
+		t.Fatalf("reviewHashWorkspaceFile opened a FIFO (would block); want ok=false")
+	}
+
+	// Symlink (could target a blocking device or a protected file).
+	linkPath := filepath.Join(dir, "id_rsa")
+	if err := os.Symlink(fifoPath, linkPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if _, ok := reviewHashWorkspaceFile(linkPath); ok {
+		t.Fatalf("reviewHashWorkspaceFile followed a symlink; want ok=false")
+	}
+
+	// Regular file — must still hash normally.
+	regularPath := filepath.Join(dir, "regular.txt")
+	if err := os.WriteFile(regularPath, []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write regular: %v", err)
+	}
+	got, ok := reviewHashWorkspaceFile(regularPath)
+	if !ok {
+		t.Fatalf("reviewHashWorkspaceFile skipped a regular file; want ok=true")
+	}
+	if got != sha256Hex([]byte("hello\n")) {
+		t.Fatalf("reviewHashWorkspaceFile regular hash = %q, want %q", got, sha256Hex([]byte("hello\n")))
 	}
 }

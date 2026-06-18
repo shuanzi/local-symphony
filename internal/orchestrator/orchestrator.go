@@ -541,26 +541,26 @@ func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]strin
 			continue
 		}
 		// Added tracked file (status A): fail-closed on any protected
-		// delete/rename/copy. `record.paths[len-1]` is the destination
-		// path git diff would emit.
+		// delete/rename/copy/typechange. `record.paths[len-1]` is the
+		// destination path git diff would emit.
 		if strings.HasPrefix(record.status, "A") {
 			if hashesUnknown {
-				// A protected tracked file was deleted/renamed/copied →
-				// cannot rule out this A file holding modified-then-copied
-				// protected bytes → skip (fail closed). The
-				// index-vs-worktree mismatch (P1#2) is moot: the A file's
-				// diff never runs.
+				// A protected tracked file was deleted/renamed/copied/
+				// typechanged → cannot rule out this A file holding
+				// modified-then-copied protected bytes → skip (fail
+				// closed). The index-vs-worktree mismatch (P1#2) is moot:
+				// the A file's diff never runs.
 				continue
 			}
-			// Round 6: no protected delete/rename/copy, but the A file
-			// may be a copy of a MODIFIED protected file (source remains).
-			// Hash the A file's WORKSPACE content (the bytes `git diff
-			// HEAD -- <path>` emits) and skip it if the hash matches any
-			// recoverable protected version. On read error, SKIP (fail
-			// closed for that file — cannot prove it is safe).
+			// Round 6: no protected delete/rename/copy/typechange, but the
+			// A file may be a copy of a MODIFIED protected file (source
+			// remains). Hash the A file's WORKSPACE content (the bytes
+			// `git diff HEAD -- <path>` emits) and skip it if the hash
+			// matches any recoverable protected version. On read error,
+			// SKIP (fail closed for that file — cannot prove it is safe).
 			//
-			// Fast path: when there are NO existing protected files at
-			// all (len(existingHashes)==0), no A file can be a copy of
+			// Fast path: when there are NO existing protected files at all
+			// (len(existingHashes)==0), no A file can be a copy of
 			// protected content, so we skip the read+hash and keep the A
 			// record directly — full common-case correlation with zero
 			// per-A I/O.
@@ -568,15 +568,40 @@ func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]strin
 			if len(existingHashes) > 0 {
 				h, ok := hashWorkspaceFile(filepath.Join(root, dst))
 				if !ok {
-					// Cannot read the A file's workspace bytes → cannot
-					// prove it is safe → skip (fail closed for this file).
 					continue
 				}
 				if existingHashes[h] {
-					// A file's content matches a recoverable version of
-					// an existing protected file → it is a copy of
-					// protected content → skip so its bytes never enter
-					// the diff.
+					continue
+				}
+			}
+		}
+		// D4/R16 round-8 — modified tracked file (status M): a tracked
+		// non-protected file overwritten with protected bytes (`cp .env
+		// config.txt`, config.txt already tracked → `M config.txt`) is
+		// reported by `git diff --name-status` as `M`, NOT `A`, so the
+		// A-only check missed it and `git diff HEAD -- config.txt` hashed
+		// the protected bytes into cumulative_diff_sha. The M record's
+		// workspace content matches an existing protected version's hash,
+		// so the same content-hash check suppresses it. This is the
+		// source-REMAINS case (unknown=false). When hashesUnknown=true we
+		// do NOT fail-closed M records (unlike A) — an unrelated
+		// in-progress modification is preserved (mirrors the review path's
+		// trade-off); a protected delete whose bytes were copied onto a
+		// tracked M file is a residual evasion the A/untracked fail-closed
+		// covers only for new files.
+		if strings.HasPrefix(record.status, "M") {
+			if !hashesUnknown && len(existingHashes) > 0 {
+				dst := record.paths[len(record.paths)-1]
+				h, ok := hashWorkspaceFile(filepath.Join(root, dst))
+				if !ok {
+					// Cannot read the file's workspace bytes → cannot
+					// prove it is safe → skip (fail closed for THIS file).
+					continue
+				}
+				if existingHashes[h] {
+					// M file's content matches a recoverable version of
+					// an existing protected file → copy of protected
+					// content → skip so its bytes never enter the diff.
 					continue
 				}
 			}
@@ -801,50 +826,59 @@ func cumulativeUntrackedDigest(root string, protectedPaths []string) string {
 // whether the file was unmodified-then-deleted/renamed/copied or
 // unstaged-modified-then-deleted/renamed/copied).
 //
+// D4 / R16 round 8 — a protected TYPECHANGE (a `T` record: a tracked file
+// whose type changed, e.g. a regular file modified then replaced by a
+// symlink) is the same class of unrecoverability: the pre-typechange
+// worktree bytes are gone once the regular file is replaced, and a copy of
+// them would only match the now-absent modified bytes — not the
+// HEAD/index/symlink-target versions a content-hash check builds. So a
+// protected `T` triggers fail-closed just like D/R/C.
+//
 // Therefore content-hash matching CANNOT be made safe in the
-// protected-delete/rename/copy case. We fail closed instead:
+// protected-delete/rename/copy/typechange case. We fail closed instead:
 //
-//   - If ANY protected tracked file is DELETED, RENAMED, or COPIED (i.e.
-//     a `D` record on a protected path, OR an `R`/`C` record whose SOURCE
-//     path is protected) → return (nil, true). The caller suppresses ALL
-//     untracked content (sentinel: path + fixed marker, NO content) and
-//     SKIPS all added-tracked (A) records from the diff pathspec.
-//     Protected bytes never enter cumulative_diff_sha.
+//   - If ANY protected tracked file is DELETED, RENAMED, COPIED, or
+//     TYPECHANGED (i.e. a `D` or `T` record on a protected path, OR an
+//     `R`/`C` record whose SOURCE path is protected) → return (nil, true).
+//     The caller suppresses ALL untracked content (sentinel: path + fixed
+//     marker, NO content) and SKIPS all added-tracked (A) records from the
+//     diff pathspec. Protected bytes never enter cumulative_diff_sha.
 //
-//   - If NO protected tracked file is deleted/renamed/copied (the COMMON
-//     case) → return (empty non-nil map, false). The caller hashes
-//     untracked content normally (full content-level correlation) and
-//     keeps A records.
+//   - If NO protected tracked file is deleted/renamed/copied/typechanged
+//     (the COMMON case) → return (empty non-nil map, false). The caller
+//     hashes untracked content normally (full content-level correlation)
+//     and keeps A records.
 //
 // This is the user-approved P1>P2 trade-off: P1 security (never leak
 // protected bytes) wins over P2 content-level diagnostic correlation,
-// but ONLY in the (uncommon) protected-delete/rename/copy case; the
-// common case keeps full correlation.
+// but ONLY in the (uncommon) protected-delete/rename/copy/typechange
+// case; the common case keeps full correlation.
 //
 // hashesUnknown is true whenever the name-status enumeration fails OR any
 // record is a protected delete (D on a protected path) or a protected
-// rename/copy source (R/C whose SOURCE path is protected). It is false
-// only when enumeration succeeds and no protected path is deleted, nor
-// used as the source of a rename/copy.
+// rename/copy source (R/C whose SOURCE path is protected), or typechanged
+// (T on a protected path). It is false only when enumeration succeeds and
+// no protected path is deleted, used as the source of a rename/copy, or
+// typechanged.
 func deletedProtectedContentHashes(root string, protectedPaths []string) (hashes map[string]bool, unknown bool) {
-	// Enumerate D, R, C records against HEAD. `--find-renames` and
+	// Enumerate D, R, C, T records against HEAD. `--find-renames` and
 	// `--find-copies*` make git report renames/copies (R/C) instead of
-	// collapsing them to a D + A pair; `--diff-filter=DRC` keeps only
-	// deletes, renames, and copies so we can inspect their sources. The
-	// status field is NUL-separated from the path field(s); for R/C the
-	// source and destination paths are BOTH present (source first), for
-	// D only the single deleted path. This mirrors the parsing in
-	// filteredTrackedDiffPathspecs.
-	out, err := exec.Command("git", "-C", root, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "--diff-filter=DRC", "-z", "HEAD").Output()
+	// collapsing them to a D + A pair; `--diff-filter=DRCT` keeps only
+	// deletes, renames, copies, and typechanges so we can inspect their
+	// sources/paths. The status field is NUL-separated from the path
+	// field(s); for R/C the source and destination paths are BOTH present
+	// (source first), for D/T only the single path. This mirrors the
+	// parsing in filteredTrackedDiffPathspecs.
+	out, err := exec.Command("git", "-C", root, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "--diff-filter=DRCT", "-z", "HEAD").Output()
 	if err != nil {
 		// Enumeration failed → cannot prove no protected file was
-		// deleted/renamed/copied → fail closed.
+		// deleted/renamed/copied/typechanged → fail closed.
 		return nil, true
 	}
 	if len(out) == 0 {
-		// No deletes/renames/copies at all → no protected operation →
-		// content hashing proceeds normally (no suppression work;
-		// callers must NOT os.ReadFile untracked files for matching).
+		// No deletes/renames/copies/typechanges at all → no protected
+		// operation → content hashing proceeds normally (no suppression
+		// work; callers must NOT os.ReadFile untracked files for matching).
 		return map[string]bool{}, false
 	}
 	fields := strings.Split(string(out), "\x00")
@@ -872,6 +906,22 @@ func deletedProtectedContentHashes(root string, protectedPaths []string) (hashes
 			}
 			continue
 		}
+		if strings.HasPrefix(status, "T") {
+			// D4/R16 round-8: a TYPECHANGE on a protected tracked file
+			// (e.g. a regular file modified then replaced by a symlink).
+			// The pre-typechange worktree bytes are unrecoverable once the
+			// regular file is gone, and a copy would only match the
+			// now-absent modified bytes — not the HEAD/index/symlink-target
+			// versions a content-hash check builds — so content-hash
+			// matching cannot be made safe. A `T` record carries a single
+			// path (the typechanged file); if it is protected, fail closed
+			// so the caller skips ALL A/M records and suppresses ALL
+			// untracked content.
+			if security.IsProtectedPathWithConfig(paths[0], protectedPaths) {
+				return nil, true
+			}
+			continue
+		}
 		// status starts with R or C: paths[0] is the SOURCE path. A
 		// protected file that is renamed or copied is just as dangerous
 		// as one that is deleted — its bytes are moved/copied to a new
@@ -885,8 +935,9 @@ func deletedProtectedContentHashes(root string, protectedPaths []string) (hashes
 			return nil, true
 		}
 	}
-	// Deletes/renames/copies exist but NONE touch a protected source/path
-	// → no protected operation → content hashing proceeds normally.
+	// Deletes/renames/copies/typechanges exist but NONE touch a protected
+	// source/path → no protected operation → content hashing proceeds
+	// normally.
 	return map[string]bool{}, false
 }
 
@@ -1005,7 +1056,26 @@ func existingProtectedContentHashes(root string, protectedPaths []string) map[st
 // hashWorkspaceFile streams a worktree file's content into a sha256 hasher
 // (bounded memory via io.Copy) and returns the hex hash. Returns ok=false on
 // any error (file absent, permission, etc.).
+//
+// D4/R16 round-8 fix: Lstat first and refuse to open non-regular files
+// (FIFOs, devices) and symlinks. A protected path that is a FIFO, a device,
+// or a symlink to /dev/zero would otherwise block os.Open/io.Copy for the
+// full duration of rework prompt generation (computeCumulativeDiffSHA calls
+// this for every enumerated protected file AND every added/untracked
+// candidate). Mirrors readUntrackedPatchData's Lstat+IsRegular guard. A
+// special file yields ok=false, which callers treat as fail-closed (the
+// protected version is simply not added to existingHashes; an added/
+// untracked file that cannot be hashed is skipped rather than correlated).
 func hashWorkspaceFile(path string) (string, bool) {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return "", false
+	}
+	// Skip symlinks (could target a protected file or a blocking device) and
+	// non-regular files (FIFO/device/socket would block on Open/Read).
+	if !st.Mode().IsRegular() {
+		return "", false
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", false

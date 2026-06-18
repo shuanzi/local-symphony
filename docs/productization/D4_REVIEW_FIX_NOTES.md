@@ -89,3 +89,72 @@ acceptance-local passed
 | `internal/review/review_test.go` | 新增 F4/F5 failing test + `sha256Hex` / `mustReviewPacketIDForRun` helper |
 | `internal/review/safe_summary.go` | F3 新增 `BuildSafeSummaryFromIssueWithPrev` + `buildSafeSummaryFromIssueCore`；F5 替换 `containsCI` → `containsCIToken` + `isBoundaryByteCI` |
 | `internal/review/safe_summary_test.go` | 新增 F3 failing test；改 `TestSafeSummaryScanForRawArtifactsRejectsRefusalKindTokens` ChangedFiles fixture 为 word-bounded |
+
+---
+
+## Round 8 — protected-content copy/typechange/special-file leaks (commit `c669420` review)
+
+Codex 第 8 轮 review（针对 commit `c669420`）提了 7 个 finding（2 P1 + 5 P2），全部围绕 protected-content（secrets）在 review packet 收集和 `cumulative_diff_sha` 哈希中的多个绕过路径。逻辑高度相关，合并修复。
+
+### R8-1 / R8-2 — modified tracked protected-copy leak (P1 / P2)
+
+**问题**：当受保护文件被复制覆盖到一个**已 tracked** 的非保护文件（`cp .env config.txt`，`config.txt` 已 tracked），porcelain 报 `M config.txt`（不是 `A`）。protected-content 哈希检查只对 ADDED (`A`) record 运行（review.go `isAddedRecord` / orchestrator.go `HasPrefix "A"`），`M` record 漏过 → `git diff HEAD -- config.txt` 把受保护字节（`SECRET=new`）emit 进 `changes.patch` / hash 进 `cumulative_diff_sha`。
+
+**修复**：把 content-hash 检查扩展到 MODIFIED (`M`) record。
+- review.go `collectChanges`：新增 `isModifiedTrackedRecord` + `matchesModifiedTracked`。`matchesModifiedTracked` 仅在 `unknown=false`（source REMAINS）时对 M record 的 workspace content 做 content-hash match（命中 `existingHashes` 则 deny）；`unknown=true` 时**不** fail-closed M record（保留无关的 in-progress modification，遵循 `TestGenerateDoesNotReincludeProtectedRenameFromHandoff` 已批准的 trade-off）。
+- orchestrator.go `filteredTrackedDiffPathspecs`：同样对 `M` record 在 `!hashesUnknown && len(existingHashes)>0` 时做 content-hash match，命中则 skip。
+
+**Regression test**：`TestGenerateSuppressesModifiedTrackedCopyOfProtectedFile`（review）/ `TestFilteredTrackedDiffSkipsModifiedTrackedCopyOfProtectedFile`（orchestrator）。两者都验证 `M config.txt`（modified-source copy）被抑制、无关 `M feature.txt`（old→new）被保留。
+
+### R8-3 / R8-4 — protected typechange (T) fail-closed (P1 / P2)
+
+**问题**：受保护 tracked 文件被 typechange（`T`，例如 modify 后替换成 symlink）。其 modified bytes 不可恢复（与 D/R/C 同类不可恢复性）。但 `protectedDeletedContent`（review.go）只检查 `deleted()` (D) 和 `renamedOrCopied()` (R/C)，`deletedProtectedContentHashes`（orchestrator.go）用 `--diff-filter=DRC`，都排除 `T` → `unknown`/`hashesUnknown` 保持 false → copied secret（added `public.txt`）漏进 `changes.patch` / `cumulative_diff_sha`。
+
+**修复**：把受保护 `T` record 当作 fail-closed（`unknown=true` / `hashesUnknown=true`），与 D/R/C 一致。
+- review.go：新增 `typechange()` 方法（`code[0]=='T' || code[1]=='T'`），`protectedDeletedContent` 对受保护 `T` record（path 在 `record.paths[0]`）返回 `unknown=true`。
+- orchestrator.go：`deletedProtectedContentHashes` 把 `--diff-filter=DRC` 改为 `--diff-filter=DRCT`，并对 `T` record 检查受保护 path → fail-closed。
+
+**Regression test**：`TestGenerateFailsClosedOnProtectedTypechange`（review）/ `TestFilteredTrackedDiffFailsClosedOnProtectedTypechange`（orchestrator）。场景：modify `.env` → copy 到 added `public.txt` → `rm .env; ln -s public.txt .env`（typechange）。验证 `SECRET=new` 不泄漏、`public.txt` 被 fail-closed 抑制。
+
+### R8-5 / R8-6 — special-file blocking in workspace hashers (P2)
+
+**问题**：`reviewHashWorkspaceFile`（review.go:670）和 `hashWorkspaceFile`（orchestrator.go:1009）直接 `os.Open` + `io.Copy`，不检查 `Lstat().Mode().IsRegular()`。受保护 path 若是 FIFO / device / 指向 `/dev/zero` 的 symlink，会**无限阻塞** review packet 生成 / rework prompt 生成。
+
+**修复**：两个 helper 都先 `os.Lstat`，非 regular file 和 symlink 返回 `ok=false`（不 open、不读）。镜像 `readUntrackedPatchData` 的 Lstat+IsRegular guard。
+
+**Regression test**：`TestReviewHashWorkspaceFileSkipsSpecialFiles`（review）/ `TestHashWorkspaceFileSkipsSpecialFiles`（orchestrator）。直接调 helper（不经过 Generate/computeCumulativeDiffSHA），用 FIFO + symlink + regular file 验证 FIFO/symlink 返回 `ok=false`、regular file 正常 hash。直接调 helper 确保测试本身不会因 FIFO 阻塞挂起。
+
+### R8-7 — binary untracked protected-copy SHA256 leak (P2)
+
+**问题**：review.go `matchesUntracked` 中，`readUntrackedPatchData` 对小型**二进制** copy of protected file（含 NUL）返回 `(data, size, binaryOrLarge, nil)` —— `data != nil` 且 `reason != nil`。旧代码 `if reason != nil || data == nil { return false }` 在比较 hash 前就返回 false（preserve），`untrackedInfo` 随后 `sha = SHA256Bytes(data)` → 受保护字节的 content-derived fingerprint 泄漏进 `untracked-files.json` / `review.json`。orchestrator 的 `cumulativeUntrackedDigest` 路径用 streaming hash 不受此影响（已正确 suppress）。
+
+**修复**：`matchesUntracked` 改为只在 `data == nil`（symlink / non-regular / large，无字节返回且 `untrackedInfo` 留 `sha=""`）时 preserve；`data != nil`（text **或** binary，有字节）一律先对 `existingHashes` 做 content-hash match，命中则 suppress。这样小型二进制 protected copy 被抑制（无 patch、无 sha）。
+
+**Regression test**：`TestGenerateSuppressesBinaryUntrackedCopyOfProtectedContent`。场景：protected `.env` 含 NUL（二进制）→ cp 到 untracked `safe.txt`。验证 `SECRET=binary` 原文和其 SHA256 fingerprint 都不泄漏、`safe.txt` 无 patch 无 sha、无关 `notes.txt` 被保留。
+
+### 验收对照（Round 8）
+
+| Finding | Severity | Regression test | 修复位置 | 状态 |
+| --- | --- | --- | --- | --- |
+| R8-1 modified tracked protected-copy (review) | P1 | `TestGenerateSuppressesModifiedTrackedCopyOfProtectedFile` | `internal/review/review.go` `collectChanges` + `matchesModifiedTracked` + `isModifiedTrackedRecord` | ✅ |
+| R8-2 modified tracked protected-copy (cumulative) | P2 | `TestFilteredTrackedDiffSkipsModifiedTrackedCopyOfProtectedFile` | `internal/orchestrator/orchestrator.go` `filteredTrackedDiffPathspecs` M-record 分支 | ✅ |
+| R8-3 protected typechange fail-closed (review) | P1 | `TestGenerateFailsClosedOnProtectedTypechange` | `internal/review/review.go` `typechange()` + `protectedDeletedContent` | ✅ |
+| R8-4 protected typechange fail-closed (cumulative) | P2 | `TestFilteredTrackedDiffFailsClosedOnProtectedTypechange` | `internal/orchestrator/orchestrator.go` `deletedProtectedContentHashes` `--diff-filter=DRCT` + T 分支 | ✅ |
+| R8-5 special-file blocking (review hasher) | P2 | `TestReviewHashWorkspaceFileSkipsSpecialFiles` | `internal/review/review.go` `reviewHashWorkspaceFile` Lstat guard | ✅ |
+| R8-6 special-file blocking (cumulative hasher) | P2 | `TestHashWorkspaceFileSkipsSpecialFiles` | `internal/orchestrator/orchestrator.go` `hashWorkspaceFile` Lstat guard | ✅ |
+| R8-7 binary untracked protected-copy SHA256 leak | P2 | `TestGenerateSuppressesBinaryUntrackedCopyOfProtectedContent` | `internal/review/review.go` `matchesUntracked` data!=nil 分支 | ✅ |
+
+### 验收门禁（Round 8）
+
+```
+go test ./internal/review ./internal/orchestrator ./internal/store ./internal/db   PASS
+go test ./...                                                                       PASS
+python3 scripts/validate_contracts.py                                               PASS (contract validation passed)
+bash scripts/acceptance-local.sh                                                    PASS (acceptance-local passed)
+go vet ./internal/review/ ./internal/orchestrator/                                  PASS
+```
+
+### 设计权衡说明
+
+- **M record 在 `unknown=true` 时不 fail-closed**（与 A record 不同）：`unknown=true` 时 `existingHashes` 为 nil（受保护文件 pre-operation worktree bytes 不可恢复），无法做 content-hash match；但 fail-closed **所有** M record 会丢掉无关的 in-progress modification（如 protected rename 期间的 `app.txt` old→new），破坏已批准的 trade-off（`TestGenerateDoesNotReincludeProtectedRenameFromHandoff`）。因此 M record 仅在 `unknown=false`（source REMAINS）时做 content-hash match，`unknown=true` 时保留。"protected delete 的字节被复制到一个 tracked M file" 是一个 residual evasion，A/untracked 的 fail-closed 仅覆盖新文件——这是有意识接受的残余风险，与 review finding 描述的 source-REMAINS 场景一致。
+- **T record 归入 fail-closed**：typechange 的 pre-typechange worktree bytes 不可恢复（regular file 被 symlink 替换后字节消失），且 copy 只会匹配已不存在的 modified bytes 而非 HEAD/index/symlink-target 版本，content-hash match 无法保证安全。因此与 D/R/C 同等 fail-closed。

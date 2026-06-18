@@ -2,10 +2,13 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1770,5 +1773,200 @@ func TestCumulativeUntrackedDigestKeepsEmptyFileWhenProtectedHasNoBlob(t *testin
 	digestNoEmpty := cumulativeUntrackedDigest(ws, nil)
 	if digestWithEmpty == digestNoEmpty {
 		t.Fatalf("cumulative untracked digest did not change when empty.txt was removed; want empty file KEPT (its hash folded in), not suppressed (fix B regression): %q == %q", digestWithEmpty, digestNoEmpty)
+	}
+}
+
+// TestFilteredTrackedDiffSkipsModifiedTrackedCopyOfProtectedFile codifies the
+// D4 / R16 round-8 fix for the modified-tracked-copy P1 leak in the
+// orchestrator's filteredTrackedDiffPathspecs path.
+//
+// Scenario: a protected tracked .env is committed (SECRET=old), MODIFIED to
+// SECRET=new, and an EXISTING tracked non-protected file config.txt is
+// OVERWRITTEN with the modified protected bytes (`cp .env config.txt`,
+// config.txt already tracked → `git diff --name-status` reports
+// `M config.txt`, NOT `A`). Source .env REMAINS. Round 5/6's content-hash
+// check only ran for A records, so `git diff HEAD -- config.txt` hashed the
+// modified protected bytes (SECRET=new) into cumulative_diff_sha.
+//
+// Round 8 extends the content-hash check to M records: config.txt's workspace
+// content matches .env's workspace hash in existingHashes → the M record is
+// skipped. An unrelated modified tracked feature.txt IS kept (the M check is
+// content-hash, not fail-closed-all).
+func TestFilteredTrackedDiffSkipsModifiedTrackedCopyOfProtectedFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=old\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "config.txt"), []byte("base config\n"), 0o644); err != nil {
+		t.Fatalf("write config.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "feature.txt"), []byte("old feature\n"), 0o644); err != nil {
+		t.Fatalf("write feature.txt: %v", err)
+	}
+	gitCommit(t, ws, "base")
+	// MODIFY the protected file (the bytes that will be copied).
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=new\n"), 0o600); err != nil {
+		t.Fatalf("modify .env: %v", err)
+	}
+	// Overwrite the EXISTING tracked config.txt with the modified protected
+	// bytes. git diff --name-status reports `M config.txt`, not `A`.
+	modified, err := os.ReadFile(filepath.Join(ws, ".env"))
+	if err != nil {
+		t.Fatalf("read modified .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "config.txt"), modified, 0o644); err != nil {
+		t.Fatalf("overwrite config.txt: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "add", "config.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add config.txt: %v\n%s", err, out)
+	}
+	// Unrelated modified tracked file — MUST be kept.
+	if err := os.WriteFile(filepath.Join(ws, "feature.txt"), []byte("new feature\n"), 0o644); err != nil {
+		t.Fatalf("modify feature.txt: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "add", "feature.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add feature.txt: %v\n%s", err, out)
+	}
+
+	// Sanity: confirm git reports config.txt as M (not A).
+	probe, err := exec.Command("git", "-C", ws, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "-z", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("name-status probe: %v", err)
+	}
+	if !strings.Contains(string(probe), "M\x00config.txt") {
+		t.Fatalf("config.txt not reported as a modified (M) record; test premise invalid:\n%q", string(probe))
+	}
+
+	diff := string(filteredTrackedDiff(ws, nil))
+	// The modified protected bytes MUST NOT leak via config.txt.
+	if strings.Contains(diff, "SECRET=new") {
+		t.Fatalf("filtered tracked diff leaked modified protected bytes via modified-tracked copy config.txt:\n%s", diff)
+	}
+	if strings.Contains(diff, "diff --git a/config.txt b/config.txt") {
+		t.Fatalf("filtered tracked diff included modified-tracked-copy-of-protected config.txt:\n%s", diff)
+	}
+	// The unrelated modified feature.txt MUST be kept.
+	if !strings.Contains(diff, "diff --git a/feature.txt b/feature.txt") {
+		t.Fatalf("filtered tracked diff dropped unrelated modified tracked feature.txt (correlation broken):\n%s", diff)
+	}
+	if !strings.Contains(diff, "+new feature") {
+		t.Fatalf("filtered tracked diff missing feature.txt content:\n%s", diff)
+	}
+}
+
+// TestFilteredTrackedDiffFailsClosedOnProtectedTypechange codifies the D4 / R16
+// round-8 fix for the protected-typechange P1 leak in the orchestrator's
+// deletedProtectedContentHashes path.
+//
+// Scenario: a protected tracked .env is committed (SECRET=old), MODIFIED to
+// SECRET=new, copied into a new added public.txt (filler + the secret so it
+// is reported as A, not C), then the protected .env is REPLACED BY A SYMLINK
+// (`rm .env; ln -s public.txt .env`). `git diff --name-status` reports
+// `T .env` (typechange) plus `A public.txt`. Round 4/5/6 used
+// `--diff-filter=DRC`, which EXCLUDES T, so a protected typechange left
+// hashesUnknown=false and the added public.txt (a copy of the now-unrecoverable
+// modified .env bytes) was kept → SECRET=new hashed into cumulative_diff_sha.
+//
+// Round 8 uses `--diff-filter=DRCT` and treats a protected T as fail-closed:
+// hashesUnknown=true → the A record (public.txt) is skipped. The modified
+// protected bytes never enter the diff.
+func TestFilteredTrackedDiffFailsClosedOnProtectedTypechange(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=old\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	gitCommit(t, ws, "add env")
+	// MODIFY the protected file.
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=new\n"), 0o600); err != nil {
+		t.Fatalf("modify .env: %v", err)
+	}
+	// public.txt = filler + the modified protected bytes, large enough to
+	// fall below git's copy similarity threshold → reported as A (not C).
+	var pb strings.Builder
+	for i := 0; i < 20; i++ {
+		pb.WriteString("filler line 0123456789\n")
+	}
+	pb.WriteString("SECRET=new\n")
+	if err := os.WriteFile(filepath.Join(ws, "public.txt"), []byte(pb.String()), 0o644); err != nil {
+		t.Fatalf("write public.txt: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "add", "public.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add public.txt: %v\n%s", err, out)
+	}
+	// Replace the protected .env with a symlink → typechange (T).
+	if err := os.Remove(filepath.Join(ws, ".env")); err != nil {
+		t.Fatalf("rm .env: %v", err)
+	}
+	if err := os.Symlink("public.txt", filepath.Join(ws, ".env")); err != nil {
+		t.Fatalf("symlink .env -> public.txt: %v", err)
+	}
+
+	// Sanity: confirm git reports a T record on .env under DRCT (and that
+	// the old DRC filter would have MISSED it).
+	probeDRCT, err := exec.Command("git", "-C", ws, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "--diff-filter=DRCT", "-z", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("DRCT probe: %v", err)
+	}
+	if !strings.Contains(string(probeDRCT), "T\x00.env") {
+		t.Fatalf("protected .env not reported as a typechange (T) under DRCT; test premise invalid:\n%q", string(probeDRCT))
+	}
+
+	diff := string(filteredTrackedDiff(ws, nil))
+	if strings.Contains(diff, "SECRET=new") {
+		t.Fatalf("filtered tracked diff leaked protected bytes via added public.txt in protected-typechange scenario:\n%s", diff)
+	}
+	if strings.Contains(diff, "diff --git a/public.txt b/public.txt") {
+		t.Fatalf("filtered tracked diff kept added public.txt (A record) in protected-typechange fail-closed mode:\n%s", diff)
+	}
+}
+
+// TestHashWorkspaceFileSkipsSpecialFiles codifies the D4 / R16 round-8 fix
+// for the special-file blocking P2 in the orchestrator's hashWorkspaceFile.
+//
+// A protected path that is a FIFO, device, or symlink must NOT be opened +
+// io.Copy'd (a FIFO/device can block indefinitely during
+// computeCumulativeDiffSHA, which calls this for every enumerated protected
+// file and every added/untracked candidate). The helper now Lstat's first
+// and returns ok=false for non-regular files and symlinks. This test
+// exercises the helper directly (not via computeCumulativeDiffSHA) so it
+// cannot hang the suite on a FIFO.
+func TestHashWorkspaceFileSkipsSpecialFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// FIFO.
+	fifoPath := filepath.Join(dir, ".env")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	if _, ok := hashWorkspaceFile(fifoPath); ok {
+		t.Fatalf("hashWorkspaceFile opened a FIFO (would block); want ok=false")
+	}
+
+	// Symlink (could target a blocking device or a protected file).
+	linkPath := filepath.Join(dir, "id_rsa")
+	if err := os.Symlink(fifoPath, linkPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if _, ok := hashWorkspaceFile(linkPath); ok {
+		t.Fatalf("hashWorkspaceFile followed a symlink; want ok=false")
+	}
+
+	// Regular file — must still hash normally.
+	regularPath := filepath.Join(dir, "regular.txt")
+	if err := os.WriteFile(regularPath, []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write regular: %v", err)
+	}
+	h := sha256.Sum256([]byte("hello\n"))
+	want := hex.EncodeToString(h[:])
+	got, ok := hashWorkspaceFile(regularPath)
+	if !ok {
+		t.Fatalf("hashWorkspaceFile skipped a regular file; want ok=true")
+	}
+	if got != want {
+		t.Fatalf("hashWorkspaceFile regular hash = %q, want %q", got, want)
 	}
 }
