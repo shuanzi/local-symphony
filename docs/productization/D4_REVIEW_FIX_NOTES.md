@@ -264,3 +264,36 @@ bash scripts/acceptance-local.sh                                                
 - **snapshot 优先于 live config**：review 必须用 run dispatch 时捕获的策略，而非实时 WORKFLOW.md。snapshot 的 `config_json` 是 dispatch 时 `EffectiveConfig` 的精确快照。回退链（snapshot → live `config.Load` → `DefaultPolicy`）保证老 run（无 snapshot）不崩，且回退仍用 defaults（安全）。
 - **`T` record 不 blanket fail-closed**：与 M 一致——`unknown=true` 时保留无关 typechange（如 app 配置文件类型变更），仅 `unknown=false` 时对 emit 字节做 content-hash match。"protected delete 字节被塞进非保护 path 的 typechange symlink target" 是 `unknown=true` 下的 residual evasion，A/untracked 的 fail-closed 不覆盖 typechange——这是有意识接受的残余风险（与 M 同类），与 finding 描述的 source-REMAINS 场景一致。
 - **`=` boundary 不影响 path**：`=` 不在 path segment / identifier 中出现，加它只影响 key/value prose 形态。path 中的 `.` 仍由 `isPathPunctuationBoundary` 特殊处理（path 内的点不是 boundary）。
+
+---
+
+## Round 11：typechange symlink target 尾部换行符归一化
+
+**Trigger**: codex 审查 commit `f20a9d1`，1 条新 finding（G，P1）。
+
+### 发现列表
+
+| 编号 | 发现 | 严重度 | 回归测试 | 涉及文件 | 状态 |
+|------|------|--------|----------|----------|------|
+| R11-G | shell-trimmed symlink target hashes | P1 | 已有 `TestFilteredTrackedDiffSkipsProtectedBytesInTrackedTypechange` / `TestGenerateSuppressesProtectedBytesInTrackedTypechange` 覆盖核心路径 | `internal/review/review.go` `matchesTypechangeTracked` + `internal/orchestrator/orchestrator.go` `hashTypechangeEmittedBytes` | ✅ |
+
+### 详情
+
+**G (P1) — shell-trimmed symlink target hashes**：
+
+`ln -s "$(cat .env)" config.txt` 场景中，shell 命令替换 `$(cat .env)` 会截去尾部换行符。当 `.env` 末尾是 `\n`（`"SECRET=real\n"`）时，symlink target 是 `"SECRET=real"`（无换行），但 `existingHashes` 存的是 `SHA256("SECRET=real\n")`（从磁盘文件读取）。`matchesTypechangeTracked` 和 `hashTypechangeEmittedBytes` 的 hash 比对失败 → typechange 的 patch 泄漏 secret。
+
+**修复**：
+
+- `review.go` `matchesTypechangeTracked`：在 `os.Readlink` 返回后，先检查 `target` 的 hash，再检查 `target+"\n"` 的 hash（覆盖 shell 截断场景）。
+- `orchestrator.go` `hashTypechangeEmittedBytes`：返回类型从 `(string, bool)` 改为 `([]string, bool)`，返回多个 hash 变体（`target` + `target+"\n"`）。调用方遍历所有 hash 比 `existingHashes`。
+- `target+"\n" != target` 的 guard 确保在 target 自身含 `\n` 时不重复计算。
+
+### 验收门
+
+```
+go test ./...                                   PASS
+go vet ./...                                    PASS
+validate_contracts.py                           PASS
+acceptance-local.sh                             PASS
+```
