@@ -340,3 +340,43 @@ go vet ./...                                    PASS
 validate_contracts.py                           PASS
 acceptance-local.sh                             PASS
 ```
+
+
+---
+
+## Round 13: M fail-closed + modified symlink target + blob rtrim
+
+**Trigger**: codex review commit `b7c2220`, 6 findings (L/N/P P1, M/O/Q P2).
+
+| ID | Finding | Severity | Files | Status |
+|----|---------|----------|-------|--------|
+| R13-L | M unknown=true not fail-closed (review) | P1 | review.go matchesModifiedTracked | done |
+| R13-M | M hashesUnknown not fail-closed (orchestrator) | P2 | orchestrator.go filteredTrackedDiffPathspecs | done |
+| R13-N | Modified symlink target hashed as file content | P1 | review.go matchesModifiedTracked | done |
+| R13-O | Same, orchestrator path | P2 | orchestrator.go M guard | done |
+| R13-P | HEAD/index blob missing rtrim variant | P1 | review.go existingProtectedContentHashes | done |
+| R13-Q | Same, orchestrator path | P2 | orchestrator.go existingProtectedContentHashes | done |
+
+### Details
+
+**L/M**: `cp .env config.txt && git rm .env` produces `D .env` + `M config.txt`. Round-8 M guard only checked when !unknown. Fix: always build existingHashes (HEAD/index blobs recoverable via git show even for deleted files). Content-hash-match M records even when unknown=true.
+
+**N/O**: Tracked symlink `config -> safe.txt` modified to `config -> SECRET` reports `M config`. reviewHashWorkspaceFile follows symlinks and hashes target file content, but git diff emits target TEXT. Fix: check os.Readlink first for M symlinks, hash target text.
+
+**P/Q**: Round-12 only added rtrim to workspace hashes. Staged blob `SECRET
+
+` -> `$(git show :.env)` strips both newlines. Fix: add reviewHashGitBlobRTrim / hashGitBlobRTrim, compute rtrim hash for HEAD/index blobs.
+
+### Design trade-offs
+
+- **existingHashes always built**: HEAD/index blobs recoverable even when unknown=true. Workspace version of deleted file naturally skipped (os.ReadFile fails). Enables M/T content-hash matching without blanket fail-closed.
+- **Symlink target first**: os.Readlink on M symlinks before falling back to file content hash. Matches what git diff actually emits.
+
+### Acceptance gate
+
+```
+go test ./...                                   PASS
+go vet ./...                                    PASS
+validate_contracts.py                           PASS
+acceptance-local.sh                             PASS
+```

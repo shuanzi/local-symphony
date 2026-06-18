@@ -522,14 +522,13 @@ func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]strin
 	// a match. See existingProtectedContentHashes for the full rationale
 	// and the documented filler-copy residual risk.
 	_, hashesUnknown := deletedProtectedContentHashes(root, protectedPaths)
-	// When not unknown (no protected delete/rename/copy — all protected
-	// files REMAIN), build the existing-protected-content hash set ONCE
-	// and content-hash-match each A record against it. When unknown, the
-	// set is unused (we skip ALL A records unconditionally).
+	// D4/R16 round-13 (codex finding M): always build
+	// existingHashes, even when hashesUnknown=true. The
+	// HEAD/index versions of deleted protected files are
+	// still recoverable via git show and provide the hash
+	// set for content-matching M/T records.
 	var existingHashes map[string]bool
-	if !hashesUnknown {
-		existingHashes = existingProtectedContentHashes(root, protectedPaths)
-	}
+	existingHashes = existingProtectedContentHashes(root, protectedPaths)
 	safe := []string{}
 	for _, record := range records {
 		// Per-record protected check: a record whose source or
@@ -609,25 +608,48 @@ func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]strin
 		// workspace content matches an existing protected version's hash,
 		// so the same content-hash check suppresses it. This is the
 		// source-REMAINS case (unknown=false). When hashesUnknown=true we
-		// do NOT fail-closed M records (unlike A) — an unrelated
-		// in-progress modification is preserved (mirrors the review path's
-		// trade-off); a protected delete whose bytes were copied onto a
-		// tracked M file is a residual evasion the A/untracked fail-closed
-		// covers only for new files.
+		// now ALSO fail-closed M records (round-13 finding M) — a
+		// protected delete whose bytes were copied onto a tracked M
+		// file (`cp .env config.txt && git rm .env`) would otherwise
+		// leak into cumulative_diff_sha.
 		if strings.HasPrefix(record.status, "M") {
-			if !hashesUnknown && len(existingHashes) > 0 {
+			if hashesUnknown {
+				// D4/R16 round-13 (codex finding M): when a protected
+				// tracked file was deleted/renamed/copied/typechanged
+				// (hashesUnknown=true), the pre-operation bytes are
+				// unrecoverable. An M record whose workspace content
+				// was overwritten with protected bytes (`cp .env
+				// config.txt && git rm .env`) would leak into
+				// cumulative_diff_sha. Fail closed: skip ALL M records.
+				continue
+			}
+			if len(existingHashes) > 0 {
 				dst := record.paths[len(record.paths)-1]
-				h, ok := hashWorkspaceFile(filepath.Join(root, dst))
-				if !ok {
-					// Cannot read the file's workspace bytes → cannot
-					// prove it is safe → skip (fail closed for THIS file).
-					continue
-				}
-				if existingHashes[h] {
-					// M file's content matches a recoverable version of
-					// an existing protected file → copy of protected
-					// content → skip so its bytes never enter the diff.
-					continue
+				// D4/R16 round-13 (codex finding O): for a modified
+				// symlink, git diff emits the symlink TARGET TEXT,
+				// not the target file content. Check the target
+				// text first via os.Readlink before falling back
+				// to hashWorkspaceFile (which follows symlinks).
+				full := filepath.Join(root, dst)
+				if target, rerr := os.Readlink(full); rerr == nil {
+					// M file is a symlink → git diff emits
+					// target text. Hash the target text.
+					h2 := sha256.Sum256([]byte(target))
+					h := hex.EncodeToString(h2[:])
+					if existingHashes[h] {
+						continue
+					}
+				} else {
+					h, ok := hashWorkspaceFile(full)
+					if !ok {
+						// Cannot read → cannot prove
+						// safe → skip (fail closed for
+						// THIS file).
+						continue
+					}
+					if existingHashes[h] {
+						continue
+					}
 				}
 			}
 		}
@@ -646,7 +668,7 @@ func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]strin
 		// symlink, hash the target text (what git diff emits); otherwise
 		// hash the workspace file content.
 		if strings.HasPrefix(record.status, "T") {
-			if !hashesUnknown && len(existingHashes) > 0 {
+			if len(existingHashes) > 0 {
 				dst := record.paths[len(record.paths)-1]
 				h, ok := hashTypechangeEmittedBytes(root, dst)
 				if !ok {
@@ -754,11 +776,10 @@ func cumulativeUntrackedDigest(root string, protectedPaths []string) string {
 	// read ONCE and the hash is reused for both the match check and the
 	// digest write (bounded memory, no double read).
 	_, hashesUnknown := deletedProtectedContentHashes(root, protectedPaths)
-	// When not unknown, build the existing-protected-content hash set ONCE.
+	// D4/R16 round-13 (codex finding M): always build
+	// existingHashes, even when hashesUnknown=true.
 	var existingHashes map[string]bool
-	if !hashesUnknown {
-		existingHashes = existingProtectedContentHashes(root, protectedPaths)
-	}
+	existingHashes = existingProtectedContentHashes(root, protectedPaths)
 	paths := strings.Split(string(out), "\x00")
 	paths = paths[:len(paths)-1]
 	sort.Strings(paths)
@@ -1134,11 +1155,25 @@ func existingProtectedContentHashes(root string, protectedPaths []string) map[st
 		// be untracked-new, no HEAD version).
 		if h, ok := hashGitBlob(root, "HEAD:"+rel); ok {
 			set[h] = true
+			// D4/R16 round-13 (codex finding Q): add
+			// trailing-newline-stripped (rtrim) variant for
+			// HEAD blob too. `$(git show :.env)` strips
+			// trailing newlines, so a symlink target
+			// created from the staged blob text may not
+			// match the exact blob hash.
+			if rtrimHash, ok := hashGitBlobRTrim(root, "HEAD:"+rel); ok && rtrimHash != h {
+				set[rtrimHash] = true
+			}
 		}
 		// (c) index version — the staged bytes. Skip on error (file may be
 		// untracked, no index version).
 		if h, ok := hashGitBlob(root, ":"+rel); ok {
 			set[h] = true
+			// D4/R16 round-13 (codex finding Q): same rtrim
+			// variant for the staged/index blob.
+			if rtrimHash, ok := hashGitBlobRTrim(root, ":"+rel); ok && rtrimHash != h {
+				set[rtrimHash] = true
+			}
 		}
 	}
 	return set
@@ -1239,6 +1274,29 @@ func hashGitBlob(root, spec string) (string, bool) {
 		return "", false // git show failed (no such blob, non-zero exit) → absent
 	}
 	return hex.EncodeToString(h.Sum(nil)), true
+}
+
+// hashGitBlobRTrim streams `git -C root show <spec>` output, reads the
+// full blob content, trims trailing newlines, and returns the SHA256 hex
+// hash of the trimmed content. D4/R16 round-13 (codex finding Q): `$(git
+// show :.env)` strips trailing newlines, so a symlink target created from
+// a staged blob text may not match the exact blob hash. The rtrim variant
+// is added to existingHashes alongside the exact blob hash.
+func hashGitBlobRTrim(root, spec string) (string, bool) {
+	cmd := exec.Command("git", "-C", root, "show", spec)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", false
+	}
+	trimmed := string(bytes.TrimRight(out, "\n"))
+	if len(trimmed) == len(out) {
+		// No trailing newlines were stripped — the rtrim hash is
+		// identical to the exact blob hash, and the caller already
+		// added that.
+		return "", false
+	}
+	h := sha256.Sum256([]byte(trimmed))
+	return hex.EncodeToString(h[:]), true
 }
 
 func runnerForRun(run *core.RunAttempt, wf *config.Workflow) agentrunner.Runner {

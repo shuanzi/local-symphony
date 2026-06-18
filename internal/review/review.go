@@ -422,14 +422,10 @@ func collectChanges(root string, protectedPaths []string) ([]string, []Untracked
 				// the review finding describes, so it only fires when
 				// unknown=false (no protected delete/rename/copy/typechange):
 				// existingHashes is built and a content-hash match suppresses
-				// the M record. When unknown=true we do NOT fail-closed M
-				// records (unlike A) — an unrelated in-progress modification
-				// such as app.txt old→new is preserved, matching the
-				// user-approved trade-off codified by
-				// TestGenerateDoesNotReincludeProtectedRenameFromHandoff. A
-				// protected delete whose bytes were copied onto a tracked M
-				// file in the same worktree is a residual evasion the
-				// unknown=true fail-closed covers only for A/untracked.
+				// the M record. When unknown=true we now ALSO fail-closed M
+				// records (round-13 finding L) — a protected delete whose
+				// bytes were copied onto a tracked M file (`cp .env
+				// config.txt && git rm .env`) would otherwise leak.
 				dst := safePaths[len(safePaths)-1]
 				if protectedDeleted.matchesModifiedTracked(root, dst) {
 					denied[dst] = true
@@ -691,7 +687,7 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord, prote
 				// unrecoverable when unstaged modifications existed,
 				// and undetectable after deletion. Fail closed: deny
 				// ALL non-path-protected untracked files.
-				return protectedDeletedContentSet{existingHashes: nil, unknown: true}
+				return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: true}
 			}
 			continue
 		}
@@ -709,7 +705,7 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord, prote
 			if path == "" || !security.IsProtectedPathWithConfig(path, protectedPaths) {
 				continue
 			}
-			return protectedDeletedContentSet{existingHashes: nil, unknown: true}
+			return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: true}
 		}
 		if record.typechange() {
 			// D4/R16 round-8: a protected tracked file whose TYPE changed
@@ -731,7 +727,7 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord, prote
 			if path == "" || !security.IsProtectedPathWithConfig(path, protectedPaths) {
 				continue
 			}
-			return protectedDeletedContentSet{existingHashes: nil, unknown: true}
+			return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: true}
 		}
 	}
 	// No protected delete/rename/copy — all protected files REMAIN.
@@ -832,10 +828,24 @@ func existingProtectedContentHashes(root string, protectedPaths []string) map[st
 		// (b) HEAD version — the committed bytes.
 		if h, ok := reviewHashGitBlob(root, "HEAD:"+rel); ok {
 			set[h] = true
+			// D4/R16 round-13 (codex finding P): add
+			// trailing-newline-stripped (rtrim) variant for
+			// HEAD blob too. `$(git show :.env)` strips
+			// trailing newlines, so a symlink target
+			// created from the staged blob text may not
+			// match the exact blob hash.
+			if rtrimHash, ok := reviewHashGitBlobRTrim(root, "HEAD:"+rel); ok && rtrimHash != h {
+				set[rtrimHash] = true
+			}
 		}
 		// (c) index version — the staged bytes.
 		if h, ok := reviewHashGitBlob(root, ":"+rel); ok {
 			set[h] = true
+			// D4/R16 round-13 (codex finding P): same rtrim
+			// variant for the staged/index blob.
+			if rtrimHash, ok := reviewHashGitBlobRTrim(root, ":"+rel); ok && rtrimHash != h {
+				set[rtrimHash] = true
+			}
 		}
 	}
 	return set
@@ -913,6 +923,27 @@ func reviewHashGitBlob(root, spec string) (string, bool) {
 	return hex.EncodeToString(h.Sum(nil)), true
 }
 
+// reviewHashGitBlobRTrim streams `git -C root show <spec>` output, reads the
+// full blob content, trims trailing newlines, and returns the SHA256 hex hash
+// of the trimmed content. D4/R16 round-13 (codex finding P): `$(git show :.env)`
+// strips trailing newlines, so a symlink target created from a staged blob
+// text may not match the exact blob hash. The rtrim variant is added to
+// existingHashes alongside the exact blob hash.
+func reviewHashGitBlobRTrim(root, spec string) (string, bool) {
+	cmd := exec.Command("git", "-C", root, "show", spec)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", false
+	}
+	trimmed := string(bytes.TrimRight(out, "\n"))
+	if len(trimmed) == len(out) {
+		// No trailing newlines were stripped — the rtrim hash is identical
+		// to the exact blob hash, and the caller already added that.
+		return "", false
+	}
+	return security.SHA256Bytes([]byte(trimmed)), true
+}
+
 // matchesAddedTracked reports whether a tracked ADDED (A) file must be
 // suppressed (denied) from the review packet's `changed` list. Mirrors
 // matchesUntracked for the A-record path.
@@ -951,30 +982,64 @@ func (s protectedDeletedContentSet) matchesAddedTracked(root, path string) bool 
 // version's hash, so it is suppressed here. This is the source-REMAINS
 // case the review finding describes.
 //
-// Unlike matchesAddedTracked, this does NOT fail-closed when unknown=true.
-// When a protected file is deleted/renamed/copied/typechanged, existingHashes
-// is nil (the pre-operation protected bytes are unrecoverable), so a
-// content-hash check is impossible; but fail-closing ALL M records would
-// drop unrelated in-progress modifications (e.g. app.txt old→new during a
-// protected rename), breaking the user-approved trade-off codified by
-// TestGenerateDoesNotReincludeProtectedRenameFromHandoff. So:
-//   - When unknown → return false (keep the M record; the A/untracked
-//     fail-closed already covers the copy-of-protected-byte risk for new
-//     files).
-//   - When not unknown and existingHashes is empty → false (no protected
-//     content to match → keep).
-//   - When not unknown and existingHashes is non-empty → content-hash-match
-//     the M file's workspace content; suppress on a match. On read error
-//     return true (fail closed for THIS file — cannot prove it is safe),
-//     which is narrower than fail-closing all M records.
+// D4/R16 round-13 (codex finding L): when unknown=true (a protected
+// tracked file was deleted/renamed/copied/typechanged),
+// existingHashes still contains the HEAD/index versions of
+// deleted protected files (and workspace versions of remaining
+// ones). Content-hash-match the M file's workspace content
+// against this set: `cp .env config.txt && git rm .env` produces
+// `D .env` + `M config.txt` — config.txt's content matches
+// .env's HEAD/index hash → suppress. An unrelated modification
+// (app.txt old→new) does not match → keep. This is narrower
+// than blanket fail-closed and preserves the
+// TestGenerateDoesNotReincludeProtectedRenameFromHandoff contract.
+// So:
+//   - When existingHashes is empty → false (no protected content
+//     to match → keep).
+//   - When existingHashes is non-empty → check symlink target
+//     text first (finding N), then content-hash-match workspace
+//     content; suppress on a match. On read error return true
+//     (fail closed for THIS file).
 func (s protectedDeletedContentSet) matchesModifiedTracked(root, path string) bool {
-	if s.unknown {
-		return false
-	}
 	if len(s.existingHashes) == 0 {
+		// No protected content hashes to match against → keep.
+		// This covers the case where unknown=true AND no
+		// protected files exist at all (empty repo).
 		return false
 	}
-	h, ok := reviewHashWorkspaceFile(filepath.Join(root, path))
+	// D4/R16 round-13 (codex finding L): when unknown=true
+	// (a protected tracked file was deleted/renamed/copied/
+	// typechanged), the pre-operation worktree bytes are
+	// unrecoverable. But existingHashes still contains the
+	// HEAD/index versions of deleted protected files (and
+	// workspace versions of remaining ones). Content-hash-
+	// match the M file's workspace content against this set:
+	// if it matches, suppress (it's a copy of protected
+	// bytes). If it doesn't match, keep it (unrelated
+	// modification like app.txt old→new). This is narrower
+	// than blanket fail-closed and preserves the
+	// TestGenerateDoesNotReincludeProtectedRenameFromHandoff
+	// contract.
+	//
+	// D4/R16 round-13 (codex finding N): for a modified
+	// symlink, git diff emits the symlink TARGET TEXT, not
+	// the target file content. reviewHashWorkspaceFile
+	// follows symlinks (os.Stat) and hashes the target file
+	// — but the emitted bytes are the target text. Check
+	// the target text first via os.Readlink.
+	full := filepath.Join(root, path)
+	if target, rerr := os.Readlink(full); rerr == nil {
+		// M file is a symlink → git diff emits the target text.
+		// Hash the target text and match against existingHashes.
+		if s.existingHashes[security.SHA256Bytes([]byte(target))] {
+			return true
+		}
+		// Target text did not match a protected hash; the
+		// symlink's target FILE content (what git diff would
+		// NOT emit) is not relevant for suppression.
+		return false
+	}
+	h, ok := reviewHashWorkspaceFile(full)
 	if !ok {
 		// Cannot read the M file's workspace bytes → cannot prove it
 		// is safe → fail closed for THIS file only.
@@ -1006,9 +1071,6 @@ func (s protectedDeletedContentSet) matchesModifiedTracked(root, path string) bo
 // the regular file's, which is safe unless it matches protected content —
 // covered by reading the workspace content via reviewHashWorkspaceFile).
 func (s protectedDeletedContentSet) matchesTypechangeTracked(root, path string) bool {
-	if s.unknown {
-		return false
-	}
 	if len(s.existingHashes) == 0 {
 		return false
 	}
