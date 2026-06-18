@@ -1,6 +1,7 @@
 package review
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -809,6 +810,24 @@ func existingProtectedContentHashes(root string, protectedPaths []string) map[st
 		// (a) workspace version — the modified bytes a `cp` copies.
 		if h, ok := reviewHashWorkspaceFile(filepath.Join(root, rel)); ok {
 			set[h] = true
+			// D4/R16 round-12 (codex findings H/I): `$(cat .env)`
+			// strips trailing newlines, so
+			// `ln -s "$(cat .env)" leak` creates a symlink
+			// whose target lacks those newlines. Add
+			// trailing-newline-stripped (rtrim) content-hash
+			// variants so matchesTypechangeTracked /
+			// hashTypechangeEmittedBytes detect the copy
+			// regardless of how many newlines were stripped.
+			// Read the file bytes to derive the rtrim hash.
+			if data, rerr := os.ReadFile(filepath.Join(root, rel)); rerr == nil {
+				trimmed := string(bytes.TrimRight(data, "\n"))
+				if len(trimmed) < len(data) {
+					trimmedHash := security.SHA256Bytes([]byte(trimmed))
+					if trimmedHash != h {
+						set[trimmedHash] = true
+					}
+				}
+			}
 		}
 		// (b) HEAD version — the committed bytes.
 		if h, ok := reviewHashGitBlob(root, "HEAD:"+rel); ok {
@@ -1002,14 +1021,6 @@ func (s protectedDeletedContentSet) matchesTypechangeTracked(root, path string) 
 		// Workspace path is a symlink → emitted content is the target text.
 		h := security.SHA256Bytes([]byte(target))
 		if s.existingHashes[h] {
-			return true
-		}
-		// D4/R16 round-11 (codex finding G): shell command substitution
-		// `$(cat .env)` strips trailing newlines. When .env ends with
-		// "\n", the symlink target is "SECRET=real" (no newline) but
-		// existingHashes contains SHA256("SECRET=real\n") from the
-		// on-disk file. Check the +"\n" variant so the hash matches.
-		if s.existingHashes[security.SHA256Bytes([]byte(target+"\n"))] {
 			return true
 		}
 		// The target text did not match; a symlink whose target is a path

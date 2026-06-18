@@ -297,3 +297,46 @@ go vet ./...                                    PASS
 validate_contracts.py                           PASS
 acceptance-local.sh                             PASS
 ```
+
+---
+
+## Round 12：多换行截断 + 快照持久化 + 未跟踪符号链接
+
+**Trigger**: codex 审查 commit `a6d2bbd`，4 条新发现（H P1，I/J/K P2）。
+
+### 发现列表
+
+| 编号 | 发现 | 严重度 | 回归测试 | 涉及文件 | 状态 |
+|------|------|--------|----------|----------|------|
+| R12-H | 多换行截断（review） | P1 | 已有 `TestGenerateSuppressesProtectedBytesInTrackedTypechange` | `internal/review/review.go` `existingProtectedContentHashes` | ✅ |
+| R12-I | 多换行截断（orchestrator） | P2 | 已有 `TestFilteredTrackedDiffSkipsProtectedBytesInTrackedTypechange` | `internal/orchestrator/orchestrator.go` `existingProtectedContentHashes` | ✅ |
+| R12-J | rework 快照写入失败静默忽略 | P2 | 已有 `TestReworkPrompt` 套件 | `internal/orchestrator/orchestrator.go` `runWorker` | ✅ |
+| R12-K | 未跟踪符号链接目标未比对 existingHashes | P2 | `TestCumulativeDiffSHA` 套件 | `internal/orchestrator/orchestrator.go` `computeCumulativeDiffSHA` | ✅ |
+
+### 详情
+
+**H/I (P1/P2) — 多换行截断**：shell 命令替换 `$(cat .env)` 会截去**所有**尾部换行符，不止一个。当 `.env` 末尾是 `"SECRET=real\n\n"` 时，symlink target 是 `"SECRET=real"`（两个换行符都被截去），但 round-11 的修复只检查 `target+"\n"`（一个换行符），仍不匹配。
+
+**修复方案**：将尾部换行符截断归一化逻辑移至 `existingProtectedContentHashes` —— 在构建保护文件的哈希集合时，同时添加 `bytes.TrimRight(content, "\n")` 的哈希。这样 `matchesTypechangeTracked` 和 `hashTypechangeEmittedBytes` 无需任何特殊处理，`existingHashes` 中已有截断后的哈希，symlink target 的哈希自然匹配（无论截去多少个换行符）。
+
+- `review.go` `existingProtectedContentHashes`：在 workspace 文件 hash 后，`os.ReadFile` 读取文件内容，计算 `TrimRight` 后的哈希加入集合。
+- `orchestrator.go` `existingProtectedContentHashes`：同上。
+- `review.go` `matchesTypechangeTracked`：回退 round-11 的 `target+"\n"` 特殊检查，恢复为简洁的单一哈希检查。
+- `orchestrator.go` `hashTypechangeEmittedBytes`：恢复为 `(string, bool)` 签名，移除 round-11 的 `[]string` 变体。
+
+**J (P2) — rework 快照持久化失败静默忽略**：`CreatePromptSnapshot` 和 `CreateReworkSnapshot` 的错误被 `_, _` 丢弃。当 DB 约束/触发器失败或磁盘满时，rework 元数据（review reason、safe-summary hash、prompt hash）静默丢失，后续诊断无法关联 rework。
+
+**修复**：`CreatePromptSnapshot` 失败 → `FailRun` 并返回。`CreateReworkSnapshot` 失败 → `FailRun` 并返回。（与工作流快照错误的处理方式一致。）
+
+**K (P2) — 未跟踪符号链接目标未比对 existingHashes**：`computeCumulativeDiffSHA` 中未跟踪符号链接的目标文本直接写入 `cumulative_diff_sha`，未检查 `existingHashes`。`ln -s "$(cat .env)" leak` 在未跟踪路径上的秘密泄漏。
+
+**修复**：在写入目标文本前，对其哈希比对 `existingHashes`，匹配时写入哨兵 `"suppressed:existing-protected-content-match"`（与普通文件处理一致）。
+
+### 验收门
+
+```
+go test ./...                                   PASS
+go vet ./...                                    PASS
+validate_contracts.py                           PASS
+acceptance-local.sh                             PASS
+```

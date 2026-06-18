@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -206,10 +207,15 @@ func (o Orchestrator) runWorker(runID string, wf *config.Workflow) error {
 		ph := sha256.Sum256([]byte(prompt))
 		ch := sha256.Sum256([]byte(issue.ID + runID))
 		psID, psErr := o.Store.CreatePromptSnapshot(runID, wfID, hex.EncodeToString(ch[:]), hex.EncodeToString(ph[:]), promptRoot)
-		if psErr == nil && psID != "" {
-			reworkRec.PromptSnapshotID = psID
-			reworkRec.PromptHash = promptHash
-			_, _ = o.Store.CreateReworkSnapshot(reworkRec)
+		if psErr != nil {
+			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("create prompt snapshot: %v", psErr), core.RunFailed)
+			return nil
+		}
+		reworkRec.PromptSnapshotID = psID
+		reworkRec.PromptHash = promptHash
+		if _, err := o.Store.CreateReworkSnapshot(reworkRec); err != nil {
+			_ = o.Store.FailRun(runID, core.FailurePromptRenderFailed, fmt.Sprintf("create rework snapshot: %v", err), core.RunFailed)
+			return nil
 		}
 	} else {
 		// PR #27 / D4 F2: write a metadata-only redacted artifact
@@ -642,21 +648,14 @@ func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]strin
 		if strings.HasPrefix(record.status, "T") {
 			if !hashesUnknown && len(existingHashes) > 0 {
 				dst := record.paths[len(record.paths)-1]
-				hashes, ok := hashTypechangeEmittedBytes(root, dst)
+				h, ok := hashTypechangeEmittedBytes(root, dst)
 				if !ok {
 					// Cannot read the emitted bytes → cannot prove they
 					// are safe → skip (fail closed for THIS file), mirroring
 					// the M guard.
 					continue
 				}
-				matched := false
-				for _, h := range hashes {
-					if existingHashes[h] {
-						matched = true
-						break
-					}
-				}
-				if matched {
+				if existingHashes[h] {
 					// Emitted bytes match a recoverable version of an
 					// existing protected file → skip so its bytes never
 					// enter the diff.
@@ -840,6 +839,21 @@ func cumulativeUntrackedDigest(root string, protectedPaths []string) string {
 			_, _ = h.Write([]byte(fileHash))
 		} else if info.Mode()&os.ModeSymlink != 0 {
 			if target, err := os.Readlink(path); err == nil {
+				// D4/R16 round-12 (codex finding K): an
+				// untracked symlink whose target text is
+				// copied from a protected file must not
+				// leak into cumulative_diff_sha.
+				// Hash-match the target text against
+				// existingHashes; on match write a sentinel.
+				if len(existingHashes) > 0 {
+					h2 := sha256.Sum256([]byte(target))
+					targetHash := hex.EncodeToString(h2[:])
+					if existingHashes[targetHash] {
+						_, _ = h.Write([]byte("suppressed:existing-protected-content-match"))
+						_, _ = h.Write([]byte{0})
+						continue
+					}
+				}
 				_, _ = h.Write([]byte(target))
 			}
 		}
@@ -1096,6 +1110,25 @@ func existingProtectedContentHashes(root string, protectedPaths []string) map[st
 		// deleted in workspace but present in index/HEAD).
 		if h, ok := hashWorkspaceFile(filepath.Join(root, rel)); ok {
 			set[h] = true
+			// D4/R16 round-12 (codex findings H/I): `$(cat .env)`
+			// strips trailing newlines, so
+			// `ln -s "$(cat .env)" leak` creates a symlink
+			// whose target lacks those newlines. Add
+			// trailing-newline-stripped (rtrim) content-hash
+			// variants so hashTypechangeEmittedBytes /
+			// matchesTypechangeTracked detect the copy
+			// regardless of how many newlines were stripped.
+			// Read the file bytes to derive the rtrim hash.
+			if data, rerr := os.ReadFile(filepath.Join(root, rel)); rerr == nil {
+				trimmed := string(bytes.TrimRight(data, "\n"))
+				if len(trimmed) < len(data) {
+					h2 := sha256.Sum256([]byte(trimmed))
+					trimmedHash := hex.EncodeToString(h2[:])
+					if trimmedHash != h {
+						set[trimmedHash] = true
+					}
+				}
+			}
 		}
 		// (b) HEAD version — the committed bytes. Skip on error (file may
 		// be untracked-new, no HEAD version).
@@ -1156,44 +1189,29 @@ func hashWorkspaceFile(path string) (string, bool) {
 	return hex.EncodeToString(h.Sum(nil)), true
 }
 
-// hashTypechangeEmittedBytes returns the SHA256 hashes of the bytes `git diff
-// HEAD -- <rel>` would EMIT for a typechanged (T) tracked file at root/rel —
-// i.e. the content that would be folded into cumulative_diff_sha. For a regular
+// hashTypechangeEmittedBytes returns the SHA256 of the bytes `git diff HEAD
+// -- <rel>` would EMIT for a typechanged (T) tracked file at root/rel — i.e.
+// the content that would be folded into cumulative_diff_sha. For a regular
 // file → symlink typechange, git diff emits the symlink TARGET text (the
 // stored link target), so we hash os.Readlink's result. For a symlink →
 // regular (or other) typechange, git diff emits the new regular file's
 // content, so we hash the workspace file via hashWorkspaceFile. Returns
-// multiple hash variants to handle shell command-substitution trailing-newline
-// stripping (round-11 finding G). Returns ok=false when the bytes cannot be
-// read (caller keeps the record — a non-readable typechange cannot be
-// content-matched, and unlike A we do not blanket fail-closed T records on
-// read error; the protected-source fail-closed via hashesUnknown covers the
-// dangerous protected-operation case).
+// ok=false when the bytes cannot be read (caller keeps the record — a
+// non-readable typechange cannot be content-matched, and unlike A we do not
+// blanket fail-closed T records on read error; the protected-source
+// fail-closed via hashesUnknown covers the dangerous protected-operation
+// case).
 //
 // D4/R16 round-10 (codex finding F).
-func hashTypechangeEmittedBytes(root, rel string) ([]string, bool) {
+func hashTypechangeEmittedBytes(root, rel string) (string, bool) {
 	full := filepath.Join(root, rel)
 	if target, err := os.Readlink(full); err == nil {
 		// Workspace path is a symlink → git diff emits the target text.
 		h := sha256.Sum256([]byte(target))
-		hashes := []string{hex.EncodeToString(h[:])}
-		// D4/R16 round-11 (codex finding G): shell command substitution
-		// `$(cat .env)` strips trailing newlines. When .env ends with
-		// "\n", the symlink target is "SECRET=real" (no newline) but
-		// existingHashes contains SHA256("SECRET=real\n") from the
-		// on-disk file. Also return the +"\n" variant so the caller
-		// can match against the on-disk file hash.
-		if s := target + "\n"; s != target {
-			h2 := sha256.Sum256([]byte(s))
-			hashes = append(hashes, hex.EncodeToString(h2[:]))
-		}
-		return hashes, true
+		return hex.EncodeToString(h[:]), true
 	}
 	// Not a symlink → git diff emits the workspace file content.
-	if h, ok := hashWorkspaceFile(full); ok {
-		return []string{h}, true
-	}
-	return nil, false
+	return hashWorkspaceFile(full)
 }
 // any error (spec refers to an absent blob, git failure, etc.).
 //
