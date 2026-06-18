@@ -540,30 +540,49 @@ func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]strin
 		if protected {
 			continue
 		}
-		// Added tracked file (status A): fail-closed on any protected
-		// delete/rename/copy/typechange. `record.paths[len-1]` is the
-		// destination path git diff would emit.
-		if strings.HasPrefix(record.status, "A") {
+		// Added tracked file (status A) or copy destination (status C):
+		// fail-closed on any protected delete/rename/copy/typechange.
+		// `record.paths[len-1]` is the destination path git diff would
+		// emit.
+		//
+		// D4/R16 round-9: the C case closes the symlinked-protected-source
+		// leak (finding B). `git diff --find-copies-harder` reports a
+		// verbatim copy of a protected file as `C<score> <src> <dst>` —
+		// NOT `A` — when git can match it to a tracked source blob. When
+		// the protected file is a SYMLINK to a regular secret (`.env ->
+		// shared/env`), the copy is detected as `C shared/env public.txt`
+		// (source = the non-protected regular target), so the per-record
+		// protected-source check does NOT fire, the A-record content-hash
+		// check does NOT run (status is C, not A), and `git diff HEAD --
+		// public.txt` hashed the protected bytes into cumulative_diff_sha.
+		// Round 9's Stat-follows-symlinks fix puts the symlinked protected
+		// bytes into existingHashes; we now content-hash-check C
+		// destinations too (same fail-closed + content-hash logic as A),
+		// so the copy is suppressed.
+		if strings.HasPrefix(record.status, "A") || strings.HasPrefix(record.status, "C") {
 			if hashesUnknown {
 				// A protected tracked file was deleted/renamed/copied/
-				// typechanged → cannot rule out this A file holding
+				// typechanged → cannot rule out this A/C file holding
 				// modified-then-copied protected bytes → skip (fail
 				// closed). The index-vs-worktree mismatch (P1#2) is moot:
-				// the A file's diff never runs.
+				// the file's diff never runs.
 				continue
 			}
-			// Round 6: no protected delete/rename/copy/typechange, but the
-			// A file may be a copy of a MODIFIED protected file (source
-			// remains). Hash the A file's WORKSPACE content (the bytes
-			// `git diff HEAD -- <path>` emits) and skip it if the hash
-			// matches any recoverable protected version. On read error,
-			// SKIP (fail closed for that file — cannot prove it is safe).
+			// Round 6/9: no protected delete/rename/copy/typechange, but the
+			// A/C file may hold protected bytes — a copy of a MODIFIED
+			// protected file (A, source remains), or a verbatim copy git
+			// matched to a non-protected source that equals protected
+			// content reachable via a protected symlink (C, finding B).
+			// Hash the file's WORKSPACE content (the bytes `git diff
+			// HEAD -- <path>` emits) and skip it if the hash matches any
+			// recoverable protected version. On read error, SKIP (fail
+			// closed for that file — cannot prove it is safe).
 			//
 			// Fast path: when there are NO existing protected files at all
-			// (len(existingHashes)==0), no A file can be a copy of
-			// protected content, so we skip the read+hash and keep the A
-			// record directly — full common-case correlation with zero
-			// per-A I/O.
+			// (len(existingHashes)==0), no A/C file can hold protected
+			// content, so we skip the read+hash and keep the record
+			// directly — full common-case correlation with zero per-file
+			// I/O.
 			dst := record.paths[len(record.paths)-1]
 			if len(existingHashes) > 0 {
 				h, ok := hashWorkspaceFile(filepath.Join(root, dst))
@@ -1057,22 +1076,32 @@ func existingProtectedContentHashes(root string, protectedPaths []string) map[st
 // (bounded memory via io.Copy) and returns the hex hash. Returns ok=false on
 // any error (file absent, permission, etc.).
 //
-// D4/R16 round-8 fix: Lstat first and refuse to open non-regular files
-// (FIFOs, devices) and symlinks. A protected path that is a FIFO, a device,
-// or a symlink to /dev/zero would otherwise block os.Open/io.Copy for the
-// full duration of rework prompt generation (computeCumulativeDiffSHA calls
-// this for every enumerated protected file AND every added/untracked
-// candidate). Mirrors readUntrackedPatchData's Lstat+IsRegular guard. A
-// special file yields ok=false, which callers treat as fail-closed (the
-// protected version is simply not added to existingHashes; an added/
-// untracked file that cannot be hashed is skipped rather than correlated).
+// D4/R16 round-8 fix: refuse to open non-regular files (FIFOs, devices) so
+// a protected path that is a FIFO, a device, or a symlink to /dev/zero
+// cannot block os.Open/io.Copy for the full duration of rework prompt
+// generation (computeCumulativeDiffSHA calls this for every enumerated
+// protected file AND every added/untracked candidate).
+//
+// D4/R16 round-9 fix: the round-8 Lstat guard also skipped symlinks, which
+// dropped a protected path that is a symlink to a REGULAR secret file (e.g.
+// `.env -> ../shared/env`) from existingHashes — a copy made through that
+// symlink then failed the content-hash suppression and the secret leaked
+// into cumulative_diff_sha. We now Stat (follows symlinks): a symlink whose
+// target is a regular file is hashed; a symlink whose target is a
+// FIFO/device/socket (e.g. -> /dev/zero) resolves to a non-regular mode and
+// is skipped BEFORE opening (no block). A broken/looping symlink fails Stat
+// → ok=false (skip). A special file yields ok=false, which callers treat as
+// fail-closed (the protected version is simply not added to existingHashes;
+// an added/untracked file that cannot be hashed is skipped rather than
+// correlated).
 func hashWorkspaceFile(path string) (string, bool) {
-	st, err := os.Lstat(path)
+	st, err := os.Stat(path)
 	if err != nil {
 		return "", false
 	}
-	// Skip symlinks (could target a protected file or a blocking device) and
-	// non-regular files (FIFO/device/socket would block on Open/Read).
+	// Skip non-regular targets (FIFO/device/socket, whether the path itself
+	// or a symlink's target). os.Stat follows symlinks, so a symlink to a
+	// regular secret file resolves to a regular mode and IS hashed below.
 	if !st.Mode().IsRegular() {
 		return "", false
 	}

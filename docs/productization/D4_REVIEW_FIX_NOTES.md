@@ -158,3 +158,54 @@ go vet ./internal/review/ ./internal/orchestrator/                              
 
 - **M record 在 `unknown=true` 时不 fail-closed**（与 A record 不同）：`unknown=true` 时 `existingHashes` 为 nil（受保护文件 pre-operation worktree bytes 不可恢复），无法做 content-hash match；但 fail-closed **所有** M record 会丢掉无关的 in-progress modification（如 protected rename 期间的 `app.txt` old→new），破坏已批准的 trade-off（`TestGenerateDoesNotReincludeProtectedRenameFromHandoff`）。因此 M record 仅在 `unknown=false`（source REMAINS）时做 content-hash match，`unknown=true` 时保留。"protected delete 的字节被复制到一个 tracked M file" 是一个 residual evasion，A/untracked 的 fail-closed 仅覆盖新文件——这是有意识接受的残余风险，与 review finding 描述的 source-REMAINS 场景一致。
 - **T record 归入 fail-closed**：typechange 的 pre-typechange worktree bytes 不可恢复（regular file 被 symlink 替换后字节消失），且 copy 只会匹配已不存在的 modified bytes 而非 HEAD/index/symlink-target 版本，content-hash match 无法保证安全。因此与 D/R/C 同等 fail-closed。
+
+---
+
+## Round 9 — symlinked-protected-source + configured-protected-paths (commit `5b976c5` review)
+
+Codex 第 9 轮 review（针对 commit `5b976c5`）提了 3 个 finding（2 P1 + 1 P2），都是 round-8 Lstat 修复和长期存在的 config 透传遗漏引入/暴露的 protected-content 泄漏。
+
+### R9-A / R9-B — follow regular symlink targets in workspace hashers (P1 / P2)
+
+**问题**：round-8 的 Lstat guard 让 `reviewHashWorkspaceFile`（review.go）/ `hashWorkspaceFile`（orchestrator.go）对**所有** symlink 返回 `ok=false`。但受保护 path 若是**指向 regular secret 文件的 symlink**（`.env -> ../shared/env`），其 workspace bytes 现在永远不会被 hash 进 `existingHashes` → 通过该 symlink 复制出的 added/untracked file 无法被 content-hash 抑制 → secret 泄漏进 `changes.patch`/`review.json`/`cumulative_diff_sha`。
+
+**修复**：两个 helper 改用 `os.Stat`（follow symlink）：symlink 指向 regular file 则 hash 其 target 字节；symlink 指向 FIFO/device/socket（如 `-> /dev/zero`）则 Stat 解析出非 regular mode → skip（不 open、不阻塞）；broken/looping symlink Stat 失败 → `ok=false`。受保护 symlinked 文件的字节重新进入 `existingHashes`。
+
+- review 路径：porcelain 把 verbatim copy 报为 `A`，A-record content-hash check 命中 `existingHashes`（含 symlinked protected bytes）→ 抑制。
+- orchestrator 路径：`git diff --find-copies-harder` 把 verbatim copy 报为 `C`（source = 非 protected 的 regular target），所以 per-record protected-source check 不触发、A-record check 也不运行（status 是 C 不是 A）。**R9 额外把 content-hash check 扩展到 `C` 目标**（与 A 同 fail-closed + content-hash 逻辑），使 C-record 副本也被抑制。
+
+**Regression test**：
+- 单元：`TestReviewHashWorkspaceFileSkipsSpecialFiles` / `TestHashWorkspaceFileSkipsSpecialFiles` 扩展（FIFO/symlink-to-FIFO skip；symlink-to-regular follow+hash；broken symlink skip）。
+- 端到端：`TestGenerateSuppressesCopyViaSymlinkedProtectedFile`（review，porcelain A 路径）/ `TestFilteredTrackedDiffSkipsCopyViaSymlinkedProtectedFile`（orchestrator，C 路径）。
+
+### R9-C — honor configured protected paths in review collection (P1)
+
+**问题**：review.go 在 6 处用 `security.IsProtectedPath`（**仅** built-in 默认），忽略 workflow `approvals.protected_paths`。所以自定义 protected path（如 `secrets/**`）在 review 收集中不被保护：`reviewSafePath` 放行、`existingProtectedContentHashes` 不 hash、`protectedDeletedContent`/`protectedCopyDestinations` 不识别。一个 modified/copied `secrets/token.txt` 能 emit 进 `changes.patch`/`review.json`，尽管系统其它部分（orchestrator）把它当 protected。这是**长期存在**的 gap，round-8 Lstat 修复交互后更显眼。
+
+**修复**：`Generate` 通过 `loadProtectedPaths(g.Store.RepoRoot)`（`config.Load`，缺 WORKFLOW.md 时回退 `security.DefaultPolicy().ProtectedPaths`）读取 workflow protected_paths，透传给 `collectChanges` → `reviewSafePath`/`reviewDiffPaths`/`protectedDeletedContent`/`existingProtectedContentHashes`/`protectedCopyDestinations`，全部改用 `security.IsProtectedPathWithConfig(path, protectedPaths)`，与 orchestrator 一致。
+
+**Regression test**：`TestGenerateHonorsConfiguredProtectedPaths`。在 repo root 写 WORKFLOW.md（`protected_paths: ["secrets/**"]`），git workspace 里 commit `secrets/token.txt`、modify、cp 到 added `public.txt`。验证 `secrets/token.txt` 与 `public.txt`（custom-protected 副本）均不泄漏，无关 added `feature.txt` 被保留。
+
+### 验收对照（Round 9）
+
+| Finding | Severity | Regression test | 修复位置 | 状态 |
+| --- | --- | --- | --- | --- |
+| R9-A follow regular symlink targets (review hasher) | P1 | `TestReviewHashWorkspaceFileSkipsSpecialFiles` + `TestGenerateSuppressesCopyViaSymlinkedProtectedFile` | `internal/review/review.go` `reviewHashWorkspaceFile` Lstat→Stat | ✅ |
+| R9-B follow regular symlink targets (cumulative hasher) | P2 | `TestHashWorkspaceFileSkipsSpecialFiles` + `TestFilteredTrackedDiffSkipsCopyViaSymlinkedProtectedFile` | `internal/orchestrator/orchestrator.go` `hashWorkspaceFile` Lstat→Stat + `filteredTrackedDiffPathspecs` C-record content-hash 分支 | ✅ |
+| R9-C honor configured protected paths in review | P1 | `TestGenerateHonorsConfiguredProtectedPaths` | `internal/review/review.go` `loadProtectedPaths` + 透传 protectedPaths 到 collectChanges/reviewSafePath/protectedDeletedContent/existingProtectedContentHashes/protectedCopyDestinations/reviewDiffPaths | ✅ |
+
+### 验收门禁（Round 9）
+
+```
+go test ./...                                                                       PASS
+python3 scripts/validate_contracts.py                                               PASS (contract validation passed)
+go vet ./internal/review/ ./internal/orchestrator/                                  PASS
+bash scripts/acceptance-local.sh                                                    PASS (acceptance-local passed)
+```
+
+### 设计权衡说明（Round 9）
+
+- **Lstat → Stat（follow symlink）**：round-8 用 Lstat 是为了不阻塞 FIFO/device/symlink。Stat 同样能拒绝 FIFO/device（Stat follow symlink 后解析出非 regular mode → skip，不 open），同时让指向 regular secret 的 symlink 被 hash 进 `existingHashes`。symlink-to-`/dev/zero` 解析为 device → skip（不阻塞），满足 round-8 的防阻塞目标。
+- **C-record content-hash check（orchestrator）**：`--find-copies-harder` 把 verbatim copy 报为 `C <src> <dst>`。当受保护文件是 symlink 指向非 protected regular 文件时，copy 的 source 是那个非 protected regular 文件，per-record protected-source check 不触发。把 content-hash check 扩展到 C 目标（与 A 同 fail-closed 语义）使这种 copy 被抑制。C 目标本身是新文件，`hashesUnknown=true` 时 fail-closed 与 A 一致。
+- **review 路径不需要 C-record check**：review 用 porcelain（不 detect copy），verbatim copy 一律报为 `A`，A-record content-hash check 已覆盖。review 的 `protectedCopyDestinations`（用 `--find-copies-harder`）只用于额外标记 protected-source copy，R9-C 已让它用 `IsProtectedPathWithConfig`。
+- **config 替换而非追加**：`applyMap` 对 `protected_paths` 是替换（`c.Approvals.ProtectedPaths = v`），不是追加。这是既有行为，orchestrator 一直如此；R9-C 只让 review 与之一致，不改变 config 语义。

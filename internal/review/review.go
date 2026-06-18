@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"local-symphony/internal/config"
 	"local-symphony/internal/core"
 	"local-symphony/internal/gitx"
 	"local-symphony/internal/security"
@@ -57,16 +58,26 @@ func (g Generator) Generate(runID string) (string, error) {
 	if err := os.MkdirAll(filepath.Join(root, "prompt"), 0o755); err != nil {
 		return "", reviewPacketError("create review packet directory", err)
 	}
-	changed, untracked, deniedChanged := collectChanges(issue.Workspace.Path)
+	// D4/R16 round-9: honor the workflow's configured protected_paths
+	// (approvals.protected_paths) in review collection, not just the
+	// built-in defaults. The orchestrator already threads these into its
+	// cumulative_diff_sha hashing via IsProtectedPathWithConfig; review
+	// collection must use the SAME policy so a custom protected path such
+	// as `secrets/**` is excluded from changes.patch / review.json and
+	// included in the protected-content hash set. config.Load falls back
+	// to Defaults (which include the built-in protected paths) when
+	// WORKFLOW.md is absent or unreadable, so this never returns nil.
+	protectedPaths := loadProtectedPaths(g.Store.RepoRoot)
+	changed, untracked, deniedChanged := collectChanges(issue.Workspace.Path, protectedPaths)
 	if len(handoff.ChangedFiles) > 0 {
 		for _, f := range handoff.ChangedFiles {
-			if path := reviewSafePath(f); path != "" && !deniedChanged[path] && !contains(changed, path) {
+			if path := reviewSafePath(f, protectedPaths); path != "" && !deniedChanged[path] && !contains(changed, path) {
 				changed = append(changed, path)
 			}
 		}
 	}
 	sort.Strings(changed)
-	diffPaths := reviewDiffPaths(changed)
+	diffPaths := reviewDiffPaths(changed, protectedPaths)
 	patch := gitx.DiffBinaryPaths(issue.Workspace.Path, diffPaths)
 	if untrackedPatch := syntheticPatch(issue.Workspace.Path, untracked); untrackedPatch != "" {
 		if patch != "" && !strings.HasSuffix(patch, "\n") {
@@ -250,12 +261,28 @@ func (g Generator) Generate(runID string) (string, error) {
 	return finalID, nil
 }
 
-func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
+// loadProtectedPaths returns the workflow's configured protected_paths
+// (approvals.protected_paths), falling back to the built-in defaults when
+// WORKFLOW.md is absent or unreadable. D4/R16 round-9: review collection
+// honors the same configured protected-path policy the orchestrator uses
+// (IsProtectedPathWithConfig), so custom protected paths such as
+// `secrets/**` are protected in review artifacts too. config.Load never
+// returns a nil Config (it falls back to Defaults), so the returned slice
+// is always usable.
+func loadProtectedPaths(repoRoot string) []string {
+	wf, err := config.Load(repoRoot)
+	if wf == nil || err != nil {
+		return security.DefaultPolicy().ProtectedPaths
+	}
+	return wf.Config.Approvals.ProtectedPaths
+}
+
+func collectChanges(root string, protectedPaths []string) ([]string, []UntrackedInfo, map[string]bool) {
 	changed := []string{}
 	untracked := []UntrackedInfo{}
 	denied := map[string]bool{}
 	if records, err := statusPorcelainRecords(root); err == nil {
-		protectedDeleted := protectedDeletedContent(root, records)
+		protectedDeleted := protectedDeletedContent(root, records, protectedPaths)
 		// D4 / R16 round 5 — copy-aware protected-copy detection for
 		// TRACKED ADDED (A) records. `git status --porcelain` detects
 		// renames (R) but NOT copies (C): a verbatim copy of a protected
@@ -274,7 +301,7 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 		// copyDestFailClosed is true when the name-status enumeration fails
 		// or is malformed: we cannot prove no A record is a protected copy,
 		// so the caller fails closed (skips ALL tracked A records).
-		copyDestinations, copyDestOK := protectedCopyDestinations(root)
+		copyDestinations, copyDestOK := protectedCopyDestinations(root, protectedPaths)
 		copyDestFailClosed := !copyDestOK
 		for _, record := range records {
 			if len(record.paths) == 0 {
@@ -283,10 +310,10 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 			paths := record.paths
 			safePaths := make([]string, 0, len(paths))
 			for _, candidate := range paths {
-				path := reviewSafePath(candidate)
+				path := reviewSafePath(candidate, protectedPaths)
 				if path == "" {
 					if record.renamedOrCopied() && len(paths) > 1 {
-						if dst := reviewSafePath(paths[len(paths)-1]); dst != "" {
+						if dst := reviewSafePath(paths[len(paths)-1], protectedPaths); dst != "" {
 							denied[dst] = true
 						}
 					}
@@ -408,7 +435,7 @@ func collectChanges(root string) ([]string, []UntrackedInfo, map[string]bool) {
 			}
 			return nil
 		}
-		path := reviewSafePath(rel)
+		path := reviewSafePath(rel, protectedPaths)
 		if path == "" {
 			return nil
 		}
@@ -603,12 +630,12 @@ func (s protectedDeletedContentSet) matchesUntracked(root, path string) bool {
 // bytes — not the HEAD/index/symlink-target versions a content-hash check
 // builds — so content-hash matching cannot be made safe. A `T` record
 // carries a single path; we check it.
-func protectedDeletedContent(root string, records []statusPorcelainRecord) protectedDeletedContentSet {
+func protectedDeletedContent(root string, records []statusPorcelainRecord, protectedPaths []string) protectedDeletedContentSet {
 	for _, record := range records {
 		if record.deleted() {
 			for _, candidate := range record.paths {
 				path := reviewCleanPath(candidate)
-				if path == "" || !security.IsProtectedPath(path) {
+				if path == "" || !security.IsProtectedPathWithConfig(path, protectedPaths) {
 					continue
 				}
 				// A protected tracked file was deleted. Its
@@ -632,7 +659,7 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord) prote
 				continue
 			}
 			path := reviewCleanPath(record.paths[0])
-			if path == "" || !security.IsProtectedPath(path) {
+			if path == "" || !security.IsProtectedPathWithConfig(path, protectedPaths) {
 				continue
 			}
 			return protectedDeletedContentSet{existingHashes: nil, unknown: true}
@@ -654,7 +681,7 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord) prote
 				continue
 			}
 			path := reviewCleanPath(record.paths[0])
-			if path == "" || !security.IsProtectedPath(path) {
+			if path == "" || !security.IsProtectedPathWithConfig(path, protectedPaths) {
 				continue
 			}
 			return protectedDeletedContentSet{existingHashes: nil, unknown: true}
@@ -663,7 +690,7 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord) prote
 	// No protected delete/rename/copy — all protected files REMAIN.
 	// Build the existing-protected-content hash set so callers can
 	// content-hash-match untracked files and A records against it.
-	return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root), unknown: false}
+	return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: false}
 }
 
 // existingProtectedContentHashes builds the set of SHA256 content hashes of
@@ -704,7 +731,7 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord) prote
 // suppresses ALL untracked + ALL A, covering even filler copies.
 //
 // Returns an empty (non-nil) set when no protected files exist.
-func existingProtectedContentHashes(root string) map[string]bool {
+func existingProtectedContentHashes(root string, protectedPaths []string) map[string]bool {
 	set := map[string]bool{}
 	// Enumerate candidate protected files: tracked + untracked-non-ignored +
 	// ignored. The ignored enumeration is required so a gitignored protected
@@ -727,7 +754,10 @@ func existingProtectedContentHashes(root string) map[string]bool {
 		}
 	}
 	for _, rel := range candidates {
-		if !security.IsProtectedPath(rel) {
+		// D4/R16 round-9: honor configured protected_paths, not just the
+		// built-in defaults, so a custom protected path such as
+		// `secrets/**` is hashed into the set and a copy of it is suppressed.
+		if !security.IsProtectedPathWithConfig(rel, protectedPaths) {
 			continue
 		}
 		// (a) workspace version — the modified bytes a `cp` copies.
@@ -750,21 +780,29 @@ func existingProtectedContentHashes(root string) map[string]bool {
 // hasher (bounded memory via io.Copy) and returns the hex hash. Returns
 // ok=false on any error.
 //
-// D4/R16 round-8 fix: Lstat first and refuse to open non-regular files
-// (FIFOs, devices) and symlinks. A protected path that is a FIFO, a device,
-// or a symlink to a never-ending source such as /dev/zero would otherwise
-// block os.Open/io.Copy indefinitely during review packet generation. This
-// mirrors readUntrackedPatchData's Lstat+IsRegular guard. ok=false here
-// means "no hash added" — callers treat an absent hash as fail-closed
-// (cannot prove the file is not protected content), which is the safe
-// outcome for a special file.
+// D4/R16 round-8 fix: refuse to open non-regular files (FIFOs, devices) so
+// a protected path that is a FIFO, a device, or a symlink to a never-ending
+// source such as /dev/zero cannot block os.Open/io.Copy during review packet
+// generation.
+//
+// D4/R16 round-9 fix: the round-8 Lstat guard also skipped symlinks, which
+// dropped a protected path that is a symlink to a REGULAR secret file (e.g.
+// `.env -> ../shared/env`) from existingHashes — a copy made through that
+// symlink then failed the content-hash suppression and the secret leaked.
+// We now Stat (follows symlinks): a symlink whose target is a regular file
+// is hashed (the common symlinked-.env case); a symlink whose target is a
+// FIFO/device/socket (e.g. -> /dev/zero) resolves to a non-regular mode and
+// is skipped BEFORE opening (no block). A broken/looping symlink fails Stat
+// → ok=false (skip). ok=false means "no hash added"; callers treat an absent
+// hash as fail-closed, which is the safe outcome for a special file.
 func reviewHashWorkspaceFile(path string) (string, bool) {
-	st, err := os.Lstat(path)
+	st, err := os.Stat(path)
 	if err != nil {
 		return "", false
 	}
-	// Skip symlinks (could target a protected file or a blocking device) and
-	// non-regular files (FIFO/device/socket would block on Open/Read).
+	// Skip non-regular targets (FIFO/device/socket, whether the path itself
+	// or a symlink's target). os.Stat follows symlinks, so a symlink to a
+	// regular secret file resolves to a regular mode and IS hashed below.
 	if !st.Mode().IsRegular() {
 		return "", false
 	}
@@ -951,7 +989,7 @@ func isModifiedTrackedRecord(code string) bool {
 // This matches the orchestrator's behavior. When a protected file is
 // deleted/renamed/copied (protectedDeletedContent.unknown=true) the
 // fail-closed skip of ALL A records covers even filler copies.
-func protectedCopyDestinations(root string) (map[string]bool, bool) {
+func protectedCopyDestinations(root string, protectedPaths []string) (map[string]bool, bool) {
 	out, err := exec.Command("git", "-C", root, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "-z", "HEAD").Output()
 	if err != nil {
 		return nil, false
@@ -984,7 +1022,7 @@ func protectedCopyDestinations(root string) (map[string]bool, bool) {
 		// source is protected, the destination is a copy/rename of a
 		// protected file and must be skipped.
 		src := reviewCleanPath(paths[0])
-		if src == "" || !security.IsProtectedPath(src) {
+		if src == "" || !security.IsProtectedPathWithConfig(src, protectedPaths) {
 			continue
 		}
 		dst := reviewCleanPath(paths[1])
@@ -1172,20 +1210,23 @@ func reviewCleanPath(path string) string {
 	}
 	return path
 }
-func reviewSafePath(path string) string {
+func reviewSafePath(path string, protectedPaths []string) string {
 	path = reviewCleanPath(path)
 	if path == "" {
 		return ""
 	}
-	if security.IsProtectedPath(path) {
+	// D4/R16 round-9: honor configured protected_paths, not just the
+	// built-in defaults, so a custom protected path such as `secrets/**`
+	// is excluded from changes.patch / changed-files / diffstat.
+	if security.IsProtectedPathWithConfig(path, protectedPaths) {
 		return ""
 	}
 	return path
 }
-func reviewDiffPaths(changed []string) []string {
+func reviewDiffPaths(changed []string, protectedPaths []string) []string {
 	out := []string{}
 	for _, path := range changed {
-		path = reviewSafePath(path)
+		path = reviewSafePath(path, protectedPaths)
 		if path == "" || contains(out, path) {
 			continue
 		}

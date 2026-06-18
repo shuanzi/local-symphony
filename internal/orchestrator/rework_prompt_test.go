@@ -1927,17 +1927,19 @@ func TestFilteredTrackedDiffFailsClosedOnProtectedTypechange(t *testing.T) {
 // TestHashWorkspaceFileSkipsSpecialFiles codifies the D4 / R16 round-8 fix
 // for the special-file blocking P2 in the orchestrator's hashWorkspaceFile.
 //
-// A protected path that is a FIFO, device, or symlink must NOT be opened +
-// io.Copy'd (a FIFO/device can block indefinitely during
+// A protected path that is a FIFO, device, or symlink-to-non-regular must
+// NOT be opened + io.Copy'd (a FIFO/device can block indefinitely during
 // computeCumulativeDiffSHA, which calls this for every enumerated protected
-// file and every added/untracked candidate). The helper now Lstat's first
-// and returns ok=false for non-regular files and symlinks. This test
-// exercises the helper directly (not via computeCumulativeDiffSHA) so it
-// cannot hang the suite on a FIFO.
+// file and every added/untracked candidate). Round-9 refinement: a symlink
+// to a REGULAR file must be FOLLOWED and hashed (a protected path that is a
+// symlink to a regular secret must contribute to existingHashes, else a copy
+// made through it leaks into cumulative_diff_sha). This test exercises the
+// helper directly (not via computeCumulativeDiffSHA) so it cannot hang the
+// suite on a FIFO.
 func TestHashWorkspaceFileSkipsSpecialFiles(t *testing.T) {
 	dir := t.TempDir()
 
-	// FIFO.
+	// FIFO — must be skipped (would block on Open/Read).
 	fifoPath := filepath.Join(dir, ".env")
 	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
 		t.Fatalf("mkfifo: %v", err)
@@ -1946,16 +1948,17 @@ func TestHashWorkspaceFileSkipsSpecialFiles(t *testing.T) {
 		t.Fatalf("hashWorkspaceFile opened a FIFO (would block); want ok=false")
 	}
 
-	// Symlink (could target a blocking device or a protected file).
-	linkPath := filepath.Join(dir, "id_rsa")
-	if err := os.Symlink(fifoPath, linkPath); err != nil {
-		t.Fatalf("symlink: %v", err)
+	// Symlink to a FIFO (non-regular target) — must be skipped (the target
+	// would block). Resolves to a non-regular mode via os.Stat.
+	linkToFifo := filepath.Join(dir, "id_rsa")
+	if err := os.Symlink(fifoPath, linkToFifo); err != nil {
+		t.Fatalf("symlink to fifo: %v", err)
 	}
-	if _, ok := hashWorkspaceFile(linkPath); ok {
-		t.Fatalf("hashWorkspaceFile followed a symlink; want ok=false")
+	if _, ok := hashWorkspaceFile(linkToFifo); ok {
+		t.Fatalf("hashWorkspaceFile followed a symlink to a FIFO (would block); want ok=false")
 	}
 
-	// Regular file — must still hash normally.
+	// Regular file — must hash normally.
 	regularPath := filepath.Join(dir, "regular.txt")
 	if err := os.WriteFile(regularPath, []byte("hello\n"), 0o644); err != nil {
 		t.Fatalf("write regular: %v", err)
@@ -1968,5 +1971,101 @@ func TestHashWorkspaceFileSkipsSpecialFiles(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("hashWorkspaceFile regular hash = %q, want %q", got, want)
+	}
+
+	// D4/R16 round-9: symlink to a REGULAR file — must be FOLLOWED and
+	// hashed (a protected path that is a symlink to a regular secret must
+	// contribute to existingHashes, else a copy made through it leaks).
+	secretTarget := filepath.Join(dir, "shared-env")
+	if err := os.WriteFile(secretTarget, []byte("SECRET=shared\n"), 0o600); err != nil {
+		t.Fatalf("write symlink target: %v", err)
+	}
+	symlinkToRegular := filepath.Join(dir, ".env-link")
+	if err := os.Symlink(secretTarget, symlinkToRegular); err != nil {
+		t.Fatalf("symlink to regular: %v", err)
+	}
+	hLink := sha256.Sum256([]byte("SECRET=shared\n"))
+	wantLink := hex.EncodeToString(hLink[:])
+	gotLink, okLink := hashWorkspaceFile(symlinkToRegular)
+	if !okLink {
+		t.Fatalf("hashWorkspaceFile skipped a symlink to a regular file; want ok=true (round-9: follow regular symlink targets)")
+	}
+	if gotLink != wantLink {
+		t.Fatalf("hashWorkspaceFile symlink hash = %q, want %q (hash of the regular target's bytes)", gotLink, wantLink)
+	}
+
+	// Broken symlink (dangling target) — must be skipped (Stat fails).
+	broken := filepath.Join(dir, "broken-link")
+	if err := os.Symlink(filepath.Join(dir, "does-not-exist"), broken); err != nil {
+		t.Fatalf("symlink broken: %v", err)
+	}
+	if _, ok := hashWorkspaceFile(broken); ok {
+		t.Fatalf("hashWorkspaceFile followed a broken symlink; want ok=false")
+	}
+}
+
+// TestFilteredTrackedDiffSkipsCopyViaSymlinkedProtectedFile codifies the D4
+// / R16 round-9 fix for the symlinked-protected-source P2 leak in the
+// orchestrator's cumulative-diff path (finding B).
+//
+// Scenario: a protected .env is a SYMLINK to a regular secret file
+// (`.env -> shared/env`, shared/env = SECRET=real). Round 8's Lstat guard
+// skipped ALL symlinks in hashWorkspaceFile, so existingProtectedContent
+// Hashes never recorded the protected bytes; a copy made through that
+// symlink (into an added public.txt) was then KEPT by
+// filteredTrackedDiffPathspecs and `git diff HEAD -- public.txt` hashed the
+// protected bytes into cumulative_diff_sha.
+//
+// Round 9 makes hashWorkspaceFile Stat (follow) symlinks: a symlink whose
+// target is regular is hashed, so existingHashes includes the symlinked
+// .env's bytes and the copy (public.txt) is content-hash-suppressed. An
+// unrelated added file (feature.txt) IS kept.
+func TestFilteredTrackedDiffSkipsCopyViaSymlinkedProtectedFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.MkdirAll(filepath.Join(ws, "shared"), 0o755); err != nil {
+		t.Fatalf("mkdir shared: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "shared/env"), []byte("SECRET=real\n"), 0o644); err != nil {
+		t.Fatalf("write shared/env: %v", err)
+	}
+	gitCommit(t, ws, "add shared env")
+	// .env -> shared/env (a symlinked protected file; .env is protected by
+	// the built-in IsProtectedPath).
+	if err := os.Symlink("shared/env", filepath.Join(ws, ".env")); err != nil {
+		t.Fatalf("symlink .env -> shared/env: %v", err)
+	}
+	// Copy the symlinked protected file's content (resolves to SECRET=real)
+	// into a new added public file. Source .env REMAINS.
+	modified, err := os.ReadFile(filepath.Join(ws, ".env"))
+	if err != nil {
+		t.Fatalf("read symlinked .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "public.txt"), modified, 0o644); err != nil {
+		t.Fatalf("write public.txt: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "add", "public.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add public.txt: %v\n%s", err, out)
+	}
+	// Unrelated safe added file — MUST be kept.
+	if err := os.WriteFile(filepath.Join(ws, "feature.txt"), []byte("new feature\n"), 0o644); err != nil {
+		t.Fatalf("write feature.txt: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "add", "feature.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add feature.txt: %v\n%s", err, out)
+	}
+
+	diff := string(filteredTrackedDiff(ws, nil))
+	// The symlinked protected bytes MUST NOT leak via public.txt.
+	if strings.Contains(diff, "SECRET=real") {
+		t.Fatalf("filtered tracked diff leaked symlinked protected bytes via added public.txt:\n%s", diff)
+	}
+	if strings.Contains(diff, "diff --git a/public.txt b/public.txt") {
+		t.Fatalf("filtered tracked diff included added copy-of-symlinked-protected public.txt:\n%s", diff)
+	}
+	// The unrelated safe added file MUST be kept.
+	if !strings.Contains(diff, "diff --git a/feature.txt b/feature.txt") {
+		t.Fatalf("filtered tracked diff dropped unrelated safe added feature.txt (correlation broken):\n%s", diff)
 	}
 }

@@ -1878,17 +1878,18 @@ func TestGenerateSuppressesBinaryUntrackedCopyOfProtectedContent(t *testing.T) {
 }
 
 // TestReviewHashWorkspaceFileSkipsSpecialFiles codifies the D4 / R16 round-8
-// fix for the special-file blocking P2 in review.go's reviewHashWorkspaceFile.
-//
-// A protected path that is a FIFO, device, or symlink must NOT be opened +
-// io.Copy'd (a FIFO/device can block indefinitely; a symlink could target a
-// blocking source). The helper now Lstat's first and returns ok=false for
-// non-regular files and symlinks. This test exercises the helper directly
-// (not via Generate) so it cannot hang the suite on a FIFO.
+// fix for the special-file blocking P2 in review.go's reviewHashWorkspaceFile,
+// and the round-9 refinement: a FIFO/device must still be skipped (would
+// block), but a symlink to a REGULAR file must be FOLLOWED and hashed (a
+// protected path that is a symlink to a regular secret, e.g. `.env ->
+// ../shared/env`, must contribute to existingHashes or a copy made through
+// it leaks). A symlink to a non-regular target (FIFO/device) is still
+// skipped. This test exercises the helper directly (not via Generate) so it
+// cannot hang the suite on a FIFO.
 func TestReviewHashWorkspaceFileSkipsSpecialFiles(t *testing.T) {
 	dir := t.TempDir()
 
-	// FIFO.
+	// FIFO — must be skipped (would block on Open/Read).
 	fifoPath := filepath.Join(dir, ".env")
 	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
 		t.Fatalf("mkfifo: %v", err)
@@ -1897,16 +1898,17 @@ func TestReviewHashWorkspaceFileSkipsSpecialFiles(t *testing.T) {
 		t.Fatalf("reviewHashWorkspaceFile opened a FIFO (would block); want ok=false")
 	}
 
-	// Symlink (could target a blocking device or a protected file).
-	linkPath := filepath.Join(dir, "id_rsa")
-	if err := os.Symlink(fifoPath, linkPath); err != nil {
-		t.Fatalf("symlink: %v", err)
+	// Symlink to a FIFO (non-regular target) — must be skipped (the target
+	// would block). Resolves to a non-regular mode via os.Stat.
+	linkToFifo := filepath.Join(dir, "id_rsa")
+	if err := os.Symlink(fifoPath, linkToFifo); err != nil {
+		t.Fatalf("symlink to fifo: %v", err)
 	}
-	if _, ok := reviewHashWorkspaceFile(linkPath); ok {
-		t.Fatalf("reviewHashWorkspaceFile followed a symlink; want ok=false")
+	if _, ok := reviewHashWorkspaceFile(linkToFifo); ok {
+		t.Fatalf("reviewHashWorkspaceFile followed a symlink to a FIFO (would block); want ok=false")
 	}
 
-	// Regular file — must still hash normally.
+	// Regular file — must hash normally.
 	regularPath := filepath.Join(dir, "regular.txt")
 	if err := os.WriteFile(regularPath, []byte("hello\n"), 0o644); err != nil {
 		t.Fatalf("write regular: %v", err)
@@ -1917,5 +1919,188 @@ func TestReviewHashWorkspaceFileSkipsSpecialFiles(t *testing.T) {
 	}
 	if got != sha256Hex([]byte("hello\n")) {
 		t.Fatalf("reviewHashWorkspaceFile regular hash = %q, want %q", got, sha256Hex([]byte("hello\n")))
+	}
+
+	// D4/R16 round-9: symlink to a REGULAR file — must be FOLLOWED and
+	// hashed (a protected path that is a symlink to a regular secret must
+	// contribute to existingHashes, else a copy made through it leaks).
+	secretTarget := filepath.Join(dir, "shared-env")
+	if err := os.WriteFile(secretTarget, []byte("SECRET=shared\n"), 0o600); err != nil {
+		t.Fatalf("write symlink target: %v", err)
+	}
+	symlinkToRegular := filepath.Join(dir, ".env-link")
+	if err := os.Symlink(secretTarget, symlinkToRegular); err != nil {
+		t.Fatalf("symlink to regular: %v", err)
+	}
+	gotLink, okLink := reviewHashWorkspaceFile(symlinkToRegular)
+	if !okLink {
+		t.Fatalf("reviewHashWorkspaceFile skipped a symlink to a regular file; want ok=true (round-9: follow regular symlink targets)")
+	}
+	if gotLink != sha256Hex([]byte("SECRET=shared\n")) {
+		t.Fatalf("reviewHashWorkspaceFile symlink hash = %q, want %q (hash of the regular target's bytes)", gotLink, sha256Hex([]byte("SECRET=shared\n")))
+	}
+
+	// Broken symlink (dangling target) — must be skipped (Stat fails).
+	broken := filepath.Join(dir, "broken-link")
+	if err := os.Symlink(filepath.Join(dir, "does-not-exist"), broken); err != nil {
+		t.Fatalf("symlink broken: %v", err)
+	}
+	if _, ok := reviewHashWorkspaceFile(broken); ok {
+		t.Fatalf("reviewHashWorkspaceFile followed a broken symlink; want ok=false")
+	}
+}
+
+// TestGenerateHonorsConfiguredProtectedPaths codifies the D4 / R16 round-9
+// fix for the configured-protected-paths P1 leak in review.go.
+//
+// Scenario: a workflow configures a CUSTOM protected_paths entry
+// `secrets/**` (via WORKFLOW.md approvals.protected_paths). Before round 9,
+// review collection used the built-in-only security.IsProtectedPath, so
+// `secrets/token.txt` was NOT treated as protected: reviewSafePath let it
+// through, existingProtectedContentHashes did not hash it, and a copy of it
+// (into an added public.txt) was emitted into changes.patch / review.json
+// even though the rest of the system (orchestrator) treated it as protected.
+//
+// Round 9 threads the workflow's protected_paths through Generator/collectChanges
+// (loadProtectedPaths + IsProtectedPathWithConfig). Now `secrets/token.txt`
+// is excluded from changes.patch / changed-files, hashed into existingHashes,
+// and a copy of it (added public.txt) is content-hash-suppressed. An unrelated
+// added file (feature.txt) IS kept.
+func TestGenerateHonorsConfiguredProtectedPaths(t *testing.T) {
+	st := newReviewTestStore(t)
+	// Write a WORKFLOW.md at the repo root that configures a CUSTOM
+	// protected_paths entry `secrets/**` (replacing the built-in defaults).
+	// config.Load (called by loadProtectedPaths) reads this.
+	workflowPath := filepath.Join(st.RepoRoot, "WORKFLOW.md")
+	workflow := `---
+approvals:
+  protected_paths: ["secrets/**"]
+---
+Do the work.
+`
+	if err := os.WriteFile(workflowPath, []byte(workflow), 0o644); err != nil {
+		t.Fatalf("write WORKFLOW.md: %v", err)
+	}
+
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "secrets/token.txt", "TOKEN=old\n")
+	writeFile(t, workspace, "app.txt", "base\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// MODIFY the custom-protected file (the bytes that will be copied).
+	writeFile(t, workspace, "secrets/token.txt", "TOKEN=new\n")
+	// Verbatim copy of the MODIFIED custom-protected bytes into a new
+	// public file. Source REMAINS (no delete/rename/copy).
+	modified, err := os.ReadFile(filepath.Join(workspace, "secrets/token.txt"))
+	if err != nil {
+		t.Fatalf("read modified secrets/token.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "public.txt"), modified, 0o644); err != nil {
+		t.Fatalf("write public.txt: %v", err)
+	}
+	runGit(t, workspace, "add", "public.txt")
+	// Unrelated safe added file — MUST be kept.
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"public.txt", "feature.txt", "secrets/token.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// The custom-protected path and its copied bytes MUST NOT leak. The
+	// custom-protected secrets/token.txt is excluded by reviewSafePath; the
+	// added public.txt (copy of modified custom-protected content) is
+	// content-hash-suppressed. The unrelated feature.txt IS kept.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"TOKEN=new",
+			"TOKEN=old",
+			"secrets/token.txt",
+			"diff --git a/public.txt b/public.txt",
+			"public.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked custom-protected content (%q) — configured protected_paths not honored:\n%s", name, marker, art)
+			}
+		}
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated added feature.txt (correlation broken):\n%s", patch)
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if strings.Contains(changed, "secrets/") || strings.Contains(changed, "public.txt") {
+		t.Fatalf("changed-files.txt kept custom-protected path or its copy:\n%s", changed)
+	}
+	if !strings.Contains(changed, "feature.txt") {
+		t.Fatalf("changed-files.txt dropped unrelated feature.txt:\n%s", changed)
+	}
+}
+
+// TestGenerateSuppressesCopyViaSymlinkedProtectedFile codifies the D4 / R16
+// round-9 fix for the symlinked-protected-source P1 leak in review.go.
+//
+// Scenario: a protected .env is a SYMLINK to a regular secret file
+// (`.env -> shared/env`, where shared/env holds SECRET=real). Round 8's Lstat
+// guard skipped ALL symlinks in reviewHashWorkspaceFile, so existingProtected
+// ContentHashes never recorded the protected workspace bytes; a copy made
+// through that symlink (into an added public.txt) then failed the
+// content-hash suppression and the secret leaked into changes.patch /
+// review.json.
+//
+// Round 9 makes reviewHashWorkspaceFile Stat (follow) symlinks: a symlink
+// whose target is a regular file is hashed, so existingHashes includes the
+// symlinked .env's bytes and the copy (public.txt) is suppressed. An
+// unrelated added file (feature.txt) IS kept.
+func TestGenerateSuppressesCopyViaSymlinkedProtectedFile(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, "app.txt", "base\n")
+	// A regular secret file, and a protected .env symlink pointing at it.
+	writeFile(t, workspace, "shared/env", "SECRET=real\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+	// .env -> shared/env (a symlinked protected file). .env is protected by
+	// the built-in IsProtectedPath (base ".env").
+	if err := os.Symlink("shared/env", filepath.Join(workspace, ".env")); err != nil {
+		t.Fatalf("symlink .env -> shared/env: %v", err)
+	}
+	// Copy the symlinked protected file's content (resolves to SECRET=real)
+	// into a new added public file. Source .env REMAINS.
+	modified, err := os.ReadFile(filepath.Join(workspace, ".env"))
+	if err != nil {
+		t.Fatalf("read symlinked .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "public.txt"), modified, 0o644); err != nil {
+		t.Fatalf("write public.txt: %v", err)
+	}
+	runGit(t, workspace, "add", "public.txt")
+	// Unrelated safe added file — MUST be kept.
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"public.txt", "feature.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// The symlinked protected bytes (SECRET=real) and the copy (public.txt)
+	// MUST NOT leak. The unrelated feature.txt IS kept.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"SECRET=real",
+			"diff --git a/public.txt b/public.txt",
+			"public.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked symlinked-protected-copy content (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated added feature.txt (correlation broken):\n%s", patch)
 	}
 }
