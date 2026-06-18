@@ -4,6 +4,13 @@ Local Symphony 是一个基于 OpenAI Symphony 项目思想改造的本地优先
 
 当前工程是 v1 本地版本，默认使用 fake runner 跑通端到端流程；真实 Codex adapter 目前是 fixture-gated skeleton，未配置受支持 fixture 时会 fail-closed，不会直接启动未知协议版本的 Codex 进程。
 
+阶段 D 收口状态（D6 原始记录为 2026-06-09；本 PR 已同步 2026-06-17 的 `origin/main`，详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`）：
+
+- **D1 / R10** review packet metadata/artifact surface 与 structured projection 已可用：`GET /api/v1/reviews/{issue_ref}` 经 `internal/httpapi.reviewStructuredProjection` 从 review.json 加载 summary/tests/risks/verification/approvals/tool_calls/how_to_continue 并由 dashboard 渲染；R2 review 已收口（原 1 P2 已修：ReviewPacketArtifact.kind enum 已补全 prompt_snapshot/codex_log/agent_file/diagnostic）。
+- **D3 / R14** 已把 Codex availability preflight 接到 diagnostics/status/state surface（`CodexAvailability(...)` 调 `codex.RunPreflight`）。
+- **D5 / R13** release packaging 已随当前 `main` 合入；当前 checkout 包含 `scripts/build-release.sh` 与 `web/package-lock.json`，release artifact 说明见 `docs/RELEASE_NOTES.md`。
+- **D4 / R16** Rework prompt 上下文产品化准备中；**D2 / R11** Dashboard 产品化补齐准备中。
+
 ## 1. 项目能力概览
 
 v1 已覆盖以下本地闭环：
@@ -164,6 +171,7 @@ WORKFLOW.md                      # 项目 workflow 配置；不存在时自动�
 ~/.symphony/workspaces/          # 默认 issue worktree 根目录
 ~/.symphony/runtime/             # serve 运行期 descriptor
 ~/.symphony/cli-sessions/        # per-project CLI bearer session 文件（mode 0600）
+~/.symphony/cli-session.json     # legacy 单文件 session fallback，仅用于兼容旧版本
 ```
 
 查看当前项目状态：
@@ -212,11 +220,11 @@ CLI bearer session 由 `symphony serve` 自动 mint 并落到 `~/.symphony/cli-s
 # 列出本机所有已存 session（多项目场景）
 /path/to/local-symphony/dist/symphony login --list
 
-# 登出当前项目（删除本地 session 文件并请求 daemon 撤销 server-side row）
+# 登出当前项目（先请求 daemon revoke 当前 CLI session；确认后删除本地 session 文件）
 /path/to/local-symphony/dist/symphony login --logout
 ```
 
-`login` 不创建新 session。新 session 必须在 `symphony serve` 启动时由 daemon 端通过 open-token 流程签发。`symphony tool` 命令走独立的 Tool Gateway token 路径，不会被 `login`/`logout` 触发。
+`login` 不创建新 session。新 session 必须在 `symphony serve` 启动时由 daemon 端通过 open-token 流程签发。`login --logout` 会优先调用 daemon revoke 当前 CLI bearer；revoke 已确认、token 不匹配或没有本地 bearer 可撤销时，才删除本地 project-scoped session 文件和 legacy fallback 文件。若 daemon-side revoke 无法确认，则保留本地文件供重试。`symphony tool` 命令走独立的 Tool Gateway token 路径，不会被 `login`/`logout` 触发。
 
 当前 `web/` 是 React/Vite dashboard MVP 和动作合同检查。`symphony serve` 的 `/api/v1/*` 与 `/tool/v1/call` 路由优先于 dashboard 静态资源。根路径只会从可信 dashboard dist 位置读取静态资源：优先使用 `SYMPHONY_DASHBOARD_DIST` 指向的构建产物目录；未设置时从 `symphony` 可执行文件所在目录推导 `web/dist`、`../web/dist`、`../share/local-symphony/web/dist` 等安装位置。被管理项目根目录下的 `web/dist` 不会作为默认候选。
 
@@ -553,7 +561,7 @@ localhost
 
 ### 真实 Codex 不运行
 
-这是 v1 的预期行为。当前真实 Codex adapter 是 fixture-gated skeleton；默认测试与验收使用 fake runner。
+这是 v1 的预期行为。当前真实 Codex adapter 是 fixture-gated skeleton；默认测试与验收使用 fake runner。**D3 / R14** 已把 Codex availability preflight 接到 diagnostics / status / state surface：`symphony diagnostics` / `/api/v1/diagnostics` 经 `internal/observability.Diagnostics` 调用 `codex.RunPreflight(...)` 投影 `codex.available`、`codex.version`、`codex.support.{cli,model,sandbox}`、fixture metadata 与 `last_preflight`；`symphony status` 与 `GET /api/v1/state` 通过 `observability.CodexAvailability(...)` 暴露同一类 Codex availability projection（有 supported fixture 时报真实 version/support/available，无 fixture 时 `available=false`、`warning=unsupported_codex_version`）。当前 diagnostics/state contract 不含 Codex `reason`/`status` 字段，失败分类通过 nullable `last_preflight.failure_*` 与 `warning` 表达。未配置支持 fixture 的版本在启动真实 `codex app-server` 进程前以 `unsupported_codex_version` 失败。Real Codex integration test 仍只通过 `SYMPHONY_TEST_CODEX=1` 显式开启。
 
 ## 15. 清理本地数据
 
@@ -567,6 +575,7 @@ rm -f WORKFLOW.md
 # 全局 runtime/session/workspace 数据，按需清理
 rm -rf ~/.symphony/runtime
 rm -rf ~/.symphony/cli-sessions
+rm -f ~/.symphony/cli-session.json # legacy fallback，仅旧版本兼容
 rm -rf ~/.symphony/workspaces/<project_id>
 
 # 谨慎：会删除所有 Local Symphony 全局项目索引与 session 数据

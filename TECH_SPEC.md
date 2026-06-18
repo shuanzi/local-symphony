@@ -1,9 +1,10 @@
 # Local Symphony App v1 Tech SPEC
 
-**状态**：v1 技术方案合并版
-**更新日期**：2026-05-11
+**状态**：v1 阶段 D 收口（2026-06-09）
+**更新日期**：2026-06-09（阶段 D 收口状态注；技术合同与 §1–§20 一致，未新增/扩大 v1 能力）
 **来源**：`local-symphony.zip` 原始文档包经 agent-executable hardening 后更新
 **文档权威性**：`PRD.md` 是 Local Symphony App v1 产品事实与产品范围的 source of truth。本文档是字段、表结构、API/schema、状态机、校验规则等技术合同细节的 source of truth；`api/openapi.yaml`、`db/schema/*.sql`、`schemas/*.schema.json`、`docs/agent_work_orders/*.md` 与 `docs/testing/*.md` 是本文的可执行合同与验收材料。本文档与 executable contracts 不得新增或扩大 `PRD.md` 未定义的 v1 产品能力。
+**阶段 D 收口状态指针**：`docs/productization/D6_DOCS_CLOSE_NOTES.md`（R 项 status note 表、文档变更清单、已知限制）
 
 ---
 
@@ -2063,6 +2064,8 @@ The prelaunch fixture gate is based only on the installed Codex version and comm
 
 Default CI MUST use `internal/agent/fake`. Real Codex tests MUST be opt-in through `SYMPHONY_TEST_CODEX=1`.
 
+> **阶段 D 收口状态（2026-06-09；已按当前 tree 校准）**：D3 / R14 已把 Codex availability preflight 接到 diagnostics/status/state surfaces：`internal/observability.Diagnostics` 调用 `codex.RunPreflight(...)` 并投影 `codex.available`、`codex.version`、`codex.support.{cli,model,sandbox}`、fixture metadata/support 与 `last_preflight`；`symphony status` 与 `GET /api/v1/state` 通过 `observability.CodexAvailability(...)` 暴露同一类 Codex availability projection。当前 diagnostics contract 仍不包含 Codex `reason` / `status` 字段，失败分类通过 nullable `last_preflight.failure_*` 与 `warning=unsupported_codex_version` 表达；状态面不得额外合成 diagnostics 未定义的 Codex 字段。`api/openapi.yaml` / `schemas/diagnostics.schema.json` / `web/src/types.ts` / `web/src/App.tsx` 同步（dashboard Overview 链接到 Diagnostics）。阶段 D 状态入口以当前 tree 内的 `docs/productization/D6_DOCS_CLOSE_NOTES.md` 为准。
+
 ### 10.3 Runner interface
 
 The orchestrator sees a minimal runner interface:
@@ -2296,12 +2299,13 @@ Status command:
 ```text
 primary API: GET /api/v1/state
 daemon unavailable: CLI MAY fall back to GET /api/v1/health only to report daemon availability; if health is unavailable too, exit 3
-human output: concise status for daemon, project, workflow, running runs, pending approvals, Human Review, paused issues, Codex availability, and recent failure summary
---json output: envelope-unwrapped stable object with daemon, project, workflow, running_runs, pending_approvals, human_review, paused_issues, codex, and recent_failures fields
+human output: concise status for the shipped state payload: project id, repo root, recent issues, and runs
+--json output: envelope-unwrapped stable object with project_id, repo_root, issues, runs, and codex fields
 ```
 
-`symphony status --json` MUST return the state object directly, not an API envelope. It MUST NOT invent data from diagnostics; unavailable fields from `/api/v1/state` are `null`, empty lists, or `unknown` according to the field type.
-`GET /api/v1/state` `AppState` uses these same field names; legacy `active_runs` remains a compatibility alias for `running_runs` count.
+`symphony status --json` MUST return the state object directly, not an API envelope. It MUST NOT invent data from diagnostics. The shipped `/api/v1/state` payload currently contains `project_id`, `repo_root`, `issues`, `runs`, and `codex`; non-required `AppState` schema fields such as daemon/workflow/running-runs/approval/review/paused/failure overview sections are compatibility/future expansion slots and are not promised by `symphony status` until the implementation populates them.
+`symphony status` and `GET /api/v1/state` expose Codex availability/support through `observability.CodexAvailability(...)`. They MUST NOT synthesize additional Codex fields that the diagnostics/state contracts do not define; diagnostics does not promise Codex reason/status fields.
+`GET /api/v1/state` `AppState` uses the shipped field names above.
 
 Issue commands:
 
@@ -2685,7 +2689,7 @@ Auth bootstrap rules:
 ```text
 1. symphony init creates no browser session and no raw browser token.
 2. symphony serve creates or rotates a CLI token for the current OS user when no valid token exists.
-3. raw CLI token is written to ~/.symphony/cli-session.json with owner-only permissions where supported.
+3. raw CLI token is written to the project-scoped ~/.symphony/cli-sessions/<project>.json with owner-only permissions where supported; legacy ~/.symphony/cli-session.json is compatibility fallback only.
 4. token hash is stored in app DB local_sessions.
 5. runtime descriptor never contains secrets.
 6. symphony open reads the CLI bearer token and calls POST /api/v1/auth/open-token.
@@ -2703,7 +2707,7 @@ Browser uses HttpOnly SameSite=Lax cookie plus `X-Symphony-CSRF` for command API
 
 Unauthenticated access is limited to bootstrap endpoints. `GET /api/v1/health` MAY be unauthenticated. `POST /api/v1/auth/exchange` is unauthenticated at the session layer but MUST require a valid one-time open token. `POST /api/v1/auth/open-token` and `POST /api/v1/auth/cli-token/rotate` require an authenticated local operator credential. All project state, command APIs, SSE streams, artifacts, diagnostics, and Tool Gateway operations require the actor-specific authorization defined in 13.1.
 
-If `~/.symphony/cli-session.json` is missing but a daemon is running, user MUST run an explicit local login/rotate command from the same OS account. Implementation MUST NOT print existing raw tokens from DB because only hashes are stored.
+If `~/.symphony/cli-sessions/<project>.json` is missing but a daemon is running, user MUST run an explicit local login/rotate command from the same OS account. The legacy `~/.symphony/cli-session.json` MAY be read only as compatibility fallback. Implementation MUST NOT print existing raw tokens from DB because only hashes are stored.
 
 ### 12.4 Health/state/events
 
@@ -3207,7 +3211,7 @@ v1 has no multi-tenant RBAC. Authorization is fixed by local actor class and cre
 | Actor / entrypoint | Accepted credential | Authority | Explicitly not allowed |
 |---|---|---|---|
 | local operator browser | loopback `symphony_session` cookie plus `X-Symphony-CSRF` for command APIs | Full operator command authority over the local project through REST/SSE. | No direct SQLite, Git, filesystem, Codex, or Tool Gateway access from the dashboard. |
-| operator CLI | CLI bearer token from `~/.symphony/cli-session.json` | Same full operator command authority as authenticated browser for normal `symphony ...` REST commands. | No unauthenticated command execution; no Tool Gateway authority unless invoking `symphony tool ...` with a run-scoped tool token. |
+| operator CLI | CLI bearer token from project-scoped `~/.symphony/cli-sessions/<project>.json`; legacy `~/.symphony/cli-session.json` is fallback compatibility only | Same full operator command authority as authenticated browser for normal `symphony ...` REST commands. | No unauthenticated command execution; no Tool Gateway authority unless invoking `symphony tool ...` with a run-scoped tool token. |
 | future desktop shell | authenticated local operator session or equivalent local token | Not implemented in v1; if later added as a local UI wrapper, it has the same operator command authority and backend checks as browser/CLI. | No bypass around REST auth/CSRF, policy checks, or backend containment rules. |
 | agent Tool Gateway | run-scoped tool token with `project_id`, `issue_id`, `run_id`, `workspace_path`, `allowed_tools`, and expiry | Only the fixed Tool Gateway registry entries allowed for the current run scope. | No REST `/api/v1` operator command APIs, no arbitrary tools outside registry, no Done transition, no cross-run/issue/workspace access. |
 | unauthenticated | none, invalid, expired, or wrong token | Bootstrap only: unauthenticated health and one-time open-token exchange when the presented open token is valid. | No project state, commands, SSE streams, artifacts, diagnostics, dashboard session APIs requiring a session, CLI rotation/open-token APIs, or Tool Gateway calls. |
@@ -3227,7 +3231,8 @@ CLI:
 
 ```text
 Bearer token
-stored in ~/.symphony/cli-session.json
+stored in ~/.symphony/cli-sessions/<project>.json
+legacy fallback may read ~/.symphony/cli-session.json for compatibility only
 token hash stored in app DB
 ```
 
@@ -4370,3 +4375,21 @@ raw prompt/raw Codex logs not exposed by v1 API
 single dist/symphony binary builds
 known limitations are documented
 ```
+
+## 21. 阶段 D 收口指针（D6 / R15）
+
+阶段 D（D1 / D2 / D3 / D4 / D5 / D6）截至 2026-06-09 的 R 项 status note 表、文档变更清单与已知限制详见：
+
+```text
+docs/productization/D6_DOCS_CLOSE_NOTES.md
+```
+
+要点：
+
+- D1 / R10 review packet metadata/artifact surface 与 structured projection 已可用：`GET /api/v1/reviews/{issue_ref}` 经 `internal/httpapi.reviewStructuredProjection` 从 review.json 加载 summary/tests/risks/verification/approvals/tool_calls/how_to_continue 并由 dashboard 渲染，R2 review 已收口（原 1 P2 已修：ReviewPacketArtifact.kind enum 已补全）。
+- D3 / R14 已把 Codex availability preflight 接到 diagnostics/status/state surfaces（`observability.CodexAvailability(...)` / `Diagnostics` 调 `codex.RunPreflight(...)`，`AppState.codex` 保留并填充），阶段 D 状态入口以 `docs/productization/D6_DOCS_CLOSE_NOTES.md` 为准。
+- D5 / R13 release packaging 已随当前 `main` 合入；当前 checkout 包含 `scripts/build-release.sh` 与 `web/package-lock.json`，release artifact 说明见 `docs/RELEASE_NOTES.md`。
+- C3 数据层 5 轮 review 0 finding；协调层 shutdown-ordering 1 P1 留作 C5 daemon lifecycle design problem。
+- C4 trust 边界专项 4 项（fail-open 反复 / validation 区分 / 镜像未去重 / project_id 不匹配可观测性）留作 v1.1 收口后续。
+
+D6 范围内以文档同步为主，附带 OpenAPI `AppState` state contract delta（保留并填充 `codex` 字段以匹配 `CodexAvailability(...)` 输出）和测试合同 manifest 对齐；不触碰 Go 实现代码或 dashboard 前端逻辑。

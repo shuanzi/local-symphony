@@ -1,9 +1,10 @@
 # Local Symphony App v1 PRD
 
-**状态**：v1 产品方案合并版
-**更新日期**：2026-05-11
+**状态**：v1 阶段 D 收口（2026-06-09）
+**更新日期**：2026-06-09（阶段 D 收口状态注；产品范围与 §1–§22 一致，未新增/扩大 v1 能力）
 **来源**：`local-symphony.zip` 原始文档包经 agent-executable hardening 后更新
 **文档权威性**：Local Symphony App v1 的产品事实和产品范围以本 PRD 定义为准。`TECH_SPEC.md` 只作为字段、表结构、API/schema、状态机、校验规则等技术合同细节的 source of truth；它和 executable contracts 不得新增或扩大本 PRD 未定义的 v1 产品能力。
+**阶段 D 收口状态指针**：`docs/productization/D6_DOCS_CLOSE_NOTES.md`（R 项 status note 表、文档变更清单、已知限制）
 
 ---
 
@@ -270,6 +271,8 @@ Codex Runner 使用 `codex app-server`。v1 要求 Codex adapter 是 version-fix
 
 真实 Codex adapter 是 v1 release scope，但真实 Codex 兼容性必须通过 committed fixture gate 进入；没有匹配 fixture 的本机 Codex 版本只阻断 real Codex dispatch，不影响 fake runner 主路径和默认 CI。默认测试使用 fake runner。Real Codex tests 只在显式设置 `SYMPHONY_TEST_CODEX=1` 时运行。
 
+> **阶段 D 收口状态（2026-06-09；已同步 2026-06-17 `origin/main`）**：D3 / R14 已把 Codex availability preflight 接到 diagnostics / status / state surface：`symphony diagnostics` / `GET /api/v1/diagnostics` 经 `internal/observability.Diagnostics` 调 `codex.RunPreflight(...)` 投影 `codex.available`、`codex.version`、`codex.support.{cli,model,sandbox}` 与 fixture metadata；`symphony status` / `GET /api/v1/state` 经 `observability.CodexAvailability(...)` 暴露同一类 projection（有 supported fixture 时报真实 version/support/available，无 fixture 时 `available=false` + `warning=unsupported_codex_version`）。当前 diagnostics/state contract 不含 Codex `reason`/`status` 字段，失败分类通过 nullable `last_preflight.failure_*` 与 `warning` 表达。Real Codex dispatch 在 fixtures 缺失时 fail-closed with `unsupported_codex_version`。D5 / R13 release packaging 已随当前 `main` 合入；当前 checkout 包含 `scripts/build-release.sh` 与 `web/package-lock.json`，release artifact 说明见 `docs/RELEASE_NOTES.md`。详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
+
 ### 8.5 WORKFLOW.md 与 Prompt
 
 `WORKFLOW.md` 是项目拥有的 workflow contract：
@@ -518,7 +521,7 @@ CLI 全局 flags 至少包括 `--project <path>`、`--api-url <url>`、`--json`�
 
 CLI exit codes 必须采用 TECH_SPEC 11.1 的 0-9 映射；尤其 daemon/gateway unavailable 为 3，auth failure 为 4，permission/policy denial 为 5，not found 为 6，state conflict 为 7，timeout 为 8，workflow/config error 为 9；API `error.code=approval_not_pending` 必须映射为 7。
 
-`symphony status` 使用 `/api/v1/state` 输出与 Overview 对齐的 concise project/daemon/workflow/run/approval/review/paused/Codex/failure 状态；daemon 不可用时只能降级到 `/health` 可用性信息或报错。
+`symphony status` 使用 `/api/v1/state` 输出当前 shipped state payload：`project_id`、`repo_root`、`issues`、`runs` 以及 `codex`（Codex availability projection，由 `observability.CodexAvailability(...)` 在每次调用时重新跑 preflight 投影，与 `symphony diagnostics` / `GET /api/v1/diagnostics` 同源）；`codex` 字段覆盖 `available`、`version`、`support.{cli,model,sandbox}`、`metadata`、`fixture_support`、`last_preflight` 与 `warning`（有 supported fixture 时报真实 version/support/available，无 fixture 时 `available=false` + `warning=unsupported_codex_version`）。daemon 不可用时只能降级到 `/health` 可用性信息或报错。daemon/workflow/approval/review/paused/failure 聚合属于后续 Overview/status 产品化扩展，不由当前 `/api/v1/state` 合同承诺。当前 state contract 不含 Codex `reason` / `status` 字段，失败分类通过 nullable `last_preflight.failure_*` 与 `warning` 表达；`status` / `state` 经 `observability.CodexAvailability(...)` 暴露 Codex availability/support projection，但不得额外合成 diagnostics/state 合同未定义的 Codex 字段。
 
 正常 CLI 是 operator 工具，走 REST API。`symphony tool ...` 是 agent 工具入口，走 Tool Gateway 本地传输，不走 REST `/api/v1`；transport 可为 Unix socket、named pipe 或 loopback HTTP，具体以 TECH_SPEC 为准，并且必须 JSON-only 输出。
 
@@ -565,7 +568,7 @@ Codex-mediated command auto-deny、network auto-deny、protected-path read/write
 
 Tool Gateway `artifact.attach` 命中 protected path 是另一类拒绝：daemon 必须 hard deny 该 tool call、记录 failed tool_call 并向 agent 返回 tool error；不得写入 approval row，也不得由该拒绝本身直接终止 run。若 agent 后续无法恢复或完成任务，run 才按正常失败路径进入终止状态。
 
-Token 生命周期必须可验收：CLI bearer raw token 只写入 `~/.symphony/cli-session.json`，在 OS 支持时权限必须为 current-user only，app DB 只保存 hash；runtime descriptor 不得包含 secret。Open token 必须短 TTL、one-time、hash-only at rest，成功 exchange 后立即失效，重复使用或过期使用返回 unauthorized。CSRF 只强制用于 cookie-authenticated command APIs；只读 state/health 类接口仍必须满足各自 auth 要求，但不得错误要求 CLI bearer 请求携带 CSRF。Tool token 必须绑定 project/issue/run/workspace/allowed_tools/expiry，只能调用固定 Tool Gateway registry；run terminal、operator run cancel、approval `cancel_run`、reconciliation cancel 或 daemon shutdown 时必须 revoke，且不得赋予 REST operator command 权限。
+Token 生命周期必须可验收：CLI bearer raw token 主路径只写入 project-scoped `~/.symphony/cli-sessions/<project>.json`，legacy `~/.symphony/cli-session.json` 仅作为旧版本 fallback/compatibility；在 OS 支持时权限必须为 current-user only，app DB 只保存 hash；runtime descriptor 不得包含 secret。`symphony login --logout` 必须优先请求 daemon 撤销当前 CLI bearer，确认 revoke、token 不匹配或无本地 bearer 可撤销后才删除本地 session 文件；若 daemon-side revoke 无法确认，必须保留本地文件供重试。Open token 必须短 TTL、one-time、hash-only at rest，成功 exchange 后立即失效，重复使用或过期使用返回 unauthorized。CSRF 只强制用于 cookie-authenticated command APIs；只读 state/health 类接口仍必须满足各自 auth 要求，但不得错误要求 CLI bearer 请求携带 CSRF。Tool token 必须绑定 project/issue/run/workspace/allowed_tools/expiry，只能调用固定 Tool Gateway registry；run terminal、operator run cancel、approval `cancel_run`、reconciliation cancel 或 daemon shutdown 时必须 revoke，且不得赋予 REST operator command 权限。
 
 产品文案必须区分三层安全边界：
 

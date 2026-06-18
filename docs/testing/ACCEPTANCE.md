@@ -1,6 +1,18 @@
 # Local Symphony App v1 Acceptance
 
-## A0 Contract validation
+**阶段 D 收口状态（2026-06-09）**：本 acceptance 文档按"是否依赖真实 Codex"分为三类。
+
+| 类别 | 标记 | 触发方式 | 涉及段 |
+|---|---|---|---|
+| **fake acceptance** | `[fake]` | 默认 CI / `go test ./...` + `python3 scripts/validate_contracts.py` + `cd web && npm ci && npm run typecheck && npm test`；`bash scripts/acceptance-local.sh` 只覆盖本地构建 + daemon-backed A1/A2/A9 主路径冒烟 | A0 / A0a / A0b / A1 / A2 / A3 / A3a / A4 / A4a / A4a.1 / A4b / A5 / A6 / A7 / A9 / A9a |
+| **安全回归** | `[security-regression]` | 默认 CI / `go test ./internal/security ./internal/observability ./internal/httpapi ./internal/toolgateway ./internal/agent/codex ./internal/store` | A8 |
+| **real Codex opt-in acceptance** | `[real-codex-opt-in]` | 显式 `SYMPHONY_TEST_CODEX=1` | A10 |
+
+`[fake]` 与 `[security-regression]` 不依赖本机真实 Codex；`acceptance-local.sh` 是本地主路径 smoke，不运行 A0-A9a 的全部 fake rejection matrix；`[real-codex-opt-in]` 必须 fixture 齐备且显式 opt-in，否则按 `unsupported_codex_version` 失败（fail-closed）。详见 `docs/productization/D6_DOCS_CLOSE_NOTES.md`。
+
+---
+
+## A0 Contract validation `[fake]`
 
 ```bash
 scripts/validate-contracts.sh
@@ -31,7 +43,7 @@ docs/agent_work_orders/*.md do not contain forbidden v1 command-like capability 
 security regression command/topic manifest includes default fake-only commands and gates real Codex behind SYMPHONY_TEST_CODEX=1
 ```
 
-## A0a WORKFLOW validation
+## A0a WORKFLOW validation `[fake]`
 
 Expected：
 
@@ -41,7 +53,7 @@ wrong type, missing required field, unsupported enum, and unset-or-empty full-st
 unset-or-empty full-string $VAR_NAME blocks dispatch and invalid reload does not replace the effective config
 ```
 
-## A0b Workflow validate API
+## A0b Workflow validate API `[fake]`
 
 Call `POST /api/v1/workflow/validate` with omitted body, `{}`, and `{"dry_run": true}`.
 
@@ -59,7 +71,7 @@ candidate_workflow_md, candidate_config, render_context, unknown fields, malform
 invalid WORKFLOW.md content returns 200 with validation.valid=false
 ```
 
-## A1 Init and local tracker
+## A1 Init and local tracker `[fake]`
 
 ```bash
 symphony init --issue-prefix LOC
@@ -70,7 +82,7 @@ symphony issue show LOC-1 --json
 
 Expected：issue identifier is `LOC-1`, state is `Ready`, dispatch_paused is false.
 
-## A2 Fake runner main path
+## A2 Fake runner main path `[fake]`
 
 ```bash
 symphony serve --project . --no-open
@@ -92,7 +104,7 @@ main repo working tree not polluted except documented init files
 symphony review path prints metadata/path diagnostics only and does not print packet file contents or raw artifact bytes
 ```
 
-## A3 Rework path
+## A3 Rework path `[fake]`
 
 ```bash
 symphony review send-to-rework LOC-1 --reason "Need stronger tests"
@@ -102,7 +114,7 @@ symphony review LOC-1
 
 Expected：same workspace/branch reused; latest review packet has packet_no incremented; cumulative diff includes prior changes.
 
-## A3a Send to Rework rejection matrix
+## A3a Send to Rework rejection matrix `[fake]`
 
 Each rejection must return the listed error code and leave issue state, active run records, review packet metadata, review packet files, comments, and system events unchanged.
 
@@ -115,7 +127,7 @@ Each rejection must return the listed error code and leave issue state, active r
 | latest review packet status is not generated | review_packet_required |
 | latest review packet row is generated but does not belong to latest completed handoff run | review_packet_required |
 
-## A4 Failure pause and resume
+## A4 Failure pause and resume `[fake]`
 
 Use fake runner failure fixture.
 
@@ -130,7 +142,7 @@ symphony issue dispatch-resume LOC-1 clears pause
 next dispatch succeeds when other eligibility guards pass
 ```
 
-## A4a Manual dispatch control rejects active run
+## A4a Manual dispatch control rejects active run `[fake]`
 
 Start a run, then call manual dispatch pause and resume against the same Working issue.
 
@@ -145,7 +157,7 @@ issue.dispatch_paused_at is unchanged by both requests
 active run remains active unless separately cancelled
 ```
 
-## A4a.1 Manual dispatch control rejects blank reason
+## A4a.1 Manual dispatch control rejects blank reason `[fake]`
 
 Call manual dispatch pause and resume with missing, blank, and trim-to-empty `--reason` / request `reason` values.
 
@@ -160,7 +172,7 @@ issue.dispatch_paused_at is unchanged by both requests
 no system event or issue comment is appended
 ```
 
-## A4b Reconciliation pause survives unblock
+## A4b Reconciliation pause survives unblock `[fake]`
 
 Start a run, use an operator transition to move its Working issue to Blocked, then resolve Blocked to Ready.
 
@@ -177,13 +189,13 @@ symphony issue dispatch-resume LOC-1 clears pause
 next dispatch succeeds when other eligibility guards pass
 ```
 
-## A5 Missing handoff
+## A5 Missing handoff `[fake]`
 
 Use fake runner fixture that completes without handoff twice.
 
 Expected：run.status = completed_without_handoff; failure_code = missing_handoff; issue restored to source state and paused.
 
-## A6 Tool Gateway scope
+## A6 Tool Gateway scope `[fake]`
 
 Expected：
 
@@ -197,7 +209,7 @@ expired/revoked tool token fails
 second handoff.submit for the same run with a different canonical payload hash returns handoff_conflict, CLI exit code 7, does not replace the original handoff, and does not advance Human Review
 ```
 
-## A7 Review packet integrity
+## A7 Review packet integrity `[fake]`
 
 Expected review packet contains:
 
@@ -227,7 +239,7 @@ untracked-files.json sets patch_included=false for each omitted untracked file
 untracked-files.json includes a non-empty reason for each omitted untracked file
 ```
 
-## A8 Security
+## A8 Security `[security-regression]`
 
 Expected：
 
@@ -245,7 +257,7 @@ symphony review path does not bypass Review API + Artifact API redaction/refusal
 security tests do not claim compliance-grade DLP
 ```
 
-## A9 Done gate
+## A9 Done gate `[fake]`
 
 ```bash
 symphony review mark-done LOC-1 --reason "Accepted"
@@ -253,7 +265,7 @@ symphony review mark-done LOC-1 --reason "Accepted"
 
 Expected：issue state = Done; no git commit, push, PR, merge, publish, workspace cleanup, reset, or delete occurs.
 
-## A9a Mark Done rejection matrix
+## A9a Mark Done rejection matrix `[fake]`
 
 Each rejection must return the listed error code and leave issue state, active run records, review packet metadata, review packet files, comments, and system events unchanged.
 
@@ -266,7 +278,7 @@ Each rejection must return the listed error code and leave issue state, active r
 | latest review packet status is not generated | review_packet_required |
 | latest review packet row is generated but does not belong to latest completed handoff run | review_packet_required |
 
-## A10 Codex fixture gate
+## A10 Codex fixture gate `[real-codex-opt-in]`
 
 Expected：
 
