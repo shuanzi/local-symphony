@@ -581,31 +581,60 @@ func bulletPaths(v []string) string {
 // escapePathForMarkdown neutralizes control characters in a file path so
 // a Git-valid name containing, e.g., a newline (`docs/x\nraw_prompt`)
 // cannot break out of its bullet line and inject a raw-artifact marker
-// (or any other prose) into the Rework prompt. Control bytes and the
-// backtick (which could close a surrounding code fence prematurely) are
-// replaced with a visible escape sequence. The path is wrapped in
-// backticks so any embedded markdown punctuation is rendered literally.
-// Round 14 / R14-2.
+// (or any other prose) into the Rework prompt. Control bytes are
+// replaced with a visible `\uXXXX` escape. The path is wrapped in a
+// CommonMark code span so any embedded markdown punctuation renders
+// literally.
+//
+// Round 15 / R15-1: backslashes are literal inside a code span, so
+// backslash-escaping internal backticks does NOT stop them from closing
+// a single-backtick wrapper — a Git-valid filename like `` `raw_prompt ``
+// would close the span and leak the marker. Instead we use the CommonMark
+// rule: wrap the content in N+1 backticks where N is the longest run of
+// backticks in the path, and pad with a space when the content begins or
+// ends with a backtick so the closing delimiter is unambiguous.
 func escapePathForMarkdown(p string) string {
-	var b strings.Builder
-	b.Grow(len(p) + 2)
-	b.WriteByte('`')
+	// First, replace control characters with a visible escape so they
+	// cannot start a new prompt line. The backtick-run scan below
+	// operates on the post-escape string.
+	var eb strings.Builder
+	eb.Grow(len(p) + 4)
 	for _, r := range p {
 		switch {
 		case r < 0x20 || r == 0x7f:
 			// C0 control chars + DEL: covers \n \r \t \f \v and
 			// anything else that could start a new prompt line.
-			fmt.Fprintf(&b, "\\u%04x", r)
-		case r == '`':
-			b.WriteString("\\`")
-		case r == '\\':
-			b.WriteString("\\\\")
+			fmt.Fprintf(&eb, "\\u%04x", r)
 		default:
-			b.WriteRune(r)
+			eb.WriteRune(r)
 		}
 	}
-	b.WriteByte('`')
-	return b.String()
+	content := eb.String()
+	// Longest run of backticks in the content; the wrapper needs one
+	// more than this so no interior run can close the span.
+	longest := 0
+	run := 0
+	for i := 0; i < len(content); i++ {
+		if content[i] == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	fence := strings.Repeat("`", longest+1)
+	// CommonMark: pad with a single space when the content begins or
+	// ends with a backtick so the closing fence is unambiguous. A
+	// space is safe here because paths are rendered inside a code span
+	// where leading/trailing spaces are visually trimmed by renderers
+	// but still delimit the fence.
+	pad := ""
+	if len(content) > 0 && (content[0] == '`' || content[len(content)-1] == '`') {
+		pad = " "
+	}
+	return fence + pad + content + pad + fence
 }
 
 // isBoundaryByteCI reports whether b is a "boundary" byte — a

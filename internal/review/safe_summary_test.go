@@ -612,6 +612,77 @@ func TestSafeSummaryEscapesChangedFilePathsBeforeMarkdown(t *testing.T) {
 	}
 }
 
+// TestSafeSummaryEscapesBacktickBearingFilePaths (R15-1) verifies that a
+// Git-valid changed-file path containing a literal backtick cannot
+// close the single-backtick code-span wrapper and leak a raw-artifact
+// marker. Round 14 used a single-backtick wrapper with backslash-escaped
+// internal backticks, but backslashes are literal inside a CommonMark
+// code span, so `` `raw_prompt `` would close the span and render the
+// marker as prompt text. The fix uses an N+1 backtick fence.
+func TestSafeSummaryEscapesBacktickBearingFilePaths(t *testing.T) {
+	cases := []struct {
+		name    string
+		path    string
+		leaked  string // substring that must NOT render as stand-alone prose
+	}{
+		{"leading backtick + marker", "`raw_prompt", "raw_prompt"},
+		{"backtick before marker", "x`raw_prompt", "raw_prompt"},
+		{"two backticks + marker", "``raw_prompt", "raw_prompt"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &SafeSummary{
+				ReviewPacketID: "rp_bt",
+				Status:         "generated",
+				Summary:        "Changed a backtick-bearing file name.",
+				ChangedFiles:   []string{tc.path},
+				HowToContinue:  "Review the escaped paths.",
+			}
+			if err := s.Seal(); err != nil {
+				t.Fatalf("Seal: %v", err)
+			}
+			md, err := s.ToMarkdown()
+			if err != nil {
+				t.Fatalf("ToMarkdown: %v", err)
+			}
+			// The marker must never render as a stand-alone prompt
+			// line (which would re-inject the raw-artifact marker).
+			for _, line := range strings.Split(md, "\n") {
+				if strings.TrimSpace(line) == tc.leaked {
+					t.Fatalf("marker %q rendered as a stand-alone line: %q", tc.leaked, md)
+				}
+			}
+			// The wrapper must use strictly more backticks than the
+			// longest backtick run in the path so it cannot be closed
+			// by an interior backtick. Compute the longest run.
+			longest := 0
+			run := 0
+			for i := 0; i < len(tc.path); i++ {
+				if tc.path[i] == '`' {
+					run++
+					if run > longest {
+						longest = run
+					}
+				} else {
+					run = 0
+				}
+			}
+			expectedFence := strings.Repeat("`", longest+1)
+			// The rendered markdown must contain an opening fence of
+			// at least expectedFence length.
+			if !strings.Contains(md, expectedFence) {
+				t.Fatalf("markdown missing %d-backtick fence (got: %q)", longest+1, md)
+			}
+			// No backslash-escaped backtick should remain (round-14
+			// behavior); the N+1 fence handles backticks without
+			// backslash escapes.
+			if strings.Contains(md, "\\`") {
+				t.Fatalf("markdown used backslash-escaped backtick (R15-1 regression): %q", md)
+			}
+		})
+	}
+}
+
 // TestBuildSafeSummaryHandlesMalformedGitMetadata (R14-3) verifies that
 // a review.json which is valid JSON but lacks an object-valued `git`
 // field does not panic during safe summary projection. A manually-edited

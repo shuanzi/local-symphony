@@ -433,3 +433,42 @@ acceptance-local.sh                             PASS (acceptance-local passed)
 - **Escape at the renderer, not the scan**: the refusal-kind scan is about artifact-*kind* labels and must stay path-tolerant (round-8 F5). Control-character injection is a separate concern handled at the markdown renderer, where it is cheapest and where escaping cannot regress the scan's path false-positive behavior. Wrapping paths in backticks is the standard markdown idiom for literal path rendering.
 - **Graceful degrade, not fail-closed, for malformed `git`**: a missing `head_sha` is non-fatal (the rest of the safe summary is still useful and the field is optional). Panicking is strictly worse. This mirrors how `pickString`/`pickStringSlice` already silently skip non-string fields elsewhere in the same projection.
 
+---
+
+## Round 15: N+1 backtick fence for path code spans
+
+**Trigger**: codex review commit `21ad057` (round-14 fix), 1 new finding (P2), submitted 2026-06-22.
+
+### Findings
+
+| ID | Finding | Severity | Files | Status |
+|----|---------|----------|-------|--------|
+| R15-1 | Keep path backticks from closing the wrapper | P2 | `internal/review/safe_summary.go` `escapePathForMarkdown` | done |
+
+### Details
+
+**R15-1 (P2) — backticks close the single-backtick wrapper**: round-14 `escapePathForMarkdown` wrapped the path in a single-backtick code span and backslash-escaped internal backticks. But in CommonMark backslashes are *literal* inside a code span — they do not escape backticks — so a Git-valid filename containing a backtick immediately followed by a raw-artifact marker (`` `raw_prompt ``) still closed the span and rendered `raw_prompt` as ordinary prompt text, leaving the changed-file injection guard incomplete.
+
+**Fix**: use the CommonMark rule for code spans containing backticks. Compute the longest run of backticks `N` in the (control-char-escaped) path and wrap the content in `N+1` backticks; if the content begins or ends with a backtick, pad with a single space so the closing fence is unambiguous. No backslash escaping of backticks is performed (it would be a no-op inside the span). Control characters are still replaced with the visible `\uXXXX` escape from round 14.
+
+### Regression tests
+
+| Finding | Regression test |
+|---------|-----------------|
+| R15-1 | `TestSafeSummaryEscapesBacktickBearingFilePaths` (3 cases: leading backtick, interior backtick, two-backtick run; asserts no stand-alone marker line, fence length = longest run + 1, no `\`-escaped backticks) |
+
+### Acceptance gate (Round 15)
+
+```
+go test ./...                                   PASS
+go vet ./...                                    PASS
+validate_contracts.py                           PASS (contract validation passed)
+acceptance-local.sh                             PASS (acceptance-local passed)
+```
+
+### Design trade-offs (Round 15)
+
+- **N+1 fence over backslash escaping**: backslash-escaping is wrong inside a code span (CommonMark treats backslashes literally there), and replacing backticks with a visible escape like ``` would harm readability for the common case. The N+1-fence rule is exactly what CommonMark specifies for this situation and preserves the path verbatim while guaranteeing no interior backtick run can close the span.
+- **Space padding only when needed**: padding is added only when the content begins or ends with a backtick, so ordinary paths (no backticks) render as a clean single-backtick span with no surrounding spaces. Renderers visually trim the single leading/trailing space inside a code span, so the padded form still reads as the path.
+
+
