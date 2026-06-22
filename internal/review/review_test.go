@@ -1815,15 +1815,70 @@ func TestGenerateSuppressesModifiedTrackedCopyAfterProtectedDelete(t *testing.T)
 	if strings.Contains(changed, "config.txt") {
 		t.Fatalf("changed-files.txt kept denied modified-tracked copy config.txt:\n%s", changed)
 	}
-	// The unrelated modified feature.txt MUST be kept (M check is
-	// content-hash, not blanket fail-closed — preserves the
-	// TestGenerateDoesNotReincludeProtectedRenameFromHandoff contract).
+	// D4/R16 round-17 (R17-1): when a protected file is DELETED
+	// (unrecoverable=true), the modified-then-deleted bytes are not in
+	// existingHashes, so a modified tracked file holding them would not
+	// content-hash-match. Fail-closed M records in that mode: the
+	// unrelated modified feature.txt is ALSO suppressed (P1 security wins
+	// over P2 correlation per the round-8 user-approved trade-off). This
+	// narrows the TestGenerateDoesNotReincludeProtectedRenameFromHandoff
+	// contract to R/C (where bytes are recoverable); D/T fail-closes M.
 	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
-	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
-		t.Fatalf("changes.patch dropped unrelated modified tracked feature.txt (correlation broken):\n%s", patch)
+	if strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch kept unrelated modified tracked feature.txt in unrecoverable (protected-delete) fail-closed mode:\n%s", patch)
 	}
-	if !strings.Contains(changed, "feature.txt") {
-		t.Fatalf("changed-files.txt dropped unrelated modified tracked feature.txt:\n%s", changed)
+	if strings.Contains(changed, "feature.txt") {
+		t.Fatalf("changed-files.txt kept unrelated modified tracked feature.txt in unrecoverable fail-closed mode:\n%s", changed)
+	}
+}
+
+// TestGenerateFailsClosedOnModifiedTrackedCopyOfModifiedThenDeletedProtected
+// (R17-1) codifies the round-17 fix for the residual leak the round-13
+// M-record content-hash guard could not close: a protected file MODIFIED,
+// copied onto an existing tracked non-protected file, then DELETED. The
+// modified-then-deleted bytes are unrecoverable (not in HEAD/index), so
+// the M file's content does NOT match any recoverable hash in
+// existingHashes — round-13's content-hash match would keep it and leak.
+// Round-17 marks a protected D/T as unrecoverable and fail-closes M
+// records in that mode.
+func TestGenerateFailsClosedOnModifiedTrackedCopyOfModifiedThenDeletedProtected(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=old\n")
+	writeFile(t, workspace, "config.txt", "base config\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// MODIFY the protected file (the bytes that will be copied), copy the
+	// MODIFIED bytes onto the existing tracked config.txt, then DELETE .env.
+	writeFile(t, workspace, ".env", "SECRET=modified\n")
+	modified, err := os.ReadFile(filepath.Join(workspace, ".env"))
+	if err != nil {
+		t.Fatalf("read modified .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "config.txt"), modified, 0o644); err != nil {
+		t.Fatalf("overwrite config.txt with modified protected bytes: %v", err)
+	}
+	runGit(t, workspace, "add", "config.txt")
+	runGit(t, workspace, "rm", "-f", ".env")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"config.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// config.txt (modified-tracked copy of MODIFIED-then-deleted protected
+	// content) MUST be suppressed: the modified bytes are unrecoverable so
+	// no content-hash match is possible — fail-closed is the only defense.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"SECRET=modified",
+			"diff --git a/config.txt b/config.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked modified-then-deleted protected bytes via M record (%q):\n%s", name, marker, art)
+			}
+		}
 	}
 }
 
@@ -1914,10 +1969,13 @@ func TestGenerateSuppressesProtectedBytesInRenamedDestination(t *testing.T) {
 	if strings.Contains(changed, "new.txt") {
 		t.Fatalf("changed-files.txt kept denied renamed destination new.txt:\n%s", changed)
 	}
-	// The unrelated modified feature.txt MUST be kept.
+	// D4/R16 round-17 (R17-1): the protected .env was DELETED
+	// (unrecoverable=true), so M records fail-closed in this mode. The
+	// unrelated modified feature.txt is ALSO suppressed (P1 security
+	// over P2 correlation).
 	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
-	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
-		t.Fatalf("changes.patch dropped unrelated modified tracked feature.txt (correlation broken):\n%s", patch)
+	if strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch kept unrelated modified tracked feature.txt in unrecoverable (protected-delete) fail-closed mode:\n%s", patch)
 	}
 }
 // fix for the protected-typechange P1 leak in review.go's
@@ -2561,7 +2619,12 @@ func TestGenerateFailsClosedOnTypechangeAfterProtectedDelete(t *testing.T) {
 		}
 	}
 	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
-	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
-		t.Fatalf("changes.patch dropped unrelated modified tracked feature.txt:\n%s", patch)
+	// D4/R16 round-17 (R17-1): the protected .env was DELETED
+	// (unrecoverable=true), so M records fail-closed. The unrelated
+	// modified feature.txt is ALSO suppressed (P1 security over P2
+	// correlation) — updated from "feature.txt MUST be kept" to match
+	// the round-17 fix.
+	if strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch kept unrelated modified tracked feature.txt in unrecoverable (protected-delete) fail-closed mode:\n%s", patch)
 	}
 }

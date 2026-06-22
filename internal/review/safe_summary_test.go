@@ -612,7 +612,44 @@ func TestSafeSummaryEscapesChangedFilePathsBeforeMarkdown(t *testing.T) {
 	}
 }
 
-// TestSafeSummaryEscapesBacktickBearingFilePaths (R15-1) verifies that a
+// TestSafeSummaryEscapesDiffstatBeforeRendering (R17-3) verifies that a
+// diffstat containing a backtick-bearing or control-char-bearing filename
+// cannot close the diffstat code fence or inject a stand-alone marker line
+// into the Rework prompt. Diffstat rows are excluded from the refusal-kind
+// scan (they contain file paths), so the renderer must escape them.
+func TestSafeSummaryEscapesDiffstatBeforeRendering(t *testing.T) {
+	s := &SafeSummary{
+		ReviewPacketID: "rp_diffstat",
+		Status:         "generated",
+		Summary:        "Changed a backtick-bearing file.",
+		Diffstat:       "1\t0\t`raw_prompt\n",
+		HowToContinue:  "Review the escaped diffstat.",
+	}
+	if err := s.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	md, err := s.ToMarkdown()
+	if err != nil {
+		t.Fatalf("ToMarkdown: %v", err)
+	}
+	// The raw newline-bearing diffstat must not appear verbatim (the
+	// embedded newline would inject `raw_prompt` as a stand-alone line).
+	if strings.Contains(md, "1\t0\t`raw_prompt\n") {
+		t.Fatalf("markdown emitted unescaped diffstat: %q", md)
+	}
+	// `raw_prompt` must not render as a stand-alone prompt line.
+	for _, line := range strings.Split(md, "\n") {
+		if strings.TrimSpace(line) == "raw_prompt" {
+			t.Fatalf("markdown rendered raw_prompt as a stand-alone line: %q", md)
+		}
+	}
+	// The diffstat fence must use more than one backtick (the content
+	// contains a backtick, so a single-backtick fence would close early).
+	if !strings.Contains(md, "``") {
+		t.Fatalf("markdown did not use a multi-backtick diffstat fence: %q", md)
+	}
+}
+
 // Git-valid changed-file path containing a literal backtick cannot
 // close the single-backtick code-span wrapper and leak a raw-artifact
 // marker. Round 14 used a single-backtick wrapper with backslash-escaped

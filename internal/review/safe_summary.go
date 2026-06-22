@@ -318,9 +318,18 @@ func (s *SafeSummary) ToMarkdown() (string, error) {
 	b.WriteString("\n\n## Changed Files\n")
 	b.WriteString(bulletPaths(s.ChangedFiles))
 	if strings.TrimSpace(s.Diffstat) != "" {
-		b.WriteString("\n\n## Diffstat\n```\n")
-		b.WriteString(strings.TrimSpace(s.Diffstat))
-		b.WriteString("\n```\n")
+		// D4/R16 round-17 (codex finding R17-3): diffstat rows contain
+		// file paths and are excluded from the refusal-kind scan. A
+		// Git-valid filename containing a backtick could close the
+		// single-backtick fence below prematurely, and a filename
+		// containing a control char (newline) could inject a stand-alone
+		// marker line inside the block. Escape control chars and use an
+		// N+1 backtick fence (N = longest backtick run in the diffstat)
+		// so no interior backtick run can close the block.
+		escaped := escapeDiffstatForMarkdown(strings.TrimSpace(s.Diffstat))
+		b.WriteString("\n\n## Diffstat\n")
+		b.WriteString(escaped)
+		b.WriteString("\n")
 	}
 	b.WriteString("\n## How to Continue\n")
 	b.WriteString(strings.TrimSpace(s.HowToContinue))
@@ -576,6 +585,44 @@ func bulletPaths(v []string) string {
 		out = append(out, "- "+escapePathForMarkdown(x))
 	}
 	return strings.Join(out, "\n")
+}
+
+// escapeDiffstatForMarkdown renders a diffstat block as a CommonMark fenced
+// code block with control characters neutralized and a fence longer than any
+// backtick run in the content. Diffstat rows contain file paths that are
+// excluded from the refusal-kind scan (they are paths, not artifact-kind
+// labels), so a Git-valid filename containing a backtick could close a
+// single-backtick fence prematurely and a filename containing a control
+// char (newline) could inject a stand-alone marker line. Round 17 / R17-3.
+func escapeDiffstatForMarkdown(diffstat string) string {
+	// Replace control characters with a visible escape so they cannot
+	// start a new prompt line or alter the fence structure.
+	var eb strings.Builder
+	eb.Grow(len(diffstat) + 4)
+	for _, r := range diffstat {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&eb, "\\u%04x", r)
+		default:
+			eb.WriteRune(r)
+		}
+	}
+	content := eb.String()
+	// Longest run of backticks in the content; the fence needs one more.
+	longest := 0
+	run := 0
+	for i := 0; i < len(content); i++ {
+		if content[i] == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	fence := strings.Repeat("`", longest+1)
+	return fence + "\n" + content + "\n" + fence
 }
 
 // escapePathForMarkdown neutralizes control characters in a file path so

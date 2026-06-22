@@ -668,6 +668,18 @@ func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]strin
 		// symlink, hash the target text (what git diff emits); otherwise
 		// hash the workspace file content.
 		if strings.HasPrefix(record.status, "T") {
+			if hashesUnknown {
+				// D4/R16 round-17 (codex finding R17-2): a protected
+				// file was deleted/renamed/copied/typechanged, so the
+				// pre-operation worktree bytes may be unrecoverable.
+				// A typechanged non-protected file (e.g. a symlink whose
+				// target is modified-then-deleted protected bytes) can
+				// hold those bytes, and existingHashes is nil in this
+				// mode so the content-hash match below cannot run. Fail
+				// closed: skip T records while hashesUnknown=true
+				// (mirrors the A/C/M fail-closed).
+				continue
+			}
 			if len(existingHashes) > 0 {
 				dst := record.paths[len(record.paths)-1]
 				h, ok := hashTypechangeEmittedBytes(root, dst)

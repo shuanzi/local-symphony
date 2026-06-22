@@ -1982,6 +1982,71 @@ func TestFilteredTrackedDiffFailsClosedOnProtectedTypechange(t *testing.T) {
 	}
 }
 
+// TestFilteredTrackedDiffFailsClosedOnTypechangeInHashesUnknownMode (R17-2)
+// codifies the round-17 fix for a protected-content leak via a NON-protected
+// typechange when hashesUnknown=true in the cumulative-diff path.
+//
+// Scenario: a protected tracked .env is committed (SECRET=old), MODIFIED to
+// SECRET=new, an existing tracked non-protected config.txt is replaced by a
+// symlink whose target is the MODIFIED protected bytes
+// (`rm config.txt; ln -s "$SECRET=new" config.txt`), and the protected .env
+// is DELETED (`git rm -f .env`). `git diff --name-status` reports `D .env`
+// (sets hashesUnknown=true) plus `T config.txt` (non-protected typechange
+// whose emitted symlink target is the modified-then-deleted protected bytes).
+// Round-16's T branch only content-hash-matched when existingHashes was
+// non-empty; in hashesUnknown mode existingHashes is nil, so the T record
+// fell through and `git diff HEAD -- config.txt` folded the protected bytes
+// into cumulative_diff_sha.
+//
+// Round 17 fix: skip T records when hashesUnknown=true (mirror the A/C/M
+// fail-closed).
+func TestFilteredTrackedDiffFailsClosedOnTypechangeInHashesUnknownMode(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=old\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "config.txt"), []byte("base config\n"), 0o644); err != nil {
+		t.Fatalf("write config.txt: %v", err)
+	}
+	gitCommit(t, ws, "add env and config")
+	// MODIFY the protected file, then make config.txt a symlink whose
+	// target is the modified protected bytes, then DELETE .env.
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=new\n"), 0o600); err != nil {
+		t.Fatalf("modify .env: %v", err)
+	}
+	if err := os.Remove(filepath.Join(ws, "config.txt")); err != nil {
+		t.Fatalf("rm config.txt: %v", err)
+	}
+	if err := os.Symlink("SECRET=new", filepath.Join(ws, "config.txt")); err != nil {
+		t.Fatalf("symlink config.txt -> modified-secret: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "add", "config.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add config.txt: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", ws, "rm", "-f", ".env").CombinedOutput(); err != nil {
+		t.Fatalf("git rm -f .env: %v\n%s", err, out)
+	}
+
+	// Sanity: D .env (hashesUnknown) + T config.txt (non-protected typechange).
+	probe, err := exec.Command("git", "-C", ws, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "--diff-filter=DRCT", "-z", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("DRCT probe: %v", err)
+	}
+	if !strings.Contains(string(probe), "D\x00.env") || !strings.Contains(string(probe), "T\x00config.txt") {
+		t.Fatalf("expected D .env + T config.txt; test premise invalid:\n%q", string(probe))
+	}
+
+	diff := string(filteredTrackedDiff(ws, nil))
+	if strings.Contains(diff, "SECRET=new") {
+		t.Fatalf("filtered tracked diff leaked modified-then-deleted protected bytes via non-protected typechange in hashesUnknown mode:\n%s", diff)
+	}
+	if strings.Contains(diff, "diff --git a/config.txt b/config.txt") {
+		t.Fatalf("filtered tracked diff kept non-protected T config.txt in hashesUnknown fail-closed mode:\n%s", diff)
+	}
+}
+
 // TestHashWorkspaceFileSkipsSpecialFiles codifies the D4 / R16 round-8 fix
 // for the special-file blocking P2 in the orchestrator's hashWorkspaceFile.
 //

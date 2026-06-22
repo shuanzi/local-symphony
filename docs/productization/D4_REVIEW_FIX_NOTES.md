@@ -522,5 +522,57 @@ acceptance-local.sh                             PASS (acceptance-local passed)
 - **R destination fail-closed only when unknown=true**: when `unknown=false` (no protected delete/rename/copy/typechange) the destination's content is content-hash-matched, not blanket-suppressed, so an unrelated rename whose destination does not match protected content is preserved (correlation). When `unknown=true` the fail-closed matches the existing A/C/untracked behavior — the documented trade-off that protected-content unrecoverability justifies dropping potentially-correlated records. This does not affect the `TestGenerateDoesNotReincludeProtectedRenameFromHandoff` contract (that test's `app.txt` is an M record, content-hash-matched and kept).
 - **R16-2/R16-3 source-protected case already handled**: when the rename SOURCE is protected, the review path-safety loop (`reviewSafePath` → `denied[dst]=true`) and the orchestrator per-record protected-source check already skip the destination before these new guards run. The new guards specifically close the non-protected-source / protected-bytes-destination case the broad review identified.
 
+---
+
+## Round 17: unrecoverable D/T fail-closed for M/T + diffstat fence escape
+
+**Trigger**: codex round-17 broad review (`--base main`), 3 new findings (2 P1 + 1 P2). The two P1s are residual protected-content leaks the round-16 fixes did not close: when a protected file is MODIFIED, copied onto a tracked file, then DELETED (or typechanged), the modified-then-deleted bytes are unrecoverable and absent from `existingHashes`, so the round-13/16 content-hash match keeps the copy and leaks. The P2 is the diffstat analogue of round-14/15 path escaping.
+
+### Findings
+
+| ID | Finding | Severity | Files | Status |
+|----|---------|----------|-------|--------|
+| R17-1 | Fail closed modified files after protected deletes | P1 | `internal/review/review.go` `protectedDeletedContentSet.unrecoverable` + `matchesModifiedTracked` | done |
+| R17-2 | Suppress typechanged files in protected-delete mode | P1 | `internal/orchestrator/orchestrator.go` `filteredTrackedDiffPathspecs` T branch | done |
+| R17-3 | Escape diffstat before rendering safe summaries | P2 | `internal/review/safe_summary.go` `escapeDiffstatForMarkdown` | done |
+
+### Details
+
+**R17-1 (P1) — modified-then-deleted bytes are unrecoverable**: round-16's ls-tree enumeration added a deleted protected file's HEAD blob to `existingHashes`, closing the *unmodified* copy leak. But when the protected file was MODIFIED before deletion, the modified bytes are NOT in HEAD/index and are unrecoverable; a modified tracked file holding them (`cp <modified-.env> config.txt && git rm -f .env`) does not match any recoverable hash, so `matchesModifiedTracked` kept it and `SECRET=modified` leaked. Round-13's documented "M is content-hash, not blanket fail-closed" trade-off accepted this residual risk to preserve correlation of unrelated M files during a protected *rename*. The broad review re-flags it as a P1 leak.
+
+**Fix**: distinguish "protected bytes unrecoverable" (protected D/T — modified-then-deleted/typechanged) from "protected bytes moved to a recoverable destination" (protected R/C). New `protectedDeletedContentSet.unrecoverable` flag, set for D and T, clear for R/C. `matchesModifiedTracked` fail-closes (returns true) when `unrecoverable=true`. This narrows the `TestGenerateDoesNotReincludeProtectedRenameFromHandoff` contract to R/C (where bytes are recoverable and an unrelated M app.txt is still content-hash-kept); during a protected D/T, M records fail-closed. Three existing/round-16 tests that asserted "unrelated feature.txt (M) is kept during a protected delete" were updated to assert fail-closed suppression (P1 security over P2 correlation, per the round-8 user-approved trade-off).
+
+**R17-2 (P1) — same gap for typechanges in the cumulative-diff path**: `filteredTrackedDiffPathspecs`'s T branch only content-hash-matched when `len(existingHashes) > 0`. In `hashesUnknown` mode `existingHashes` is nil, so the T branch did nothing and a non-protected typechange whose symlink target held modified-then-deleted protected bytes fell through into `cumulative_diff_sha`.
+
+**Fix**: when `hashesUnknown=true` skip T records (mirror the A/C/M fail-closed), before the content-hash branch.
+
+**R17-3 (P2) — diffstat fence escape**: `ToMarkdown` rendered `Diffstat` raw inside a single-backtick fence. Diffstat rows contain file paths (excluded from the refusal-kind scan), so a Git-valid filename containing a backtick could close the fence prematurely and a filename containing a newline could inject a stand-alone marker line.
+
+**Fix**: new `escapeDiffstatForMarkdown` — replace control chars with `\uXXXX` and wrap in an N+1 backtick fence (N = longest backtick run in the content), the same approach as round-15's `escapePathForMarkdown`.
+
+### Regression tests
+
+| Finding | Regression test |
+|---------|-----------------|
+| R17-1 | `TestGenerateFailsClosedOnModifiedTrackedCopyOfModifiedThenDeletedProtected` (modify .env → cp to config.txt → git rm .env; config.txt suppressed) + updated `TestGenerateSuppressesModifiedTrackedCopyAfterProtectedDelete` / `TestGenerateFailsClosedOnTypechangeAfterProtectedDelete` (unrelated M feature.txt now fail-closed under D/T) |
+| R17-2 | `TestFilteredTrackedDiffFailsClosedOnTypechangeInHashesUnknownMode` (modify .env → symlink config.txt to modified secret → git rm .env; T config.txt suppressed in hashesUnknown mode) |
+| R17-3 | `TestSafeSummaryEscapesDiffstatBeforeRendering` (backtick + newline in diffstat filename; no stand-alone marker line; multi-backtick fence) |
+
+### Acceptance gate (Round 17)
+
+```
+go test ./...                                   PASS
+go vet ./...                                    PASS
+validate_contracts.py                           PASS (contract validation passed)
+acceptance-local.sh                             PASS (acceptance-local passed)
+```
+
+### Design trade-offs (Round 17)
+
+- **D/T vs R/C unrecoverability split**: a protected D or T means the pre-operation worktree bytes (possibly modified) are gone and unrecoverable from HEAD/index; a protected R/C means the bytes moved to a destination that IS recoverable (the destination's workspace bytes are in `existingHashes`). Only D/T set `unrecoverable=true`. This preserves the `TestGenerateDoesNotReincludeProtectedRenameFromHandoff` contract (R/C keeps unrelated M app.txt via content-hash) while closing the modified-then-deleted leak (D/T fail-closes M). The cost: during a protected delete/typechange, unrelated in-progress M modifications are also suppressed (correlation loss). This is the P1-security-over-P2-correlation trade-off round-8 already documented, now applied consistently to D/T.
+- **T fail-closed only in hashesUnknown mode**: in the orchestrator, when `hashesUnknown=false` (no protected D/R/C/T) a non-protected T is still content-hash-matched (an unrelated typechange like a config-file type change is kept). Only `hashesUnknown=true` fail-closes T, mirroring A/C/M.
+- **Diffstat N+1 fence reuses the round-15 pattern**: the same CommonMark rule (fence longer than any interior backtick run) that made `escapePathForMarkdown` correct applies to the multi-line diffstat block. Control-char escaping is shared with the path renderer.
+
+
 
 

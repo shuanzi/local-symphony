@@ -580,6 +580,20 @@ type protectedDeletedContentSet struct {
 	// match → all preserved. nil when unknown=true (unused; we deny all).
 	existingHashes map[string]bool
 	unknown        bool
+	// unrecoverable is set when a protected file was DELETED or
+	// TYPECHANGED (D/T) — the pre-operation worktree bytes may have been
+	// modified and are NOT recoverable from HEAD/index (only the old
+	// committed bytes are). D4/R16 round-17 (codex finding R17-1): in
+	// that case a modified tracked file may hold the modified-then-
+	// deleted protected bytes, which do NOT match any recoverable hash in
+	// existingHashes, so the M-record content-hash match would keep it
+	// and leak. When unrecoverable=true the M-record guard fail-closes.
+	// R/C (rename/copy) do NOT set this — the protected bytes moved to a
+	// destination and remain recoverable, so existingHashes covers an M
+	// copy and the TestGenerateDoesNotReincludeProtectedRenameFromHandoff
+	// contract (keep unrelated M app.txt during a protected rename) is
+	// preserved.
+	unrecoverable bool
 }
 
 // matchesUntracked reports whether an untracked file must be suppressed
@@ -711,8 +725,11 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord, prote
 				// have been copied into an untracked file) is
 				// unrecoverable when unstaged modifications existed,
 				// and undetectable after deletion. Fail closed: deny
-				// ALL non-path-protected untracked files.
-				return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: true}
+				// ALL non-path-protected untracked files. D4/R16
+				// round-17 (R17-1): mark unrecoverable so the M-record
+				// guard also fail-closes (the modified-then-deleted
+				// bytes are not in existingHashes).
+				return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: true, unrecoverable: true}
 			}
 			continue
 		}
@@ -722,7 +739,13 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord, prote
 			// protected bytes were moved/copied to a new path and could
 			// be further copied into an untracked file; the
 			// pre-rename/copy worktree content is unrecoverable when
-			// unstaged modifications existed. Fail closed.
+			// unstaged modifications existed. Fail closed. R/C does
+			// NOT set unrecoverable: the protected bytes moved to a
+			// destination and are still recoverable (the destination's
+			// workspace bytes are in existingHashes), so an M-record
+			// copy can still content-hash-match and the
+			// TestGenerateDoesNotReincludeProtectedRenameFromHandoff
+			// contract (keep unrelated M app.txt) is preserved.
 			if len(record.paths) == 0 {
 				continue
 			}
@@ -730,7 +753,7 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord, prote
 			if path == "" || !security.IsProtectedPathWithConfig(path, protectedPaths) {
 				continue
 			}
-			return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: true}
+			return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: true, unrecoverable: false}
 		}
 		if record.typechange() {
 			// D4/R16 round-8: a protected tracked file whose TYPE changed
@@ -744,7 +767,8 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord, prote
 			// builds. Fail closed so ALL untracked + ALL A/M records are
 			// suppressed. A `T` record carries a single path (the
 			// typechanged file); parseStatusPorcelainZ stores it at
-			// paths[0].
+			// paths[0]. D4/R16 round-17 (R17-1): mark unrecoverable
+			// (same rationale as D) so the M-record guard fail-closes.
 			if len(record.paths) == 0 {
 				continue
 			}
@@ -752,13 +776,13 @@ func protectedDeletedContent(root string, records []statusPorcelainRecord, prote
 			if path == "" || !security.IsProtectedPathWithConfig(path, protectedPaths) {
 				continue
 			}
-			return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: true}
+			return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: true, unrecoverable: true}
 		}
 	}
 	// No protected delete/rename/copy — all protected files REMAIN.
 	// Build the existing-protected-content hash set so callers can
 	// content-hash-match untracked files and A records against it.
-	return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: false}
+	return protectedDeletedContentSet{existingHashes: existingProtectedContentHashes(root, protectedPaths), unknown: false, unrecoverable: false}
 }
 
 // existingProtectedContentHashes builds the set of SHA256 content hashes of
@@ -1052,6 +1076,19 @@ func (s protectedDeletedContentSet) matchesAddedTracked(root, path string) bool 
 //     content; suppress on a match. On read error return true
 //     (fail closed for THIS file).
 func (s protectedDeletedContentSet) matchesModifiedTracked(root, path string) bool {
+	// D4/R16 round-17 (codex finding R17-1): when a protected file was
+	// DELETED or TYPECHANGED (unrecoverable=true), its pre-operation
+	// worktree bytes may have been modified and are NOT recoverable from
+	// HEAD/index. A modified tracked file may hold those modified-then-
+	// deleted bytes, which do NOT match any recoverable hash in
+	// existingHashes, so the content-hash match below would keep it and
+	// leak. Fail-closed M records in that case. R/C (unrecoverable=false)
+	// keeps the content-hash path so the
+	// TestGenerateDoesNotReincludeProtectedRenameFromHandoff contract
+	// (keep unrelated M app.txt during a protected rename) is preserved.
+	if s.unrecoverable {
+		return true
+	}
 	if len(s.existingHashes) == 0 {
 		// No protected content hashes to match against → keep.
 		// This covers the case where unknown=true AND no
