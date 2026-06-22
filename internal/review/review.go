@@ -453,6 +453,31 @@ func collectChanges(root string, protectedPaths []string) ([]string, []Untracked
 					continue
 				}
 			}
+			if record.code != "??" && record.renamedOrCopied() && len(safePaths) > 1 {
+				// D4/R16 round-16 (codex finding R16-2) — rename/copy
+				// destination guard. A tracked non-protected file renamed
+				// to a new path whose destination carries copied protected
+				// bytes (`cp .env old.txt >> append; git mv old.txt
+				// new.txt`) is reported by porcelain as an `R old.txt
+				// new.txt` record. The destination is NOT an A/M/T record,
+				// so the guards above did not cover it; `git diff HEAD --
+				// new.txt` emits the protected bytes as a new-file patch.
+				// When the rename SOURCE is protected the destination is
+				// already denied by the path-safety loop above (the source
+				// path fails reviewSafePath → denied[dst]=true); this guard
+				// covers the case where the SOURCE is non-protected but the
+				// DESTINATION carries protected bytes. When unknown=true
+				// fail-closed the destination (mirror of the A-record
+				// fail-closed — the destination could carry unrecoverable
+				// protected bytes); when unknown=false content-hash-match
+				// the destination's workspace content against
+				// existingHashes (the source-REMAINS exact-copy case).
+				dst := safePaths[len(safePaths)-1]
+				if protectedDeleted.matchesRenamedDestination(root, dst) {
+					denied[dst] = true
+					continue
+				}
+			}
 			for _, path := range safePaths {
 				if !contains(changed, path) {
 					changed = append(changed, path)
@@ -796,6 +821,25 @@ func existingProtectedContentHashes(root string, protectedPaths []string) map[st
 			candidates = append(candidates, p)
 		}
 	}
+	// D4/R16 round-16 (codex finding R16-1): ALSO enumerate protected
+	// files present in HEAD via `git ls-tree -r HEAD --name-only`. A
+	// protected file that was DELETED (`git rm -f .env`) is gone from
+	// the index and worktree, so the three enumerations above no longer
+	// list it — its HEAD blob hash was never added to the set, and a
+	// modified tracked file holding the copied bytes (`cp .env
+	// config.txt && git rm -f .env`) failed the content-hash match and
+	// leaked. ls-tree lists the file at its HEAD-committed path so
+	// `git show HEAD:<path>` recovers the blob hash even after a staged
+	// delete. (Workspace/index enumerations above already cover the
+	// non-deleted case; ls-tree only adds deleted-from-workspace files.)
+	if out, err := exec.Command("git", "-C", root, "ls-tree", "-r", "HEAD", "--name-only", "-z").Output(); err == nil {
+		for _, p := range strings.Split(string(out), "\x00") {
+			if p == "" {
+				continue
+			}
+			candidates = append(candidates, p)
+		}
+	}
 	for _, rel := range candidates {
 		// D4/R16 round-9: honor configured protected_paths, not just the
 		// built-in defaults, so a custom protected path such as
@@ -1050,6 +1094,47 @@ func (s protectedDeletedContentSet) matchesModifiedTracked(root, path string) bo
 	if !ok {
 		// Cannot read the M file's workspace bytes → cannot prove it
 		// is safe → fail closed for THIS file only.
+		return true
+	}
+	return s.existingHashes[h]
+}
+
+// matchesRenamedDestination reports whether a tracked RENAME/COPY (R/C)
+// destination must be suppressed (denied) from the review packet's
+// `changed` list because its workspace content may carry protected bytes.
+//
+// D4/R16 round-16 (codex finding R16-2): a renamed destination is not an
+// A/M/T record, so the round-5/8/10 guards did not cover it, and
+// `git diff HEAD -- <dst>` emits the destination bytes as a new-file
+// patch. When unknown=true (a protected file was
+// deleted/renamed/copied/typechanged) the destination could carry
+// unrecoverable protected bytes (e.g. `cat .env >> old.txt; git mv
+// old.txt new.txt; git rm -f .env`), so fail-closed — mirroring the
+// A-record fail-closed. When unknown=false (source REMAINS), the
+// destination's exact-copy content matches an existingHashes entry, so
+// content-hash-match like the M guard; an unrelated rename whose
+// destination does not match protected content is kept.
+func (s protectedDeletedContentSet) matchesRenamedDestination(root, path string) bool {
+	if s.unknown {
+		// Mirror the A-record fail-closed: when a protected file was
+		// deleted/renamed/copied/typechanged the destination could
+		// carry unrecoverable protected bytes we cannot hash-match.
+		return true
+	}
+	if len(s.existingHashes) == 0 {
+		return false
+	}
+	full := filepath.Join(root, path)
+	// A rename destination may be a symlink whose target text is the
+	// protected content git diff emits; check the target text first
+	// (same rationale as matchesModifiedTracked finding N).
+	if target, rerr := os.Readlink(full); rerr == nil {
+		return s.existingHashes[security.SHA256Bytes([]byte(target))]
+	}
+	h, ok := reviewHashWorkspaceFile(full)
+	if !ok {
+		// Cannot read the destination's workspace bytes → cannot prove
+		// it is safe → fail closed for THIS destination only.
 		return true
 	}
 	return s.existingHashes[h]

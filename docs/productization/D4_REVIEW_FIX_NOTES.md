@@ -471,4 +471,56 @@ acceptance-local.sh                             PASS (acceptance-local passed)
 - **N+1 fence over backslash escaping**: backslash-escaping is wrong inside a code span (CommonMark treats backslashes literally there), and replacing backticks with a visible escape like ``` would harm readability for the common case. The N+1-fence rule is exactly what CommonMark specifies for this situation and preserves the path verbatim while guaranteeing no interior backtick run can close the span.
 - **Space padding only when needed**: padding is added only when the content begins or ends with a backtick, so ordinary paths (no backticks) render as a clean single-backtick span with no surrounding spaces. Renderers visually trim the single leading/trailing space inside a code span, so the padded form still reads as the path.
 
+---
+
+## Round 16: deleted-protected enumeration + rename-destination guards (broad review)
+
+**Trigger**: codex review of the full PR diff (`--base main`), 3 new findings (2 P1 + 1 P2). These are protected-content convergence gaps in the round-8–13 logic that the broad review surfaced (not regressions from rounds 14/15). All three are about a deleted/renamed protected file whose recoverable bytes were missed by the existing-hash enumeration, letting a copy of those bytes through into `changes.patch` / `cumulative_diff_sha`.
+
+### Findings
+
+| ID | Finding | Severity | Files | Status |
+|----|---------|----------|-------|--------|
+| R16-1 | Fail closed modified files after protected deletes | P1 | `internal/review/review.go` `existingProtectedContentHashes` (+ orchestrator mirror) | done |
+| R16-2 | Hash-check renamed destinations before diffing | P1 | `internal/review/review.go` `collectChanges` + `matchesRenamedDestination` | done |
+| R16-3 | Suppress unchecked rename/typechange diffs from cumulative hash | P2 | `internal/orchestrator/orchestrator.go` `filteredTrackedDiffPathspecs` R branch | done |
+
+### Details
+
+**R16-1 (P1) — deleted protected file not enumerated**: round-13's M-record guard relies on `existingHashes` containing a deleted protected file's HEAD/index blob so a modified tracked copy (`cp .env config.txt && git rm -f .env`) content-hash-matches and is suppressed. But `existingProtectedContentHashes` enumerated protected files only from `git ls-files -z` (tracked), `--others --exclude-standard` (untracked), and `--others --ignored` (ignored) — all of which list files present in the index/worktree. A protected file that was `git rm`-ed is gone from the index AND worktree, so none of the three enumerations listed it; its HEAD blob hash was never added to the set; `config.txt`'s content did not match; the `M` record was kept; `SECRET=real` leaked into `changes.patch`. Round-13's documented premise ("HEAD/index blobs recoverable via git show even for deleted files") was correct about recoverability but wrong about enumeration.
+
+**Fix**: `existingProtectedContentHashes` (both review and orchestrator copies) ALSO enumerates protected files present in HEAD via `git ls-tree -r HEAD --name-only -z`. `ls-tree` lists the file at its HEAD-committed path even after a staged delete, so `git show HEAD:<path>` recovers the blob hash and the M-record content-hash match suppresses the copy. The unrelated-modification trade-off is unchanged (the M check is still content-hash, not blanket fail-closed — `existingHashes` is simply more complete now).
+
+**R16-2 (P1) — renamed destination not checked**: a tracked non-protected file renamed to a new path whose destination carries copied protected bytes (`cat .env >> old.txt; git mv old.txt new.txt; git rm -f .env`) is reported by porcelain as `R old.txt new.txt`. The destination is not an A/M/T record, so the round-5/8/10 guards did not cover it; `git diff HEAD -- new.txt` emitted the protected bytes as a new-file patch into `changes.patch`/`review.json`. (When the rename SOURCE is protected the destination is already denied by the path-safety loop; this is the non-protected-source, protected-bytes-destination case.)
+
+**Fix**: `collectChanges` adds an R/C destination guard. New `matchesRenamedDestination`: when `unknown=true` fail-closed (mirror of the A-record fail-closed — the destination could carry unrecoverable protected bytes); when `unknown=false` content-hash-match the destination's workspace content (symlink target text first, then file content) against `existingHashes`. An unrelated rename whose destination does not match protected content is kept.
+
+**R16-3 (P2) — same gap in the cumulative-diff path**: `filteredTrackedDiffPathspecs` had the same hole for R records — they fell through to the `safe` append without a content check, folding protected bytes into `cumulative_diff_sha`.
+
+**Fix**: add an R branch to `filteredTrackedDiffPathspecs`: when `hashesUnknown=true` skip (fail-closed, mirroring A/C); otherwise content-hash-match the destination's emitted bytes (via `hashTypechangeEmittedBytes`, which handles symlinks) against `existingHashes`.
+
+### Regression tests
+
+| Finding | Regression test |
+|---------|-----------------|
+| R16-1 | `TestGenerateSuppressesModifiedTrackedCopyAfterProtectedDelete` (`cp .env config.txt && git rm -f .env` → `M config.txt` suppressed; unrelated `feature.txt` kept) |
+| R16-2 | `TestGenerateSuppressesProtectedBytesInRenamedDestination` (`cat .env >> old.txt; git mv old.txt new.txt; git rm -f .env` → `R` destination suppressed; unrelated `feature.txt` kept) |
+| R16-3 | `TestFilteredTrackedDiffSkipsRenamedDestinationWithProtectedBytes` (same scenario in the orchestrator `filteredTrackedDiff` path) |
+
+### Acceptance gate (Round 16)
+
+```
+go test ./...                                   PASS
+go vet ./...                                    PASS
+validate_contracts.py                           PASS (contract validation passed)
+acceptance-local.sh                             PASS (acceptance-local passed)
+```
+
+### Design trade-offs (Round 16)
+
+- **ls-tree enumeration is additive**: the existing three enumerations (tracked / untracked / ignored) already cover all files present in the worktree or index; `ls-tree HEAD` only adds files that exist in HEAD but were deleted from the index/worktree (the `git rm` case). It cannot drop any candidate, so it cannot regress the source-REMAINS case. The HEAD-blob hash it adds is exactly the recoverable version round-13 assumed was present.
+- **R destination fail-closed only when unknown=true**: when `unknown=false` (no protected delete/rename/copy/typechange) the destination's content is content-hash-matched, not blanket-suppressed, so an unrelated rename whose destination does not match protected content is preserved (correlation). When `unknown=true` the fail-closed matches the existing A/C/untracked behavior — the documented trade-off that protected-content unrecoverability justifies dropping potentially-correlated records. This does not affect the `TestGenerateDoesNotReincludeProtectedRenameFromHandoff` contract (that test's `app.txt` is an M record, content-hash-matched and kept).
+- **R16-2/R16-3 source-protected case already handled**: when the rename SOURCE is protected, the review path-safety loop (`reviewSafePath` → `denied[dst]=true`) and the orchestrator per-record protected-source check already skip the destination before these new guards run. The new guards specifically close the non-protected-source / protected-bytes-destination case the broad review identified.
+
+
 

@@ -685,6 +685,36 @@ func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]strin
 				}
 			}
 		}
+		// D4/R16 round-16 (codex finding R16-3) — renamed destination
+		// (status R). A tracked non-protected file renamed to a new path
+		// whose destination carries copied protected bytes (`cat .env >>
+		// old.txt; git mv old.txt new.txt; git rm -f .env`) is reported
+		// by `git diff --name-status --find-renames` as `R<score> <src>
+		// <dst>`. The destination is not an A/C/M/T record, so the guards
+		// above did not cover it and `git diff HEAD -- <dst>` hashed the
+		// protected bytes into cumulative_diff_sha. When the rename SOURCE
+		// is protected the per-record protected-source check above already
+		// skipped it; this handles a NON-protected source whose
+		// DESTINATION carries protected bytes. When hashesUnknown=true
+		// fail-closed the destination (mirror of the A/C fail-closed);
+		// otherwise content-hash-match the destination's emitted bytes
+		// (symlink target text first, then workspace content) against
+		// existingHashes.
+		if strings.HasPrefix(record.status, "R") {
+			if hashesUnknown {
+				continue
+			}
+			if len(existingHashes) > 0 {
+				dst := record.paths[len(record.paths)-1]
+				h, ok := hashTypechangeEmittedBytes(root, dst)
+				if !ok {
+					continue
+				}
+				if existingHashes[h] {
+					continue
+				}
+			}
+		}
 		safe = append(safe, record.paths[len(record.paths)-1])
 	}
 	return safe, nil
@@ -1115,6 +1145,25 @@ func existingProtectedContentHashes(root string, protectedPaths []string) map[st
 		if err != nil {
 			continue
 		}
+		for _, p := range strings.Split(string(out), "\x00") {
+			if p == "" {
+				continue
+			}
+			candidates = append(candidates, p)
+		}
+	}
+	// D4/R16 round-16 (codex finding R16-1/O): ALSO enumerate protected
+	// files present in HEAD via `git ls-tree -r HEAD --name-only`. A
+	// protected file that was DELETED (`git rm -f .env`) is gone from
+	// the index and worktree, so the three enumerations above no longer
+	// list it — its HEAD blob hash was never added to the set, and a
+	// modified tracked file holding the copied bytes (`cp .env
+	// config.txt && git rm -f .env`) failed the content-hash match and
+	// the protected bytes were folded into cumulative_diff_sha /
+	// changes.patch. ls-tree lists the file at its HEAD-committed path
+	// so `git show HEAD:<path>` recovers the blob hash even after a
+	// staged delete.
+	if out, err := exec.Command("git", "-C", root, "ls-tree", "-r", "HEAD", "--name-only", "-z").Output(); err == nil {
 		for _, p := range strings.Split(string(out), "\x00") {
 			if p == "" {
 				continue

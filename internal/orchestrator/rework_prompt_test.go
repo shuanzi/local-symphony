@@ -595,6 +595,64 @@ func TestFilteredTrackedDiffSkipsProtectedDestination(t *testing.T) {
 	}
 }
 
+// TestFilteredTrackedDiffSkipsRenamedDestinationWithProtectedBytes (R16-3)
+// codifies the round-16 fix for a protected-content leak via a RENAME
+// destination whose workspace content carries protected bytes, in the
+// cumulative-diff path (filteredTrackedDiffPathspecs).
+//
+// Scenario: a protected tracked .env is committed (SECRET=real), and an
+// unrelated tracked old.txt is committed with several lines of benign
+// content. The protected bytes are appended to old.txt, old.txt is
+// RENAMED to new.txt (`git mv`), and the protected .env is DELETED
+// (`git rm -f`). `git diff --name-status --find-renames` reports this as
+// `R old.txt new.txt` (high similarity — only an append) plus `D .env`.
+// The protected delete sets hashesUnknown=true; the A/C/M guards did not
+// cover the R destination, so new.txt reached the diff and
+// `git diff HEAD -- new.txt` folded `SECRET=real` into cumulative_diff_sha.
+//
+// Round 16 fix: treat an R destination like an A/C destination —
+// fail-closed when hashesUnknown=true. An unrelated added file is still
+// kept when there is no protected operation.
+func TestFilteredTrackedDiffSkipsRenamedDestinationWithProtectedBytes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=real\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "old.txt"), []byte("line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n"), 0o644); err != nil {
+		t.Fatalf("write old.txt: %v", err)
+	}
+	gitCommit(t, ws, "add env and old.txt")
+	// Append protected bytes to old.txt, rename old.txt -> new.txt, delete .env.
+	secret, err := os.ReadFile(filepath.Join(ws, ".env"))
+	if err != nil {
+		t.Fatalf("read .env: %v", err)
+	}
+	f, err := os.OpenFile(filepath.Join(ws, "old.txt"), os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("open old.txt for append: %v", err)
+	}
+	if _, err := f.Write(secret); err != nil {
+		t.Fatalf("append protected bytes: %v", err)
+	}
+	f.Close()
+	if out, err := exec.Command("git", "-C", ws, "add", "old.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add old.txt: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", ws, "mv", "old.txt", "new.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git mv old.txt new.txt: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", ws, "rm", "-f", ".env").CombinedOutput(); err != nil {
+		t.Fatalf("git rm -f .env: %v\n%s", err, out)
+	}
+
+	diff := string(filteredTrackedDiff(ws, nil))
+	if strings.Contains(diff, "SECRET=real") || strings.Contains(diff, "diff --git a/new.txt b/new.txt") || strings.Contains(diff, "rename to new.txt") {
+		t.Fatalf("filtered tracked diff leaked protected bytes via renamed destination:\n%s", diff)
+	}
+}
+
 // TestCumulativeUntrackedDigestSkipsCopyOfDeletedProtectedContent
 // verifies that an untracked file which is a verbatim copy of a deleted
 // protected file's bytes has its content suppressed (a sentinel is

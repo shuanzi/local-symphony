@@ -1734,7 +1734,192 @@ func TestGenerateSuppressesModifiedTrackedCopyOfProtectedFile(t *testing.T) {
 	}
 }
 
-// TestGenerateFailsClosedOnProtectedTypechange codifies the D4 / R16 round-8
+// TestGenerateSuppressesModifiedTrackedCopyAfterProtectedDelete (R16-1)
+// codifies the round-16 fix for a protected-content leak in review.go's
+// matchesModifiedTracked path when a protected file is DELETED.
+//
+// Scenario: a protected tracked .env is committed (SECRET=real), then an
+// EXISTING tracked non-protected file config.txt is overwritten with the
+// protected bytes (`cp .env config.txt`), and the protected .env is
+// DELETED (`git rm -f .env`). porcelain reports `D .env` + `M config.txt`.
+// protectedDeletedContent sets unknown=true. The round-13 M guard
+// content-hash-matches config.txt against existingHashes — but
+// existingProtectedContentHashes enumerated only files still present in
+// the worktree/index, so the DELETED .env was never enumerated and its
+// HEAD blob hash was absent from existingHashes. config.txt's content
+// therefore did not match → the M record was kept → SECRET=real leaked
+// into changes.patch / review.json.
+//
+// Round 16 fix: existingProtectedContentHashes also enumerates protected
+// files present in HEAD (`git ls-tree -r HEAD --name-only`) so a deleted
+// protected file's HEAD blob hash is still in the set, and the M-record
+// content-hash match suppresses the copy. The unrelated modified
+// feature.txt is still kept (M check is content-hash, not blanket
+// fail-closed).
+func TestGenerateSuppressesModifiedTrackedCopyAfterProtectedDelete(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=real\n")
+	writeFile(t, workspace, "config.txt", "base config\n")
+	writeFile(t, workspace, "feature.txt", "old feature\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// Overwrite the EXISTING tracked config.txt with the protected bytes,
+	// then DELETE the protected .env. porcelain reports `D .env` +
+	// `M config.txt`.
+	protected, err := os.ReadFile(filepath.Join(workspace, ".env"))
+	if err != nil {
+		t.Fatalf("read .env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "config.txt"), protected, 0o644); err != nil {
+		t.Fatalf("overwrite config.txt with protected bytes: %v", err)
+	}
+	runGit(t, workspace, "add", "config.txt")
+	runGit(t, workspace, "rm", "-f", ".env")
+	// Unrelated modified tracked file — MUST be kept.
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"config.txt", "feature.txt"})
+
+	// Sanity: confirm git reports D .env + M config.txt (guards the test
+	// premise: protected-delete sets unknown=true, and config.txt is M).
+	probe, err := exec.Command("git", "-C", workspace, "status", "--porcelain=v1", "-z", "-uall").Output()
+	if err != nil {
+		t.Fatalf("porcelain probe: %v", err)
+	}
+	if !strings.Contains(string(probe), "D  .env") && !strings.Contains(string(probe), "D .env") {
+		t.Fatalf(".env not reported as a deleted (D) record; test premise invalid:\n%q", string(probe))
+	}
+	if !strings.Contains(string(probe), "M  config.txt") && !strings.Contains(string(probe), "MM config.txt") && !strings.Contains(string(probe), "M config.txt") {
+		t.Fatalf("config.txt not reported as a modified (M) record; test premise invalid:\n%q", string(probe))
+	}
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// config.txt (modified-tracked copy of DELETED protected content) MUST
+	// be suppressed: no protected bytes anywhere in the packet.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"SECRET=real",
+			"diff --git a/config.txt b/config.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked modified-tracked copy of deleted protected content (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if strings.Contains(changed, "config.txt") {
+		t.Fatalf("changed-files.txt kept denied modified-tracked copy config.txt:\n%s", changed)
+	}
+	// The unrelated modified feature.txt MUST be kept (M check is
+	// content-hash, not blanket fail-closed — preserves the
+	// TestGenerateDoesNotReincludeProtectedRenameFromHandoff contract).
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated modified tracked feature.txt (correlation broken):\n%s", patch)
+	}
+	if !strings.Contains(changed, "feature.txt") {
+		t.Fatalf("changed-files.txt dropped unrelated modified tracked feature.txt:\n%s", changed)
+	}
+}
+
+// TestGenerateSuppressesProtectedBytesInRenamedDestination (R16-2)
+// codifies the round-16 fix for a protected-content leak via a RENAME
+// destination when a protected file was deleted (unknown=true).
+//
+// Scenario: a protected tracked .env is committed (SECRET=real), and an
+// unrelated tracked file old.txt is committed with several lines of
+// benign content. The protected bytes are APPENDED to old.txt, old.txt is
+// RENAMED to new.txt, and the protected .env is DELETED. porcelain
+// reports `R old.txt new.txt` (high similarity — only an append) plus
+// `D .env`. The protected delete sets unknown=true; round-5 made tracked
+// ADDED (A) records fail-closed in that mode, but a RENAME destination is
+// not an A record, so new.txt fell through into `changed` and
+// gitx.DiffBinaryPaths emitted `SECRET=real` into changes.patch /
+// review.json.
+//
+// Round 16 fix: treat a RENAME/COPY destination like an added tracked
+// file for protected-content suppression — fail-closed when unknown=true
+// (the destination could carry unrecoverable protected bytes), and
+// content-hash-match when unknown=false. An unrelated modified tracked
+// file is still kept.
+func TestGenerateSuppressesProtectedBytesInRenamedDestination(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=real\n")
+	writeFile(t, workspace, "old.txt", "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n")
+	writeFile(t, workspace, "feature.txt", "old feature\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	// Append the protected bytes to old.txt, rename old.txt -> new.txt
+	// (high similarity → porcelain reports R), and DELETE the protected
+	// .env (sets unknown=true). new.txt now ends with SECRET=real and
+	// git diff HEAD -- new.txt emits it as a new-file patch.
+	protected, err := os.ReadFile(filepath.Join(workspace, ".env"))
+	if err != nil {
+		t.Fatalf("read .env: %v", err)
+	}
+	{
+		f, err := os.OpenFile(filepath.Join(workspace, "old.txt"), os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			t.Fatalf("open old.txt for append: %v", err)
+		}
+		if _, err := f.Write(protected); err != nil {
+			t.Fatalf("append protected bytes to old.txt: %v", err)
+		}
+		f.Close()
+	}
+	runGit(t, workspace, "add", "old.txt")
+	runGit(t, workspace, "mv", "old.txt", "new.txt")
+	runGit(t, workspace, "rm", "-f", ".env")
+	// Unrelated modified tracked file — MUST be kept.
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"new.txt", "feature.txt"})
+
+	// Sanity: confirm porcelain reports an R record whose destination is
+	// new.txt (guards the test premise: the leak vector is a rename
+	// destination, not an A or M record).
+	probe, err := exec.Command("git", "-C", workspace, "status", "--porcelain=v1", "-z", "-uall").Output()
+	if err != nil {
+		t.Fatalf("porcelain probe: %v", err)
+	}
+	if !strings.Contains(string(probe), "R") {
+		t.Fatalf("rename not reported as an R record; test premise invalid:\n%q", string(probe))
+	}
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// new.txt (renamed destination holding protected bytes) MUST be
+	// suppressed: no protected bytes anywhere in the packet.
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{
+			"SECRET=real",
+			"diff --git a/new.txt b/new.txt",
+			"rename to new.txt",
+		} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked protected bytes via renamed destination (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+	changed := readReviewArtifact(t, st, issue, run, "changed-files.txt")
+	if strings.Contains(changed, "new.txt") {
+		t.Fatalf("changed-files.txt kept denied renamed destination new.txt:\n%s", changed)
+	}
+	// The unrelated modified feature.txt MUST be kept.
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated modified tracked feature.txt (correlation broken):\n%s", patch)
+	}
+}
 // fix for the protected-typechange P1 leak in review.go's
 // protectedDeletedContent path.
 //
