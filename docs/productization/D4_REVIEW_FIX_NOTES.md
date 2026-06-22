@@ -380,3 +380,56 @@ go vet ./...                                    PASS
 validate_contracts.py                           PASS
 acceptance-local.sh                             PASS
 ```
+
+---
+
+## Round 14: rework reason raw markers + changed-file path escape + malformed git metadata
+
+**Trigger**: codex review commit `b1aa88f`, 3 new findings (all P2), submitted 2026-06-22. This is the first review round after the long protected-content convergence (rounds 8–13); the findings shift back to the D4 / R16 rework-prompt raw-artifact boundary that is the PR's core productization goal.
+
+### Findings
+
+| ID | Finding | Severity | Files | Status |
+|----|---------|----------|-------|--------|
+| R14-1 | Reject raw markers in rework reasons | P2 | `internal/agent/codex/rework_prompt.go` `BuildReworkPrompt` + `internal/review/safe_summary.go` `ScanRefusalKind` | done |
+| R14-2 | Escape changed-file paths before markdown | P2 | `internal/review/safe_summary.go` `bulletPaths` + `escapePathForMarkdown` | done |
+| R14-3 | Guard malformed git metadata in review packets | P2 | `internal/review/safe_summary.go` `hydrateSafeSummaryFromArtifacts` | done |
+
+### Details
+
+**R14-1 (P2) — raw markers in rework reasons**: `BuildReworkPrompt` writes the operator's Send-to-Rework reason verbatim into the next agent prompt (`buildReworkEnvelope`) and persists it on the `rework_snapshots` row. The safe-summary path already rejects raw-artifact markers (`kind=raw_prompt`, `codex_log`, …) before rendering, but the free-form `ReviewReason` was not scanned. A reason containing such a marker could reintroduce raw prompt / log / secret artifact references into the next prompt, bypassing the D4 guard.
+
+**Fix**: export `review.ScanRefusalKind` (wraps the existing `scanRefusalKind`) and call it on `in.ReviewReason` at the top of `BuildReworkPrompt`, before the reason is rendered or persisted. A hit returns `fmt.Errorf("rework reason contains raw artifact marker %q: rejected", hit)` and fails the dispatch (same fail-closed semantics as the safe-summary scan). The token-boundary scan already handles the `=` delimiter (round-10 R10-E), so `kind=raw_prompt` / `artifact=codex_log` key/value forms are caught; legitimate prose like "rerun the codex launch smoke test" and path-bounded substrings like `internal/codex_log_reader.go` are not.
+
+**R14-2 (P2) — changed-file path control chars**: `ChangedFiles` entries are excluded from the refusal-kind scan (they are file-system paths, not artifact-kind labels — round-8 F5). A Git-valid filename containing a control character such as a newline (`docs/x\nraw_prompt`) therefore passed the scan, then `bullet` rendered it verbatim — emitting `raw_prompt` as its own prompt line and bypassing the raw-artifact marker guard.
+
+**Fix**: add `bulletPaths` (a path-aware variant of `bullet`) and `escapePathForMarkdown`. Control characters (C0 control bytes `\n \r \t \f \v` etc. + DEL, via `r < 0x20 || r == 0x7f`) are replaced with a visible `\uXXXX` escape; backtick and backslash are backslash-escaped; the whole path is wrapped in backticks so embedded markdown punctuation renders literally and cannot close a surrounding code fence. `ToMarkdown` renders `ChangedFiles` via `bulletPaths` instead of `bullet`. Ordinary paths (`internal/greet/greet.go`) are unaffected.
+
+**R14-3 (P2) — malformed git metadata panic**: `hydrateSafeSummaryFromArtifacts` chained a type assertion `packet["git"].(map[string]any)["head_sha"].(string)`. A `review.json` that is valid JSON but lacks an object-valued `git` field (e.g. a manually-edited or partially-migrated packet artifact) panics on the inner assertion, taking down the worker during Send-to-Rework summary projection instead of returning a review-packet error.
+
+**Fix**: use a comma-ok assertion for the `git` field first; only when it is an object do we read `head_sha`. A missing/non-object `git` degrades to an empty `HeadSHA` (the projection continues with the other fields).
+
+### Regression tests
+
+| Finding | Regression test |
+|---------|-----------------|
+| R14-1 reject | `TestBuildReworkPromptRejectsRawMarkersInReviewReason` (4 marker forms incl. key/value `kind=raw_prompt`) |
+| R14-1 no-false-positive | `TestBuildReworkPromptAcceptsCleanReviewReason` (prose + path-bounded substrings accepted) |
+| R14-2 escape | `TestSafeSummaryEscapesChangedFilePathsBeforeMarkdown` (newline-bearing path escaped; stand-alone `raw_prompt` line absent; legitimate path preserved) |
+| R14-3 no-panic | `TestBuildSafeSummaryHandlesMalformedGitMetadata` (`git` as string AND `git` absent → graceful degrade, empty `HeadSHA`, no panic) |
+
+### Acceptance gate (Round 14)
+
+```
+go test ./...                                   PASS
+go vet ./...                                    PASS
+validate_contracts.py                           PASS (contract validation passed)
+acceptance-local.sh                             PASS (acceptance-local passed)
+```
+
+### Design trade-offs (Round 14)
+
+- **Scan the reason at render time, not at ingest**: the operator reason is stored on `review_packets`/`review_reasons` as written; we scan it only when it is about to enter an agent prompt (`BuildReworkPrompt`). This keeps the ingest path tolerant (an operator can save a reason that mentions a marker) while the prompt boundary stays fail-closed. The rework_snapshots row is stamped from the same `in.ReviewReason` that passed the scan, so persisted metadata is consistent with what was rendered.
+- **Escape at the renderer, not the scan**: the refusal-kind scan is about artifact-*kind* labels and must stay path-tolerant (round-8 F5). Control-character injection is a separate concern handled at the markdown renderer, where it is cheapest and where escaping cannot regress the scan's path false-positive behavior. Wrapping paths in backticks is the standard markdown idiom for literal path rendering.
+- **Graceful degrade, not fail-closed, for malformed `git`**: a missing `head_sha` is non-fatal (the rest of the safe summary is still useful and the field is optional). Panicking is strictly worse. This mirrors how `pickString`/`pickStringSlice` already silently skip non-string fields elsewhere in the same projection.
+

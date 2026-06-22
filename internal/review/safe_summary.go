@@ -316,7 +316,7 @@ func (s *SafeSummary) ToMarkdown() (string, error) {
 	b.WriteString("\n\n## Followups\n")
 	b.WriteString(bullet(s.Followups))
 	b.WriteString("\n\n## Changed Files\n")
-	b.WriteString(bullet(s.ChangedFiles))
+	b.WriteString(bulletPaths(s.ChangedFiles))
 	if strings.TrimSpace(s.Diffstat) != "" {
 		b.WriteString("\n\n## Diffstat\n```\n")
 		b.WriteString(strings.TrimSpace(s.Diffstat))
@@ -353,8 +353,17 @@ func hydrateSafeSummaryFromArtifacts(summary *SafeSummary, root string) error {
 			summary.Followups = pickStringSlice(packet, "handoff", "followups")
 			summary.Acceptance = pickStringSlice(packet, "issue", "acceptance_criteria")
 			summary.ChangedFiles = pickStringSlice(packet, "changed_files")
-			if head, ok := packet["git"].(map[string]any)["head_sha"].(string); ok {
-				summary.HeadSHA = head
+			// Round 14 / R14-3: a manually-edited or partially-migrated
+			// review.json may be valid JSON but lack an object-valued
+			// `git` field. The previous chained assertion
+			// `packet["git"].(map[string]any)["head_sha"]` panics on
+			// that input, taking down the worker during Send-to-Rework
+			// summary projection. Degrade to a missing head_sha
+			// instead.
+			if gitField, ok := packet["git"].(map[string]any); ok {
+				if head, ok := gitField["head_sha"].(string); ok {
+					summary.HeadSHA = head
+				}
 			}
 		}
 	}
@@ -466,6 +475,17 @@ func scanRefusalKind(raw string) string {
 	return ""
 }
 
+// ScanRefusalKind is the exported form of scanRefusalKind. It lets
+// callers outside the review package (notably the rework prompt
+// renderer) apply the same raw-artifact marker guard to free-form
+// operator text — e.g. the Send-to-Rework reason — that must not
+// reintroduce raw prompt / log / secret artifact references into the
+// next agent prompt. Returns "" when the text is clean, or the
+// offending marker otherwise. Round 14 / R14-1.
+func ScanRefusalKind(raw string) string {
+	return scanRefusalKind(raw)
+}
+
 func containsCIToken(haystack, needle string) bool {
 	if needle == "" {
 		return true
@@ -538,6 +558,54 @@ func isPathNameByteCI(b byte) bool {
 		b += 32
 	}
 	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_' || b == '-'
+}
+
+// bulletPaths renders changed-file path entries as markdown bullets with
+// each path escaped via escapePathForMarkdown. ChangedFiles entries are
+// excluded from the refusal-kind scan (they are file-system paths, not
+// artifact-kind labels), so a Git-valid filename that embeds a blocklist
+// token — or more importantly a filename containing a control character
+// such as a newline — must not reach the rendered prompt verbatim.
+// Round 14 / R14-2.
+func bulletPaths(v []string) string {
+	if len(v) == 0 {
+		return "- none"
+	}
+	out := make([]string, 0, len(v))
+	for _, x := range v {
+		out = append(out, "- "+escapePathForMarkdown(x))
+	}
+	return strings.Join(out, "\n")
+}
+
+// escapePathForMarkdown neutralizes control characters in a file path so
+// a Git-valid name containing, e.g., a newline (`docs/x\nraw_prompt`)
+// cannot break out of its bullet line and inject a raw-artifact marker
+// (or any other prose) into the Rework prompt. Control bytes and the
+// backtick (which could close a surrounding code fence prematurely) are
+// replaced with a visible escape sequence. The path is wrapped in
+// backticks so any embedded markdown punctuation is rendered literally.
+// Round 14 / R14-2.
+func escapePathForMarkdown(p string) string {
+	var b strings.Builder
+	b.Grow(len(p) + 2)
+	b.WriteByte('`')
+	for _, r := range p {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			// C0 control chars + DEL: covers \n \r \t \f \v and
+			// anything else that could start a new prompt line.
+			fmt.Fprintf(&b, "\\u%04x", r)
+		case r == '`':
+			b.WriteString("\\`")
+		case r == '\\':
+			b.WriteString("\\\\")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('`')
+	return b.String()
 }
 
 // isBoundaryByteCI reports whether b is a "boundary" byte — a

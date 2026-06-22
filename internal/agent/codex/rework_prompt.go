@@ -43,6 +43,15 @@ func BuildReworkPrompt(basePrompt string, in ReworkContextInput) (string, string
 	if strings.TrimSpace(in.ReviewReason) == "" {
 		return "", "", fmt.Errorf("rework reason is required")
 	}
+	// Round 14 / R14-1: the operator's Send-to-Rework reason is written
+	// verbatim into the next agent prompt (see buildReworkEnvelope) and
+	// persisted on the rework_snapshots row. Apply the same refusal-kind
+	// scan the safe summary uses so a reason containing a raw-artifact
+	// marker (e.g. `kind=raw_prompt` or `codex_log`) cannot reintroduce
+	// raw prompt / log / secret artifact references into the prompt.
+	if hit := review.ScanRefusalKind(in.ReviewReason); hit != "" {
+		return "", "", fmt.Errorf("rework reason contains raw artifact marker %q: rejected", hit)
+	}
 	if in.SafeSummary == nil {
 		return "", "", fmt.Errorf("safe summary is required")
 	}

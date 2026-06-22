@@ -557,3 +557,112 @@ func TestBuildSafeSummaryPreservesHandoffSummaryWithMarkdownHeadings(t *testing.
 		t.Fatalf("summary.Summary = %q, want %q (full handoff.summary must be preserved, not truncated at first markdown sub-heading)", summary.Summary, fullSummary)
 	}
 }
+
+// TestSafeSummaryEscapesChangedFilePathsBeforeMarkdown (R14-2) verifies
+// that a Git-valid changed-file path containing a control character —
+// e.g. a newline that would otherwise emit `raw_prompt` as its own
+// prompt line — is neutralized before being rendered into the Rework
+// prompt. ChangedFiles entries are excluded from the refusal-kind scan
+// (they are paths, not artifact-kind labels), so the renderer itself
+// must escape control bytes so a crafted filename cannot inject a
+// marker or break the markdown structure.
+func TestSafeSummaryEscapesChangedFilePathsBeforeMarkdown(t *testing.T) {
+	s := &SafeSummary{
+		ReviewPacketID: "rp_escape",
+		Status:         "generated",
+		Summary:        "Changed a file whose name embeds a marker.",
+		ChangedFiles: []string{
+			"docs/x\nraw_prompt",
+			"normal/path.go",
+		},
+		HowToContinue: "Review the escaped paths.",
+	}
+	if err := s.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	md, err := s.ToMarkdown()
+	if err != nil {
+		t.Fatalf("ToMarkdown: %v", err)
+	}
+	// The raw, unescaped path must not appear: the embedded newline
+	// would render `raw_prompt` as its own line in the prompt.
+	if strings.Contains(md, "docs/x\nraw_prompt") {
+		t.Fatalf("markdown emitted unescaped newline-bearing path: %q", md)
+	}
+	// The newline control char must be replaced with a visible escape
+	// sequence (backslash-u-000a) so it cannot start a new prompt line.
+	if !strings.Contains(md, "docs/x\\u000araw_prompt") {
+		t.Fatalf("markdown did not escape the newline control char: %q", md)
+	}
+	// `raw_prompt` must not appear as a stand-alone line (which would
+	// re-inject the raw-artifact marker into the prompt).
+	for _, line := range strings.Split(md, "\n") {
+		if strings.TrimSpace(line) == "raw_prompt" {
+			t.Fatalf("markdown rendered raw_prompt as a stand-alone line: %q", md)
+		}
+	}
+	// The legitimate path is still rendered (escaped form wraps it in
+	// backticks but the path text must remain reachable).
+	if !strings.Contains(md, "normal/path.go") {
+		t.Fatalf("markdown dropped legitimate path: %q", md)
+	}
+	// The escaped path is wrapped in backticks so it renders literally.
+	if !strings.Contains(md, "`docs/x") {
+		t.Fatalf("markdown did not wrap escaped path in backticks: %q", md)
+	}
+}
+
+// TestBuildSafeSummaryHandlesMalformedGitMetadata (R14-3) verifies that
+// a review.json which is valid JSON but lacks an object-valued `git`
+// field does not panic during safe summary projection. A manually-edited
+// or partially-migrated packet artifact previously triggered a chained
+// type assertion panic (`packet["git"].(map[string]any)["head_sha"]`)
+// that took down the worker during Send-to-Rework; the projection must
+// degrade to a missing head_sha instead.
+func TestBuildSafeSummaryHandlesMalformedGitMetadata(t *testing.T) {
+	st := newReviewTestStore(t)
+	issue, run := prepareReviewRun(t, st)
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	root := filepath.Join(st.RepoRoot, ".symphony", "artifacts", issue.Identifier, run.ID)
+	jpath := filepath.Join(root, "review.json")
+	data, err := os.ReadFile(jpath)
+	if err != nil {
+		t.Fatalf("read review.json: %v", err)
+	}
+	var packet map[string]any
+	if err := json.Unmarshal(data, &packet); err != nil {
+		t.Fatalf("unmarshal review.json: %v", err)
+	}
+	// Corrupt the `git` field so it is no longer an object. A panic
+	// here surfaces as a failing test (not a hang), proving the guard.
+	packet["git"] = "not-an-object"
+	// Also test the missing-field case by removing it entirely in a
+	// sub-check; the comma-ok guard must handle both.
+	jb, _ := json.Marshal(packet)
+	if err := os.WriteFile(jpath, jb, 0o644); err != nil {
+		t.Fatalf("write review.json: %v", err)
+	}
+	summary, err := BuildSafeSummaryFromRun(st, run.ID)
+	if err != nil {
+		t.Fatalf("BuildSafeSummaryFromRun returned error for malformed git metadata (want graceful degrade): %v", err)
+	}
+	if summary.HeadSHA != "" {
+		t.Fatalf("HeadSHA = %q, want empty when git metadata is malformed", summary.HeadSHA)
+	}
+
+	// Also cover the entirely-missing `git` field.
+	delete(packet, "git")
+	jb, _ = json.Marshal(packet)
+	if err := os.WriteFile(jpath, jb, 0o644); err != nil {
+		t.Fatalf("write review.json (no git): %v", err)
+	}
+	summary2, err := BuildSafeSummaryFromRun(st, run.ID)
+	if err != nil {
+		t.Fatalf("BuildSafeSummaryFromRun returned error for missing git metadata (want graceful degrade): %v", err)
+	}
+	if summary2.HeadSHA != "" {
+		t.Fatalf("HeadSHA = %q, want empty when git metadata is absent", summary2.HeadSHA)
+	}
+}

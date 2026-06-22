@@ -96,6 +96,70 @@ func TestBuildReworkPromptRejectsRawRefusalKindLeak(t *testing.T) {
 	}
 }
 
+// TestBuildReworkPromptRejectsRawMarkersInReviewReason (R14-1) verifies
+// that the operator's Send-to-Rework reason is scanned for raw-artifact
+// markers before it is rendered into the next agent prompt or persisted
+// on the rework_snapshots row. A reason containing a blocked marker
+// (e.g. `kind=raw_prompt` or a stand-alone `codex_log` token) must be
+// rejected just like a safe summary containing the same marker.
+func TestBuildReworkPromptRejectsRawMarkersInReviewReason(t *testing.T) {
+	summary := &review.SafeSummary{ReviewPacketID: "rp_1", Status: "generated", Summary: "ok", HowToContinue: "continue"}
+	if err := summary.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	cases := []string{
+		"kind=raw_prompt",
+		"artifact=codex_log",
+		"please reuse the codex_log from the last run",
+		"raw_prompt was leaked",
+	}
+	for _, reason := range cases {
+		in := ReworkContextInput{
+			Run:           &core.RunAttempt{ID: "run_2", IssueID: "iss_1", SourceIssueState: core.StateRework},
+			ReviewReason:  reason,
+			SafeSummary:   summary,
+			BaseSHA:       "b1",
+			CumulativeDiffSHA: "d1",
+		}
+		if _, _, err := BuildReworkPrompt("base", in); err == nil {
+			t.Fatalf("BuildReworkPrompt accepted review reason with raw marker %q", reason)
+		}
+	}
+}
+
+// TestBuildReworkPromptAcceptsCleanReviewReason (R14-1 companion)
+// verifies that an ordinary rework reason — including one that mentions
+// the word "codex" or a path segment that merely contains a blocked
+// substring — is NOT rejected by the refusal-kind scan.
+func TestBuildReworkPromptAcceptsCleanReviewReason(t *testing.T) {
+	summary := &review.SafeSummary{ReviewPacketID: "rp_1", Status: "generated", Summary: "ok", HowToContinue: "continue"}
+	if err := summary.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	cases := []string{
+		"Cover edge case for empty input",
+		"Rerun the codex launch smoke test",
+		"Update internal/codex_log_reader.go to handle EOF",
+		"The raw_prompt_handler needs a fix",
+	}
+	for _, reason := range cases {
+		in := ReworkContextInput{
+			Run:           &core.RunAttempt{ID: "run_2", IssueID: "iss_1", SourceIssueState: core.StateRework},
+			ReviewReason:  reason,
+			SafeSummary:   summary,
+			BaseSHA:       "b1",
+			CumulativeDiffSHA: "d1",
+		}
+		prompt, _, err := BuildReworkPrompt("base", in)
+		if err != nil {
+			t.Fatalf("BuildReworkPrompt rejected clean reason %q: %v", reason, err)
+		}
+		if !strings.Contains(prompt, reason) {
+			t.Fatalf("prompt missing clean review reason %q: %q", reason, prompt)
+		}
+	}
+}
+
 func TestBuildReworkSnapshotRecordPopulatesExpectedFields(t *testing.T) {
 	summary := &review.SafeSummary{ReviewPacketID: "rp_1", Status: "generated", Summary: "ok", HowToContinue: "continue"}
 	if err := summary.Seal(); err != nil {
