@@ -2284,3 +2284,99 @@ func TestGenerateSuppressesProtectedBytesInTrackedTypechange(t *testing.T) {
 		t.Fatalf("changes.patch dropped unrelated modified tracked feature.txt (correlation broken):\n%s", patch)
 	}
 }
+
+// TestGenerateSuppressesProtectedBytesInAddedSymlinkTarget codifies the PR #27
+// follow-up fix for added tracked symlinks: git diff emits the symlink target
+// text, while reviewHashWorkspaceFile follows the symlink and hashes the target
+// file contents. The target text must be hashed before review diffs are built.
+func TestGenerateSuppressesProtectedBytesInAddedSymlinkTarget(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=real")
+	writeFile(t, workspace, "feature.txt", "old feature\n")
+	// A benign file whose NAME equals the protected content. If the A-record
+	// guard follows the symlink, it hashes these benign file bytes and misses
+	// the protected target text that git diff emits.
+	writeFile(t, workspace, "SECRET=real", "benign target file\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	if err := os.Symlink("SECRET=real", filepath.Join(workspace, "leak")); err != nil {
+		t.Fatalf("ln -s SECRET=real leak: %v", err)
+	}
+	runGit(t, workspace, "add", "leak")
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"leak", "feature.txt"})
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{"SECRET=real", "diff --git a/leak b/leak"} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked protected bytes via added symlink target (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated modified tracked feature.txt:\n%s", patch)
+	}
+}
+
+// TestGenerateFailsClosedOnTypechangeAfterProtectedDelete codifies the PR #27
+// follow-up fix for non-protected T records when a protected delete makes the
+// copied worktree bytes unrecoverable. In that mode typechanges must be
+// suppressed fail-closed instead of relying on recoverable content hashes.
+func TestGenerateFailsClosedOnTypechangeAfterProtectedDelete(t *testing.T) {
+	st := newReviewTestStore(t)
+	workspace := initGitWorkspace(t)
+	writeFile(t, workspace, ".env", "SECRET=old")
+	writeFile(t, workspace, "config.txt", "base config\n")
+	writeFile(t, workspace, "feature.txt", "old feature\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "base")
+
+	writeFile(t, workspace, ".env", "SECRET=new")
+	secret, err := os.ReadFile(filepath.Join(workspace, ".env"))
+	if err != nil {
+		t.Fatalf("read modified .env: %v", err)
+	}
+	if err := os.Remove(filepath.Join(workspace, "config.txt")); err != nil {
+		t.Fatalf("rm config.txt: %v", err)
+	}
+	if err := os.Symlink(string(secret), filepath.Join(workspace, "config.txt")); err != nil {
+		t.Fatalf("ln -s <modified-secret> config.txt: %v", err)
+	}
+	runGit(t, workspace, "add", "config.txt")
+	runGit(t, workspace, "rm", "-f", ".env")
+	writeFile(t, workspace, "feature.txt", "new feature\n")
+	runGit(t, workspace, "add", "feature.txt")
+	issue, run := prepareReviewRunWithWorkspace(t, st, workspace, []string{"config.txt", "feature.txt"})
+
+	probe, err := exec.Command("git", "-C", workspace, "status", "--porcelain=v1", "-z", "-uall").Output()
+	if err != nil {
+		t.Fatalf("porcelain probe: %v", err)
+	}
+	if !strings.Contains(string(probe), "D  .env") || !strings.Contains(string(probe), "T  config.txt") {
+		t.Fatalf("expected protected delete and non-protected typechange; test premise invalid:\n%q", string(probe))
+	}
+
+	if _, err := (Generator{Store: st}).Generate(run.ID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	for _, name := range []string{"changes.patch", "changed-files.txt", "diffstat.txt", "untracked-files.json", "review.json"} {
+		art := readReviewArtifact(t, st, issue, run, name)
+		for _, marker := range []string{"SECRET=new", "diff --git a/config.txt b/config.txt"} {
+			if strings.Contains(art, marker) {
+				t.Fatalf("%s leaked protected bytes via typechange after protected delete (%q):\n%s", name, marker, art)
+			}
+		}
+	}
+	patch := readReviewArtifact(t, st, issue, run, "changes.patch")
+	if !strings.Contains(patch, "diff --git a/feature.txt b/feature.txt") || !strings.Contains(patch, "+new feature") {
+		t.Fatalf("changes.patch dropped unrelated modified tracked feature.txt:\n%s", patch)
+	}
+}

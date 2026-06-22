@@ -443,10 +443,10 @@ func collectChanges(root string, protectedPaths []string) ([]string, []Untracked
 				// the protected bytes. (A typechange on a PROTECTED path is
 				// already fail-closed by protectedDeletedContent.unknown;
 				// this guard handles the NON-protected path case.) Like the
-				// M guard, this only content-hash-checks when unknown=false
-				// (source REMAINS); when unknown=true we do NOT blanket
-				// fail-closed T records (preserve an unrelated typechange),
-				// matching the M trade-off.
+				// M guard for matchable content, but when unknown=true we
+				// MUST blanket fail-closed T records: symlink target text
+				// can contain unrecoverable protected-delete worktree bytes
+				// that are not present in existingHashes.
 				dst := safePaths[len(safePaths)-1]
 				if protectedDeleted.matchesTypechangeTracked(root, dst) {
 					denied[dst] = true
@@ -963,7 +963,14 @@ func (s protectedDeletedContentSet) matchesAddedTracked(root, path string) bool 
 	if len(s.existingHashes) == 0 {
 		return false
 	}
-	h, ok := reviewHashWorkspaceFile(filepath.Join(root, path))
+	full := filepath.Join(root, path)
+	if target, rerr := os.Readlink(full); rerr == nil {
+		// A tracked symlink's diff emits the target text, not the
+		// target file's contents. Hash the bytes Git will emit before
+		// falling back to workspace-file hashing for regular files.
+		return s.existingHashes[security.SHA256Bytes([]byte(target))]
+	}
+	h, ok := reviewHashWorkspaceFile(full)
 	if !ok {
 		// Cannot read the A file's workspace bytes → cannot prove it
 		// is safe → fail closed for this file.
@@ -1061,16 +1068,21 @@ func (s protectedDeletedContentSet) matchesModifiedTracked(root, path string) bo
 // a PROTECTED path is already fail-closed via
 // protectedDeletedContent.unknown=true; this handles the non-protected path.)
 //
-// Like matchesModifiedTracked this does NOT blanket fail-closed when
-// unknown=true (an unrelated typechange is preserved, matching the M
-// trade-off). When unknown=false it reads the symlink target via os.Readlink
-// (the target text is what `git diff` emits), hashes it, and suppresses on a
+// When unknown=true, blanket fail-closed: a protected delete/rename/copy/
+// typechange can make the original worktree bytes unrecoverable, and a
+// regular→symlink typechange can emit those bytes as symlink target text even
+// when no recoverable hash matches. When unknown=false it reads the symlink
+// target via os.Readlink (the target text is what `git diff` emits), hashes
+// it, and suppresses on a
 // match against existingHashes. A non-symlink typechange (e.g. symlink →
 // regular) returns false (its content is the regular file's bytes, handled
 // by the normal path; and a symlink→regular typechange's emitted content is
 // the regular file's, which is safe unless it matches protected content —
 // covered by reading the workspace content via reviewHashWorkspaceFile).
 func (s protectedDeletedContentSet) matchesTypechangeTracked(root, path string) bool {
+	if s.unknown {
+		return true
+	}
 	if len(s.existingHashes) == 0 {
 		return false
 	}
