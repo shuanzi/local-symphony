@@ -590,7 +590,18 @@ func filteredTrackedDiffPathspecs(root string, protectedPaths []string) ([]strin
 			// I/O.
 			dst := record.paths[len(record.paths)-1]
 			if len(existingHashes) > 0 {
-				h, ok := hashWorkspaceFile(filepath.Join(root, dst))
+				// D4/R16 round-18 (codex finding R18-1): for an A/C
+				// symlink, git diff emits the symlink TARGET TEXT, not
+				// the target file content. hashWorkspaceFile follows
+				// symlinks (os.Stat) and hashes the target file — but
+				// the emitted bytes are the target text. When the
+				// target text is protected content but also names a
+				// benign regular file, hashWorkspaceFile would hash the
+				// benign file, miss the protected-content match, and
+				// keep the A/C record → protected target text folded
+				// into cumulative_diff_sha. Hash the target text first
+				// via os.Readlink (same approach as the M/T/R branches).
+				h, ok := hashTypechangeEmittedBytes(root, dst)
 				if !ok {
 					continue
 				}

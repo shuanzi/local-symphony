@@ -608,7 +608,12 @@ func escapeDiffstatForMarkdown(diffstat string) string {
 		}
 	}
 	content := eb.String()
-	// Longest run of backticks in the content; the fence needs one more.
+	// Longest run of backticks in the content; a fenced code block needs
+	// a fence longer than any interior backtick run AND at least three
+	// backticks (CommonMark requires ≥3 for a fenced code block). Round
+	// 18 / R18-2: the previous `longest+1` emitted a one-backtick "fence"
+	// for ordinary diffstats, which is not a valid code block, so the
+	// diffstat rendered as normal markdown.
 	longest := 0
 	run := 0
 	for i := 0; i < len(content); i++ {
@@ -621,7 +626,11 @@ func escapeDiffstatForMarkdown(diffstat string) string {
 			run = 0
 		}
 	}
-	fence := strings.Repeat("`", longest+1)
+	fenceLen := longest + 1
+	if fenceLen < 3 {
+		fenceLen = 3
+	}
+	fence := strings.Repeat("`", fenceLen)
 	return fence + "\n" + content + "\n" + fence
 }
 

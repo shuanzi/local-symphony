@@ -650,6 +650,34 @@ func TestSafeSummaryEscapesDiffstatBeforeRendering(t *testing.T) {
 	}
 }
 
+// TestSafeSummaryDiffstatUsesValidFencedCodeBlock (R18-2) verifies that an
+// ordinary diffstat (no backticks) is rendered inside a valid CommonMark
+// fenced code block (≥3 backticks). Round-17's escapeDiffstatForMarkdown
+// used longest+1 backticks, which is only 1 for ordinary diffstats — not a
+// valid fenced code block, so the diffstat rendered as normal markdown and
+// paths excluded from the refusal-kind scan were not contained.
+func TestSafeSummaryDiffstatUsesValidFencedCodeBlock(t *testing.T) {
+	s := &SafeSummary{
+		ReviewPacketID: "rp_fence",
+		Status:         "generated",
+		Summary:        "Ordinary change.",
+		Diffstat:       "3\t1\tinternal/greet/greet.go\n",
+		HowToContinue:  "Review.",
+	}
+	if err := s.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	md, err := s.ToMarkdown()
+	if err != nil {
+		t.Fatalf("ToMarkdown: %v", err)
+	}
+	// A fenced code block requires a line of ≥3 backticks before and
+	// after the content.
+	if !strings.Contains(md, "\n```\n") {
+		t.Fatalf("markdown did not use a ≥3-backtick fenced code block for an ordinary diffstat: %q", md)
+	}
+}
+
 // Git-valid changed-file path containing a literal backtick cannot
 // close the single-backtick code-span wrapper and leak a raw-artifact
 // marker. Round 14 used a single-backtick wrapper with backslash-escaped

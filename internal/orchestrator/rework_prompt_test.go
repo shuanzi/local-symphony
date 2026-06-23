@@ -653,6 +653,70 @@ func TestFilteredTrackedDiffSkipsRenamedDestinationWithProtectedBytes(t *testing
 	}
 }
 
+// TestFilteredTrackedDiffHashesAddedSymlinkTargetText (R18-1) codifies the
+// round-18 fix for an A/C symlink whose target text is protected content but
+// also names a benign regular file, in the cumulative-diff path.
+//
+// Scenario: a protected tracked .env is committed (SECRET=real). A benign
+// regular file named `SECRET=real` is committed. An added tracked symlink
+// `leak` is created whose target text is `SECRET=real` (`ln -s SECRET=real
+// leak && git add leak`). porcelain reports `A leak`. Round-17's A-branch
+// used hashWorkspaceFile, which FOLLOWS the symlink and hashes the benign
+// regular file `SECRET=real` — but `git diff HEAD -- leak` emits the symlink
+// TARGET TEXT (`SECRET=real`). The protected-content match missed (benign
+// file hash ≠ .env hash unless .env's content happens to match), so `leak`
+// was kept and the protected target text was folded into cumulative_diff_sha.
+//
+// Round 18 fix: hash the symlink target text (os.Readlink) first, like the
+// M/T/R branches.
+func TestFilteredTrackedDiffHashesAddedSymlinkTargetText(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, issue, _ := newReworkDispatchIssueWithGitWorkspace(t)
+	ws := issue.Workspace.Path
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=real\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	// A benign regular file whose NAME equals the protected content but
+	// whose CONTENT is different. The symlink `leak` targets this file by
+	// name, so hashWorkspaceFile (follows symlinks) hashes the benign
+	// content — which does NOT match .env. But `git diff HEAD -- leak`
+	// emits the symlink TARGET TEXT (`SECRET=real`), which DOES match the
+	// protected content. This is the round-18 gap: the A-branch hashed
+	// the resolved file content instead of the emitted target text.
+	if err := os.WriteFile(filepath.Join(ws, "SECRET=real"), []byte("benign content\n"), 0o644); err != nil {
+		t.Fatalf("write benign file named after protected content: %v", err)
+	}
+	gitCommit(t, ws, "add env and benign file")
+	// Add a symlink whose target text is the protected content.
+	if err := os.Symlink("SECRET=real", filepath.Join(ws, "leak")); err != nil {
+		t.Fatalf("symlink leak -> protected content: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", ws, "add", "leak").CombinedOutput(); err != nil {
+		t.Fatalf("git add leak: %v\n%s", err, out)
+	}
+
+	// Sanity: leak is reported as an A record.
+	probe, err := exec.Command("git", "-C", ws, "diff", "--name-status", "--find-renames", "--find-copies", "--find-copies-harder", "-z", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("name-status probe: %v", err)
+	}
+	if !strings.Contains(string(probe), "A\x00leak") && !strings.Contains(string(probe), "C") {
+		t.Fatalf("leak not reported as an A/C record; test premise invalid:\n%q", string(probe))
+	}
+
+	diff := string(filteredTrackedDiff(ws, nil))
+	// The symlink target text (the protected content) must not be folded
+	// into the cumulative diff. `git diff HEAD -- leak` emits the target
+	// text `SECRET=real`; the round-18 fix hash-matches it against
+	// existingHashes (which contains .env's hash) and skips it.
+	if strings.Contains(diff, "SECRET=real") {
+		t.Fatalf("filtered tracked diff leaked protected bytes via added symlink target text:\n%s", diff)
+	}
+	if strings.Contains(diff, "diff --git a/leak b/leak") {
+		t.Fatalf("filtered tracked diff kept added symlink leak (target text matches protected content):\n%s", diff)
+	}
+}
+
 // TestCumulativeUntrackedDigestSkipsCopyOfDeletedProtectedContent
 // verifies that an untracked file which is a verbatim copy of a deleted
 // protected file's bytes has its content suppressed (a sentinel is

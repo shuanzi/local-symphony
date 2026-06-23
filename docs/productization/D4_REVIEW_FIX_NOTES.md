@@ -573,6 +573,51 @@ acceptance-local.sh                             PASS (acceptance-local passed)
 - **T fail-closed only in hashesUnknown mode**: in the orchestrator, when `hashesUnknown=false` (no protected D/R/C/T) a non-protected T is still content-hash-matched (an unrelated typechange like a config-file type change is kept). Only `hashesUnknown=true` fail-closes T, mirroring A/C/M.
 - **Diffstat N+1 fence reuses the round-15 pattern**: the same CommonMark rule (fence longer than any interior backtick run) that made `escapePathForMarkdown` correct applies to the multi-line diffstat block. Control-char escaping is shared with the path renderer.
 
+---
+
+## Round 18: A/C symlink target text + valid diffstat fence
+
+**Trigger**: codex round-18 broad review (`--base main`), 2 new findings (1 P1 + 1 P2), both direct follow-ups to the round-17 fixes.
+
+### Findings
+
+| ID | Finding | Severity | Files | Status |
+|----|---------|----------|-------|--------|
+| R18-1 | Hash symlink targets before keeping A/C records | P1 | `internal/orchestrator/orchestrator.go` `filteredTrackedDiffPathspecs` A/C branch | done |
+| R18-2 | Use a valid code fence for diffstat blocks | P2 | `internal/review/safe_summary.go` `escapeDiffstatForMarkdown` | done |
+
+### Details
+
+**R18-1 (P1) — A/C symlink target text not hashed**: round-17's orchestrator R-branch fix used `hashTypechangeEmittedBytes` (which hashes the symlink target text via `os.Readlink` first), but the A/C branch (round-9) still used `hashWorkspaceFile`, which FOLLOWS symlinks and hashes the target file's content. For an A/C symlink whose target text is protected content but also names a benign regular file with different content, `hashWorkspaceFile` hashed the benign file → no match → the A/C record was kept → `git diff HEAD -- <path>` emitted the protected target text into `cumulative_diff_sha`. (The review-side `matchesAddedTracked` already handled this via `os.Readlink` first — only the orchestrator A/C branch had the gap.)
+
+**Fix**: the A/C branch now uses `hashTypechangeEmittedBytes` (readlink first, then workspace content) instead of `hashWorkspaceFile`, matching the M/T/R branches and the review side.
+
+**R18-2 (P2) — diffstat fence too short**: round-17's `escapeDiffstatForMarkdown` used `longest+1` backticks. For an ordinary diffstat (no backticks) that is 1 backtick — not a valid CommonMark fenced code block (which requires ≥3), so the diffstat rendered as normal markdown and path text excluded from the refusal-kind scan was not contained.
+
+**Fix**: `fenceLen = max(3, longest+1)`.
+
+### Regression tests
+
+| Finding | Regression test |
+|---------|-----------------|
+| R18-1 | `TestFilteredTrackedDiffHashesAddedSymlinkTargetText` (added symlink `leak -> SECRET=real` where `SECRET=real` is a benign file with different content; verified the test FAILS with the reverted `hashWorkspaceFile` and PASSES with the `hashTypechangeEmittedBytes` fix) |
+| R18-2 | `TestSafeSummaryDiffstatUsesValidFencedCodeBlock` (ordinary diffstat rendered in a ≥3-backtick fenced code block) |
+
+### Acceptance gate (Round 18)
+
+```
+go test ./...                                   PASS
+go vet ./...                                    PASS
+validate_contracts.py                           PASS (contract validation passed)
+acceptance-local.sh                             PASS (acceptance-local passed)
+```
+
+### Design trade-offs (Round 18)
+
+- **A/C uses the same emitted-bytes hasher as M/T/R**: `hashTypechangeEmittedBytes` reads the symlink target text first (what `git diff` emits for a symlink) and falls back to workspace file content for regular files. This unifies all four record-type branches on the same "hash what git diff emits" principle and closes the symlink-target-text gap. The review side already did this (`matchesAddedTracked`), so the two packages are now consistent.
+- **`max(3, longest+1)` for fences**: fenced code blocks need ≥3 backticks regardless of content; the `longest+1` rule only guarantees the fence is longer than interior backtick runs. Taking the max satisfies both constraints. (The path renderer `escapePathForMarkdown` uses a code SPAN, not a fenced block, so it correctly stays at `longest+1` — spans have no minimum length.)
+
+
 
 
 
