@@ -25,6 +25,12 @@ included Linear adapter serves `linear_graphql` so repo skills can make raw Line
 Symphony executes that tool with its configured auth and removes `LINEAR_API_KEY` from the Codex
 child environment, so the agent does not need a second tracker login.
 
+本仓库另附不依赖 Linear、Linear API key 或 Linear MCP 的 Local Tracker 设计 profile。该 profile 以 SQLite
+作为任务与状态真相，要求 host 隔离 tracker storage，并只向 Codex 暴露受当前 issue 与 lease 限制的
+`local_tracker` tool；完整契约见
+[`LOCAL_TRACKER_SPEC.md`](../LOCAL_TRACKER_SPEC.md)。当前 reference implementation 尚未实现该 profile。
+随附的 `WORKFLOW.local.md` template 还要求 operator 在启动 daemon 前设置 trusted host environment `SOURCE_REPO_URL`。
+
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
@@ -253,6 +259,7 @@ The observability UI now runs on a minimal Phoenix stack:
 - `lib/`: application code and Mix tasks
 - `test/`: ExUnit coverage for runtime behavior
 - `WORKFLOW.md`: in-repo workflow contract used by local runs
+- `WORKFLOW.local.md`: 尚未实现的 Local Tracker profile conformance fixture
 - `../.codex/`: repository-local Codex skills and setup helpers
 
 ## Testing

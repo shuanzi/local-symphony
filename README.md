@@ -34,6 +34,11 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+本仓库还提供 Local Tracker 的设计规范，以本地 SQLite 作为任务与状态真相，且不依赖
+Linear credential 或 Linear MCP。规范见
+[`LOCAL_TRACKER_SPEC.md`](LOCAL_TRACKER_SPEC.md)，参考模板见
+[`elixir/WORKFLOW.local.md`](elixir/WORKFLOW.local.md)；当前 reference implementation 尚未实现该 profile。
+
 ---
 
 ## License
